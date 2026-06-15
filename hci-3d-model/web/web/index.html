@@ -1,0 +1,2934 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Floor Plan Model Trainer</title>
+<style>
+/* ── Reset & Base ─────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #232733;
+  --border: #2e3345;
+  --text: #e1e4ed;
+  --text-dim: #8b90a0;
+  --accent: #6c8cff;
+  --accent-hover: #8aa4ff;
+  --green: #4ade80;
+  --red: #f87171;
+  --orange: #fb923c;
+  --yellow: #fbbf24;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow: 0 4px 24px rgba(0,0,0,0.3);
+}
+html, body { height: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  overflow: hidden;
+}
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  border-radius: var(--radius);
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+input, select {
+  font-family: inherit;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+input:focus, select:focus { border-color: var(--accent); }
+
+/* ── Layout ───────────────────────────────────────────────────────── */
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+header h1 {
+  font-size: 18px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+header h1 .icon { font-size: 22px; }
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+.status-badge .dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.status-badge.busy .dot { background: var(--orange); animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* ── Tabs ─────────────────────────────────────────────────────────── */
+.tab-bar {
+  display: flex;
+  gap: 2px;
+  padding: 0 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.tab-btn {
+  background: transparent;
+  color: var(--text-dim);
+  padding: 10px 20px;
+  border-radius: 0;
+  font-size: 13px;
+  font-weight: 500;
+  border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+}
+.tab-btn:hover { color: var(--text); background: var(--surface2); }
+.tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: transparent;
+}
+.view-mode-btn {
+  background: var(--surface2);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.view-mode-btn:hover { color: var(--text); border-color: var(--accent); }
+.view-mode-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.thumb-item {
+  flex-shrink: 0;
+  width: 60px; height: 60px;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 2px solid transparent;
+  position: relative;
+  background: var(--surface2);
+}
+.thumb-item:hover { border-color: var(--accent-hover); }
+.thumb-item.selected { border-color: var(--accent); }
+.thumb-item img { width: 100%; height: 100%; object-fit: cover; }
+.thumb-item .thumb-label {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  font-size: 8px; color: #fff; background: rgba(0,0,0,0.6);
+  padding: 1px 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tab-content { display: none; flex: 1; overflow: hidden; }
+.tab-content.active { display: flex; flex-direction: column; }
+
+/* ── Main area ────────────────────────────────────────────────────── */
+main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+
+/* ── Buttons ──────────────────────────────────────────────────────── */
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+}
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-secondary {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover:not(:disabled) { background: var(--border); }
+.btn-success { background: var(--green); color: #000; }
+.btn-success:hover:not(:disabled) { filter: brightness(1.1); }
+.btn-danger { background: var(--red); color: #fff; }
+.btn-danger:hover:not(:disabled) { filter: brightness(1.1); }
+
+/* ── Cards ────────────────────────────────────────────────────────── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+}
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ── Progress bar ─────────────────────────────────────────────────── */
+.progress-bar {
+  width: 100%;
+  height: 6px;
+  background: var(--surface2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.progress-bar .fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--green));
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+/* ── Train Tab ────────────────────────────────────────────────────── */
+.train-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto 1fr;
+  gap: 16px;
+  padding: 16px 24px;
+  flex: 1;
+  overflow: hidden;
+}
+.train-controls {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.train-controls .sep {
+  width: 1px;
+  height: 28px;
+  background: var(--border);
+  margin: 0 4px;
+}
+.param-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.param-group label {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.param-group input { width: 60px; text-align: center; }
+
+.image-viewer {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.image-viewer .viewer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.image-viewer .viewer-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.image-viewer .viewer-nav button {
+  padding: 4px 12px;
+  font-size: 16px;
+}
+.image-viewer .viewer-body {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  border-radius: var(--radius);
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+}
+.image-viewer .viewer-body img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+/* ── Pan/Zoom Viewer ──────────────────────────────────────────────── */
+.pz-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  border-radius: var(--radius);
+  cursor: grab;
+  user-select: none;
+}
+.pz-wrap.grabbing { cursor: grabbing; }
+.pz-wrap.draw-mode  { cursor: crosshair !important; }
+.pz-inner {
+  position: absolute;
+  top: 0; left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+.pz-inner img {
+  display: block;
+  max-width: none;
+  max-height: none;
+}
+.pz-toolbar {
+  position: absolute;
+  bottom: 10px; right: 10px;
+  display: flex;
+  gap: 4px;
+  z-index: 10;
+}
+.pz-toolbar button {
+  width: 30px; height: 30px;
+  padding: 0;
+  font-size: 16px;
+  background: rgba(26,29,39,0.85);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+}
+.pz-toolbar button:hover { background: var(--surface2); }
+.pz-zoom-label {
+  position: absolute;
+  bottom: 10px; left: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(26,29,39,0.75);
+  padding: 2px 7px;
+  border-radius: 4px;
+  z-index: 10;
+  pointer-events: none;
+}
+.image-viewer .viewer-body .placeholder {
+  color: var(--text-dim);
+  font-size: 14px;
+  text-align: center;
+  padding: 40px;
+}
+
+.log-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.log-output {
+  flex: 1;
+  background: var(--bg);
+  border-radius: var(--radius);
+  padding: 12px;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-y: auto;
+  color: var(--text-dim);
+  min-height: 0;
+}
+.log-output .log-line { white-space: pre-wrap; word-break: break-all; }
+.log-output .log-line.success { color: var(--green); }
+.log-output .log-line.error { color: var(--red); }
+.log-output .log-line.info { color: var(--accent); }
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.metric-card {
+  background: var(--bg);
+  border-radius: var(--radius);
+  padding: 10px;
+  text-align: center;
+}
+.metric-card .value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.metric-card .label {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* ── Correct Tab ──────────────────────────────────────────────────── */
+.correct-layout {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 16px;
+  padding: 16px 24px;
+  flex: 1;
+  overflow: hidden;
+}
+.correct-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.correct-controls select { min-width: 200px; }
+.label-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+.label-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.label-item:hover { background: var(--surface2); }
+.label-item .cls-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+.label-item .cls-badge .color-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.label-item .actions { display: flex; gap: 4px; }
+.label-item .actions button { padding: 3px 8px; font-size: 11px; }
+.label-item.highlighted { background: rgba(108,140,255,0.18); border-left: 3px solid var(--accent); }
+.label-item.selected-item { background: rgba(74,222,128,0.12); }
+.label-item input[type=checkbox] { cursor:pointer; width:14px;height:14px; }
+.label-item.active-edit { background:rgba(251,146,60,0.18); border-left:3px solid var(--orange); }
+.resize-handle {
+  position:absolute; width:10px; height:10px; background:#fff;
+  border:2px solid var(--accent); border-radius:2px; cursor:nwse-resize;
+  transform:translate(-50%,-50%); z-index:20;
+}
+#correctDrawCanvas.draw-active { pointer-events:all !important; cursor:crosshair !important; }
+.view-mode-btn.draw-on { background:var(--orange) !important; color:#000 !important; border-color:var(--orange) !important; }
+
+/* ── Test Tab ─────────────────────────────────────────────────────── */
+.test-layout {
+  display: flex;
+  flex-direction: column;
+  padding: 12px 20px;
+  flex: 1;
+  overflow: hidden;
+  gap: 10px;
+}
+.test-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.test-results {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  overflow: hidden;
+  min-height: 0;
+}
+.test-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.test-panel .panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.test-panel .panel-body {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  border-radius: var(--radius);
+  overflow: hidden;
+  min-height: 0;
+}
+.test-panel .panel-body img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.detection-counts {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.detection-counts .count-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+
+/* ── Upload area ──────────────────────────────────────────────────── */
+.upload-zone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: var(--text-dim);
+}
+.upload-zone:hover, .upload-zone.dragover {
+  border-color: var(--accent);
+  background: rgba(108,140,255,0.05);
+  color: var(--text);
+}
+.upload-zone .upload-icon { font-size: 32px; margin-bottom: 8px; }
+
+/* ── Scrollbar ────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* ── Responsive ───────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .train-layout { grid-template-columns: 1fr; }
+  .correct-layout { grid-template-columns: 1fr; }
+  .test-results { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- ── Header ─────────────────────────────────────────────────── -->
+  <header>
+    <h1><span class="icon">🏠</span> Floor Plan Model Trainer</h1>
+    <div class="status-badge" id="statusBadge">
+      <span class="dot"></span>
+      <span id="statusText">Ready</span>
+    </div>
+  </header>
+
+  <!-- ── Tab Bar ────────────────────────────────────────────────── -->
+  <nav class="tab-bar" role="tablist">
+    <button class="tab-btn active" data-tab="train" role="tab" aria-selected="true">Train</button>
+    <button class="tab-btn" data-tab="correct" role="tab" aria-selected="false">Correct Labels</button>
+    <button class="tab-btn" data-tab="test" role="tab" aria-selected="false">Test Model</button>
+  </nav>
+
+  <main>
+
+    <!-- ════════════════════════════════════════════════════════════ -->
+    <!-- TRAIN TAB                                                    -->
+    <!-- ════════════════════════════════════════════════════════════ -->
+    <section class="tab-content active" id="tab-train">
+      <div class="train-layout">
+        <!-- Controls row -->
+        <div class="train-controls card">
+          <button class="btn-primary" id="btnDownload" onclick="downloadGDrive()">
+            ⬇ Download GDrive
+          </button>
+          <button class="btn-secondary" id="btnUpload" onclick="document.getElementById('fileInput').click()">
+            📁 Upload Images
+          </button>
+          <input type="file" id="fileInput" multiple accept="image/*,.svg" style="display:none"
+                 onchange="uploadFiles(this.files, true)">
+          <div class="sep"></div>
+          <button class="btn-primary" id="btnAutoLabel" onclick="autoLabel()">
+            🏷 Auto-Label All
+          </button>
+          <div class="sep"></div>
+          <div class="param-group">
+            <label for="epochs">Epochs</label>
+            <input type="number" id="epochs" value="50" min="1" max="500">
+          </div>
+          <div class="param-group">
+            <label for="batch">Batch</label>
+            <input type="number" id="batch" value="4" min="1" max="64">
+          </div>
+          <div class="param-group">
+            <label for="imgsz">ImgSz</label>
+            <input type="number" id="imgsz" value="640" min="320" max="1280" step="32">
+          </div>
+          <button class="btn-success" id="btnTrain" onclick="startTraining()">
+            ▶ Train Model
+          </button>
+        </div>
+
+        <!-- Image viewer -->
+        <div class="card image-viewer">
+          <div class="viewer-header" style="flex-direction:column;gap:6px;align-items:stretch">
+            <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+              <button class="view-mode-btn active" id="vmRaw" onclick="setViewMode('raw')">📁 Raw Images</button>
+              <button class="view-mode-btn" id="vmLabelled" onclick="setViewMode('labelled')">🏷 Labelled Images</button>
+              <span id="imgCounter" style="font-size:12px;color:var(--text-dim);margin-left:4px">0 / 0</span>
+              <div style="flex:1"></div>
+              <!-- Selection controls (raw mode only) -->
+              <span id="selectionBar" style="display:none;align-items:center;gap:4px">
+                <span id="selCount" style="font-size:12px;color:var(--accent);font-weight:600"></span>
+                <button class="btn-secondary" style="font-size:11px;padding:3px 8px" onclick="selectAllRaw()">Select All</button>
+                <button class="btn-secondary" style="font-size:11px;padding:3px 8px" onclick="deselectAllRaw()">Deselect All</button>
+                <button class="btn-success"   style="font-size:11px;padding:3px 10px;font-weight:600" id="btnTrainSelected" onclick="trainSelected()" disabled>▶ Train Selected</button>
+              </span>
+              <button class="btn-secondary" onclick="prevImage()">◀</button>
+              <button class="btn-secondary" onclick="nextImage()">▶</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px">
+              <div id="folderPathBar" style="font-size:11px;color:var(--text-dim);background:var(--bg);border-radius:4px;padding:3px 8px;font-family:monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                Loading...
+              </div>
+              <button class="btn-secondary" style="font-size:11px;padding:2px 8px;flex-shrink:0"
+                onclick="document.getElementById('fileInput').click()" title="Upload images to raw folder">
+                + Add Images
+              </button>
+            </div>
+          </div>
+
+          <!-- Thumbnail strip -->
+          <div id="thumbStrip" style="display:flex;gap:6px;overflow-x:auto;padding:6px 0;min-height:64px;max-height:80px;background:var(--bg);border-radius:var(--radius);margin-bottom:6px"></div>
+
+          <!-- Main viewer -->
+          <div class="viewer-body" id="trainViewerOuter" style="flex:1;min-height:0;position:relative">
+            <div class="pz-wrap" id="trainViewer">
+              <div class="pz-inner" id="trainViewerInner">
+                <div class="placeholder" style="padding:60px 40px;color:var(--text-dim);text-align:center">
+                  <div style="font-size:48px;margin-bottom:12px">🖼</div>
+                  Click a button above or select files to view images here
+                </div>
+              </div>
+              <div class="pz-toolbar">
+                <button onclick="pzZoom('trainViewer',1.25)" title="Zoom In">+</button>
+                <button onclick="pzZoom('trainViewer',0.8)" title="Zoom Out">−</button>
+                <button onclick="pzFit('trainViewer')" title="Fit">⊡</button>
+                <button onclick="pzReset('trainViewer')" title="Reset">↺</button>
+              </div>
+              <div class="pz-zoom-label" id="trainViewerZoom">100%</div>
+            </div>
+          </div>
+          <div id="imgStats" style="margin-top:6px;font-size:12px;color:var(--text-dim)"></div>
+        </div>
+
+        <!-- Log + Metrics -->
+        <div class="card log-panel">
+          <div class="card-title">Training Log</div>
+          <div class="progress-bar" style="margin-bottom:8px">
+            <div class="fill" id="progressFill" style="width:0%"></div>
+          </div>
+          <div class="log-output" id="logOutput"></div>
+          <div class="metrics-grid" id="metricsGrid"></div>
+          <!-- Model version history -->
+          <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:8px">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+              <span style="font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px">Model Versions</span>
+              <button class="btn-secondary" style="font-size:11px;padding:2px 8px" onclick="refreshModelVersions()">↻</button>
+            </div>
+            <div id="modelVersionList" style="max-height:160px;overflow-y:auto;font-size:11px">
+              <div style="color:var(--text-dim);padding:8px">No versions yet — train a model first</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════════════════════════════════════════════════════════════ -->
+    <!-- CORRECT TAB                                                  -->
+    <!-- ════════════════════════════════════════════════════════════ -->
+    <section class="tab-content" id="tab-correct">
+      <div class="correct-layout">
+        <!-- Left: image panel -->
+        <div class="card" style="display:flex;flex-direction:column;overflow:hidden;gap:0">
+
+          <!-- Row 1: image selector + refresh + save -->
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-bottom:6px;border-bottom:1px solid var(--border);margin-bottom:6px">
+            <select id="correctImageSelect" onchange="loadCorrectImage()" style="min-width:180px;flex:1">
+              <option value="">— Select image —</option>
+            </select>
+            <button class="btn-secondary" onclick="refreshCorrectList()" title="Reload image list">↻ Refresh</button>
+            <button class="btn-success"   onclick="saveCorrections()"    title="Save all corrections to disk">💾 Save</button>
+            <button class="btn-danger"    onclick="revertCorrections()"  title="Revert to original labels">↩ Revert</button>
+            <div style="width:1px;height:24px;background:var(--border);margin:0 4px"></div>
+            <button class="btn-primary" id="btnUpdateModel" onclick="openUpdateModelPanel()"
+              title="Fine-tune model using corrected labels">🔄 Update Model</button>
+            <span id="ocrCorrectionBadge" style="display:none;background:#4ade80;color:#000;font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px">OCR Corrected</span>
+          </div>
+
+          <!-- Row 2: view mode + zoom controls -->
+          <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-bottom:6px">
+            <button class="view-mode-btn active" id="cvMarked" onclick="setCorrectView('marked')">🏷 Labelled</button>
+            <button class="view-mode-btn" id="cvPre"           onclick="setCorrectView('pre')">🔍 Pre-OCR</button>
+            <button class="view-mode-btn" id="cvPost"          onclick="setCorrectView('post')">✅ Post-OCR</button>
+            <div style="flex:1"></div>
+            <button class="btn-secondary" style="padding:3px 10px" onclick="pzZoom('correctViewer',1.25)">+</button>
+            <button class="btn-secondary" style="padding:3px 10px" onclick="pzZoom('correctViewer',0.8)">−</button>
+            <button class="btn-secondary" style="padding:3px 10px" onclick="pzFit('correctViewer')">⊡ Fit</button>
+            <button class="btn-secondary" style="padding:3px 10px" onclick="pzReset('correctViewer')">↺</button>
+            <span id="correctViewerZoom" style="font-size:11px;color:var(--text-dim);min-width:36px;text-align:right">100%</span>
+          </div>
+
+          <!-- Row 3: Draw annotation toolbar -->
+          <div id="drawToolbar" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px;padding:6px 8px;background:var(--surface2);border-radius:var(--radius);border:1px solid var(--border)">
+            <span style="font-size:12px;font-weight:600;color:var(--text-dim)">✏️ Draw:</span>
+            <button class="view-mode-btn" id="btnDrawMode" onclick="toggleDrawMode()"
+              title="Click to enable draw mode, then drag a rectangle on the image">
+              🖊 Draw Region
+            </button>
+            <select id="drawClass" style="font-size:12px;padding:3px 6px;min-width:120px">
+              <option value="Room">Room</option>
+              <option value="Door">Door</option>
+              <option value="Window">Window</option>
+              <option value="Wall">Wall</option>
+              <option value="Furniture">Furniture</option>
+              <option value="Stair">Stair</option>
+              <option value="Column">Column</option>
+              <option value="FlowTerminal">FlowTerminal</option>
+              <option value="LightFixture">LightFixture</option>
+              <option value="ElectricAppliance">ElectricAppliance</option>
+            </select>
+            <span id="drawStatus" style="font-size:11px;color:var(--text-dim)">Select class and click Draw Region</span>
+            <div style="flex:1"></div>
+            <button class="btn-danger" style="font-size:11px;padding:3px 8px" onclick="cancelDraw()" id="btnCancelDraw" style="display:none">✕ Cancel</button>
+          </div>
+
+          <!-- Row 4: OCR summary bar -->
+          <div id="ocrSummaryBar" style="font-size:11px;color:var(--text-dim);background:var(--bg);border-radius:4px;padding:4px 8px;margin-bottom:6px;font-family:monospace;white-space:pre-wrap;display:none"></div>
+
+          <!-- Image canvas -->
+          <div style="flex:1;min-height:0;position:relative">
+            <div class="pz-wrap" id="correctViewer">
+              <div class="pz-inner" id="correctViewerInner">
+                <div class="placeholder" style="padding:60px 40px;color:var(--text-dim);text-align:center">Select a labelled image to review and correct</div>
+              </div>
+              <!-- Overlay canvas: highlight + draw annotation -->
+              <canvas id="correctHighlightCanvas" style="position:absolute;top:0;left:0;pointer-events:none;opacity:0.8"></canvas>
+              <canvas id="correctDrawCanvas"      style="position:absolute;top:0;left:0;pointer-events:none;width:100%;height:100%"></canvas>
+              <!-- Edit overlay: bbox resize handles -->
+              <div id="editOverlay" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;display:none">
+                <canvas id="editBboxCanvas" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none"></canvas>
+                <div id="editHandles"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Status bar -->
+          <div id="correctStatusBar" style="font-size:11px;color:var(--text-dim);padding-top:4px"></div>
+        </div>
+
+        <!-- Right: label list panel -->
+        <div class="card" style="display:flex;flex-direction:column;overflow:hidden">
+
+          <!-- Header + filter -->
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+            <span style="font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px">Labels</span>
+            <span id="correctSummary" style="font-size:12px;color:var(--text-dim)"></span>
+            <div style="flex:1"></div>
+            <select id="filterClass" onchange="filterLabels()" style="font-size:11px;padding:2px 6px">
+              <option value="">All classes</option>
+            </select>
+          </div>
+
+          <!-- Bulk actions -->
+          <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">
+            <button class="btn-secondary" style="font-size:11px;padding:3px 8px" onclick="selectAllLabels()">☑ Select All</button>
+            <button class="btn-secondary" style="font-size:11px;padding:3px 8px" onclick="deselectAllLabels()">☐ Deselect</button>
+            <button class="btn-danger"    style="font-size:11px;padding:3px 8px" onclick="removeSelectedLabels()">✕ Remove Selected</button>
+            <select id="bulkRelabelClass" style="font-size:11px;padding:2px 4px">
+              <option value="">Relabel to...</option>
+            </select>
+            <button class="btn-secondary" style="font-size:11px;padding:3px 8px" onclick="relabelSelected()">↩ Apply</button>
+          </div>
+
+          <!-- Label list -->
+          <div class="label-list" id="labelList" style="flex:1;overflow-y:auto">
+            <div style="padding:20px;text-align:center;color:var(--text-dim)">No labels loaded</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ════════════════════════════════════════════════════════════ -->
+    <!-- TEST TAB                                                     -->
+    <!-- ════════════════════════════════════════════════════════════ -->
+    <section class="tab-content" id="tab-test">
+      <div class="test-layout">
+
+        <!-- Controls row -->
+        <div class="test-controls card" style="flex-wrap:wrap;gap:6px;align-items:center">
+          <button class="btn-primary" onclick="document.getElementById('testFileInput').click()">
+            📷 Select Image
+          </button>
+          <input type="file" id="testFileInput" accept="image/*" style="display:none"
+                 onchange="selectTestImage(this.files[0])">
+          <span id="testFileName" style="font-size:12px;color:var(--text-dim);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+          <div class="sep"></div>
+
+          <!-- Model A -->
+          <span style="font-size:11px;font-weight:600;color:var(--accent)">Model A:</span>
+          <select id="testModelA" style="font-size:12px;padding:3px 6px;min-width:160px;max-width:220px">
+            <option value="">— loading... —</option>
+          </select>
+
+          <!-- Model B -->
+          <span style="font-size:11px;font-weight:600;color:var(--orange)">Model B:</span>
+          <select id="testModelB" style="font-size:12px;padding:3px 6px;min-width:160px;max-width:220px">
+            <option value="">— none (single model) —</option>
+          </select>
+
+          <button class="btn-secondary" style="font-size:11px;padding:3px 8px" onclick="loadTestModels()" title="Refresh model list">↻</button>
+          <div class="sep"></div>
+
+          <div class="param-group">
+            <label style="font-size:11px">ImgSz</label>
+            <input type="number" id="testImgsz" value="640" min="320" max="1280" step="32" style="width:58px">
+          </div>
+          <div class="param-group">
+            <label style="font-size:11px">Conf</label>
+            <input type="range" id="testConf" min="1" max="50" value="10" step="1"
+              style="width:70px;vertical-align:middle"
+              oninput="document.getElementById('testConfVal').textContent=this.value+'%'">
+            <span id="testConfVal" style="font-size:11px;color:var(--text-dim);min-width:28px">10%</span>
+          </div>
+
+          <button class="btn-success" id="btnDetect" onclick="runDetection()" disabled>
+            ▶ Compare
+          </button>
+          <span id="testStatus" style="font-size:12px;color:var(--text-dim)"></span>
+        </div>
+
+        <!-- Warning bar -->
+        <div id="modelWarningBar" style="display:none;font-size:11px;padding:6px 10px;border-radius:var(--radius);line-height:1.5"></div>
+
+        <!-- Main grid: orig | result A | result B | detection list -->
+        <div id="testGrid" style="display:grid;grid-template-columns:1fr 1fr 1fr 260px;gap:10px;flex:1;overflow:hidden;min-height:0">
+
+          <!-- Original -->
+          <div class="test-panel">
+            <div class="panel-title" style="color:var(--text-dim)">Original</div>
+            <div class="panel-body" id="testOrigPanelOuter" style="position:relative">
+              <div class="pz-wrap" id="testOrigPanel">
+                <div class="pz-inner" id="testOrigPanelInner">
+                  <div class="placeholder" style="padding:30px;color:var(--text-dim);font-size:12px">Select an image</div>
+                </div>
+                <div class="pz-toolbar">
+                  <button onclick="pzZoom('testOrigPanel',1.25)">+</button>
+                  <button onclick="pzZoom('testOrigPanel',0.8)">−</button>
+                  <button onclick="pzFit('testOrigPanel')">⊡</button>
+                  <button onclick="pzReset('testOrigPanel')">↺</button>
+                </div>
+                <div class="pz-zoom-label" id="testOrigPanelZoom">100%</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Result A -->
+          <div class="test-panel">
+            <div class="panel-title" style="display:flex;align-items:center;gap:6px">
+              <span style="width:10px;height:10px;border-radius:50%;background:var(--accent);flex-shrink:0"></span>
+              <span id="titleA" style="color:var(--accent)">Model A</span>
+              <span id="badgeA" style="font-size:10px;padding:1px 6px;border-radius:8px;display:none"></span>
+            </div>
+            <div class="panel-body" id="testResultAOuter" style="position:relative">
+              <div class="pz-wrap" id="testResultA">
+                <div class="pz-inner" id="testResultAInner">
+                  <div class="placeholder" style="padding:30px;color:var(--text-dim);font-size:12px">Run detection</div>
+                </div>
+                <div class="pz-toolbar">
+                  <button onclick="pzZoom('testResultA',1.25)">+</button>
+                  <button onclick="pzZoom('testResultA',0.8)">−</button>
+                  <button onclick="pzFit('testResultA')">⊡</button>
+                  <button onclick="pzReset('testResultA')">↺</button>
+                </div>
+                <div class="pz-zoom-label" id="testResultAZoom">100%</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Result B -->
+          <div class="test-panel" id="panelB">
+            <div class="panel-title" style="display:flex;align-items:center;gap:6px">
+              <span style="width:10px;height:10px;border-radius:50%;background:var(--orange);flex-shrink:0"></span>
+              <span id="titleB" style="color:var(--orange)">Model B</span>
+              <span id="badgeB" style="font-size:10px;padding:1px 6px;border-radius:8px;display:none"></span>
+            </div>
+            <div class="panel-body" id="testResultBOuter" style="position:relative">
+              <div class="pz-wrap" id="testResultB">
+                <div class="pz-inner" id="testResultBInner">
+                  <div class="placeholder" style="padding:30px;color:var(--text-dim);font-size:12px">Select Model B to compare</div>
+                </div>
+                <div class="pz-toolbar">
+                  <button onclick="pzZoom('testResultB',1.25)">+</button>
+                  <button onclick="pzZoom('testResultB',0.8)">−</button>
+                  <button onclick="pzFit('testResultB')">⊡</button>
+                  <button onclick="pzReset('testResultB')">↺</button>
+                </div>
+                <div class="pz-zoom-label" id="testResultBZoom">100%</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Detection list -->
+          <div class="card" style="display:flex;flex-direction:column;overflow:hidden;min-height:0">
+            <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">
+              Detections
+            </div>
+            <div id="detectionSummary" style="font-size:11px;color:var(--text-dim);margin-bottom:6px"></div>
+            <div id="detectionList" style="flex:1;overflow-y:auto;min-height:0">
+              <div style="padding:16px;text-align:center;color:var(--text-dim);font-size:12px">Run detection to see results</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ── Drop overlay ─────────────────────────────────────────────── -->
+<!-- Update Model Panel -->
+<div id="updateModelPanel" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;align-items:center;justify-content:center" onclick="closeUpdateModelPanel()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:24px;width:420px;max-width:95vw;box-shadow:var(--shadow)" onclick="event.stopPropagation()">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <h3 style="font-size:16px;font-weight:600">🔄 Update Model from Corrections</h3>
+      <button class="btn-secondary" style="padding:4px 10px" onclick="closeUpdateModelPanel()">✕</button>
+    </div>
+    <!-- Info bar -->
+    <div id="updateModelInfo" style="background:var(--bg);border-radius:var(--radius);padding:8px 12px;margin-bottom:14px;font-size:12px;font-family:monospace;color:var(--text-dim)">
+      Loading...
+    </div>
+
+    <!-- Mode tabs -->
+    <div style="display:flex;gap:4px;margin-bottom:14px">
+      <button class="view-mode-btn active" id="ftModeIncremental" onclick="setFtMode('incremental')"
+        title="Fine-tune FROM the selected base model — corrections accumulate">
+        🔄 Incremental
+      </button>
+      <button class="view-mode-btn" id="ftModeScratch" onclick="setFtMode('scratch')"
+        title="Train from scratch using yolov8n-seg.pt base">
+        🆕 From Scratch
+      </button>
+      <button class="view-mode-btn" id="ftModeMerge" onclick="setFtMode('merge')"
+        title="Weight-average two existing models">
+        🔀 Merge Models
+      </button>
+    </div>
+
+    <!-- Incremental / Scratch params -->
+    <div id="ftParamsPanel">
+      <div style="margin-bottom:10px">
+        <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">Base Model (fine-tune FROM this)</label>
+        <select id="ftBaseModel" style="width:100%;font-size:12px;padding:4px 6px">
+          <option value="">— loading models... —</option>
+        </select>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:3px" id="ftBaseModelHint">
+          Select the model to continue training from
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px">
+        <div>
+          <label style="font-size:11px;color:var(--text-dim)">Epochs</label>
+          <input type="number" id="ftEpochs" value="5" min="1" max="100"
+            style="width:100%;margin-top:4px;text-align:center">
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--text-dim)">Batch</label>
+          <input type="number" id="ftBatch" value="2" min="1" max="16"
+            style="width:100%;margin-top:4px;text-align:center">
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--text-dim)">ImgSz</label>
+          <input type="number" id="ftImgsz" value="640" min="320" max="1280" step="32"
+            style="width:100%;margin-top:4px;text-align:center">
+        </div>
+      </div>
+    </div>
+
+    <!-- Merge params -->
+    <div id="ftMergePanel" style="display:none;margin-bottom:14px">
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:8px;line-height:1.5">
+        Weight-average two models: <code>merged = α×A + (1-α)×B</code><br>
+        Best for combining models trained on different data subsets.
+      </div>
+      <div style="margin-bottom:8px">
+        <label style="font-size:11px;color:var(--accent)">Model A</label>
+        <select id="ftMergeA" style="width:100%;font-size:12px;padding:4px 6px;margin-top:3px">
+          <option value="">— select model A —</option>
+        </select>
+      </div>
+      <div style="margin-bottom:8px">
+        <label style="font-size:11px;color:var(--orange)">Model B</label>
+        <select id="ftMergeB" style="width:100%;font-size:12px;padding:4px 6px;margin-top:3px">
+          <option value="">— select model B —</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-dim)">Weight α (A contribution)</label>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+          <input type="range" id="ftAlpha" min="0" max="100" value="50" step="5"
+            style="flex:1" oninput="document.getElementById('ftAlphaVal').textContent=this.value+'%'">
+          <span id="ftAlphaVal" style="font-size:12px;min-width:36px">50%</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px">
+      <button class="btn-success" id="btnStartFinetune" onclick="startFinetune()" style="flex:1;font-weight:600">
+        ▶ Start Fine-tune
+      </button>
+      <button class="btn-secondary" onclick="closeUpdateModelPanel()" style="flex:0 0 auto">Cancel</button>
+    </div>
+    <div id="finetuneStatus" style="margin-top:10px;font-size:12px;color:var(--text-dim);display:none"></div>
+  </div>
+</div>
+
+<!-- Metadata Check Modal -->
+<div id="metadataModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:300;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:24px;width:480px;max-width:95vw;box-shadow:var(--shadow)" onclick="event.stopPropagation()">
+    <h3 style="font-size:15px;font-weight:600;margin-bottom:12px">📄 Existing Analysis Found</h3>
+    <div id="metadataModalBody" style="font-size:13px;color:var(--text-dim);margin-bottom:16px;line-height:1.7"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-success" style="flex:1" onclick="metadataChoice('use')">
+        ✅ Use Existing Data
+      </button>
+      <button class="btn-primary" style="flex:1" onclick="metadataChoice('gemini')">
+        🤖 Re-analyse with Gemini
+      </button>
+      <button class="btn-secondary" style="flex:1" onclick="metadataChoice('local')">
+        🔧 Re-analyse Locally
+      </button>
+    </div>
+    <div style="margin-top:8px">
+      <button class="btn-secondary" style="width:100%;font-size:11px" onclick="metadataChoice('all')">
+        Apply to all images (skip future prompts this session)
+      </button>
+    </div>
+  </div>
+</div>
+
+<div id="dropOverlay" style="display:none;position:fixed;inset:0;background:rgba(108,140,255,0.1);
+  border:3px dashed var(--accent);z-index:999;pointer-events:none;
+  display:none;align-items:center;justify-content:center">
+  <div style="background:var(--surface);padding:32px 48px;border-radius:var(--radius-lg);
+    font-size:18px;font-weight:600;color:var(--accent)">
+    Drop images here to upload
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════
+const API = '';  // same origin
+let labelledImages = [];   // basenames of labelled images
+let rawImages      = [];   // filenames of raw images
+let viewMode       = 'raw'; // 'raw' | 'labelled'
+let viewImages     = [];   // current list shown
+let currentImgIdx  = 0;
+let testFile       = null;
+let sseConnected   = false;
+let uploadedFiles  = {};   // filename -> dataURL (for raw preview of just-uploaded files)
+let folderPaths    = { raw: '', labelled: '' };  // server-side folder paths
+let selectedRawFiles = new Set();  // filenames selected for training
+
+const CLASS_COLORS = {
+  Wall:'#c80000', Window:'#ff00ff', Door:'#00a5ff', Room:'#00c800',
+  Slab:'#646464', Roof:'#505050', Column:'#ffa500', Beam:'#8b4513',
+  Stair:'#6464ff', Railing:'#b4b4b4', CurtainWall:'#c89696',
+  Furniture:'#c8c800', Covering:'#d2b48c', LightFixture:'#ffffa5',
+  ElectricAppliance:'#a5a5ff', FlowTerminal:'#a5ffa5', EnergyConversionDevice:'#ffc864'
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// TABS
+// ═══════════════════════════════════════════════════════════════════
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-selected','false'); });
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    btn.setAttribute('aria-selected','true');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'correct') refreshCorrectList();
+    if (btn.dataset.tab === 'test') loadTestModels();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// SSE - Real-time log stream
+// ═══════════════════════════════════════════════════════════════════
+function connectSSE() {
+  if (sseConnected) return;
+  const es = new EventSource(API + '/api/stream');
+  es.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      if (d.log) appendLog(d.log);
+      if (d.progress) {
+        updateProgress(d.progress.pct, d.progress.status, d.progress.metrics);
+      }
+    } catch(err) {}
+  };
+  es.onerror = () => { sseConnected = false; setTimeout(connectSSE, 3000); };
+  sseConnected = true;
+}
+
+function appendLog(text) {
+  const el = document.getElementById('logOutput');
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  if (text.includes('✅') || text.includes('✓')) line.classList.add('success');
+  else if (text.includes('ERROR') || text.includes('SKIP')) line.classList.add('error');
+  else if (text.includes('Epoch') || text.includes('Device')) line.classList.add('info');
+  line.textContent = text;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateProgress(pct, status, metrics) {
+  document.getElementById('progressFill').style.width = pct + '%';
+  if (status) {
+    document.getElementById('statusText').textContent = status;
+    const badge = document.getElementById('statusBadge');
+    if (status === 'Ready' || status.includes('complete') || status.includes('Done')) {
+      badge.classList.remove('busy');
+    } else {
+      badge.classList.add('busy');
+    }
+  }
+  if (metrics && Object.keys(metrics).length) {
+    const grid = document.getElementById('metricsGrid');
+    grid.innerHTML = '';
+    for (const [k, v] of Object.entries(metrics)) {
+      grid.innerHTML += `<div class="metric-card"><div class="value">${v}</div><div class="label">${k}</div></div>`;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAIN TAB - Download
+// ═══════════════════════════════════════════════════════════════════
+async function downloadGDrive() {
+  const btn = document.getElementById('btnDownload');
+  btn.disabled = true;
+  appendLog('Starting Google Drive download...');
+  try {
+    await fetch(API + '/api/download', { method: 'POST' });
+    appendLog('Download task started (check log for progress)');
+    // Poll until raw images appear then switch to raw view
+    const iv = setInterval(async () => {
+      const s = await fetchStatus();
+      if (s && s.raw_images && s.raw_images.length) {
+        rawImages = s.raw_images;
+        if (s.raw_folder) folderPaths.raw = s.raw_folder + '  (' + rawImages.length + ' images)';
+        setViewMode('raw');
+        clearInterval(iv);
+        btn.disabled = false;
+      }
+    }, 3000);
+    setTimeout(() => { clearInterval(iv); btn.disabled = false; }, 300000);
+  } catch(e) {
+    appendLog('ERROR: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAIN TAB - Upload
+// ═══════════════════════════════════════════════════════════════════
+async function uploadFiles(files, addToRaw) {
+  if (!files || !files.length) return;
+  const fileArr = Array.from(files);
+  const imgFiles = fileArr.filter(f => f.type.startsWith('image/') || f.name.toLowerCase().endsWith('.svg'));
+  if (!imgFiles.length) { appendLog('No image files selected.'); return; }
+
+  appendLog(`Adding ${imgFiles.length} file(s) to Raw Images...`);
+
+  // Store dataURLs for instant local preview
+  const readers = imgFiles.map(f => new Promise(resolve => {
+    if (f.name.toLowerCase().endsWith('.svg')) { resolve(); return; }
+    const r = new FileReader();
+    r.onload = e => { uploadedFiles[f.name] = e.target.result; resolve(); };
+    r.readAsDataURL(f);
+  }));
+  await Promise.all(readers);
+
+  // Switch to raw view immediately so user sees files appearing
+  setViewMode('raw');
+
+  // Upload to server
+  const fd = new FormData();
+  for (const f of imgFiles) fd.append('files', f);
+  try {
+    const res = await fetch(API + '/api/upload', { method: 'POST', body: fd });
+    const data = await res.json();
+    rawImages = data.images || [];
+    if (data.raw_folder) folderPaths.raw = data.raw_folder + '  (' + rawImages.length + ' images)';
+    appendLog(`✅ ${data.saved} image(s) added to Raw Images folder`);
+    appendLog(`   Folder: ${data.raw_folder || 'gdrive_dataset/images_raw'}`);
+    setViewMode('raw');
+  } catch(e) {
+    appendLog('ERROR uploading: ' + e.message);
+  }
+  // Reset both file inputs
+  document.getElementById('fileInput').value = '';
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAIN TAB - Auto-Label
+// ═══════════════════════════════════════════════════════════════════
+let _metadataSessionChoice = null; // 'use' | 'local' | 'gemini' — applies to all this session
+let _metadataResolve = null;       // promise resolver for modal
+
+function metadataChoice(choice) {
+  document.getElementById('metadataModal').style.display = 'none';
+  if (choice === 'all') {
+    // Apply current radio choice to all — ask which mode
+    const mode = prompt('Apply to all images:\n  use = use existing\n  local = re-analyse locally\n  gemini = re-analyse with Gemini\n\nEnter choice:', 'use');
+    _metadataSessionChoice = mode || 'use';
+    if (_metadataResolve) _metadataResolve(_metadataSessionChoice);
+  } else {
+    if (_metadataResolve) _metadataResolve(choice);
+  }
+  _metadataResolve = null;
+}
+
+async function _checkMetadata(basename) {
+  // If session choice already set, use it
+  if (_metadataSessionChoice) return _metadataSessionChoice;
+  try {
+    const res  = await fetch(API + '/api/metadata/check?basename=' + encodeURIComponent(basename));
+    const data = await res.json();
+    if (!data.exists) return 'local'; // no existing data, run locally
+    // Show modal with existing data summary
+    const counts = Object.entries(data.label_counts || {})
+      .map(([k,v]) => k + ': ' + v).join(', ') || 'none';
+    const ifc = Object.keys(data.ifc_classes || {}).join(', ') || '—';
+    document.getElementById('metadataModalBody').innerHTML =
+      '<strong>' + basename + '</strong><br>' +
+      'Source: <span style="color:var(--accent)">' + data.source + '</span>  ' +
+      'Saved: ' + (data.saved_at || '—') + '<br>' +
+      'Labels: ' + data.n_labels + '  Rooms: ' + data.n_rooms + '<br>' +
+      'Classes: ' + counts + '<br>' +
+      'IFC: ' + ifc;
+    document.getElementById('metadataModal').style.display = 'flex';
+    // Wait for user choice
+    return new Promise(resolve => { _metadataResolve = resolve; });
+  } catch(e) {
+    return 'local';
+  }
+}
+
+async function autoLabel() {
+  const btn = document.getElementById('btnAutoLabel');
+  btn.disabled = true;
+  _metadataSessionChoice = null; // reset session choice
+
+  // Check raw images for existing metadata
+  const status = await fetchStatus();
+  const files  = (status && status.raw_images) || [];
+  if (!files.length) {
+    appendLog('No raw images found. Upload or download images first.');
+    btn.disabled = false;
+    return;
+  }
+
+  // Check first image for metadata — if exists, ask user
+  const firstBasename = files[0].replace(/\.[^.]+$/, '');
+  const choice = await _checkMetadata(firstBasename);
+  appendLog('Metadata choice: ' + choice + (choice === _metadataSessionChoice ? ' (all images)' : ''));
+
+  appendLog('Starting auto-labelling...');
+  try {
+    await fetch(API + '/api/autolabel', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ metadata_choice: choice })
+    });
+    appendLog('Auto-label task started');
+    pollForLabels();
+  } catch(e) {
+    appendLog('ERROR: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+function pollForLabels() {
+  const interval = setInterval(async () => {
+    const status = await fetchStatus();
+    if (!status) return;
+    if (status.labelled_images && status.labelled_images.length > 0) {
+      labelledImages = status.labelled_images;
+      if (status.labelled_folder) folderPaths.labelled = status.labelled_folder + '  (' + labelledImages.length + ' labelled)';
+      setViewMode('labelled');
+      document.getElementById('btnAutoLabel').disabled = false;
+      if (status.status && (status.status.includes('Labelled') || status.status.includes('Done') || status.status === 'Ready')) {
+        clearInterval(interval);
+      }
+    }
+  }, 2000);
+  setTimeout(() => clearInterval(interval), 600000);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAIN TAB - Training
+// ═══════════════════════════════════════════════════════════════════
+function updateSelectionCount() {
+  const n = selectedRawFiles.size;
+  const el = document.getElementById('selCount');
+  const btn = document.getElementById('btnTrainSelected');
+  if (el) el.textContent = n > 0 ? `${n} selected` : 'None selected';
+  if (btn) btn.disabled = n === 0;
+}
+
+function selectAllRaw() {
+  rawImages.forEach(f => selectedRawFiles.add(f));
+  updateSelectionCount();
+  renderThumbStrip();
+}
+
+function deselectAllRaw() {
+  selectedRawFiles.clear();
+  updateSelectionCount();
+  renderThumbStrip();
+}
+
+async function trainSelected() {
+  const files = Array.from(selectedRawFiles);
+  if (!files.length) return;
+  const btn = document.getElementById('btnTrainSelected');
+  btn.disabled = true;
+  appendLog(`\n${'='.repeat(50)}`);
+  appendLog(`Auto-labelling + training ${files.length} selected file(s):`);
+  files.forEach(f => appendLog(`  • ${f}`));
+  appendLog('='.repeat(50));
+
+  // Step 1: auto-label selected files only
+  try {
+    const res = await fetch(API + '/api/autolabel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files })
+    });
+    if (!res.ok) { appendLog('ERROR starting auto-label'); btn.disabled = false; return; }
+    appendLog('Auto-labelling started...');
+  } catch(e) { appendLog('ERROR: ' + e.message); btn.disabled = false; return; }
+
+  // Step 2: wait for labelling to finish, then auto-start training
+  const iv = setInterval(async () => {
+    const s = await fetchStatus();
+    if (!s) return;
+    if (s.status && (s.status.includes('Labelled') || s.status.includes('Done'))) {
+      clearInterval(iv);
+      labelledImages = s.labelled_images || labelledImages;
+      appendLog('\n✅ Labelling complete — starting training...');
+      // Start training
+      const body = {
+        epochs: parseInt(document.getElementById('epochs').value) || 1,
+        batch:  parseInt(document.getElementById('batch').value)  || 4,
+        imgsz:  parseInt(document.getElementById('imgsz').value)  || 640,
+      };
+      try {
+        await fetch(API + '/api/train', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+      } catch(e) { appendLog('ERROR starting training: ' + e.message); }
+      pollForTraining();
+      // Switch to labelled view
+      setViewMode('labelled');
+      selectedRawFiles.clear();
+      updateSelectionCount();
+      btn.disabled = false;
+    }
+  }, 2000);
+  setTimeout(() => { clearInterval(iv); btn.disabled = false; }, 600000);
+}
+
+async function startTraining() {
+  const btn = document.getElementById('btnTrain');
+  btn.disabled = true;
+  const body = {
+    epochs: parseInt(document.getElementById('epochs').value) || 50,
+    batch: parseInt(document.getElementById('batch').value) || 4,
+    imgsz: parseInt(document.getElementById('imgsz').value) || 640,
+  };
+  appendLog(`Starting training: ${body.epochs} epochs, batch=${body.batch}, imgsz=${body.imgsz}`);
+  try {
+    const res = await fetch(API + '/api/train', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (res.status === 409) {
+      appendLog('⚠️ Training already in progress');
+    } else {
+      appendLog('Training task started');
+    }
+    // Poll for completion
+    pollForTraining();
+  } catch(e) {
+    appendLog('ERROR: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+function pollForTraining() {
+  const interval = setInterval(async () => {
+    const status = await fetchStatus();
+    if (status && !status.training) {
+      document.getElementById('btnTrain').disabled = false;
+      clearInterval(interval);
+      refreshModelVersions();
+    }
+  }, 3000);
+  setTimeout(() => { clearInterval(interval); document.getElementById('btnTrain').disabled = false; }, 7200000);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAIN TAB - Image Viewer
+// ═══════════════════════════════════════════════════════════════════
+// ── View mode ────────────────────────────────────────────────────────────────
+function setViewMode(mode) {
+  viewMode = mode;
+  const vmRaw = document.getElementById('vmRaw');
+  const vmLbl = document.getElementById('vmLabelled');
+  if (vmRaw) vmRaw.classList.toggle('active', mode === 'raw');
+  if (vmLbl) vmLbl.classList.toggle('active', mode === 'labelled');
+  viewImages = mode === 'labelled' ? labelledImages : rawImages;
+  currentImgIdx = 0;
+  const bar = document.getElementById('selectionBar');
+  if (bar) bar.style.display = mode === 'raw' ? 'flex' : 'none';
+  updateFolderPath();
+  updateSelectionCount();
+  if (viewImages.length) {
+    renderThumbStrip();
+    showCurrentImage();
+  } else {
+    // No images yet — show placeholder and fetch from server
+    pzSetPlaceholder('trainViewer', mode === 'raw'
+      ? 'No raw images yet — Download from GDrive or Upload Images'
+      : 'No labelled images yet — run Auto-Label first');
+    document.getElementById('imgCounter').textContent = '0 / 0';
+    document.getElementById('imgStats').textContent = '';
+    renderThumbStrip();
+    // Try fetching from server in case state is stale
+    fetchStatus().then(s => {
+      if (!s) return;
+      if (s.raw_images)      rawImages      = s.raw_images;
+      if (s.labelled_images) labelledImages = s.labelled_images;
+      if (s.raw_folder)      folderPaths.raw      = s.raw_folder + '  (' + rawImages.length + ' images)';
+      if (s.labelled_folder) folderPaths.labelled = s.labelled_folder + '  (' + labelledImages.length + ' labelled)';
+      viewImages = mode === 'labelled' ? labelledImages : rawImages;
+      updateFolderPath();
+      if (viewImages.length) { renderThumbStrip(); showCurrentImage(); }
+    });
+  }
+}
+
+function updateFolderPath() {
+  const bar = document.getElementById('folderPathBar');
+  if (!bar) return;
+  if (viewMode === 'raw') {
+    if (folderPaths.raw) {
+      bar.textContent = folderPaths.raw;
+    } else if (rawImages.length) {
+      bar.textContent = 'gdrive_dataset/images_raw/  (' + rawImages.length + ' images)';
+    } else {
+      bar.textContent = 'No raw images folder — download or upload images first';
+    }
+  } else {
+    if (folderPaths.labelled) {
+      bar.textContent = folderPaths.labelled;
+    } else if (labelledImages.length) {
+      bar.textContent = 'gdrive_dataset/marked/  (' + labelledImages.length + ' labelled images)';
+    } else {
+      bar.textContent = 'No labelled images yet — run Auto-Label first';
+    }
+  }
+}
+
+function renderThumbStrip() {
+  const strip = document.getElementById('thumbStrip');
+  if (!viewImages.length) {
+    strip.innerHTML = '<div style="padding:20px;color:var(--text-dim);font-size:12px">No images yet</div>';
+    return;
+  }
+  strip.innerHTML = '';
+  viewImages.forEach((name, i) => {
+    const div = document.createElement('div');
+    div.className = 'thumb-item' + (i === currentImgIdx ? ' selected' : '');
+    div.title = name;
+    div.onclick = () => {
+      if (viewMode === 'raw') {
+        // Toggle selection
+        if (selectedRawFiles.has(name)) {
+          selectedRawFiles.delete(name);
+          div.classList.remove('selected');
+        } else {
+          selectedRawFiles.add(name);
+          div.classList.add('selected');
+        }
+        updateSelectionCount();
+      }
+      currentImgIdx = i; renderThumbStrip(); showCurrentImage();
+    };
+    const isSelected = viewMode === 'raw' && selectedRawFiles.has(name);
+    if (isSelected) div.classList.add('selected');
+    // Checkbox overlay for raw mode
+    const chk = viewMode === 'raw'
+      ? `<div style="position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:3px;border:2px solid #fff;background:${isSelected ? 'var(--accent)' : 'rgba(0,0,0,0.4)'};display:flex;align-items:center;justify-content:center;font-size:9px;color:#fff">${isSelected ? '✓' : ''}</div>`
+      : '';
+    // Show thumbnail
+    if (viewMode === 'raw' && uploadedFiles[name]) {
+      div.innerHTML = `<img src="${uploadedFiles[name]}">${chk}<div class="thumb-label">${name}</div>`;
+    } else if (viewMode === 'labelled') {
+      const src = API + '/api/thumb/' + encodeURIComponent(name);
+      div.innerHTML = `<img src="${src}" onerror="this.style.display='none'">${chk}<div class="thumb-label">${name}</div>`;
+    } else {
+      // Raw image — use direct thumbnail endpoint (returns JPEG bytes)
+      const thumbSrc = API + '/api/raw_thumb/' + encodeURIComponent(name);
+      div.innerHTML = `<img src="${thumbSrc}" style="width:100%;height:100%;object-fit:cover" onerror="this.style.display='none'">${chk}<div class="thumb-label">${name}</div>`;
+    }
+    strip.appendChild(div);
+  });
+  // Scroll selected into view
+  const selected = strip.children[currentImgIdx];
+  if (selected) selected.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+}
+
+async function showCurrentImage() {
+  if (!viewImages.length) {
+    pzSetPlaceholder('trainViewer', 'No images to show');
+    document.getElementById('imgCounter').textContent = '0 / 0';
+    document.getElementById('imgStats').textContent = '';
+    return;
+  }
+  const name = viewImages[currentImgIdx];
+  document.getElementById('imgCounter').textContent = `${currentImgIdx + 1} / ${viewImages.length}`;
+
+  if (viewMode === 'raw') {
+    // Show raw image — use uploaded dataURL if available, else fetch from server
+    if (uploadedFiles[name]) {
+      pzSetImage('trainViewer', uploadedFiles[name], name);
+      document.getElementById('imgStats').textContent = name + '  (raw — not yet labelled)';
+    } else {
+      try {
+        const res = await fetch(API + '/api/raw/' + encodeURIComponent(name));
+        const data = await res.json();
+        if (data.img_b64) {
+          pzSetImage('trainViewer', `data:image/jpeg;base64,${data.img_b64}`, name);
+          document.getElementById('imgStats').textContent = name + '  (raw)';
+        }
+      } catch(e) {
+        pzSetPlaceholder('trainViewer', 'Cannot load: ' + name);
+      }
+    }
+    return;
+  }
+
+  // Labelled mode
+  const basename = name;
+  try {
+    const res = await fetch(API + '/api/image/' + encodeURIComponent(basename));
+    const data = await res.json();
+    if (data.marked_b64) {
+      pzSetImage('trainViewer', `data:image/jpeg;base64,${data.marked_b64}`, basename);
+    }
+    if (data.labels) {
+      const parts = Object.entries(data.labels).map(([k,v]) => `${k}: ${v}`).join('  ·  ');
+      document.getElementById('imgStats').textContent = `${basename}  —  ${parts}  (${data.n_labels} total)`;
+    }
+  } catch(e) {
+    pzSetPlaceholder('trainViewer', 'Error loading image');
+  }
+}
+
+function prevImage() {
+  if (!viewImages.length) return;
+  currentImgIdx = (currentImgIdx - 1 + viewImages.length) % viewImages.length;
+  renderThumbStrip();
+  showCurrentImage();
+}
+function nextImage() {
+  if (!viewImages.length) return;
+  currentImgIdx = (currentImgIdx + 1) % viewImages.length;
+  renderThumbStrip();
+  showCurrentImage();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CORRECT TAB
+// ═══════════════════════════════════════════════════════════════════
+async function refreshCorrectList() {
+  const status = await fetchStatus();
+  const sel = document.getElementById('correctImageSelect');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">— Select image —</option>';
+  if (status && status.labelled_images) {
+    for (const name of status.labelled_images) {
+      sel.innerHTML += `<option value="${name}" ${name === current ? 'selected' : ''}>${name}</option>`;
+    }
+  }
+}
+
+// ── Correct tab state ────────────────────────────────────────────
+let _correctData = {};
+let _correctView = 'marked';
+let _correctBasename = '';
+let _pendingChanges = false;  // track unsaved changes
+
+function setCorrectView(view) {
+  _correctView = view;
+  ['cvMarked','cvPre','cvPost'].forEach(id => document.getElementById(id).classList.remove('active'));
+  const map = {marked:'cvMarked', pre:'cvPre', post:'cvPost'};
+  if (map[view]) document.getElementById(map[view]).classList.add('active');
+  _renderCorrectImage();
+}
+
+function _renderCorrectImage() {
+  const d = _correctData;
+  if (!d || !d.marked_b64) return;
+  let b64 = d.marked_b64;
+  if (_correctView === 'pre'  && d.pre_label_b64)  b64 = d.pre_label_b64;
+  if (_correctView === 'post' && d.post_label_b64) b64 = d.post_label_b64;
+  pzSetImage('correctViewer', `data:image/jpeg;base64,${b64}`, _correctBasename + ' [' + _correctView + ']');
+  // Refresh edit overlay after image loads (pan-zoom state may change)
+  setTimeout(() => {
+    if (_activeEdit) _showEditOverlay(_activeEdit.cls, _activeEdit.idx, _activeEdit.bbox, null);
+  }, 300);
+}
+
+async function loadCorrectImage() {
+  const basename = document.getElementById('correctImageSelect').value;
+  if (!basename) return;
+  // Warn if unsaved changes
+  if (_pendingChanges && _correctBasename && _correctBasename !== basename) {
+    if (!confirm(`You have unsaved changes on "${_correctBasename}". Discard and switch?`)) return;
+  }
+  _correctBasename = basename;
+  _pendingChanges = false;
+  _updateSaveIndicator();
+  try {
+    const res = await fetch(API + '/api/image/' + encodeURIComponent(basename));
+    const data = await res.json();
+    _correctData = data;
+    _renderCorrectImage();
+    renderLabelList(basename, data.labels || {});
+    document.getElementById('correctSummary').textContent = `${data.n_labels || 0} labels`;
+    // OCR summary
+    const ta = data.text_analysis || {};
+    const bar = document.getElementById('ocrSummaryBar');
+    const badge = document.getElementById('ocrCorrectionBadge');
+    if (bar) { bar.style.display = ta.summary ? 'block' : 'none'; bar.textContent = ta.summary || ''; }
+    if (badge) badge.style.display = ta.was_corrected ? 'inline' : 'none';
+  } catch(e) {
+    pzSetPlaceholder('correctViewer', 'Error loading');
+  }
+}
+
+function _updateSaveIndicator() {
+  const btn = document.querySelector('button[onclick="saveCorrections()"]');
+  if (!btn) return;
+  if (_pendingChanges) {
+    btn.style.background = '#fb923c';
+    btn.textContent = '💾 Save *';
+    btn.title = 'Unsaved changes — click to save';
+  } else {
+    btn.style.background = '';
+    btn.textContent = '💾 Save';
+    btn.title = 'Save corrections to disk';
+  }
+}
+
+let _labelDetails = {};   // cls -> [{idx,bbox,poly,area}]
+let _activeEdit   = null; // {cls, idx, bbox} currently being edited
+
+async function renderLabelList(basename, labels) {
+  const el = document.getElementById('labelList');
+  if (!Object.keys(labels).length) {
+    el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-dim)">No labels</div>';
+    _labelDetails = {};
+    return;
+  }
+
+  // Fetch bbox details for all labels
+  try {
+    const res = await fetch(API + '/api/label_details/' + encodeURIComponent(basename));
+    const data = await res.json();
+    _labelDetails = data.details || {};
+  } catch(e) { _labelDetails = {}; }
+
+  let html = '';
+  const allClasses = Object.keys(CLASS_COLORS);
+  for (const [cls, count] of Object.entries(labels)) {
+    const color = CLASS_COLORS[cls] || '#888';
+    const details = _labelDetails[cls] || [];
+    for (let i = 1; i <= count; i++) {
+      const det = details.find(d => d.idx === i);
+      const bboxStr = det ? `${det.bbox[2]}×${det.bbox[3]}px` : '';
+      const isActive = _activeEdit && _activeEdit.cls === cls && _activeEdit.idx === i;
+      html += `
+        <div class="label-item ${isActive ? 'active-edit' : ''}" id="li_${cls}_${i}"
+             onclick="selectLabelForEdit('${cls}',${i})"
+             style="cursor:pointer">
+          <span class="cls-badge" style="gap:6px;display:flex;align-items:center;flex:1">
+            <span class="color-dot" style="background:${color}"></span>
+            <strong>${cls}</strong> #${i}
+            ${bboxStr ? `<span style="font-size:10px;color:var(--text-dim);margin-left:4px">${bboxStr}</span>` : ''}
+          </span>
+          <div class="actions" onclick="event.stopPropagation()">
+            <select id="relabel_${cls}_${i}" style="width:100px;font-size:11px;padding:2px 4px">
+              ${allClasses.map(c => `<option value="${c}" ${c===cls?'selected':''}>${c}</option>`).join('')}
+            </select>
+            <button class="btn-secondary" style="font-size:11px;padding:3px 6px"
+              onclick="correctLabel('${basename}','relabel','${cls}',${i})">↩</button>
+            <button class="btn-danger" style="font-size:11px;padding:3px 6px"
+              onclick="confirmRemove('${basename}','${cls}',${i})">✕</button>
+          </div>
+        </div>`;
+    }
+  }
+  el.innerHTML = html;
+}
+
+// ── Select label → show on image with resize handles ─────────────────────────
+async function selectLabelForEdit(cls, idx) {
+  // Toggle off if same
+  if (_activeEdit && _activeEdit.cls === cls && _activeEdit.idx === idx) {
+    _activeEdit = null;
+    _hideEditOverlay();
+    document.querySelectorAll('.label-item').forEach(el => el.classList.remove('active-edit'));
+    return;
+  }
+
+  // Highlight row
+  document.querySelectorAll('.label-item').forEach(el => el.classList.remove('active-edit'));
+  const row = document.getElementById(`li_${cls}_${idx}`);
+  if (row) { row.classList.add('active-edit'); row.scrollIntoView({block:'nearest'}); }
+
+  // Get bbox
+  const details = _labelDetails[cls] || [];
+  const det = details.find(d => d.idx === idx);
+  if (!det) { _hideEditOverlay(); return; }
+
+  _activeEdit = { cls, idx, bbox: [...det.bbox] };
+  _showEditOverlay(cls, idx, det.bbox, det.poly);
+}
+
+function _hideEditOverlay() {
+  const ov = document.getElementById('editOverlay');
+  if (ov) ov.style.display = 'none';
+  _activeEdit = null;
+}
+
+function _showEditOverlay(cls, idx, bbox, poly) {
+  const wrap   = document.getElementById('correctViewer');
+  const inner  = document.getElementById('correctViewerInner');
+  const ov     = document.getElementById('editOverlay');
+  const canvas = document.getElementById('editBboxCanvas');
+  const handles= document.getElementById('editHandles');
+  if (!wrap || !inner || !ov || !canvas) return;
+
+  const img = inner.querySelector('img');
+  if (!img) return;
+
+  ov.style.display = 'block';
+  ov.style.pointerEvents = 'none';
+
+  const s    = _pzGet('correctViewer');
+  const imgW = img.naturalWidth  || img.width;
+  const imgH = img.naturalHeight || img.height;
+  const ww   = wrap.clientWidth;
+  const wh   = wrap.clientHeight;
+
+  canvas.width  = ww;
+  canvas.height = wh;
+
+  const color = CLASS_COLORS[cls] || '#6c8cff';
+  const ctx   = canvas.getContext('2d');
+  ctx.clearRect(0, 0, ww, wh);
+
+  // Draw polygon fill
+  if (poly && poly.length >= 3) {
+    ctx.beginPath();
+    poly.forEach(([px, py], i) => {
+      const cx = s.tx + px * s.scale;
+      const cy = s.ty + py * s.scale;
+      i === 0 ? ctx.moveTo(cx, cy) : ctx.lineTo(cx, cy);
+    });
+    ctx.closePath();
+    ctx.fillStyle = color + '33';
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // Draw bbox outline
+  const [bx, by, bw, bh] = bbox;
+  const cx1 = s.tx + bx * s.scale;
+  const cy1 = s.ty + by * s.scale;
+  const cw  = bw * s.scale;
+  const ch  = bh * s.scale;
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 2;
+  ctx.setLineDash([6, 3]);
+  ctx.strokeRect(cx1, cy1, cw, ch);
+  ctx.setLineDash([]);
+
+  // Label
+  ctx.fillStyle = color;
+  ctx.font = 'bold 13px sans-serif';
+  ctx.fillText(`${cls} #${idx}  (${bw}×${bh}px)`, cx1 + 4, cy1 - 6);
+
+  // Resize handles at 8 corners + edges
+  handles.innerHTML = '';
+  const corners = [
+    {name:'nw', fx:0,   fy:0},   {name:'n',  fx:0.5, fy:0},   {name:'ne', fx:1,   fy:0},
+    {name:'w',  fx:0,   fy:0.5},                               {name:'e',  fx:1,   fy:0.5},
+    {name:'sw', fx:0,   fy:1},   {name:'s',  fx:0.5, fy:1},   {name:'se', fx:1,   fy:1},
+  ];
+  corners.forEach(({name, fx, fy}) => {
+    const hx = cx1 + fx * cw;
+    const hy = cy1 + fy * ch;
+    const h  = document.createElement('div');
+    h.className = 'resize-handle';
+    h.style.left = hx + 'px';
+    h.style.top  = hy + 'px';
+    h.style.pointerEvents = 'all';
+    h.style.cursor = _handleCursor(name);
+    h.dataset.handle = name;
+    h.addEventListener('mousedown', (e) => _startResize(e, name, bbox, s, imgW, imgH));
+    h.addEventListener('touchstart', (e) => _startResize(e, name, bbox, s, imgW, imgH), {passive:false});
+    handles.appendChild(h);
+  });
+}
+
+function _handleCursor(name) {
+  const map = {nw:'nw-resize',n:'n-resize',ne:'ne-resize',w:'w-resize',
+                e:'e-resize',sw:'sw-resize',s:'s-resize',se:'se-resize'};
+  return map[name] || 'move';
+}
+
+// ── Resize drag ───────────────────────────────────────────────────
+let _resizeDrag = null;
+
+function _startResize(e, handle, origBbox, s, imgW, imgH) {
+  e.preventDefault(); e.stopPropagation();
+  const src = e.touches ? e.touches[0] : e;
+  _resizeDrag = {
+    handle, origBbox: [...origBbox], s,
+    imgW, imgH,
+    startX: src.clientX, startY: src.clientY,
+    curBbox: [...origBbox],
+  };
+  document.getElementById('correctStatusBar').textContent = `Dragging ${handle} handle — release to apply`;
+}
+
+window.addEventListener('mousemove', (e) => {
+  if (!_resizeDrag) return;
+  _doResizeDrag(e.clientX, e.clientY);
+});
+window.addEventListener('touchmove', (e) => {
+  if (!_resizeDrag) return;
+  e.preventDefault();
+  _doResizeDrag(e.touches[0].clientX, e.touches[0].clientY);
+}, {passive:false});
+
+function _doResizeDrag(cx, cy) {
+  const d = _resizeDrag;
+  const dx = (cx - d.startX) / d.s.scale;  // delta in image pixels
+  const dy = (cy - d.startY) / d.s.scale;
+  let [x, y, w, h] = d.origBbox;
+
+  if (d.handle.includes('w')) { x += dx; w -= dx; }
+  if (d.handle.includes('e')) { w += dx; }
+  if (d.handle.includes('n')) { y += dy; h -= dy; }
+  if (d.handle.includes('s')) { h += dy; }
+
+  // Clamp
+  x = Math.max(0, Math.round(x)); y = Math.max(0, Math.round(y));
+  w = Math.max(8, Math.min(Math.round(w), d.imgW - x));
+  h = Math.max(8, Math.min(Math.round(h), d.imgH - y));
+
+  d.curBbox = [x, y, w, h];
+  // Live preview
+  _showEditOverlay(d.handle, 0, [x, y, w, h], null);
+  // Re-show with correct cls/idx
+  if (_activeEdit) _showEditOverlay(_activeEdit.cls, _activeEdit.idx, [x, y, w, h], null);
+}
+
+window.addEventListener('mouseup',  () => { if (_resizeDrag) _applyResize(); });
+window.addEventListener('touchend', () => { if (_resizeDrag) _applyResize(); });
+
+async function _applyResize() {
+  const d = _resizeDrag;
+  _resizeDrag = null;
+  if (!d || !_activeEdit) return;
+
+  const [x, y, w, h] = d.curBbox;
+  if (!confirm(`Resize ${_activeEdit.cls} #${_activeEdit.idx} to [${x},${y},${w}×${h}]?`)) {
+    // Restore original
+    _showEditOverlay(_activeEdit.cls, _activeEdit.idx, _activeEdit.bbox, null);
+    return;
+  }
+
+  try {
+    const res = await fetch(API + '/api/resize_label', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        basename: _correctBasename,
+        cls_name: _activeEdit.cls,
+        idx: _activeEdit.idx,
+        bbox: [x, y, w, h],
+      })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      appendLog(`✓ ${data.msg}`);
+      _activeEdit.bbox = [x, y, w, h];
+      if (data.marked_b64) { _correctData.marked_b64 = data.marked_b64; _renderCorrectImage(); }
+      if (data.labels) { _correctData.labels = data.labels; }
+      await renderLabelList(_correctBasename, data.labels || _correctData.labels || {});
+      document.getElementById('correctStatusBar').textContent = `✓ ${data.msg} (auto-saved)`;
+    } else {
+      appendLog('ERROR: ' + (data.error || 'Unknown'));
+    }
+  } catch(e) { appendLog('ERROR: ' + e.message); }
+}
+
+// Hide edit overlay when image changes
+
+
+// ── Remove with confirmation ──────────────────────────────────────
+function confirmRemove(basename, clsName, idx) {
+  if (!confirm(`Remove ${clsName} #${idx} from "${basename}"?\n\nThis will be saved immediately.`)) return;
+  correctLabel(basename, 'remove', clsName, idx);
+}
+
+async function correctLabel(basename, action, clsName, idx) {
+  const body = { basename, action, cls_name: clsName, idx };
+  if (action === 'relabel') {
+    const sel = document.getElementById(`relabel_${clsName}_${idx}`);
+    body.new_cls = sel ? sel.value : clsName;
+    if (body.new_cls === clsName) return;
+    if (!confirm(`Relabel ${clsName} #${idx} → ${body.new_cls}?\n\nThis will be saved immediately.`)) return;
+  }
+  try {
+    const res = await fetch(API + '/api/correct', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (data.ok) {
+      appendLog(`✓ ${data.msg}`);
+      // Update cached data and refresh view
+      if (data.marked_b64) {
+        _correctData.marked_b64 = data.marked_b64;
+        _correctData.labels = data.labels;
+      }
+      _renderCorrectImage();
+      renderLabelList(basename, data.labels || {});
+      const total = Object.values(data.labels || {}).reduce((a,b)=>a+b,0);
+      document.getElementById('correctSummary').textContent = `${total} labels`;
+      document.getElementById('correctStatusBar').textContent = `✓ ${data.msg} (auto-saved)`;
+    } else {
+      appendLog('ERROR: ' + (data.error || 'Unknown'));
+    }
+  } catch(e) {
+    appendLog('ERROR: ' + e.message);
+  }
+}
+
+async function saveCorrections() {
+  if (!_correctBasename) return;
+  try {
+    const res = await fetch(API + '/api/save_corrections', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ basename: _correctBasename })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      _pendingChanges = false;
+      _updateSaveIndicator();
+      appendLog(`✅ Saved: ${_correctBasename}`);
+      document.getElementById('correctStatusBar').textContent = '✅ Saved to disk';
+    } else {
+      appendLog('ERROR: ' + data.error);
+    }
+  } catch(e) { appendLog('ERROR: ' + e.message); }
+}
+
+async function revertCorrections() {
+  if (!_correctBasename) return;
+  if (!confirm(`Revert all corrections for "${_correctBasename}"?`)) return;
+  try {
+    const res = await fetch(API + '/api/revert', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ basename: _correctBasename })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      appendLog(`↩ Reverted: ${_correctBasename}`);
+      _pendingChanges = false;
+      _updateSaveIndicator();
+      loadCorrectImage();
+    } else appendLog('ERROR: ' + data.error);
+  } catch(e) { appendLog('ERROR: ' + e.message); }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TEST TAB
+// ═══════════════════════════════════════════════════════════════════
+function selectTestImage(file) {
+  if (!file) return;
+  testFile = file;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    pzSetImage('testOrigPanel', e.target.result, file.name);
+    document.getElementById('btnDetect').disabled = false;
+    document.getElementById('testStatus').textContent = '';
+    document.getElementById('testFileName').textContent = file.name;
+    pzSetPlaceholder('testResultA', 'Click Compare to run Model A');
+    pzSetPlaceholder('testResultB', 'Click Compare to run Model B');
+    document.getElementById('detectionList').innerHTML =
+      '<div style="padding:16px;text-align:center;color:var(--text-dim);font-size:12px">Run detection to see results</div>';
+    document.getElementById('detectionSummary').textContent = '';
+    document.getElementById('modelWarningBar').style.display = 'none';
+  };
+  reader.readAsDataURL(file);
+}
+
+async function loadTestModels() {
+  try {
+    const res  = await fetch(API + '/api/model_versions');
+    const data = await res.json();
+    const versions = data.versions || [];
+
+    function buildOptions(selId, includeNone) {
+      const sel = document.getElementById(selId);
+      sel.innerHTML = includeNone ? '<option value="">— none —</option>' : '<option value="">— Select model —</option>';
+      versions.forEach(v => {
+        const map50  = v.mAP50 && v.mAP50 !== '—' ? '  mAP50=' + v.mAP50 : '';
+        const active = v.is_active ? ' ★' : '';
+        const label  = (v.name || v.path).split('/').slice(-3).join('/') + map50 + active;
+        const opt    = document.createElement('option');
+        opt.value    = v.path;
+        opt.textContent = label;
+        if (v.is_active && !includeNone) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      // Ensure active model is selected for Model A
+      if (!includeNone && !sel.value && data.best_model) {
+        const opt = document.createElement('option');
+        opt.value = data.best_model;
+        opt.textContent = '★ ' + data.best_model.split('/').pop();
+        opt.selected = true;
+        sel.insertBefore(opt, sel.children[1]);
+      }
+    }
+    buildOptions('testModelA', false);
+    buildOptions('testModelB', true);
+  } catch(e) {
+    ['testModelA','testModelB'].forEach(id => {
+      document.getElementById(id).innerHTML = '<option value="">Error loading</option>';
+    });
+  }
+}
+
+async function runDetection() {
+  if (!testFile) return;
+  const btn = document.getElementById('btnDetect');
+  btn.disabled = true;
+  document.getElementById('testStatus').textContent = 'Running...';
+  document.getElementById('modelWarningBar').style.display = 'none';
+
+  const modelA = document.getElementById('testModelA').value;
+  const modelB = document.getElementById('testModelB').value;
+  const conf   = (parseInt(document.getElementById('testConf').value) || 10) / 100;
+  const imgsz  = document.getElementById('testImgsz').value;
+
+  // Update panel titles
+  document.getElementById('titleA').textContent = modelA ? modelA.split('/').pop() : 'Model A (auto)';
+  document.getElementById('titleB').textContent = modelB ? modelB.split('/').pop() : 'Model B';
+
+  pzSetPlaceholder('testResultA', '⏳ Running Model A...');
+  if (modelB) pzSetPlaceholder('testResultB', '⏳ Running Model B...');
+  document.getElementById('detectionList').innerHTML =
+    '<div style="padding:16px;text-align:center;color:var(--accent);font-size:12px">⏳ Detecting...</div>';
+
+  async function detect(modelPath, label) {
+    const fd = new FormData();
+    fd.append('file', testFile);
+    fd.append('imgsz', imgsz);
+    fd.append('conf_thresh', conf.toString());
+    if (modelPath) fd.append('model_path', modelPath);
+    const res  = await fetch(API + '/api/detect', { method: 'POST', body: fd });
+    return await res.json();
+  }
+
+  try {
+    // Run both detections in parallel
+    const promises = [detect(modelA, 'A')];
+    if (modelB) promises.push(detect(modelB, 'B'));
+    const [dataA, dataB] = await Promise.all(promises);
+
+    // ── Model A result ──
+    if (dataA.error) {
+      pzSetPlaceholder('testResultA', '❌ ' + dataA.error);
+    } else {
+      pzSetImage('testResultA', 'data:image/jpeg;base64,' + dataA.result_b64, 'Model A');
+      const badgeA = document.getElementById('badgeA');
+      badgeA.style.display = 'inline';
+      badgeA.textContent   = dataA.source === 'heuristic' ? '🔧 heuristic' : '🤖 yolo';
+      badgeA.style.background = dataA.source === 'heuristic' ? 'rgba(108,140,255,0.2)' : 'rgba(74,222,128,0.2)';
+      badgeA.style.color      = dataA.source === 'heuristic' ? 'var(--accent)' : 'var(--green)';
+    }
+
+    // ── Model B result ──
+    if (dataB) {
+      if (dataB.error) {
+        pzSetPlaceholder('testResultB', '❌ ' + dataB.error);
+      } else {
+        pzSetImage('testResultB', 'data:image/jpeg;base64,' + dataB.result_b64, 'Model B');
+        const badgeB = document.getElementById('badgeB');
+        badgeB.style.display = 'inline';
+        badgeB.textContent   = dataB.source === 'heuristic' ? '🔧 heuristic' : '🤖 yolo';
+        badgeB.style.background = dataB.source === 'heuristic' ? 'rgba(108,140,255,0.2)' : 'rgba(74,222,128,0.2)';
+        badgeB.style.color      = dataB.source === 'heuristic' ? 'var(--accent)' : 'var(--green)';
+      }
+    } else {
+      pzSetPlaceholder('testResultB', 'Select Model B to compare');
+    }
+
+    // ── Warning bar (show worst warning) ──
+    const warning = (dataA.warning || '') + (dataB && dataB.warning ? '  |  ' + dataB.warning : '');
+    if (warning.trim()) {
+      const wb = document.getElementById('modelWarningBar');
+      wb.style.display = 'block';
+      wb.textContent   = warning;
+      wb.style.background = 'rgba(251,146,60,0.1)';
+      wb.style.color      = 'var(--orange)';
+      wb.style.border     = '1px solid var(--orange)';
+    }
+
+    // ── Detection list: side-by-side comparison ──
+    const countsA = dataA.counts || {};
+    const countsB = dataB ? (dataB.counts || {}) : null;
+    const totalA  = Object.values(countsA).reduce((a,b)=>a+b,0);
+    const totalB  = countsB ? Object.values(countsB).reduce((a,b)=>a+b,0) : null;
+
+    document.getElementById('testStatus').textContent =
+      'A: ' + totalA + ' det' + (totalB !== null ? '  |  B: ' + totalB + ' det' : '');
+    document.getElementById('detectionSummary').textContent =
+      'Model A: ' + (modelA ? modelA.split('/').pop() : 'auto') +
+      (modelB ? '  vs  Model B: ' + modelB.split('/').pop() : '');
+
+    // Build comparison list
+    const allClasses = new Set([...Object.keys(countsA), ...(countsB ? Object.keys(countsB) : [])]);
+    const maxTotal   = Math.max(totalA, totalB || 0, 1);
+    let listHtml = '';
+
+    if (!allClasses.size) {
+      listHtml = '<div style="padding:16px;text-align:center;color:var(--text-dim);font-size:12px">No detections found</div>';
+    } else {
+      // Header
+      listHtml += '<div style="display:grid;grid-template-columns:1fr auto auto;gap:4px;padding:4px 8px;font-size:10px;font-weight:600;color:var(--text-dim);border-bottom:1px solid var(--border)">'
+        + '<span>Class</span><span style="color:var(--accent)">A</span>'
+        + (countsB ? '<span style="color:var(--orange)">B</span>' : '<span></span>')
+        + '</div>';
+
+      for (const cls of [...allClasses].sort()) {
+        const color  = CLASS_COLORS[cls] || '#888';
+        const cntA   = countsA[cls] || 0;
+        const cntB   = countsB ? (countsB[cls] || 0) : null;
+        const pctA   = Math.round(cntA / maxTotal * 100);
+        const pctB   = cntB !== null ? Math.round(cntB / maxTotal * 100) : 0;
+        const diff   = cntB !== null ? cntB - cntA : null;
+        const diffStr = diff === null ? '' : diff > 0 ? '+' + diff : diff < 0 ? '' + diff : '=';
+        const diffColor = diff > 0 ? 'var(--green)' : diff < 0 ? 'var(--red)' : 'var(--text-dim)';
+
+        listHtml += '<div style="padding:5px 8px;border-bottom:1px solid var(--border)">'
+          + '<div style="display:flex;align-items:center;gap:5px;margin-bottom:3px">'
+          + '<span style="width:8px;height:8px;border-radius:50%;background:' + color + ';flex-shrink:0"></span>'
+          + '<span style="font-size:12px;flex:1">' + cls + '</span>'
+          + '<span style="font-size:12px;font-weight:700;color:var(--accent);min-width:20px;text-align:right">' + cntA + '</span>'
+          + (cntB !== null
+              ? '<span style="font-size:12px;font-weight:700;color:var(--orange);min-width:20px;text-align:right">' + cntB + '</span>'
+                + '<span style="font-size:10px;color:' + diffColor + ';min-width:20px;text-align:right">' + diffStr + '</span>'
+              : '')
+          + '</div>'
+          // Bar A (accent)
+          + '<div style="height:3px;background:var(--surface2);border-radius:2px;overflow:hidden;margin-bottom:2px">'
+          + '<div style="height:100%;width:' + pctA + '%;background:var(--accent);border-radius:2px"></div></div>'
+          // Bar B (orange)
+          + (cntB !== null
+              ? '<div style="height:3px;background:var(--surface2);border-radius:2px;overflow:hidden">'
+                + '<div style="height:100%;width:' + pctB + '%;background:var(--orange);border-radius:2px"></div></div>'
+              : '')
+          + '</div>';
+      }
+    }
+    document.getElementById('detectionList').innerHTML = listHtml;
+
+  } catch(e) {
+    pzSetPlaceholder('testResultA', '❌ ' + e.message);
+    document.getElementById('testStatus').textContent = 'Error: ' + e.message;
+    document.getElementById('detectionList').innerHTML =
+      '<div style="padding:16px;color:var(--red);font-size:12px">❌ ' + e.message + '</div>';
+  }
+  btn.disabled = false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DRAG & DROP (global)
+// ═══════════════════════════════════════════════════════════════════
+let dragCounter = 0;
+document.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  dragCounter++;
+  document.getElementById('dropOverlay').style.display = 'flex';
+});
+document.addEventListener('dragleave', (e) => {
+  e.preventDefault();
+  dragCounter--;
+  if (dragCounter <= 0) {
+    dragCounter = 0;
+    document.getElementById('dropOverlay').style.display = 'none';
+  }
+});
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  document.getElementById('dropOverlay').style.display = 'none';
+  if (e.dataTransfer.files.length) {
+    uploadFiles(e.dataTransfer.files);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// STATUS POLLING
+// ═══════════════════════════════════════════════════════════════════
+async function fetchStatus() {
+  try {
+    const res = await fetch(API + '/api/status');
+    return await res.json();
+  } catch(e) { return null; }
+}
+
+async function refreshStatus() {
+  const status = await fetchStatus();
+  if (!status) return;
+  updateProgress(status.pct, status.status, status.metrics);
+
+  if (status.raw_images)      rawImages      = status.raw_images;
+  if (status.labelled_images) labelledImages = status.labelled_images;
+  // Set folder paths AFTER arrays are updated so lengths are correct
+  if (status.raw_folder)      folderPaths.raw      = status.raw_folder + '  (' + rawImages.length + ' images)';
+  if (status.labelled_folder) folderPaths.labelled = status.labelled_folder + '  (' + labelledImages.length + ' labelled)';
+
+  // Sync viewImages with current mode
+  viewImages = viewMode === 'labelled' ? labelledImages : rawImages;
+
+  // Update UI
+  updateFolderPath();
+  updateSelectionCount();
+  if (viewImages.length) {
+    renderThumbStrip();
+    showCurrentImage();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// KEYBOARD SHORTCUTS
+// ═══════════════════════════════════════════════════════════════════
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'ArrowLeft') prevImage();
+  if (e.key === 'ArrowRight') nextImage();
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+// PAN / ZOOM ENGINE
+// ═══════════════════════════════════════════════════════════════════
+const _pzState = {};
+
+function _pzGet(id) {
+  if (!_pzState[id]) _pzState[id] = { scale: 1, tx: 0, ty: 0 };
+  return _pzState[id];
+}
+
+function _pzApply(id) {
+  const s = _pzGet(id);
+  const inner = document.getElementById(id + 'Inner');
+  if (!inner) return;
+  inner.style.transform = `translate(${s.tx}px, ${s.ty}px) scale(${s.scale})`;
+  const lbl = document.getElementById(id + 'Zoom');
+  if (lbl) lbl.textContent = Math.round(s.scale * 100) + '%';
+}
+
+function pzSetImage(id, src, alt) {
+  const inner = document.getElementById(id + 'Inner');
+  if (!inner) return;
+  const img = new window.Image();
+  img.alt = alt || '';
+  img.style.display = 'block';
+  img.onload = () => {
+    inner.innerHTML = '';
+    inner.appendChild(img);
+    pzFit(id);
+  };
+  img.src = src;
+}
+
+function pzSetPlaceholder(id, msg) {
+  const inner = document.getElementById(id + 'Inner');
+  if (!inner) return;
+  inner.innerHTML = `<div class="placeholder" style="padding:40px;color:var(--text-dim)">${msg}</div>`;
+  const s = _pzGet(id); s.scale = 1; s.tx = 0; s.ty = 0;
+  _pzApply(id);
+}
+
+function pzFit(id) {
+  const wrap  = document.getElementById(id);
+  const inner = document.getElementById(id + 'Inner');
+  if (!wrap || !inner) return;
+  const img = inner.querySelector('img');
+  if (!img) return;
+  const ww = wrap.clientWidth  || wrap.offsetWidth  || 600;
+  const wh = wrap.clientHeight || wrap.offsetHeight || 500;
+  const iw = img.naturalWidth  || img.width  || ww;
+  const ih = img.naturalHeight || img.height || wh;
+  const scale = Math.min(ww / iw, wh / ih, 1);
+  const s = _pzGet(id);
+  s.scale = scale;
+  s.tx = (ww - iw * scale) / 2;
+  s.ty = (wh - ih * scale) / 2;
+  _pzApply(id);
+}
+
+function pzReset(id) {
+  const s = _pzGet(id); s.scale = 1; s.tx = 0; s.ty = 0;
+  _pzApply(id);
+}
+
+function pzZoom(id, factor) {
+  const wrap = document.getElementById(id);
+  if (!wrap) return;
+  const cx = (wrap.clientWidth  || 600) / 2;
+  const cy = (wrap.clientHeight || 500) / 2;
+  const s  = _pzGet(id);
+  const newScale = Math.min(Math.max(s.scale * factor, 0.1), 20);
+  s.tx = cx - (cx - s.tx) * (newScale / s.scale);
+  s.ty = cy - (cy - s.ty) * (newScale / s.scale);
+  s.scale = newScale;
+  _pzApply(id);
+}
+
+function _pzInitDrag(id) {
+  const wrap = document.getElementById(id);
+  if (!wrap || wrap._pzInited) return;
+  wrap._pzInited = true;
+  let dragging = false, startX, startY, startTx, startTy;
+
+  wrap.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    // Block pan when draw mode is active on this viewer
+    if (id === 'correctViewer' && _drawMode) return;
+    dragging = true;
+    startX = e.clientX; startY = e.clientY;
+    const s = _pzGet(id); startTx = s.tx; startTy = s.ty;
+    wrap.classList.add('grabbing');
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const s = _pzGet(id);
+    s.tx = startTx + (e.clientX - startX);
+    s.ty = startTy + (e.clientY - startY);
+    _pzApply(id);
+  });
+  window.addEventListener('mouseup', () => {
+    dragging = false;
+    wrap.classList.remove('grabbing');
+  });
+
+  // Touch support
+  let lastTouchDist = null;
+  wrap.addEventListener('touchstart', (e) => {
+    if (id === 'correctViewer' && _drawMode) return;
+    if (e.touches.length === 1) {
+      dragging = true;
+      startX = e.touches[0].clientX; startY = e.touches[0].clientY;
+      const s = _pzGet(id); startTx = s.tx; startTy = s.ty;
+    } else if (e.touches.length === 2) {
+      dragging = false;
+      lastTouchDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+    }
+    e.preventDefault();
+  }, { passive: false });
+  wrap.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 1 && dragging) {
+      const s = _pzGet(id);
+      s.tx = startTx + (e.touches[0].clientX - startX);
+      s.ty = startTy + (e.touches[0].clientY - startY);
+      _pzApply(id);
+    } else if (e.touches.length === 2 && lastTouchDist) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      pzZoom(id, dist / lastTouchDist);
+      lastTouchDist = dist;
+    }
+    e.preventDefault();
+  }, { passive: false });
+  wrap.addEventListener('touchend', () => { dragging = false; lastTouchDist = null; });
+
+  // Mouse wheel zoom
+  wrap.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = wrap.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    const factor = e.deltaY < 0 ? 1.12 : 0.89;
+    const s = _pzGet(id);
+    const newScale = Math.min(Math.max(s.scale * factor, 0.1), 20);
+    s.tx = cx - (cx - s.tx) * (newScale / s.scale);
+    s.ty = cy - (cy - s.ty) * (newScale / s.scale);
+    s.scale = newScale;
+    _pzApply(id);
+  }, { passive: false });
+}
+
+// Init drag on all viewers
+['trainViewer','correctViewer','testOrigPanel','testResultA','testResultB'].forEach(id => {
+  // Defer until DOM is ready
+  setTimeout(() => _pzInitDrag(id), 200);
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// DRAW ANNOTATION TOOL
+// ═══════════════════════════════════════════════════════════════════
+let _drawMode   = false;
+let _drawStart  = null;   // {x, y} in canvas coords
+let _drawRect   = null;   // current drag rect
+
+function toggleDrawMode() {
+  _drawMode = !_drawMode;
+  const btn    = document.getElementById('btnDrawMode');
+  const canvas = document.getElementById('correctDrawCanvas');
+  const status = document.getElementById('drawStatus');
+  const cancel = document.getElementById('btnCancelDraw');
+  if (_drawMode) {
+    btn.classList.add('draw-on');
+    btn.textContent = '🖊 Drawing...';
+    canvas.classList.add('draw-active');
+    const wrap2 = document.getElementById('correctViewer');
+    if (wrap2) wrap2.classList.add('draw-mode');
+    status.textContent = 'Drag a rectangle on the image to mark a region';
+    status.style.color = 'var(--orange)';
+    if (cancel) cancel.style.display = 'inline';
+    _initDrawCanvas();
+  } else {
+    _exitDrawMode();
+  }
+}
+
+function cancelDraw() {
+  _drawMode = false;
+  _exitDrawMode();
+}
+
+function _exitDrawMode() {
+  const btn    = document.getElementById('btnDrawMode');
+  const canvas = document.getElementById('correctDrawCanvas');
+  const status = document.getElementById('drawStatus');
+  const cancel = document.getElementById('btnCancelDraw');
+  btn.classList.remove('draw-on');
+  btn.textContent = '🖊 Draw Region';
+  canvas.classList.remove('draw-active');
+  const wrap3 = document.getElementById('correctViewer');
+  if (wrap3) wrap3.classList.remove('draw-mode');
+  status.textContent = 'Select class and click Draw Region';
+  status.style.color = 'var(--text-dim)';
+  if (cancel) cancel.style.display = 'none';
+  _clearDrawCanvas();
+  _drawStart = null; _drawRect = null;
+}
+
+function _clearDrawCanvas() {
+  const c = document.getElementById('correctDrawCanvas');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+}
+
+function _initDrawCanvas() {
+  const wrap   = document.getElementById('correctViewer');
+  const canvas = document.getElementById('correctDrawCanvas');
+  if (!wrap || !canvas || canvas._drawInited) return;
+  canvas._drawInited = true;
+
+  // Use wrap-relative coords (consistent with pan-zoom state)
+  const getWrapPos = (e) => {
+    const rect = wrap.getBoundingClientRect();
+    const src  = e.touches ? e.touches[0] : e;
+    return { x: src.clientX - rect.left, y: src.clientY - rect.top };
+  };
+
+  // Listen on the WRAP (not canvas) so we always get events
+  wrap.addEventListener('mousedown', (e) => {
+    if (!_drawMode || e.button !== 0) return;
+    e.preventDefault(); e.stopPropagation();
+    _drawStart = getWrapPos(e);
+    _drawRect  = null;
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!_drawMode || !_drawStart) return;
+    const pos = getWrapPos(e);
+    _drawRect = {
+      x: Math.min(_drawStart.x, pos.x),
+      y: Math.min(_drawStart.y, pos.y),
+      w: Math.abs(pos.x - _drawStart.x),
+      h: Math.abs(pos.y - _drawStart.y),
+    };
+    _renderDrawRect();
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (!_drawMode || !_drawStart || !_drawRect) return;
+    if (_drawRect.w < 8 || _drawRect.h < 8) { _drawStart = null; _drawRect = null; return; }
+    _confirmDrawRect();
+    _drawStart = null;
+  });
+
+  // Touch support
+  wrap.addEventListener('touchstart', (e) => {
+    if (!_drawMode) return;
+    e.preventDefault(); e.stopPropagation();
+    _drawStart = getWrapPos(e);
+  }, { passive: false });
+  wrap.addEventListener('touchmove', (e) => {
+    if (!_drawMode || !_drawStart) return;
+    e.preventDefault();
+    const pos = getWrapPos(e);
+    _drawRect = {
+      x: Math.min(_drawStart.x, pos.x), y: Math.min(_drawStart.y, pos.y),
+      w: Math.abs(pos.x - _drawStart.x), h: Math.abs(pos.y - _drawStart.y),
+    };
+    _renderDrawRect();
+  }, { passive: false });
+  wrap.addEventListener('touchend', () => {
+    if (!_drawMode || !_drawRect) return;
+    if (_drawRect.w < 8 || _drawRect.h < 8) { _drawStart = null; _drawRect = null; return; }
+    _confirmDrawRect();
+    _drawStart = null;
+  });
+}
+
+function _renderDrawRect() {
+  const canvas = document.getElementById('correctDrawCanvas');
+  const wrap   = document.getElementById('correctViewer');
+  if (!canvas || !wrap) return;
+  canvas.width  = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!_drawRect) return;
+
+  const cls   = document.getElementById('drawClass').value;
+  const color = CLASS_COLORS[cls] || '#6c8cff';
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 2;
+  ctx.setLineDash([6, 3]);
+  ctx.strokeRect(_drawRect.x, _drawRect.y, _drawRect.w, _drawRect.h);
+  ctx.fillStyle = color + '22';
+  ctx.fillRect(_drawRect.x, _drawRect.y, _drawRect.w, _drawRect.h);
+
+  // Label
+  ctx.setLineDash([]);
+  ctx.fillStyle = color;
+  ctx.font = 'bold 13px sans-serif';
+  ctx.fillText(cls, _drawRect.x + 4, _drawRect.y + 16);
+}
+
+async function _confirmDrawRect() {
+  if (!_drawRect || !_correctBasename) return;
+  const cls = document.getElementById('drawClass').value;
+
+  // Convert canvas coords → image pixel coords using pan-zoom state
+  const s   = _pzGet('correctViewer');
+  const img = document.querySelector('#correctViewerInner img');
+  if (!img) { _exitDrawMode(); return; }
+
+  const imgW = img.naturalWidth  || img.width;
+  const imgH = img.naturalHeight || img.height;
+
+  // Canvas rect → image rect (inverse of pan-zoom transform)
+  const ix = (_drawRect.x - s.tx) / s.scale;
+  const iy = (_drawRect.y - s.ty) / s.scale;
+  const iw = _drawRect.w / s.scale;
+  const ih = _drawRect.h / s.scale;
+
+  // Clamp to image bounds
+  const bx = Math.max(0, Math.round(ix));
+  const by = Math.max(0, Math.round(iy));
+  const bw = Math.min(imgW - bx, Math.round(iw));
+  const bh = Math.min(imgH - by, Math.round(ih));
+
+  if (bw < 4 || bh < 4) { _exitDrawMode(); return; }
+
+  const pct = `${Math.round(bx/imgW*100)}%,${Math.round(by/imgH*100)}% → ${Math.round((bx+bw)/imgW*100)}%,${Math.round((by+bh)/imgH*100)}%`;
+  if (!confirm(`Add ${cls} at [${pct}]?\n\nThis will be saved immediately.`)) {
+    _clearDrawCanvas(); _drawStart = null; _drawRect = null; return;
+  }
+
+  // Send to server
+  try {
+    const res  = await fetch(API + '/api/section', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ basename: _correctBasename, label: cls, bbox: [bx, by, bw, bh] })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      appendLog(`✓ Added ${cls} [${bx},${by},${bw},${bh}] guid=${data.guid}`);
+      document.getElementById('drawStatus').textContent = `✓ Added ${cls} — draw another or exit`;
+      // Refresh label list and image
+      if (data.labels) {
+        _correctData.labels = data.labels;
+        renderLabelList(_correctBasename, data.labels);
+        const total = Object.values(data.labels).reduce((a,b)=>a+b,0);
+        document.getElementById('correctSummary').textContent = `${total} labels`;
+      }
+      // Reload marked image to show new annotation
+      const imgRes = await fetch(API + '/api/image/' + encodeURIComponent(_correctBasename));
+      const imgData = await imgRes.json();
+      if (imgData.marked_b64) {
+        _correctData.marked_b64 = imgData.marked_b64;
+        _renderCorrectImage();
+      }
+      document.getElementById('correctStatusBar').textContent = `✓ ${cls} added (auto-saved)`;
+    } else {
+      appendLog('ERROR: ' + (data.error || 'Unknown'));
+    }
+  } catch(e) { appendLog('ERROR: ' + e.message); }
+
+  _clearDrawCanvas(); _drawStart = null; _drawRect = null;
+  // Stay in draw mode so user can draw more
+}
+
+// Resize draw canvas when window resizes
+window.addEventListener('resize', () => {
+  const canvas = document.getElementById('correctDrawCanvas');
+  const wrap   = document.getElementById('correctViewer');
+  if (canvas && wrap) { canvas.width = wrap.clientWidth; canvas.height = wrap.clientHeight; }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// UPDATE MODEL FROM CORRECTIONS
+// ═══════════════════════════════════════════════════════════════════
+let _ftMode = 'incremental';
+
+function setFtMode(mode) {
+  _ftMode = mode;
+  ['ftModeIncremental','ftModeScratch','ftModeMerge'].forEach(id => {
+    document.getElementById(id).classList.remove('active');
+  });
+  document.getElementById('ftMode' + mode.charAt(0).toUpperCase() + mode.slice(1)).classList.add('active');
+  document.getElementById('ftParamsPanel').style.display = mode === 'merge' ? 'none' : 'block';
+  document.getElementById('ftMergePanel').style.display  = mode === 'merge' ? 'block' : 'none';
+  const btn = document.getElementById('btnStartFinetune');
+  if (mode === 'merge') {
+    btn.textContent = '🔀 Merge Models';
+  } else if (mode === 'scratch') {
+    btn.textContent = '🆕 Train from Scratch';
+    document.getElementById('ftBaseModelHint').textContent = 'Will use yolov8n-seg.pt (COCO pretrained base)';
+    document.getElementById('ftBaseModel').disabled = true;
+  } else {
+    btn.textContent = '▶ Start Fine-tune';
+    document.getElementById('ftBaseModelHint').textContent = 'Select the model to continue training from';
+    document.getElementById('ftBaseModel').disabled = false;
+  }
+}
+
+async function openUpdateModelPanel() {
+  _ftMode = 'incremental';
+  setFtMode('incremental');
+  document.getElementById('updateModelPanel').style.display = 'flex';
+  document.getElementById('finetuneStatus').style.display = 'none';
+
+  const info = document.getElementById('updateModelInfo');
+  try {
+    const [statusRes, versionsRes] = await Promise.all([
+      fetchStatus(),
+      fetch(API + '/api/model_versions').then(r => r.json())
+    ]);
+    const lbl_count = (statusRes?.labelled_images || []).length;
+    const best      = versionsRes.best_model ? versionsRes.best_model.split('/').pop() : 'None';
+    const versions  = versionsRes.versions || [];
+    info.innerHTML  = 'Active: <strong>' + best + '</strong>  ·  '
+      + 'Labelled: <strong>' + lbl_count + '</strong>  ·  '
+      + 'Versions: <strong>' + versions.length + '</strong>';
+
+    // Populate model dropdowns
+    function fillSelect(selId, activeFirst) {
+      const sel = document.getElementById(selId);
+      sel.innerHTML = '<option value="">— select —</option>';
+      versions.forEach(v => {
+        const map50 = v.mAP50 && v.mAP50 !== '—' ? ' mAP50=' + v.mAP50 : '';
+        const label = (v.name || v.path).split('/').slice(-3).join('/') + map50 + (v.is_active ? ' ★' : '');
+        const opt   = document.createElement('option');
+        opt.value   = v.path;
+        opt.textContent = label;
+        if (v.is_active && activeFirst) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      if (versionsRes.best_model && !sel.value) {
+        const opt = document.createElement('option');
+        opt.value = versionsRes.best_model;
+        opt.textContent = '★ Active: ' + versionsRes.best_model.split('/').pop();
+        opt.selected = true;
+        sel.insertBefore(opt, sel.children[1]);
+      }
+    }
+    fillSelect('ftBaseModel', true);
+    fillSelect('ftMergeA', true);
+    fillSelect('ftMergeB', false);
+  } catch(e) {
+    info.textContent = 'Could not load info: ' + e.message;
+  }
+}
+
+function closeUpdateModelPanel() {
+  document.getElementById('updateModelPanel').style.display = 'none';
+  document.getElementById('finetuneStatus').style.display = 'none';
+  const btn = document.getElementById('btnStartFinetune');
+  if (btn) btn.disabled = false;
+}
+
+async function startFinetune() {
+  const btn    = document.getElementById('btnStartFinetune');
+  const status = document.getElementById('finetuneStatus');
+  btn.disabled = true;
+  status.style.display = 'block';
+  status.style.color   = 'var(--accent)';
+
+  try {
+    let res, data, logMsg;
+
+    if (_ftMode === 'merge') {
+      const modelA = document.getElementById('ftMergeA').value;
+      const modelB = document.getElementById('ftMergeB').value;
+      const alpha  = parseInt(document.getElementById('ftAlpha').value) / 100;
+      if (!modelA || !modelB) {
+        status.textContent = '❌ Select both Model A and Model B';
+        status.style.color = 'var(--red)';
+        btn.disabled = false; return;
+      }
+      if (modelA === modelB) {
+        status.textContent = '❌ Select two different models';
+        status.style.color = 'var(--red)';
+        btn.disabled = false; return;
+      }
+      status.textContent = '⏳ Merging models (weight averaging)...';
+      res  = await fetch(API + '/api/merge_models', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ model_a: modelA, model_b: modelB, alpha })
+      });
+      data   = await res.json();
+      logMsg = '🔀 Model merge started (α=' + alpha + ')';
+    } else {
+      const baseModel = _ftMode === 'scratch' ? '' : (document.getElementById('ftBaseModel').value || '');
+      const body = {
+        epochs:     parseInt(document.getElementById('ftEpochs').value) || 5,
+        batch:      parseInt(document.getElementById('ftBatch').value)  || 2,
+        imgsz:      parseInt(document.getElementById('ftImgsz').value)  || 640,
+        mode:       _ftMode,
+        base_model: baseModel,
+      };
+      status.textContent = _ftMode === 'scratch'
+        ? '⏳ Training from scratch...'
+        : '⏳ Fine-tuning from: ' + (baseModel ? baseModel.split('/').pop() : 'active model') + '...';
+      res  = await fetch(API + '/api/train_from_corrections', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      data   = await res.json();
+      logMsg = (_ftMode === 'scratch' ? '🆕 Training from scratch' : '🔄 Fine-tune from ' + (data.base_model || '').split('/').pop())
+               + ' (' + body.epochs + ' epochs)';
+    }
+
+    if (res.status === 409) {
+      status.textContent = '⚠️ Training already running';
+      status.style.color = 'var(--orange)';
+      btn.disabled = false; return;
+    }
+    if (data.ok) {
+      status.textContent = '✓ Started — check Training Log';
+      status.style.color = 'var(--green)';
+      appendLog('\n' + logMsg);
+      setTimeout(() => {
+        document.querySelector('[data-tab="train"]').click();
+        closeUpdateModelPanel();
+      }, 1500);
+      pollForTraining();
+      pollModelVersions();
+    } else {
+      status.textContent = '❌ ' + (data.error || 'Failed');
+      status.style.color = 'var(--red)';
+      btn.disabled = false;
+    }
+  } catch(e) {
+    status.textContent = '❌ ' + e.message;
+    status.style.color = 'var(--red)';
+    btn.disabled = false;
+  }
+}
+
+// ── Model version history ─────────────────────────────────────────
+async function refreshModelVersions() {
+  try {
+    const res  = await fetch(API + '/api/model_versions');
+    const data = await res.json();
+    renderModelVersions(data);
+  } catch(e) {}
+}
+
+function renderModelVersions(data) {
+  const el = document.getElementById('modelVersionList');
+  if (!el) return;
+  const versions = data.versions || [];
+  if (!versions.length) {
+    el.innerHTML = '<div style="color:var(--text-dim);padding:8px">No versions yet — train a model first</div>';
+    return;
+  }
+  const srcIcon  = {corrections:'✏️', full_train:'🏋', scan:'🔍', finetune:'✏️'};
+  const srcLabel = {corrections:'corrections', full_train:'full train', scan:'scanned', finetune:'fine-tune'};
+  el.innerHTML = versions.map((v) => {
+    const isActive = v.is_active;
+    const ts  = (v.ts || '').replace('T',' ');
+    const src = srcIcon[v.source]  || '🔍';
+    const map50f = parseFloat(v.mAP50);
+    const map50Color = map50f >= 0.5 ? 'var(--green)' : map50f >= 0.2 ? 'var(--orange)' : 'var(--red)';
+    const map50Disp  = isNaN(map50f) ? '<span style="color:var(--text-dim)">—</span>'
+                     : '<span style="color:' + map50Color + ';font-weight:600">' + v.mAP50 + '</span>';
+    const shortName  = (v.name || v.path).split('/').slice(-3).join('/');
+    return '<div style="padding:6px 8px;border-radius:6px;margin-bottom:4px;'
+      + 'background:' + (isActive ? 'rgba(74,222,128,0.08)' : 'var(--bg)') + ';'
+      + 'border:1px solid ' + (isActive ? 'var(--green)' : 'var(--border)') + '">'
+      + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">'
+      + '<span style="font-size:13px">' + src + '</span>'
+      + '<span style="font-size:12px;font-weight:' + (isActive?'600':'400') + ';'
+      + 'color:' + (isActive?'var(--green)':'var(--text)') + ';flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + v.path + '">'
+      + (isActive ? '★ Active — ' : '') + shortName + '</span>'
+      + (isActive
+          ? '<span style="font-size:10px;color:var(--green);flex-shrink:0">✓ Active</span>'
+          : '<button class="btn-secondary" style="font-size:10px;padding:2px 8px;flex-shrink:0" onclick="setActiveModel(decodeURIComponent(\'' + encodeURIComponent(v.path) + '\'))">▶ Use</button>')
+      + '</div>'
+      + '<div style="display:flex;gap:10px;font-size:10px;color:var(--text-dim);flex-wrap:wrap">'
+      + '<span>mAP50: ' + map50Disp + '</span>'
+      + '<span>mAP50-95: ' + (v.mAP50_95 || '—') + '</span>'
+      + '<span>Epochs: ' + v.epochs + '</span>'
+      + '<span>Classes: ' + (v.nc || '?') + '</span>'
+      + '<span>' + (v.size_mb || '?') + 'MB</span>'
+      + '<span>' + ts + '</span>'
+      + '</div></div>';
+  }).join('');
+}
+
+async function setActiveModel(path) {
+  if (!confirm(`Set this model as active?\n${path.split('/').pop()}`)) return;
+  try {
+    const res  = await fetch(API + '/api/set_model', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ path })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      appendLog(`✅ Active model updated: ${path.split('/').pop()}`);
+      refreshModelVersions();
+    } else {
+      appendLog('ERROR: ' + data.error);
+    }
+  } catch(e) { appendLog('ERROR: ' + e.message); }
+}
+
+function pollModelVersions() {
+  const iv = setInterval(async () => {
+    const s = await fetchStatus();
+    if (s && !s.training) {
+      clearInterval(iv);
+      refreshModelVersions();
+    }
+  }, 4000);
+  setTimeout(() => clearInterval(iv), 7200000);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════════
+connectSSE();
+loadTestModels();
+// Load status immediately on page load
+refreshStatus().then(() => {
+  // If still no images after first load, try once more after a short delay
+  setTimeout(() => {
+    if (!viewImages.length) refreshStatus();
+  }, 1000);
+});
+refreshModelVersions();
+</script>
+</body>
+</html>

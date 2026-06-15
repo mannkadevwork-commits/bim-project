@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+/* This tells Tailwind v4 to trigger dark mode when the .dark class is present */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --color-brand: #6366f1; 
+  --color-accent: #06b6d4; 
+}
+
+/* Global resets for a full-screen 3D Viewer app */
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden; 
+  font-family: var(--font-sans);
+}
+
+/* Xeokit TreeView Plugin Overrides */
+.xeokit-tree-view ul {
+  list-style: none !important;
+  padding-left: 1.5rem !important;
+  margin-top: 0.5rem;
+}
+.xeokit-tree-view li {
+  margin-bottom: 0.25rem;
+  cursor: pointer;
+  color: inherit;
+
+}
+.xeokit-tree-view li:hover {
+  color: var(--color-brand);
+}
+
+/* NavCube Positioning */
+#myNavCubeCanvas {
+  position: absolute;
+  bottom: 50px;
+  right: 50px;
+  width: 150px;
+  height: 150px;
+  z-index: 20;
+  pointer-events: all;
+}

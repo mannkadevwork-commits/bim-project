@@ -1,0 +1,356 @@
+{
+    "building_name": "Two-Story Residential Villa",
+    "walls": [
+        {
+            "wall_id": "GW_EXT_LEFT",
+            "start_pt": [
+                0.0,
+                0.0
+            ],
+            "end_pt": [
+                0.0,
+                78.0
+            ],
+            "thickness": 0.75,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_EXT_TOP",
+            "start_pt": [
+                0.0,
+                78.0
+            ],
+            "end_pt": [
+                46.0,
+                78.0
+            ],
+            "thickness": 0.75,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_EXT_RIGHT",
+            "start_pt": [
+                46.0,
+                78.0
+            ],
+            "end_pt": [
+                46.0,
+                0.0
+            ],
+            "thickness": 0.75,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_EXT_BOTTOM",
+            "start_pt": [
+                46.0,
+                0.0
+            ],
+            "end_pt": [
+                0.0,
+                0.0
+            ],
+            "thickness": 0.75,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_MBED_LEFT",
+            "start_pt": [
+                8.0,
+                58.0
+            ],
+            "end_pt": [
+                8.0,
+                72.0
+            ],
+            "thickness": 0.75,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_MBED_TOP",
+            "start_pt": [
+                8.0,
+                72.0
+            ],
+            "end_pt": [
+                20.0,
+                72.0
+            ],
+            "thickness": 0.75,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_MBED_RIGHT",
+            "start_pt": [
+                20.0,
+                72.0
+            ],
+            "end_pt": [
+                20.0,
+                58.0
+            ],
+            "thickness": 0.375,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_MBED_BOTTOM",
+            "start_pt": [
+                20.0,
+                58.0
+            ],
+            "end_pt": [
+                8.0,
+                58.0
+            ],
+            "thickness": 0.375,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_KITCHEN_TOP",
+            "start_pt": [
+                26.0,
+                72.0
+            ],
+            "end_pt": [
+                38.0,
+                72.0
+            ],
+            "thickness": 0.75,
+            "height": 10.0,
+            "unit": "feet"
+        },
+        {
+            "wall_id": "GW_DRAWING_RIGHT",
+            "start_pt": [
+                45.0,
+                30.0
+            ],
+            "end_pt": [
+                45.0,
+                45.0
+            ],
+            "thickness": 0.75,
+            "height": 10.0,
+            "unit": "feet"
+        }
+    ],
+    "openings": [
+        {
+            "id": "GD_MAIN_ENTRANCE",
+            "type": "door",
+            "location_pt": [
+                30.0,
+                15.0
+            ],
+            "width": 4.0,
+            "height": 7.0,
+            "parent_wall_id": "GW_LOBBY_BOTTOM",
+            "operation_type": "SINGLE_SWING_RIGHT",
+            "material": "Wood",
+            "color": [
+                0.4,
+                0.2,
+                0.1
+            ],
+            "properties": [
+                {
+                    "name": "FireRating",
+                    "value": "30 min",
+                    "pset": null
+                }
+            ],
+            "unit": "feet"
+        },
+        {
+            "id": "GWIN_MBED",
+            "type": "window",
+            "location_pt": [
+                8.0,
+                65.0
+            ],
+            "width": 5.0,
+            "height": 4.0,
+            "parent_wall_id": "GW_MBED_LEFT",
+            "operation_type": "SLIDING",
+            "material": "Aluminium",
+            "color": [
+                0.8,
+                0.8,
+                0.8
+            ],
+            "properties": [],
+            "unit": "feet"
+        },
+        {
+            "id": "GD_MBED",
+            "type": "door",
+            "location_pt": [
+                18.0,
+                58.0
+            ],
+            "width": 3.0,
+            "height": 7.0,
+            "parent_wall_id": "GW_MBED_BOTTOM",
+            "operation_type": "SINGLE_SWING_LEFT",
+            "material": "Wood",
+            "color": null,
+            "properties": [],
+            "unit": "feet"
+        }
+    ],
+    "interiors": [
+        {
+            "id": "GF_MBED_BED",
+            "category": "furnishing",
+            "type": "BED",
+            "location_pt": [
+                12.0,
+                65.0
+            ],
+            "dimensions": [
+                6.5,
+                6.0,
+                1.5
+            ],
+            "material": "Wood",
+            "color": [
+                0.5,
+                0.3,
+                0.1
+            ],
+            "properties": [
+                {
+                    "name": "BedSize",
+                    "value": "King",
+                    "pset": "Pset_BedTypeCommon"
+                }
+            ],
+            "unit": "feet"
+        },
+        {
+            "id": "GS_MBED_WC",
+            "category": "sanitary",
+            "type": "WC",
+            "location_pt": [
+                23.0,
+                68.0
+            ],
+            "dimensions": [
+                1.5,
+                2.5,
+                1.5
+            ],
+            "material": "Ceramic",
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "properties": [
+                {
+                    "name": "FlushType",
+                    "value": "Dual Flush",
+                    "pset": null
+                }
+            ],
+            "unit": "feet"
+        },
+        {
+            "id": "GF_DINING_TABLE",
+            "category": "furnishing",
+            "type": "TABLE",
+            "location_pt": [
+                35.0,
+                55.0
+            ],
+            "dimensions": [
+                6.0,
+                3.5,
+                2.5
+            ],
+            "material": "Glass",
+            "color": [
+                0.9,
+                0.9,
+                1.0
+            ],
+            "properties": [
+                {
+                    "name": "SeatingCapacity",
+                    "value": "6",
+                    "pset": null
+                }
+            ],
+            "unit": "feet"
+        },
+        {
+            "id": "GA_KITCHEN_STOVE",
+            "category": "appliance",
+            "type": "STOVE",
+            "location_pt": [
+                36.0,
+                68.0
+            ],
+            "dimensions": [
+                2.5,
+                2.0,
+                0.5
+            ],
+            "material": "Stainless Steel",
+            "color": [
+                0.7,
+                0.7,
+                0.7
+            ],
+            "properties": [
+                {
+                    "name": "BurnerCount",
+                    "value": "4",
+                    "pset": null
+                },
+                {
+                    "name": "FuelType",
+                    "value": "Gas",
+                    "pset": null
+                }
+            ],
+            "unit": "feet"
+        },
+        {
+            "id": "GF_LOUNGE_SOFA",
+            "category": "furnishing",
+            "type": "SOFA",
+            "location_pt": [
+                20.0,
+                45.0
+            ],
+            "dimensions": [
+                7.0,
+                3.0,
+                3.0
+            ],
+            "material": "Fabric",
+            "color": [
+                0.2,
+                0.4,
+                0.6
+            ],
+            "properties": [
+                {
+                    "name": "SeatingCapacity",
+                    "value": "3",
+                    "pset": null
+                }
+            ],
+            "unit": "feet"
+        }
+    ]
+}

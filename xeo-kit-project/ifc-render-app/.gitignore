@@ -1,0 +1,20 @@
+# Credentials
+.env
+
+# Dependencies
+node_modules/
+
+# Generated outputs
+input.obj
+result.png
+360_viewer.html
+camera.json
+IFCRenderBundle.zip
+
+# Logs
+*.log
+report.txt
+diag.txt
+
+# OS files
+.DS_Store

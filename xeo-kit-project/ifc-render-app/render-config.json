@@ -1,0 +1,86 @@
+{
+  "lighting": {
+    "keyLight": {
+      "color": [
+        220,
+        230,
+        255
+      ],
+      "intensity": 1.2,
+      "position": [
+        -0.5,
+        1.2,
+        -0.8
+      ],
+      "castShadows": true,
+      "shadowMapSize": 2048
+    },
+    "fillLight": {
+      "color": [
+        200,
+        210,
+        230
+      ],
+      "intensity": 0.4,
+      "position": [
+        0.6,
+        0.4,
+        0.5
+      ],
+      "castShadows": false
+    },
+    "backLight": {
+      "color": [
+        220,
+        230,
+        255
+      ],
+      "intensity": 0.3,
+      "position": [
+        -0.3,
+        0.6,
+        0.8
+      ],
+      "castShadows": false
+    },
+    "ambient": {
+      "intensity": 0.6,
+      "skyColor": [
+        200,
+        218,
+        240
+      ],
+      "groundColor": [
+        232,
+        224,
+        208
+      ]
+    }
+  },
+  "material": {
+    "color": [
+      230,
+      230,
+      235
+    ],
+    "roughness": 0.7,
+    "metalness": 0.05,
+    "specularLevel": 30,
+    "glossiness": 25
+  },
+  "camera": {
+    "fov": 45
+  },
+  "background": {
+    "color": [
+      240,
+      240,
+      240
+    ]
+  },
+  "ground": {
+    "enabled": true,
+    "shadowOpacity": 0.15,
+    "gridEnabled": true
+  }
+}

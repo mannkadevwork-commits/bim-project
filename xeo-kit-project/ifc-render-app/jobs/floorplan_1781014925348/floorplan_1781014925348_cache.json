@@ -1,0 +1,509 @@
+{
+    "building_name": "20x30 Ground Floor Plan",
+    "walls": [
+        {
+            "wall_id": "wall_ext_left",
+            "start_pt": [
+                0.0,
+                0.0
+            ],
+            "end_pt": [
+                0.0,
+                9.144
+            ],
+            "thickness": 0.23,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_ext_bottom",
+            "start_pt": [
+                0.0,
+                0.0
+            ],
+            "end_pt": [
+                6.096,
+                0.0
+            ],
+            "thickness": 0.23,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_ext_right",
+            "start_pt": [
+                6.096,
+                0.0
+            ],
+            "end_pt": [
+                6.096,
+                9.144
+            ],
+            "thickness": 0.23,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_ext_top",
+            "start_pt": [
+                0.0,
+                9.144
+            ],
+            "end_pt": [
+                6.096,
+                9.144
+            ],
+            "thickness": 0.23,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_int_parking_living",
+            "start_pt": [
+                2.36,
+                0.0
+            ],
+            "end_pt": [
+                2.36,
+                4.11
+            ],
+            "thickness": 0.115,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_int_toilet_living",
+            "start_pt": [
+                2.36,
+                4.11
+            ],
+            "end_pt": [
+                2.36,
+                5.33
+            ],
+            "thickness": 0.115,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_int_toilet_bed",
+            "start_pt": [
+                0.0,
+                5.33
+            ],
+            "end_pt": [
+                3.05,
+                5.33
+            ],
+            "thickness": 0.115,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_int_bed_kitchen",
+            "start_pt": [
+                3.05,
+                5.33
+            ],
+            "end_pt": [
+                3.05,
+                9.144
+            ],
+            "thickness": 0.115,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_int_kitchen_wash",
+            "start_pt": [
+                4.57,
+                7.62
+            ],
+            "end_pt": [
+                6.096,
+                7.62
+            ],
+            "thickness": 0.115,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "wall_int_wash_left",
+            "start_pt": [
+                4.57,
+                7.62
+            ],
+            "end_pt": [
+                4.57,
+                9.144
+            ],
+            "thickness": 0.115,
+            "height": 3.0,
+            "unit": "m"
+        }
+    ],
+    "openings": [
+        {
+            "id": "door_main",
+            "type": "door",
+            "location_pt": [
+                3.5,
+                0.0
+            ],
+            "width": 1.0,
+            "height": 2.1,
+            "parent_wall_id": "wall_ext_bottom",
+            "operation_type": "SINGLE_SWING_RIGHT",
+            "material": "Wood",
+            "color": [
+                0.55,
+                0.27,
+                0.07
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "door_bedroom",
+            "type": "door",
+            "location_pt": [
+                3.05,
+                5.8
+            ],
+            "width": 0.9,
+            "height": 2.1,
+            "parent_wall_id": "wall_int_bed_kitchen",
+            "operation_type": "SINGLE_SWING_LEFT",
+            "material": "Wood",
+            "color": [
+                0.55,
+                0.27,
+                0.07
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "door_toilet",
+            "type": "door",
+            "location_pt": [
+                2.36,
+                4.7
+            ],
+            "width": 0.75,
+            "height": 2.1,
+            "parent_wall_id": "wall_int_toilet_living",
+            "operation_type": "SINGLE_SWING_RIGHT",
+            "material": "PVC",
+            "color": [
+                0.9,
+                0.9,
+                0.9
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "win_bedroom",
+            "type": "window",
+            "location_pt": [
+                1.5,
+                9.144
+            ],
+            "width": 1.5,
+            "height": 1.2,
+            "parent_wall_id": "wall_ext_top",
+            "operation_type": "SLIDING",
+            "material": "Aluminium",
+            "color": [
+                0.75,
+                0.75,
+                0.75
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "win_living",
+            "type": "window",
+            "location_pt": [
+                6.096,
+                2.5
+            ],
+            "width": 1.2,
+            "height": 1.2,
+            "parent_wall_id": "wall_ext_right",
+            "operation_type": "SLIDING",
+            "material": "Aluminium",
+            "color": [
+                0.75,
+                0.75,
+                0.75
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "win_kitchen",
+            "type": "window",
+            "location_pt": [
+                6.096,
+                8.5
+            ],
+            "width": 1.2,
+            "height": 1.2,
+            "parent_wall_id": "wall_ext_right",
+            "operation_type": "SLIDING",
+            "material": "Aluminium",
+            "color": [
+                0.75,
+                0.75,
+                0.75
+            ],
+            "properties": [],
+            "unit": "m"
+        }
+    ],
+    "interiors": [
+        {
+            "id": "bed_master",
+            "category": "furnishing",
+            "type": "BED",
+            "location_pt": [
+                1.5,
+                7.5
+            ],
+            "dimensions": [
+                1.8,
+                2.0,
+                0.5
+            ],
+            "material": "Wood",
+            "color": [
+                0.55,
+                0.27,
+                0.07
+            ],
+            "properties": [
+                {
+                    "name": "BedSize",
+                    "value": "Queen",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "sofa_living_1",
+            "category": "furnishing",
+            "type": "SOFA",
+            "location_pt": [
+                5.0,
+                0.6
+            ],
+            "dimensions": [
+                1.5,
+                0.8,
+                0.8
+            ],
+            "material": "Fabric",
+            "color": [
+                0.8,
+                0.8,
+                0.8
+            ],
+            "properties": [
+                {
+                    "name": "SeatingCapacity",
+                    "value": "2",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "sofa_living_2",
+            "category": "furnishing",
+            "type": "SOFA",
+            "location_pt": [
+                5.6,
+                2.5
+            ],
+            "dimensions": [
+                0.8,
+                2.0,
+                0.8
+            ],
+            "material": "Fabric",
+            "color": [
+                0.8,
+                0.8,
+                0.8
+            ],
+            "properties": [
+                {
+                    "name": "SeatingCapacity",
+                    "value": "3",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "dining_table",
+            "category": "furnishing",
+            "type": "TABLE",
+            "location_pt": [
+                5.0,
+                4.5
+            ],
+            "dimensions": [
+                1.2,
+                0.8,
+                0.75
+            ],
+            "material": "Wood",
+            "color": [
+                0.5,
+                0.3,
+                0.1
+            ],
+            "properties": [
+                {
+                    "name": "TableShape",
+                    "value": "Rectangular",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "wc_toilet",
+            "category": "sanitary",
+            "type": "WC",
+            "location_pt": [
+                0.5,
+                4.5
+            ],
+            "dimensions": [
+                0.4,
+                0.6,
+                0.4
+            ],
+            "material": "Ceramic",
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "properties": [
+                {
+                    "name": "FlushType",
+                    "value": "Dual Flush",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "sink_kitchen",
+            "category": "sanitary",
+            "type": "SINK",
+            "location_pt": [
+                5.5,
+                8.8
+            ],
+            "dimensions": [
+                0.6,
+                0.5,
+                0.2
+            ],
+            "material": "Stainless Steel",
+            "color": [
+                0.75,
+                0.75,
+                0.75
+            ],
+            "properties": [
+                {
+                    "name": "BowlCount",
+                    "value": "2",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "stove_kitchen",
+            "category": "appliance",
+            "type": "STOVE",
+            "location_pt": [
+                5.5,
+                7.0
+            ],
+            "dimensions": [
+                0.6,
+                0.5,
+                0.1
+            ],
+            "material": "Glass",
+            "color": [
+                0.1,
+                0.1,
+                0.1
+            ],
+            "properties": [
+                {
+                    "name": "BurnerCount",
+                    "value": "3",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "desk_working",
+            "category": "furnishing",
+            "type": "DESK",
+            "location_pt": [
+                3.2,
+                6.5
+            ],
+            "dimensions": [
+                0.4,
+                1.2,
+                0.75
+            ],
+            "material": "Wood",
+            "color": [
+                0.5,
+                0.3,
+                0.1
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "washbasin_living",
+            "category": "sanitary",
+            "type": "WASHBASIN",
+            "location_pt": [
+                3.3,
+                4.2
+            ],
+            "dimensions": [
+                0.4,
+                0.4,
+                0.2
+            ],
+            "material": "Ceramic",
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "properties": [],
+            "unit": "m"
+        }
+    ]
+}

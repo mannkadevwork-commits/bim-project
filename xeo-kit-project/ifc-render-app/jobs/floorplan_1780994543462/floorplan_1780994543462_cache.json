@@ -1,0 +1,643 @@
+{
+    "building_name": "First Floor Plan",
+    "walls": [
+        {
+            "wall_id": "w_ext_left_1",
+            "start_pt": [
+                0.0,
+                0.0
+            ],
+            "end_pt": [
+                0.0,
+                6.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_ext_left_2",
+            "start_pt": [
+                0.0,
+                6.0
+            ],
+            "end_pt": [
+                0.0,
+                10.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_ext_left_3",
+            "start_pt": [
+                0.0,
+                10.0
+            ],
+            "end_pt": [
+                0.0,
+                15.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_ext_top_1",
+            "start_pt": [
+                0.0,
+                15.0
+            ],
+            "end_pt": [
+                5.0,
+                15.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_ext_top_2",
+            "start_pt": [
+                5.0,
+                15.0
+            ],
+            "end_pt": [
+                12.0,
+                15.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_ext_right_top",
+            "start_pt": [
+                12.0,
+                15.0
+            ],
+            "end_pt": [
+                12.0,
+                11.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_ext_right_mbed",
+            "start_pt": [
+                14.0,
+                11.0
+            ],
+            "end_pt": [
+                14.0,
+                5.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_ext_bottom_1",
+            "start_pt": [
+                0.0,
+                0.0
+            ],
+            "end_pt": [
+                4.0,
+                0.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_ext_bottom_2",
+            "start_pt": [
+                4.0,
+                0.0
+            ],
+            "end_pt": [
+                8.0,
+                0.0
+            ],
+            "thickness": 0.25,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_bed1_bath",
+            "start_pt": [
+                0.0,
+                2.0
+            ],
+            "end_pt": [
+                4.0,
+                2.0
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_bed1_bed2",
+            "start_pt": [
+                4.0,
+                0.0
+            ],
+            "end_pt": [
+                4.0,
+                6.0
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_bed2_liv",
+            "start_pt": [
+                4.0,
+                4.2
+            ],
+            "end_pt": [
+                8.0,
+                4.2
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_mbed_diag",
+            "start_pt": [
+                10.0,
+                5.0
+            ],
+            "end_pt": [
+                12.0,
+                3.0
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_mbed_liv",
+            "start_pt": [
+                10.0,
+                5.0
+            ],
+            "end_pt": [
+                10.0,
+                11.0
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_stairs_liv",
+            "start_pt": [
+                4.0,
+                6.0
+            ],
+            "end_pt": [
+                4.0,
+                10.0
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_bed3_stairs",
+            "start_pt": [
+                0.0,
+                10.0
+            ],
+            "end_pt": [
+                4.0,
+                10.0
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_bed3_dress",
+            "start_pt": [
+                4.0,
+                10.0
+            ],
+            "end_pt": [
+                4.0,
+                15.0
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        },
+        {
+            "wall_id": "w_int_bath_dress_top",
+            "start_pt": [
+                8.0,
+                10.0
+            ],
+            "end_pt": [
+                8.0,
+                15.0
+            ],
+            "thickness": 0.15,
+            "height": 3.0,
+            "unit": "m"
+        }
+    ],
+    "openings": [
+        {
+            "id": "door_bed1",
+            "type": "door",
+            "location_pt": [
+                4.0,
+                5.2
+            ],
+            "width": 0.9,
+            "height": 2.1,
+            "parent_wall_id": "w_int_bed1_bed2",
+            "operation_type": "SINGLE_SWING_RIGHT",
+            "material": "Wood",
+            "color": [
+                0.5,
+                0.3,
+                0.1
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "door_bed2",
+            "type": "door",
+            "location_pt": [
+                5.5,
+                4.2
+            ],
+            "width": 0.9,
+            "height": 2.1,
+            "parent_wall_id": "w_int_bed2_liv",
+            "operation_type": "SINGLE_SWING_LEFT",
+            "material": "Wood",
+            "color": [
+                0.5,
+                0.3,
+                0.1
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "door_mbed",
+            "type": "door",
+            "location_pt": [
+                11.0,
+                4.0
+            ],
+            "width": 1.0,
+            "height": 2.1,
+            "parent_wall_id": "w_int_mbed_diag",
+            "operation_type": "SINGLE_SWING_RIGHT",
+            "material": "Wood",
+            "color": [
+                0.5,
+                0.3,
+                0.1
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "win_bed1",
+            "type": "window",
+            "location_pt": [
+                0.0,
+                4.0
+            ],
+            "width": 1.5,
+            "height": 1.2,
+            "parent_wall_id": "w_ext_left_1",
+            "operation_type": "SLIDING",
+            "material": "Aluminium",
+            "color": [
+                0.8,
+                0.8,
+                0.9
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "win_bed2",
+            "type": "window",
+            "location_pt": [
+                6.0,
+                0.0
+            ],
+            "width": 1.5,
+            "height": 1.2,
+            "parent_wall_id": "w_ext_bottom_2",
+            "operation_type": "SLIDING",
+            "material": "Aluminium",
+            "color": [
+                0.8,
+                0.8,
+                0.9
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "win_bath_top",
+            "type": "window",
+            "location_pt": [
+                10.0,
+                15.0
+            ],
+            "width": 0.6,
+            "height": 0.6,
+            "parent_wall_id": "w_ext_top_2",
+            "operation_type": "CASEMENT",
+            "material": "Aluminium",
+            "color": [
+                0.8,
+                0.8,
+                0.9
+            ],
+            "properties": [],
+            "unit": "m"
+        }
+    ],
+    "interiors": [
+        {
+            "id": "bed_master",
+            "category": "furnishing",
+            "type": "BED",
+            "location_pt": [
+                12.0,
+                8.0
+            ],
+            "dimensions": [
+                2.0,
+                1.8,
+                0.5
+            ],
+            "material": "Wood",
+            "color": [
+                0.4,
+                0.2,
+                0.1
+            ],
+            "properties": [
+                {
+                    "name": "BedSize",
+                    "value": "King",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "bed_1",
+            "category": "furnishing",
+            "type": "BED",
+            "location_pt": [
+                2.0,
+                4.0
+            ],
+            "dimensions": [
+                2.0,
+                1.6,
+                0.5
+            ],
+            "material": "Wood",
+            "color": [
+                0.4,
+                0.2,
+                0.1
+            ],
+            "properties": [
+                {
+                    "name": "BedSize",
+                    "value": "Queen",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "bed_2",
+            "category": "furnishing",
+            "type": "BED",
+            "location_pt": [
+                6.0,
+                2.0
+            ],
+            "dimensions": [
+                2.0,
+                1.2,
+                0.5
+            ],
+            "material": "Wood",
+            "color": [
+                0.4,
+                0.2,
+                0.1
+            ],
+            "properties": [
+                {
+                    "name": "BedSize",
+                    "value": "Double",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "bed_3",
+            "category": "furnishing",
+            "type": "BED",
+            "location_pt": [
+                2.0,
+                12.5
+            ],
+            "dimensions": [
+                2.0,
+                1.6,
+                0.5
+            ],
+            "material": "Wood",
+            "color": [
+                0.4,
+                0.2,
+                0.1
+            ],
+            "properties": [
+                {
+                    "name": "BedSize",
+                    "value": "Queen",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "wc_bath1",
+            "category": "sanitary",
+            "type": "WC",
+            "location_pt": [
+                1.0,
+                1.0
+            ],
+            "dimensions": [
+                0.7,
+                0.4,
+                0.4
+            ],
+            "material": "Ceramic",
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "properties": [
+                {
+                    "name": "FlushType",
+                    "value": "Dual",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "wc_bath2",
+            "category": "sanitary",
+            "type": "WC",
+            "location_pt": [
+                6.0,
+                14.0
+            ],
+            "dimensions": [
+                0.7,
+                0.4,
+                0.4
+            ],
+            "material": "Ceramic",
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "wc_bath3",
+            "category": "sanitary",
+            "type": "WC",
+            "location_pt": [
+                10.0,
+                14.0
+            ],
+            "dimensions": [
+                0.7,
+                0.4,
+                0.4
+            ],
+            "material": "Ceramic",
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "basin_bath1",
+            "category": "sanitary",
+            "type": "WASHBASIN",
+            "location_pt": [
+                3.0,
+                1.0
+            ],
+            "dimensions": [
+                0.6,
+                0.5,
+                0.8
+            ],
+            "material": "Ceramic",
+            "color": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "properties": [],
+            "unit": "m"
+        },
+        {
+            "id": "sofa_liv_1",
+            "category": "furnishing",
+            "type": "SOFA",
+            "location_pt": [
+                6.0,
+                7.0
+            ],
+            "dimensions": [
+                0.8,
+                0.8,
+                0.9
+            ],
+            "material": "Fabric",
+            "color": [
+                0.7,
+                0.7,
+                0.7
+            ],
+            "properties": [
+                {
+                    "name": "SeatingCapacity",
+                    "value": "1",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        },
+        {
+            "id": "sofa_liv_2",
+            "category": "furnishing",
+            "type": "SOFA",
+            "location_pt": [
+                7.5,
+                6.0
+            ],
+            "dimensions": [
+                0.8,
+                0.8,
+                0.9
+            ],
+            "material": "Fabric",
+            "color": [
+                0.7,
+                0.7,
+                0.7
+            ],
+            "properties": [
+                {
+                    "name": "SeatingCapacity",
+                    "value": "1",
+                    "pset": null
+                }
+            ],
+            "unit": "m"
+        }
+    ]
+}
