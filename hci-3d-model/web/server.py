@@ -808,7 +808,7 @@ def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="localhost", port=3000, reload=False)
+    uvicorn.run("server:app", host="localhost", port=3011, reload=False)
 
 # ── Raw image preview ─────────────────────────────────────────────────────────
 @app.get("/api/raw/{filename}")
