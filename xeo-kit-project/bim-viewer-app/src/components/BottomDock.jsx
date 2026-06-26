@@ -1,10 +1,24 @@
-import { Plus, Camera, Expand, Shrink, Minimize, Maximize, Trash2 } from 'lucide-react';
+import { Plus, Camera, Expand, Shrink, Minimize, Maximize, Trash2, Ruler } from 'lucide-react';
 
-export const BottomDock = ({ onAdd, onDelete, onRenderClick, toggleMaxView, isMaxView, isFullscreen, toggleBrowserFullscreen }) => {
+export const BottomDock = ({ 
+  onAdd, onDelete, onRenderClick, toggleMaxView, isMaxView, isFullscreen, toggleBrowserFullscreen,
+  isMeasuring, toggleMeasurementMode // Add these props
+}) => {
   return (
-    <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 p-2 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md border border-slate-200 dark:border-slate-800 rounded-2xl shadow-xl">
+    <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 p-2 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md border border-slate-200 dark:border-slate-800 rounded-2xl shadow-xl transition-all">
         <button onClick={onAdd} className="p-2.5 rounded-xl text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 dark:text-slate-400 dark:hover:bg-slate-800 transition-colors" title="Upload New File">
             <Plus className="w-5 h-5" />
+        </button>
+
+        <div className="w-px h-6 bg-slate-200 dark:bg-slate-700 mx-1"></div>
+        
+        {/* ADD MEASUREMENT BUTTON */}
+        <button 
+            onClick={toggleMeasurementMode} 
+            className={`p-2.5 rounded-xl transition-all duration-300 ${isMeasuring ? 'bg-indigo-600 text-white shadow-md shadow-indigo-500/30 transform scale-105' : 'text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 dark:text-slate-400 dark:hover:bg-slate-800'}`} 
+            title="Measurement Tool"
+        >
+            <Ruler className="w-5 h-5" />
         </button>
 
         <div className="w-px h-6 bg-slate-200 dark:bg-slate-700 mx-1"></div>

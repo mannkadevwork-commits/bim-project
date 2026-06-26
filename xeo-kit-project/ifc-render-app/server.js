@@ -41,13 +41,14 @@ const upload = multer({ storage: storage });
 // ==========================================
 // ASSETS & STATE API
 // ==========================================
-
 app.get('/api/assets', (req, res) => {
     const catalog = [
-        { id: 'sofa_modern', name: 'Modern Sofa', type: 'furniture', url: '/assets/sofa_modern.ifc' },
-        { id: 'bed_king', name: 'King Bed', type: 'furniture', url: '/assets/bed_king.ifc' },
-        { id: 'plant_monstera', name: 'Monstera Plant', type: 'decor', url: '/assets/plant_monstera.ifc' },
-        { id: 'partition_wall', name: 'Partition Wall', type: 'structural', url: '/assets/wall.ifc' }
+        { id: 'sofa', name: 'Modern Sofa', type: 'furniture', url: '/assets/sofa.ifc' },
+        { id: 'chair', name: 'Chair', type: 'furniture', url: '/assets/chair.ifc' },
+        { id: 'cabinet', name: 'Cabinet', type: 'furniture', url: '/assets/cabinet.ifc' },
+        { id: 'sink_mirror', name: 'Sink & Mirror', type: 'furniture', url: '/assets/sink_mirror.ifc' },
+        { id: 'commode', name: 'Commode', type: 'furniture', url: '/assets/commode.ifc' },
+        { id: 'wall', name: 'Wall', type: 'furniture', url: '/assets/wall.ifc' }
     ];
     res.json(catalog);
 });
@@ -55,15 +56,19 @@ app.get('/api/assets', (req, res) => {
 app.post('/api/projects/:jobId/save', (req, res) => {
     try {
         const jobId = req.params.jobId;
-        const statePath = path.join(jobsDir, jobId, 'project_state.json');
+        const jobDirPath = path.join(jobsDir, jobId);
+        const statePath = path.join(jobDirPath, 'project_state.json');
         
-        if (!fs.existsSync(path.dirname(statePath))) {
-            return res.status(404).json({ error: 'Project not found' });
+        // FIX: If the directory for this job doesn't exist, create it dynamically
+        if (!fs.existsSync(jobDirPath)) {
+            fs.mkdirSync(jobDirPath, { recursive: true });
         }
         
+        // Now safely write the state file
         fs.writeFileSync(statePath, JSON.stringify(req.body, null, 2));
         res.json({ success: true, message: 'Design saved successfully' });
     } catch (error) {
+        console.error("Save Error:", error);
         res.status(500).json({ error: 'Failed to save project state' });
     }
 });
@@ -164,6 +169,152 @@ app.post('/api/convert-floorplan', uploadFloorplan.single('image'), (req, res) =
       jobId: jobId 
     });
   });
+});
+
+// ==========================================
+// ELEMENT EDITING API (resize/isolate native IFC elements e.g. walls)
+// ==========================================
+// Why this exists: xeokit only exposes position/scale/rotation at the
+// MODEL level (confirmed in xeokit docs), not per-object, for the
+// PerformanceModel representation that WebIFCLoaderPlugin/XKTLoaderPlugin
+// use. A wall is one object inside the single big building model, so it
+// has no independent transform. Editing it for real means rewriting its
+// IFC geometry server-side (via ifcopenshell) and reloading just that
+// element — these three routes do that.
+const elementEditorScript = path.join(__dirname, 'ifc_element_editor.py');
+
+// Runs the python script and resolves with its parsed JSON stdout.
+// NOTE: spawnSync is used here (not the async spawn used for the AI
+// floorplan conversion) because these operations are expected to be fast
+// (single-element edits, not whole-model AI inference) and the route
+// handlers below are written synchronously for simplicity. If element
+// edits turn out to be slow in practice on large IFC files, switch this
+// to the same async spawn + listener pattern used in /api/convert-floorplan.
+const { spawnSync } = require('child_process');
+
+function runElementEditor(args) {
+  const result = spawnSync('python', [elementEditorScript, ...args], { encoding: 'utf-8' });
+
+  if (result.error) {
+    throw new Error(`Failed to launch ifc_element_editor.py: ${result.error.message}`);
+  }
+
+  const stdout = (result.stdout || '').trim();
+  if (!stdout) {
+    throw new Error(`ifc_element_editor.py produced no output. stderr: ${result.stderr}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (e) {
+    throw new Error(`ifc_element_editor.py returned non-JSON output: ${stdout}`);
+  }
+
+  if (parsed.error) {
+    throw new Error(parsed.error);
+  }
+
+  return parsed;
+}
+
+// GET current dimensions of a single element — used by the frontend to
+// seed slider defaults with the element's REAL current size instead of
+// guessing.
+app.get('/api/elements/:jobId/:globalId/inspect', (req, res) => {
+  try {
+    const { jobId, globalId } = req.params;
+    const inputIfcPath = path.join(jobsDir, jobId, 'input.ifc');
+
+    if (!fs.existsSync(inputIfcPath)) {
+      return res.status(404).json({ error: 'input.ifc not found for this job.' });
+    }
+
+    const data = runElementEditor(['inspect', '--input', inputIfcPath, '--global-id', globalId]);
+    res.json(data);
+  } catch (error) {
+    console.error('[ElementEditor] Inspect failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST new height/width/length for an element. Rewrites a copy of the
+// full IFC with that one element's geometry changed (does NOT touch the
+// original input.ifc, so the user can discard the edit by just not using
+// the new file).
+app.post('/api/elements/:jobId/:globalId/resize', (req, res) => {
+  try {
+    const { jobId, globalId } = req.params;
+    const { height, width, length } = req.body;
+
+    if (height === undefined && width === undefined && length === undefined) {
+      return res.status(400).json({ error: 'Provide at least one of height, width, length.' });
+    }
+
+    const jobDirPath = path.join(jobsDir, jobId);
+    const inputIfcPath = path.join(jobDirPath, 'input.ifc');
+
+    if (!fs.existsSync(inputIfcPath)) {
+      return res.status(404).json({ error: 'input.ifc not found for this job.' });
+    }
+
+    const editsDir = path.join(jobDirPath, 'element_edits');
+    if (!fs.existsSync(editsDir)) fs.mkdirSync(editsDir, { recursive: true });
+
+    const outputFileName = `${globalId}_${Date.now()}.ifc`;
+    const outputPath = path.join(editsDir, outputFileName);
+
+    const args = ['resize', '--input', inputIfcPath, '--output', outputPath, '--global-id', globalId];
+    if (height !== undefined) args.push('--height', String(height));
+    if (width !== undefined) args.push('--width', String(width));
+    if (length !== undefined) args.push('--length', String(length));
+
+    const data = runElementEditor(args);
+
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.headers.host;
+    res.json({
+      ...data,
+      // Frontend can fetch this and reload the model from it.
+      fileUrl: `${protocol}://${host}/jobs/${jobId}/element_edits/${outputFileName}`,
+    });
+  } catch (error) {
+    console.error('[ElementEditor] Resize failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST isolate a single element into its own standalone IFC, so the
+// frontend can load it as an independent model (same mechanism furniture
+// already uses) and get model-level transform sliders for free.
+app.post('/api/elements/:jobId/:globalId/isolate', (req, res) => {
+  try {
+    const { jobId, globalId } = req.params;
+    const jobDirPath = path.join(jobsDir, jobId);
+    const inputIfcPath = path.join(jobDirPath, 'input.ifc');
+
+    if (!fs.existsSync(inputIfcPath)) {
+      return res.status(404).json({ error: 'input.ifc not found for this job.' });
+    }
+
+    const editsDir = path.join(jobDirPath, 'element_edits');
+    if (!fs.existsSync(editsDir)) fs.mkdirSync(editsDir, { recursive: true });
+
+    const outputFileName = `${globalId}_isolated.ifc`;
+    const outputPath = path.join(editsDir, outputFileName);
+
+    const data = runElementEditor(['isolate', '--input', inputIfcPath, '--output', outputPath, '--global-id', globalId]);
+
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.headers.host;
+    res.json({
+      ...data,
+      fileUrl: `${protocol}://${host}/jobs/${jobId}/element_edits/${outputFileName}`,
+    });
+  } catch (error) {
+    console.error('[ElementEditor] Isolate failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ==========================================

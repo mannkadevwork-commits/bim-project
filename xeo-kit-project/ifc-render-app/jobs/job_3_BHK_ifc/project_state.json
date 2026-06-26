@@ -1,0 +1,462 @@
+{
+  "materials": {
+    "1ehY0D5oz6aPoCOIk7Ggxg": {
+      "color": "#2ECC71",
+      "rgb": [
+        0.1803921568627451,
+        0.8,
+        0.44313725490196076
+      ]
+    },
+    "3nlqX0Klr6wxpQ1lWge$Iv": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "117rYmnvf3QwZZrLpEaGZj": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "1ZvD$mC1nDIvokxzkvcIOE": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "0YluNCasPDEQ9ou8lGzXFY": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "1kWAENFPr8zwVUPbzzUKDi": {
+      "color": "#E74C3C",
+      "rgb": [
+        0.9058823529411765,
+        0.2980392156862745,
+        0.23529411764705882
+      ]
+    },
+    "1LisZnjhTBiQYDV0rmMNGy": {
+      "color": "#6C3483",
+      "rgb": [
+        0.4235294117647059,
+        0.20392156862745098,
+        0.5137254901960784
+      ]
+    },
+    "2F83PhmcXDsP_kci4AOUsF": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "0Zgcxli_b9xOu_S1uucXEr": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "3o65ngk5n2wfbxEu67sAtA": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "13tWtpfsj99uYcWARtmlzc": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "1VQyi9hSz8aRaDoEOb3sXS": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "1Jr7f8Qir6be8YQaTm68pv": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "1f9b9pZsD1kRxasRi8ZhNv": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "3H3OmPiqrBI8W3UeJUznOq": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "0nRXe2GMz7aeZD7P7ZwtsU": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "1OXIkBdoH5gerBveRz3FEt": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "1$7wI0n41EgxuHGv_ZNxM1": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "0Ll0j1iYX5$ud5W$y$4wJS": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "3uxNLLiMr5C8zIYTQq95Ld": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "2QT25jfNr8zv86r7JZx7eq": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "0367nJBdX38uDnKAT6SzRX": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "22Sin_LWrDteRSvJ6U4nIb": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "3GqId$yyDFxg9obNs$ljxu": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "2AOvNp_xv3JvxWJ_8r5pSj": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "2Mr8zgxAr4s92DFF3tV4lm": {
+      "color": "#DEB887",
+      "rgb": [
+        0.8705882352941177,
+        0.7215686274509804,
+        0.5294117647058824
+      ]
+    },
+    "1qMib0DOH4iP$2Q$PHrMV6": {
+      "color": "#FAD7A1",
+      "rgb": [
+        0.9803921568627451,
+        0.8431372549019608,
+        0.6313725490196078
+      ]
+    },
+    "32PD7jqhDBagyuMRMBIwk$": {
+      "color": "#FAD7A1",
+      "rgb": [
+        0.9803921568627451,
+        0.8431372549019608,
+        0.6313725490196078
+      ]
+    },
+    "1hFyaC4knF2uEH7xNU4_91": {
+      "color": "#FAD7A1",
+      "rgb": [
+        0.9803921568627451,
+        0.8431372549019608,
+        0.6313725490196078
+      ]
+    },
+    "0D_sovhX92kwoB3jVRqkK6": {
+      "color": "#2E4053",
+      "rgb": [
+        0.1803921568627451,
+        0.25098039215686274,
+        0.3254901960784314
+      ]
+    },
+    "3wCWYBgcXDeBsro7qhKF4a": {
+      "color": "#3498DB",
+      "rgb": [
+        0.20392156862745098,
+        0.596078431372549,
+        0.8588235294117647
+      ]
+    },
+    "0gfatuEQP5fxh1_K5IZFo8": {
+      "color": "#FAD7A1",
+      "rgb": [
+        0.9803921568627451,
+        0.8431372549019608,
+        0.6313725490196078
+      ]
+    },
+    "1hV_A2hjfEcB_Bz7eoOHWx": {
+      "color": "#2C3E50",
+      "rgb": [
+        0.17254901960784313,
+        0.24313725490196078,
+        0.3137254901960784
+      ]
+    },
+    "2eIVLMCjX0SxxCa4jwZJkF": {
+      "color": "#E74C3C",
+      "rgb": [
+        0.9058823529411765,
+        0.2980392156862745,
+        0.23529411764705882
+      ]
+    },
+    "1zJqEUobjBHB_UD9G8LXv2": {
+      "color": "#E74C3C",
+      "rgb": [
+        0.9058823529411765,
+        0.2980392156862745,
+        0.23529411764705882
+      ]
+    },
+    "1syhICrBPF0B_0euQhu20W": {
+      "color": "#2ECC71",
+      "rgb": [
+        0.1803921568627451,
+        0.8,
+        0.44313725490196076
+      ]
+    },
+    "1PRERIeADAWg2LJoNSJnRf": {
+      "color": "#22b041",
+      "rgb": [
+        0.13333333333333333,
+        0.6901960784313725,
+        0.2549019607843137
+      ]
+    },
+    "1ve$ZGJmr0ZRwaNTwEJXFE": {
+      "color": "#000000",
+      "rgb": [
+        0,
+        0,
+        0
+      ]
+    },
+    "1椅子H3bF7wRv$XpG5_XZ": {
+      "color": "#3498DB",
+      "rgb": [
+        0.20392156862745098,
+        0.596078431372549,
+        0.8588235294117647
+      ]
+    }
+  },
+  "furniture": [
+    {
+      "id": "bed_double",
+      "instanceId": "bed_double_1782299437077_bzoat",
+      "name": "Master Bed",
+      "src": "http://localhost:3000/assets/bed_master.ifc",
+      "position": [
+        2,
+        0,
+        -3
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "wardrobe",
+      "instanceId": "wardrobe_1782299437078_6bgeu",
+      "name": "Wardrobe",
+      "src": "http://localhost:3000/assets/wardrobe.ifc",
+      "position": [
+        4,
+        0,
+        -3
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "side_table",
+      "instanceId": "side_table_1782299437078_qop0w",
+      "name": "Side Table",
+      "src": "http://localhost:3000/assets/side_table.ifc",
+      "position": [
+        2,
+        0,
+        -1.5
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "bed_double",
+      "instanceId": "bed_double_1782370431932_v3i6h",
+      "name": "Master Bed",
+      "src": "http://localhost:3000/assets/bed_master.ifc",
+      "position": [
+        2,
+        0,
+        -3
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "wardrobe",
+      "instanceId": "wardrobe_1782370431932_klv4c",
+      "name": "Wardrobe",
+      "src": "http://localhost:3000/assets/wardrobe.ifc",
+      "position": [
+        4,
+        0,
+        -3
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "side_table",
+      "instanceId": "side_table_1782370431932_p1i9y",
+      "name": "Side Table",
+      "src": "http://localhost:3000/assets/side_table.ifc",
+      "position": [
+        2,
+        0,
+        -1.5
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "commode",
+      "instanceId": "commode_1782392179696",
+      "name": "Commode",
+      "src": "http://localhost:3000/assets/commode.ifc",
+      "position": [
+        5.565554698895657,
+        0,
+        -5.001620233355565
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "cabinet",
+      "instanceId": "cabinet_1782392758007",
+      "name": "Cabinet",
+      "src": "http://localhost:3000/assets/cabinet.ifc",
+      "position": [
+        6.77227389952467,
+        1.044478267764326e-9,
+        -5.76789768553625
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "sofa",
+      "instanceId": "sofa_1782394115441",
+      "name": "Modern Sofa",
+      "src": "http://localhost:3000/assets/sofa.ifc",
+      "position": [
+        7.23846012035257,
+        0.000023554192855851364,
+        -4.73647569932808
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

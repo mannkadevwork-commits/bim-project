@@ -1,0 +1,101 @@
+{
+  "materials": {},
+  "furniture": [
+    {
+      "id": "bed_double",
+      "instanceId": "bed_double_1782294389602_xucf7",
+      "name": "Master Bed",
+      "src": "http://localhost:3000/assets/bed_master.ifc",
+      "position": [
+        2,
+        0,
+        -3
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "wardrobe",
+      "instanceId": "wardrobe_1782294389603_dhr7d",
+      "name": "Wardrobe",
+      "src": "http://localhost:3000/assets/wardrobe.ifc",
+      "position": [
+        4,
+        0,
+        -3
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "side_table",
+      "instanceId": "side_table_1782294389604_t6lhc",
+      "name": "Side Table",
+      "src": "http://localhost:3000/assets/side_table.ifc",
+      "position": [
+        2,
+        0,
+        -1.5
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "sofa_3seater",
+      "instanceId": "sofa_3seater_1782294409858_t33ru",
+      "name": "Main Sofa",
+      "src": "http://localhost:3000/assets/sofa.ifc",
+      "position": [
+        5.15000720214844,
+        0.000023554192855851364,
+        -5.99952169799805
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "tv_unit",
+      "instanceId": "tv_unit_1782294409859_lxbv0",
+      "name": "TV Unit",
+      "src": "http://localhost:3000/assets/tv_unit.ifc",
+      "position": [
+        -2,
+        0,
+        5
+      ],
+      "rotation": [
+        0,
+        180,
+        0
+      ]
+    },
+    {
+      "id": "coffee_table",
+      "instanceId": "coffee_table_1782294409859_c0fl1",
+      "name": "Coffee Table",
+      "src": "http://localhost:3000/assets/coffee_table.ifc",
+      "position": [
+        -1,
+        0,
+        3.5
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

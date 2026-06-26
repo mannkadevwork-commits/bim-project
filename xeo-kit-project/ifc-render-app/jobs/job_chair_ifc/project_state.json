@@ -1,0 +1,21 @@
+{
+  "materials": {},
+  "furniture": [
+    {
+      "id": "cabinet",
+      "instanceId": "cabinet_1782111133990",
+      "name": "Cabinet",
+      "src": "http://localhost:3000/assets/cabinet.ifc",
+      "position": [
+        -3.471538647778221,
+        0,
+        4.612398449728819
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

@@ -1,0 +1,197 @@
+{
+  "materials": {},
+  "furniture": [
+    {
+      "id": "tv_unit",
+      "instanceId": "tv_unit_1782290511472_lmkml",
+      "name": "TV Unit",
+      "src": "http://localhost:3000/assets/tv_unit.ifc",
+      "position": [
+        -2,
+        0,
+        5
+      ],
+      "rotation": [
+        0,
+        180,
+        0
+      ]
+    },
+    {
+      "id": "bed_master",
+      "instanceId": "bed_master_1782290560784_f27f2",
+      "name": "Master Bed",
+      "src": "http://localhost:3000/assets/bed_master.ifc",
+      "position": [
+        3,
+        0,
+        -4
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "bed_guest",
+      "instanceId": "bed_guest_1782290560785_i2c5u",
+      "name": "Guest Bed",
+      "src": "http://localhost:3000/assets/bed_guest.ifc",
+      "position": [
+        -3,
+        0,
+        -4
+      ],
+      "rotation": [
+        0,
+        -90,
+        0
+      ]
+    },
+    {
+      "id": "sofa_l_shape",
+      "instanceId": "sofa_l_shape_1782290560785_xo57g",
+      "name": "L-Shape Sofa",
+      "src": "http://localhost:3000/assets/sofa_l.ifc",
+      "position": [
+        0,
+        0,
+        2
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "dining_table",
+      "instanceId": "dining_table_1782290560785_4qyul",
+      "name": "Dining Table",
+      "src": "http://localhost:3000/assets/dining.ifc",
+      "position": [
+        4,
+        0,
+        2
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "bed_master",
+      "instanceId": "bed_master_1782291067564_97i7y",
+      "name": "Master Bed",
+      "src": "http://localhost:3000/assets/bed_master.ifc",
+      "position": [
+        3,
+        0,
+        -4
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "bed_guest",
+      "instanceId": "bed_guest_1782291067565_i7kbp",
+      "name": "Guest Bed",
+      "src": "http://localhost:3000/assets/bed_guest.ifc",
+      "position": [
+        -3,
+        0,
+        -4
+      ],
+      "rotation": [
+        0,
+        -90,
+        0
+      ]
+    },
+    {
+      "id": "sofa_l_shape",
+      "instanceId": "sofa_l_shape_1782291067566_u3dau",
+      "name": "L-Shape Sofa",
+      "src": "http://localhost:3000/assets/sofa_l.ifc",
+      "position": [
+        0,
+        0,
+        2
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "dining_table",
+      "instanceId": "dining_table_1782291067567_gq9ec",
+      "name": "Dining Table",
+      "src": "http://localhost:3000/assets/dining.ifc",
+      "position": [
+        4,
+        0,
+        2
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "tv_unit",
+      "instanceId": "tv_unit_1782291261082_q2j91",
+      "name": "TV Unit",
+      "src": "http://localhost:3000/assets/tv_unit.ifc",
+      "position": [
+        -2,
+        0,
+        5
+      ],
+      "rotation": [
+        0,
+        180,
+        0
+      ]
+    },
+    {
+      "id": "tv_unit",
+      "instanceId": "tv_unit_1782291942040_o6121",
+      "name": "TV Unit",
+      "src": "http://localhost:3000/assets/tv_unit.ifc",
+      "position": [
+        -2,
+        0,
+        5
+      ],
+      "rotation": [
+        0,
+        180,
+        0
+      ]
+    },
+    {
+      "id": "tv_unit",
+      "instanceId": "tv_unit_1782294027454_im77g",
+      "name": "TV Unit",
+      "src": "http://localhost:3000/assets/tv_unit.ifc",
+      "position": [
+        -2,
+        0,
+        5
+      ],
+      "rotation": [
+        0,
+        180,
+        0
+      ]
+    }
+  ]
+}

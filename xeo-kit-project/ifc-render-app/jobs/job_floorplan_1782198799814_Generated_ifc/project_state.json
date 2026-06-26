@@ -1,0 +1,21 @@
+{
+  "materials": {},
+  "furniture": [
+    {
+      "id": "commode",
+      "instanceId": "commode_1782200783269",
+      "name": "Commode",
+      "src": "http://localhost:3000/assets/commode.ifc",
+      "position": [
+        1.4065354148915852,
+        0,
+        -4.773565610966966
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}
