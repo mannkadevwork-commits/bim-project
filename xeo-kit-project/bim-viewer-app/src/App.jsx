@@ -36,33 +36,40 @@ function App() {
   };
 
   return (
-    <div className="relative w-screen h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-50 transition-colors duration-300 overflow-hidden">
+    <div className="relative w-screen h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-50 transition-colors duration-300 overflow-hidden flex flex-col">
       
-      <Navbar 
-        onOpenUpload={() => setIsUploadOpen(true)} 
-        onOpenContact={() => setIsContactOpen(true)} 
-      />
-      
-      <BIMViewer 
-        file={modelFile} 
-        onDelete={handleDeleteRequest} // Triggers popup instead of instant delete
-        onAdd={() => setIsUploadOpen(true)} 
-      />
-      
-      <Footer />
+      {/* ── LANDING PAGE ELEMENTS (Hidden when a model is active) ── */}
+      {!modelFile && (
+        <Navbar
+          onOpenUpload={() => setIsUploadOpen(true)}
+          onOpenContact={() => setIsContactOpen(true)}
+        />
+      )}
 
-      <UploadModal 
-        isOpen={isUploadOpen} 
-        onClose={() => setIsUploadOpen(false)} 
-        onFileUpload={(file) => setModelFile(file)} 
+      {/* ── FULL SCREEN VIEWER ── */}
+      <div className="flex-1 relative h-full">
+        <BIMViewer
+          file={modelFile}
+          onDelete={handleDeleteRequest} 
+          onAdd={() => setIsUploadOpen(true)}
+        />
+      </div>
+
+      {/* ── LANDING PAGE FOOTER ── */}
+      {!modelFile && <Footer />}
+
+      <UploadModal
+        isOpen={isUploadOpen}
+        onClose={() => setIsUploadOpen(false)}
+        onFileUpload={(file) => setModelFile(file)}
       />
-      
-      <ContactForm 
-        isOpen={isContactOpen} 
-        onClose={() => setIsContactOpen(false)} 
+
+      <ContactForm
+        isOpen={isContactOpen}
+        onClose={() => setIsContactOpen(false)}
       />
-      
-      {/* ── DELETE CONFIRMATION MODAL ── */}
+
+      {/* DELETE CONFIRMATION MODAL */}
       {isDeleteModalOpen && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-slate-900/50 backdrop-blur-sm">
           <div className="bg-white dark:bg-slate-900 w-full max-w-md p-6 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 animate-in fade-in zoom-in-95 duration-200">

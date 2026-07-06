@@ -19,6 +19,9 @@ html, body, #root {
   font-family: var(--font-sans);
 }
 
+button {
+  cursor: pointer !important;
+}
 /* Xeokit TreeView Plugin Overrides */
 .xeokit-tree-view ul {
   list-style: none !important;

@@ -8,6 +8,8 @@ import { SectionPlanesPlugin } from '@xeokit/xeokit-sdk/src/plugins/SectionPlane
 import { DistanceMeasurementsPlugin } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsPlugin';
 import * as WebIFC from 'web-ifc';
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
 export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPanelOpen, setRightTab) => {
   const canvasRef = useRef(null);
   const treeContainerRef = useRef(null);
@@ -21,6 +23,9 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
 
   const measurementsPluginRef = useRef(null);
   const isMeasuringRef = useRef(false);
+
+ const globalScaleFactorRef = useRef({ x: 1, y: 1, z: 1 });
+const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
 
   const [isLoading, setIsLoading] = useState(false);
   const [isXRay, setIsXRay] = useState(false);
@@ -252,6 +257,18 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       return;
     }
 
+
+    // ── NEW: Silently sync the file to the backend so Python has physical access to it ──
+    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    fetch(`${API_BASE_URL}/api/projects/${jobId}/upload-ifc`, {
+      method: 'POST',
+      body: formData
+    }).catch(err => console.error('[BIM Engine] Backend file sync failed:', err));
+    // ────────────────────────────────────────────────────────────────────────────────────
+
     setIsLoading(true);
     if (currentModelRef.current) currentModelRef.current.destroy();
 
@@ -265,7 +282,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           id: 'main_structure',
           ifc: ifcData,
           edges: true,
-          globalizeCoordinates: true,
+          globalizeCoordinates: false,
         });
       } else if (fileExtension === 'xkt' && loadersRef.current.xkt) {
         currentModelRef.current = loadersRef.current.xkt.load({
@@ -294,6 +311,22 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
             if (!viewerRef.current.scene.models[item.instanceId]) {
               loadIFCAssetIntoScene(item.instanceId, item.src, item.position, item.rotation);
             }
+          });
+        }
+
+        // ── Delta-Based State Management ──────────────────────────────
+        // input.ifc is read-only. Re-apply every saved structural edit
+        // (scale ratio / offset) visually against the freshly loaded
+        // native entities — nothing on disk was ever touched.
+        if (projectStateRef.current.structural_edits) {
+          Object.entries(projectStateRef.current.structural_edits).forEach(([entityId, edit]) => {
+            const entity = viewerRef.current.scene.objects[entityId];
+            if (!entity) {
+              console.warn(`[BIM Engine] Structural edit skipped, entity not found: ${entityId}`);
+              return;
+            }
+            if (edit.scale) entity.scale = edit.scale;
+            if (edit.offset) entity.offset = edit.offset;
           });
         }
       });
@@ -356,7 +389,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
   };
 
-  const syncMeasurementsList = () => {
+const syncMeasurementsList = () => {
     const plugin = measurementsPluginRef.current;
     if (!plugin || !plugin.measurements) return;
 
@@ -366,9 +399,13 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         const targetPos = m.target?.worldPos;
         if (!originPos || !targetPos) return null;
 
+        // CRITICAL: Capture the model ID of the entity that was clicked
+        const modelId = m.origin?.entity?.model?.id || m.target?.entity?.model?.id || null;
+
         return {
           id: m.id,
           lengthMeters: vec3Distance(originPos, targetPos),
+          modelId: modelId, 
           midpoint: [
             (originPos[0] + targetPos[0]) / 2,
             (originPos[1] + targetPos[1]) / 2,
@@ -386,6 +423,223 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     if (!plugin) return;
     plugin.destroyMeasurement(id);
     syncMeasurementsList();
+  };
+
+// ── Shared global scaling engine ────────────────────────────────────
+// Applies a per-axis ratio [rx, ry, rz] to the ENTIRE scene (main
+// structure + every dropped asset), pivoting around the main structure's
+// current visual center so nothing rockets off-screen, then re-frames
+// the camera on the result. Both calibration flows below route through
+// this single function so there's exactly one place scene-scale bugs
+// can hide.
+const applyGlobalScale = (ratioVec) => {
+  const viewer = viewerRef.current;
+  const mainModel = currentModelRef.current;
+  if (!viewer || !mainModel) return false;
+
+  const [rx, ry, rz] = ratioVec;
+  if (![rx, ry, rz].every((r) => r > 0 && isFinite(r))) return false;
+
+  const aabb = mainModel.aabb; // [xmin,ymin,zmin,xmax,ymax,zmax]
+  const pivot = [
+    (aabb[0] + aabb[3]) / 2,
+    (aabb[1] + aabb[4]) / 2,
+    (aabb[2] + aabb[5]) / 2,
+  ];
+
+  const scalePositionAboutPivot = (pos) => [
+    pivot[0] + (pos[0] - pivot[0]) * rx,
+    pivot[1] + (pos[1] - pivot[1]) * ry,
+    pivot[2] + (pos[2] - pivot[2]) * rz,
+  ];
+
+  const mainScale = mainModel.scale || [1, 1, 1];
+  mainModel.scale = [mainScale[0] * rx, mainScale[1] * ry, mainScale[2] * rz];
+  mainModel.position = scalePositionAboutPivot(mainModel.position || [0, 0, 0]);
+
+  const scene = viewer.scene;
+  Object.keys(scene.models).forEach((id) => {
+    if (id === mainModel.id) return;
+    const assetModel = scene.models[id];
+    if (!assetModel) return;
+    const s = assetModel.scale || [1, 1, 1];
+    assetModel.scale = [s[0] * rx, s[1] * ry, s[2] * rz];
+    assetModel.position = scalePositionAboutPivot(assetModel.position || [0, 0, 0]);
+  });
+
+  globalScaleFactorRef.current = {
+    x: globalScaleFactorRef.current.x * rx,
+    y: globalScaleFactorRef.current.y * ry,
+    z: globalScaleFactorRef.current.z * rz,
+  };
+  setSceneScaleFactor({ ...globalScaleFactorRef.current });
+
+  // Old ruler lines no longer reflect real-world distance now that the
+  // scene resized underneath them.
+  const plugin = measurementsPluginRef.current;
+  if (plugin) plugin.clear();
+  setMeasurementsList([]);
+
+  // NEW: re-frame the camera on the resized model. Without this, a
+  // scene that shrinks around a pivot away from the camera's look-at
+  // point reads as "it moved" rather than "it resized" — which is
+  // exactly the bug from your screenshots.
+  viewer.cameraFlight.duration = 0.6;
+  viewer.cameraFlight.flyTo(mainModel);
+
+  return true;
+};
+
+// Uniform "fix import scale" calibration — draw a ruler line, type its
+// real-world length. Use this when the whole model came in at the wrong
+// units (e.g. an IFC authored in millimeters loaded as if it were meters).
+// ── CORE GLOBAL CALIBRATION ENGINE (The Coohom Way) ───────────────────
+  // Helper to destroy and reload the main model after the backend scales it
+  const reloadMainModel = async (jobId) => {
+    setIsLoading(true);
+    try {
+      const ifcRes = await fetch(`${API_BASE_URL}/jobs/${jobId}/input.ifc?v=${Date.now()}`);
+      const buffer = await ifcRes.arrayBuffer();
+      
+      if (currentModelRef.current) {
+        currentModelRef.current.destroy();
+        currentModelRef.current = null;
+      }
+      
+      currentModelRef.current = loadersRef.current.ifc.load({
+        id: 'main_structure',
+        ifc: new Uint8Array(buffer),
+        edges: true,
+        globalizeCoordinates: false, // Ensures we can still mutate it later if needed
+      });
+      
+      currentModelRef.current.on('loaded', () => {
+        const viewer = viewerRef.current;
+        // Fly camera to match the new size of the house
+        viewer.cameraFlight.duration = 0.6;
+        viewer.cameraFlight.flyTo(currentModelRef.current);
+        setIsLoading(false);
+        
+        if (projectStateRef.current.materials) {
+          Object.entries(projectStateRef.current.materials).forEach(([entityId, matData]) => {
+            const entity = viewer.scene.objects[entityId];
+            if (entity) entity.colorize = matData.rgb;
+          });
+        }
+      });
+    } catch (err) {
+      console.error('[BIM Engine] Failed to reload main model:', err);
+      setIsLoading(false);
+    }
+  };
+
+  const updateFurnitureScale = (ratio) => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    
+    // Scale existing dropped assets visually and positionally
+    Object.keys(viewer.scene.models).forEach((id) => {
+      if (id === 'main_structure') return; 
+      const assetModel = viewer.scene.models[id];
+      if (!assetModel) return;
+
+      const currentScale = assetModel.scale || [1, 1, 1];
+      assetModel.scale = [currentScale[0] * ratio, currentScale[1] * ratio, currentScale[2] * ratio];
+
+      const currentPos = assetModel.position || [0, 0, 0];
+      assetModel.position = [currentPos[0] * ratio, currentPos[1] * ratio, currentPos[2] * ratio];
+    });
+
+    // Save scale memory for FUTURE dropped assets
+    globalScaleFactorRef.current = {
+      x: globalScaleFactorRef.current.x * ratio,
+      y: globalScaleFactorRef.current.y * ratio,
+      z: globalScaleFactorRef.current.z * ratio,
+    };
+    setSceneScaleFactor({ ...globalScaleFactorRef.current });
+  };
+
+  // 1. Rescale using the Ruler Line
+  const scaleModelByMeasurement = async (measurementId, newDesiredLengthInMeters) => {
+    if (!file) return { success: false, error: 'No active file.' };
+    const plugin = measurementsPluginRef.current;
+    if (!plugin || !plugin.measurements) return { success: false, error: 'No active measurement.' };
+
+    const measurement = plugin.measurements[measurementId];
+    if (!measurement || !measurement.origin || !measurement.target) return { success: false };
+
+    const originPos = measurement.origin.worldPos;
+    const targetPos = measurement.target.worldPos;
+    const dx = originPos[0] - targetPos[0];
+    const dy = originPos[1] - targetPos[1];
+    const dz = originPos[2] - targetPos[2];
+    const currentLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    
+    if (!currentLength) return { success: false, error: 'Measurement is zero.' };
+
+    const ratio = parseFloat(newDesiredLengthInMeters) / currentLength;
+    if (!ratio || ratio <= 0 || !isFinite(ratio)) return { success: false, error: 'Enter a valid length.' };
+
+    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    setIsLoading(true);
+
+    try {
+      // Send command to python backend to rewrite the IFC
+      const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}/rescale`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ factor: ratio })
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error);
+
+      // Reload the newly scaled architectural file & update existing furniture
+      await reloadMainModel(jobId);
+      updateFurnitureScale(ratio);
+
+      plugin.clear();
+      setMeasurementsList([]);
+      return { success: true };
+    } catch (error) {
+      console.error('[BIM Engine] Global Rescale Error:', error);
+      setIsLoading(false);
+      return { success: false, error: 'Failed to process calibration.' };
+    }
+  };
+
+  // 2. Rescale using the Right Panel (Typing a new Wall Height)
+  const calibrateWallHeight = async (entityId, newHeightMeters) => {
+    if (!file || !entityId) return { success: false, error: 'No element selected.' };
+    const target = parseFloat(newHeightMeters);
+    if (!target || target <= 0) return { success: false, error: 'Enter a height greater than 0.' };
+
+    try {
+      const dims = await inspectNativeElement(entityId);
+      if (!dims || dims.error || !dims.height) {
+        return { success: false, error: 'Element has no parametric height.' };
+      }
+      const ratio = target / dims.height;
+      const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+      
+      setIsLoading(true);
+      console.log(`API data ${ratio} ${jobId}`);
+      const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}/rescale`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ factor: ratio }) // Uniform scale so everything remains proportionate
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error);
+
+      await reloadMainModel(jobId);
+      updateFurnitureScale(ratio);
+      
+      return { success: true };
+    } catch (err) {
+      console.error('[BIM Engine] Height calibration failed:', err);
+      setIsLoading(false);
+      return { success: false, error: 'Height calibration failed.' };
+    }
   };
 
   const flyToMeasurement = (midpoint) => {
@@ -481,6 +735,18 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     return resolveCollisionFreePosition([x, y, z]);
   };
 
+const getCursorWorldPosition = (canvasPos) => {
+    const viewer = viewerRef.current;
+    if (!viewer) return null;
+
+    const cursorPick = viewer.scene.pick({
+      canvasPos: canvasPos,
+      pickSurface: true,
+    });
+
+    return cursorPick?.worldPos || null;
+  };
+
   const loadIFCAssetIntoScene = async (instanceId, srcUrl, targetPosition, rotation) => {
     if (!loadersRef.current.ifc) return;
 
@@ -497,26 +763,151 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         globalizeCoordinates: false,
       });
 
-      assetModel.on('loaded', () => {
-        const aabb = assetModel.aabb;
+   assetModel.on('loaded', () => {
+    const gs = globalScaleFactorRef.current;
+    if (gs && (gs.x !== 1 || gs.y !== 1 || gs.z !== 1)) {
+      assetModel.scale = [gs.x, gs.y, gs.z];
+    }
 
-        if (aabb && targetPosition) {
-          const centerX = (aabb[0] + aabb[3]) / 2;
-          const centerZ = (aabb[2] + aabb[5]) / 2;
-          const bottomY = aabb[1];
+    const aabb = assetModel.aabb;
 
-          assetModel.position = [
-            targetPosition[0] - centerX,
-            targetPosition[1] - bottomY,
-            targetPosition[2] - centerZ,
-          ];
-        }
+    if (aabb && targetPosition) {
+      const centerX = (aabb[0] + aabb[3]) / 2;
+      const centerZ = (aabb[2] + aabb[5]) / 2;
+      const bottomY = aabb[1];
 
-        if (rotation) assetModel.rotation = rotation;
-      });
+      assetModel.position = [
+        targetPosition[0] - centerX,
+        targetPosition[1] - bottomY,
+        targetPosition[2] - centerZ,
+      ];
+    }
+
+    if (rotation) assetModel.rotation = rotation;
+});
 
     } catch (error) {
       console.error('[BIM Engine] Placement failure:', error);
+    }
+  };
+
+ const isolateAndMakeMoveable = async (entityId, onAdoptCallback) => {
+    if (!file) return;
+    
+    // Dynamically calculate the jobId exactly like useProjectSync.js does
+    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
+    try {
+      // Use the API_BASE_URL to hit port 3000 instead of 5173
+      const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${entityId}/isolate`, {
+        method: 'POST',
+      });
+
+      if (!response.ok) {
+        console.error('[BIM Engine] Isolate request failed:', response.status);
+        return;
+      }
+
+      const data = await response.json();
+      const { fileUrl } = data;
+      if (!fileUrl) {
+        console.error('[BIM Engine] Isolate response missing fileUrl.');
+        return;
+      }
+
+      // Hide the native element
+      const nativeEntity = viewerRef.current?.scene.objects[entityId];
+      if (nativeEntity) {
+        nativeEntity.visible = false;
+      }
+
+      // Load the new standalone asset
+      const newInstanceId = `${entityId}_isolated`;
+      await loadIFCAssetIntoScene(newInstanceId, fileUrl);
+
+      // Update the metadata panel
+      const metaObject = viewerRef.current?.metaScene.metaObjects[entityId];
+
+      if (onAdoptCallback) {
+        onAdoptCallback(entityId, newInstanceId, fileUrl, metaObject?.name);
+      }
+
+      // Automatically select the newly dropped standalone asset
+      const isolatedModel = viewerRef.current?.scene.models[newInstanceId];
+      if (isolatedModel) {
+        viewerRef.current.scene.setObjectsSelected(viewerRef.current.scene.selectedObjectIds, false);
+        isolatedModel.selected = true;
+      }
+
+      setSelectedAssetId(newInstanceId);
+
+      setSelectedObject({
+        id: newInstanceId,
+        name: metaObject?.name || 'Isolated Element',
+        type: metaObject?.type || 'Generic Component',
+        groupedProperties: metaObject
+          ? {
+              'General Details': [
+                { name: 'Element Name', value: metaObject.name || 'Unnamed' },
+                { name: 'IFC Class', value: metaObject.type || 'Unknown' },
+                { name: 'Global ID', value: metaObject.id },
+              ],
+            }
+          : {},
+      });
+
+      return newInstanceId;
+    } catch (error) {
+      console.error('[BIM Engine] Isolate-and-move failure:', error);
+    }
+  };
+
+  const inspectNativeElement = async (entityId) => {
+    if (!file || !entityId) return { error: true };
+
+    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${entityId}/inspect`);
+      const data = await response.json();
+
+      if (!response.ok || data?.error) {
+        return { error: true };
+      }
+
+      return data;
+    } catch (error) {
+      console.error('[BIM Engine] Inspect failure:', error);
+      return { error: true };
+    }
+  };
+
+  // ── Delta-Based State Management ────────────────────────────────────
+  // Replaces the old resizeNativeElement() backend round-trip. input.ifc
+  // is strictly read-only now — a parametric resize is just a scale
+  // ratio applied directly to the live native entity in Xeokit. The
+  // caller (RightPanel) is responsible for persisting the same value via
+  // useProjectSync's updateStructuralEdit so it survives a reload.
+  //
+  // NOTE: this assumes viewer.scene.objects[entityId].scale is writable
+  // for native (non-standalone-model) entities in your xeokit-sdk
+  // version. If your build's WebIFCLoaderPlugin produces entities where
+  // .scale is read-only on individual objects (only Models expose a
+  // writable .scale in some xeokit versions), this call will silently
+  // no-op and you'll need a matrix-based transform instead — flagging
+  // this now rather than papering over it.
+  const updateStructuralTransform = (entityId, transformType, axis, value) => {
+    const entity = viewerRef.current?.scene.objects[entityId];
+    if (!entity) return;
+
+    if (transformType === 'scale') {
+      const newScale = [...(entity.scale || [1, 1, 1])];
+      newScale[axis] = value;
+      entity.scale = newScale;
+    } else if (transformType === 'offset') {
+      const newOffset = [...(entity.offset || [0, 0, 0])];
+      newOffset[axis] = value;
+      entity.offset = newOffset;
     }
   };
 
@@ -563,7 +954,8 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       measurementUnit,
       snappingEnabled,
       axisBreakdownVisible,
-      totalMeasuredLength
+      totalMeasuredLength,
+      sceneScaleFactor,
     },
     actions: {
       toggleXRay,
@@ -577,13 +969,23 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       toggleMeasurementMode,
       clearMeasurements,
       deleteMeasurement,
+      scaleModelByMeasurement,
+      calibrateWallHeight,
+
       flyToMeasurement,
       toggleSnapping,
       toggleAxisBreakdown,
       setMeasurementUnit,
       formatLength,
-      updateNativeOffset,     // Expose for floor plan elements
-      updateDynamicTransform  // Expose for dropped assets
+      updateNativeOffset,     
+      updateDynamicTransform, 
+      updateStructuralTransform,
+      isolateAndMakeMoveable,
+      inspectNativeElement,
+      getCursorWorldPosition,
     },
   };
 };
+
+
+

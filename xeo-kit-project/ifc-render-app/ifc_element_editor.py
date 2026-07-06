@@ -5,7 +5,7 @@ ifc_element_editor.py
 Server-side IFC element editor, invoked by server.js via child_process.spawn.
 Requires: pip install ifcopenshell
 
-Two operations:
+Four operations:
 
   inspect  --input <ifc> --global-id <id>
       Reads back the element's current extrusion dimensions (height/width/
@@ -26,16 +26,49 @@ Two operations:
       already used for furniture assets — so it can be given a model-level
       transform independently of the rest of the building.
 
+  rescale  --input <ifc> --output <ifc> --factor <f> [--axis uniform|y]
+      Global, backend-authoritative geometric rescale of the ENTIRE IFC
+      file. This is the "proper" Coohom-style calibration: rather than
+      only scaling the WebGL mesh client-side (which desyncs the
+      frontend's visual scale from this file's actual dimensions, so any
+      later inspect/resize call on an individual element reads the WRONG
+      size), we rewrite the real IFC geometry once, so the file on disk
+      and the 3D view always agree.
+        - --axis uniform : scales X, Y, and Z together. Fixes a wrong
+                            import unit (e.g. a file authored in
+                            millimeters loaded as if it were meters).
+        - --axis y       : scales ONLY the vertical (height) axis, for
+                            "set ceiling height for the whole floor plan".
+                            X/Y floor-plan layout is untouched.
+
 LIMITATIONS (v1, flagged honestly rather than failing silently):
   - Only IfcExtrudedAreaSolid representations are supported for resize.
     Swept solids, B-reps, or curved walls will return a clear error.
   - Only IfcRectangleProfileDef is handled for width/length edits.
     Arbitrary/poly-line profiles are not supported yet.
+  - rescale assumes walls/columns/floors are extruded along the model's
+    global Z axis, which is standard for IFC authored by Revit / ArchiCAD
+    / BlenderBIM and matches this app's 3_BHK.ifc. A wall extruded along
+    a tilted local axis will scale its height incorrectly under --axis y.
+  - rescale updates the uniform Scale factor on IfcMappedItem instances
+    (shared/instanced geometry); the non-uniform transform operator
+    variant is not handled — flagged, not silently mis-scaled.
+  - rescale does not touch curved/B-rep geometry (IfcBSplineSurface etc).
 """
 
 import sys
 import argparse
 import json
+import logging
+
+# Configure logger to output to stderr. 
+# CRITICAL: This ensures logs don't corrupt the JSON output on stdout that Node.js expects.
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 try:
     import ifcopenshell
@@ -71,114 +104,132 @@ def get_extruded_solid(element):
 
 
 def cmd_inspect(args):
-    ifc_file = ifcopenshell.open(args.input)
-    element = find_element(ifc_file, args.global_id)
-    solid, _ = get_extruded_solid(element)
-
-    if solid is None:
-        print(json.dumps({
-            "error": "This element has no IfcExtrudedAreaSolid representation — "
-                     "resize is not supported for curved/complex geometry.",
-            "globalId": args.global_id,
-            "ifcClass": element.is_a(),
-        }))
-        return
-
-    profile = solid.SweptArea
-    result = {
-        "globalId": args.global_id,
-        "ifcClass": element.is_a(),
-        "name": element.Name or "Unnamed",
-        "height": solid.Depth,  # extrusion depth — for a vertical wall, this is its height
-        "profileType": profile.is_a(),
-    }
-
-    if profile.is_a("IfcRectangleProfileDef"):
-        result["width"] = profile.XDim
-        result["length"] = profile.YDim
-    else:
-        result["note"] = (
-            f"Profile type '{profile.is_a()}' is not a simple rectangle — "
-            "width/length editing is not supported for this element yet."
-        )
-
-    print(json.dumps(result))
-
-
-def cmd_resize(args):
-    ifc_file = ifcopenshell.open(args.input)
-    element = find_element(ifc_file, args.global_id)
-    solid, _ = get_extruded_solid(element)
-
-    if solid is None:
-        print(json.dumps({
-            "error": "This element has no IfcExtrudedAreaSolid representation — "
-                     "resize is not supported for curved/complex geometry."
-        }))
-        sys.exit(1)
-
-    changed = {}
-
-    if args.height is not None:
-        solid.Depth = args.height
-        changed["height"] = args.height
-
-    if args.width is not None or args.length is not None:
-        profile = solid.SweptArea
-        if not profile.is_a("IfcRectangleProfileDef"):
-            print(json.dumps({
-                "error": f"Profile type '{profile.is_a()}' does not support "
-                         "width/length editing yet (only IfcRectangleProfileDef is)."
-            }))
-            sys.exit(1)
-        if args.width is not None:
-            profile.XDim = args.width
-            changed["width"] = args.width
-        if args.length is not None:
-            profile.YDim = args.length
-            changed["length"] = args.length
-
-    ifc_file.write(args.output)
-    print(json.dumps({
-        "success": True,
-        "globalId": args.global_id,
-        "changed": changed,
-        "outputPath": args.output,
-    }))
-
-
-def cmd_isolate(args):
-    """Builds a minimal standalone IFC containing only the target element
-    and the spatial ancestors it needs (project/site/building/storey),
-    plus shared units and geometric context. This mirrors how furniture
-    assets are already loaded as independent models in the frontend, so
-    the same model-level position/scale/rotation transform machinery can
-    be reused for a single isolated wall."""
     source = ifcopenshell.open(args.input)
     element = find_element(source, args.global_id)
 
-    # Create a fresh IFC file of the same schema version as the source.
+    rep = next((r for r in element.Representation.Representations if r.RepresentationIdentifier in ["Body", "SweptSolid"]), None)
+    if not rep:
+        raise ValueError("No Body/SweptSolid representation found.")
+
+    solid = rep.Items[0]
+    if not solid.is_a("IfcExtrudedAreaSolid"):
+        raise ValueError("This element has no IfcExtrudedAreaSolid representation.")
+
+    height = solid.Depth
+    width = 0.0
+    length = 0.0
+
+    profile = solid.SweptArea
+    
+    # Handle standard rectangles
+    if profile.is_a("IfcRectangleProfileDef"):
+        width = profile.XDim
+        length = profile.YDim
+        
+    # Handle custom polygons (ArchiCAD/Revit standard walls)
+    elif profile.is_a("IfcArbitraryClosedProfileDef"):
+        curve = profile.OuterCurve
+        if curve.is_a("IfcPolyline"):
+            pts = [p.Coordinates for p in curve.Points]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            width = max(xs) - min(xs)
+            length = max(ys) - min(ys)
+
+    print(json.dumps({
+        "height": height,
+        "width": width,
+        "length": length
+    }))
+
+
+def cmd_resize(args):
+    source = ifcopenshell.open(args.input)
+    element = find_element(source, args.global_id)
+
+    logger.info(f"Initiating resize for element GlobalId: {args.global_id}")
+
+    rep = next((r for r in element.Representation.Representations if r.RepresentationIdentifier in ["Body", "SweptSolid"]), None)
+    solid = rep.Items[0]
+
+    # 1. Update Height (Depth of extrusion)
+    if args.height is not None:
+        old_height = solid.Depth
+        solid.Depth = args.height
+        logger.info(f"Element {args.global_id} - Height (Depth) modified: {old_height} -> {args.height}")
+
+    profile = solid.SweptArea
+    
+    # 2a. Resize if Rectangle
+    if profile.is_a("IfcRectangleProfileDef"):
+        if args.width is not None: 
+            old_width = profile.XDim
+            profile.XDim = args.width
+            logger.info(f"Element {args.global_id} - Width (XDim) modified: {old_width} -> {args.width}")
+            
+        if args.length is not None: 
+            old_length = profile.YDim
+            profile.YDim = args.length
+            logger.info(f"Element {args.global_id} - Length (YDim) modified: {old_length} -> {args.length}")
+        
+    # 2b. Resize if Polygon
+    elif profile.is_a("IfcArbitraryClosedProfileDef"):
+        curve = profile.OuterCurve
+        if curve.is_a("IfcPolyline"):
+            # Calculate current dimensions
+            pts = [p.Coordinates for p in curve.Points]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            current_w = max(xs) - min(xs)
+            current_l = max(ys) - min(ys)
+
+            # Calculate scale ratios
+            scale_x = (args.width / current_w) if (args.width and current_w > 0) else 1.0
+            scale_y = (args.length / current_l) if (args.length and current_l > 0) else 1.0
+            
+            if scale_x != 1.0 or scale_y != 1.0:
+                logger.info(f"Element {args.global_id} - Scaling Polygon Profile: scale_x={scale_x:.4f}, scale_y={scale_y:.4f}")
+
+            # Multiply every point in the polygon by the new scale
+            for pt in curve.Points:
+                coords = list(pt.Coordinates)
+                coords[0] *= scale_x
+                coords[1] *= scale_y
+                pt.Coordinates = tuple(coords)
+
+    # 3. Save the isolated, resized element
+    logger.info(f"Writing resized output to: {args.output}")
+    target = ifcopenshell.file(schema=source.schema)
+    for project in source.by_type("IfcProject"):
+        target.add(project)
+    target.add(element)
+    target.write(args.output)
+
+    print(json.dumps({
+        "success": True,
+        "globalId": args.global_id,
+        "outputPath": args.output,
+    }))
+
+def cmd_isolate(args):
+    """Builds a minimal standalone IFC containing ONLY the target element
+    and the foundational IfcProject context required for web-ifc to parse it."""
+    source = ifcopenshell.open(args.input)
+    element = find_element(source, args.global_id)
+    
     target = ifcopenshell.file(schema=source.schema)
 
-    # add_element pulls in the element plus everything it inversely/directly
-    # depends on (representations, placements, materials). We still need to
-    # walk up and add its spatial container chain (storey -> building -> site
-    # -> project) ourselves so the model remains spatially valid.
-    new_element = target.add(element)
+    # 1. Bring over the Project root and its basic contexts (Units, Geometries)
+    # target.add() only follows forward references, so this safely copies the project 
+    # WITHOUT pulling in the Site, Building, or other architectural elements.
+    for project in source.by_type("IfcProject"):
+        target.add(project)
 
-    container = ifcopenshell.util.element.get_container(element)
-    while container is not None:
-        target.add(container)
-        container = ifcopenshell.util.element.get_container(container)
-
-    # Pull in the project's unit assignment so dimensions render at the
-    # correct real-world scale (a model with no units defaults to unitless,
-    # which would make the wall appear at the wrong size in xeokit).
-    project = next(iter(source.by_type("IfcProject")), None)
-    if project is not None and getattr(project, "UnitsInContext", None):
-        target.add(project.UnitsInContext)
+    # 2. Bring over the actual element and its geometry
+    target.add(element)
 
     target.write(args.output)
+    
     print(json.dumps({
         "success": True,
         "globalId": args.global_id,
@@ -186,31 +237,111 @@ def cmd_isolate(args):
     }))
 
 
+def cmd_rescale(args):
+    """Global, backend-authoritative geometric rescale of the ENTIRE IFC
+    file. This is the 'proper' Coohom-style calibration: instead of only
+    scaling the WebGL mesh client-side (which desyncs the frontend's
+    visual scale from this file's actual dimensions — so any later
+    inspect/resize call on an individual element reads the WRONG size),
+    we rewrite the real IFC geometry once, so the file on disk and the
+    3D view always agree.
+
+    Two modes, chosen with --axis:
+      uniform : scales X, Y, and Z together. Use this to fix a wrong
+                import unit (e.g. a file authored in millimeters that
+                got loaded as if it were meters).
+      y       : scales ONLY the vertical (height) axis. Use this for
+                "set ceiling height for the whole floor plan" — X/Y
+                floor-plan layout is completely untouched.
+
+    See module docstring for full limitations.
+    """
+    if not args.factor or args.factor <= 0:
+        raise ValueError("--factor must be a positive number")
+
+    axis = args.axis or "uniform"
+    if axis not in ("uniform", "y"):
+        raise ValueError("--axis must be 'uniform' or 'y'")
+
+    ratio = args.factor
+    source = ifcopenshell.open(args.input)
+    
+    logger.info(f"Initiating global rescale. Factor: {ratio}, Axis: {axis}")
+
+    # 1. Scale every cartesian point in the file. One pass covers
+    #    placement translations (IfcAxis2Placement3D.Location), profile
+    #    outline points (IfcArbitraryClosedProfileDef polylines), and any
+    #    explicit point-based geometry.
+    for pt in source.by_type("IfcCartesianPoint"):
+        coords = list(pt.Coordinates)
+        if axis == "uniform":
+            coords = [c * ratio for c in coords]
+        elif len(coords) >= 3:
+            coords[2] = coords[2] * ratio  # Z (up) only
+        pt.Coordinates = tuple(coords)
+
+    # 2. Scale extrusion depths. For a vertically-extruded wall/column,
+    #    Depth IS the height, so under --axis y this is what actually
+    #    makes every wall taller/shorter in lockstep.
+    for solid in source.by_type("IfcExtrudedAreaSolid"):
+        solid.Depth = solid.Depth * ratio
+
+        # Under uniform scale the profile's own extents need scaling too —
+        # XDim/YDim are raw scalars, not points, so pass 1 doesn't touch them.
+        if axis == "uniform":
+            profile = solid.SweptArea
+            if profile.is_a("IfcRectangleProfileDef"):
+                profile.XDim = profile.XDim * ratio
+                profile.YDim = profile.YDim * ratio
+
+    # 3. IfcMappedItem instances carry their own scale factor, separate
+    #    from their target geometry's points.
+    for mapped in source.by_type("IfcMappedItem"):
+        transform = mapped.MappingTarget
+        if transform.is_a("IfcCartesianTransformationOperator3D"):
+            current_scale = transform.Scale if transform.Scale is not None else 1.0
+            if axis == "uniform":
+                transform.Scale = current_scale * ratio
+
+    target_path = args.output or args.input
+    source.write(target_path)
+    
+    # 1. ADD THIS: We must print a JSON response so your Node.js server doesn't crash!
+    print(json.dumps({
+        "success": True,
+        "outputPath": target_path,
+        "factor": args.factor,
+        "axis": axis
+    }))
+
+
+# 2. ADD THIS ENTIRE BLOCK: Without this, Python just reads the file and exits without doing anything!
 def main():
     parser = argparse.ArgumentParser(description="Server-side IFC element editor")
-    parser.add_argument("mode", choices=["inspect", "resize", "isolate"])
+    parser.add_argument("mode", choices=["inspect", "resize", "isolate", "rescale"])
     parser.add_argument("--input", required=True)
     parser.add_argument("--output")
-    parser.add_argument("--global-id", required=True, dest="global_id")
+    parser.add_argument("--global-id", dest="global_id")
     parser.add_argument("--height", type=float)
     parser.add_argument("--width", type=float)
     parser.add_argument("--length", type=float)
+    parser.add_argument("--factor", type=float, default=1.0)
+    parser.add_argument("--axis", choices=["uniform", "y"], default="uniform")
+    
     args = parser.parse_args()
 
     try:
         if args.mode == "inspect":
             cmd_inspect(args)
         elif args.mode == "resize":
-            if not args.output:
-                raise ValueError("--output is required for resize")
             cmd_resize(args)
         elif args.mode == "isolate":
-            if not args.output:
-                raise ValueError("--output is required for isolate")
             cmd_isolate(args)
+        elif args.mode == "rescale":
+            cmd_rescale(args)
     except Exception as e:
+        logger.error(f"Error during execution: {str(e)}")
         print(json.dumps({"error": str(e)}))
-        sys.exit(1)
 
 
 if __name__ == "__main__":

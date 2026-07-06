@@ -192,6 +192,22 @@
         180,
         0
       ]
+    },
+    {
+      "id": "sofa",
+      "instanceId": "sofa_1783062712676",
+      "name": "Modern Sofa",
+      "src": "http://localhost:3000/assets/sofa.ifc",
+      "position": [
+        4.105020465867471,
+        0,
+        -1.7316849627647322
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
     }
   ]
 }

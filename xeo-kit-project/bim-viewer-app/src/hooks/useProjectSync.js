@@ -28,7 +28,7 @@ const MOCK_ROOM_TEMPLATES = [
 ];
 
 export const useProjectSync = (file) => {
-  const [projectState, setProjectState] = useState({ materials: {}, furniture: [] });
+  const [projectState, setProjectState] = useState({ materials: {}, furniture: [], structural_edits: {} });
   const projectStateRef = useRef(projectState);
 
   const [availableAssets, setAvailableAssets] = useState([]);
@@ -47,14 +47,16 @@ export const useProjectSync = (file) => {
   useEffect(() => {
     if (file) {
       // Reset memory completely before reading the new file's state
-      setProjectState({ materials: {}, furniture: [] });
+      setProjectState({ materials: {}, furniture: [], structural_edits: {} });
 
       activeJobId.current = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
       const localState = localStorage.getItem(`hci_state_${activeJobId.current}`);
 
       if (localState) {
         try {
-          setProjectState(JSON.parse(localState));
+          const parsed = JSON.parse(localState);
+          // Backfill structural_edits for state saved before this key existed
+          setProjectState({ structural_edits: {}, ...parsed });
         } catch (e) {
           console.warn('[ProjectSync] Failed to parse local state, starting fresh.');
         }
@@ -62,15 +64,21 @@ export const useProjectSync = (file) => {
         fetch(`${API_BASE_URL}/api/projects/${activeJobId.current}/load`)
           .then(res => res.ok ? res.json() : null)
           .then(data => {
-            if (data && (Object.keys(data.materials || {}).length > 0 || (data.furniture || []).length > 0)) {
-              setProjectState(data);
+            if (
+              data &&
+              (Object.keys(data.materials || {}).length > 0 ||
+                (data.furniture || []).length > 0 ||
+                Object.keys(data.structural_edits || {}).length > 0)
+            ) {
+              // Backfill structural_edits for state saved before this key existed
+              setProjectState({ structural_edits: {}, ...data });
             }
           })
           .catch(() => console.warn('[ProjectSync] No previous cloud state found, starting fresh.'));
       }
     } else {
       // Wipes memory when file is deleted
-      setProjectState({ materials: {}, furniture: [] });
+      setProjectState({ materials: {}, furniture: [], structural_edits: {} });
     }
 
     // Fetch the asset catalog from the backend
@@ -85,7 +93,11 @@ export const useProjectSync = (file) => {
   // ─────────────────────────────────────────────────────────────
   useEffect(() => {
     // If state is completely empty, do not overwrite valid saves (prevents wiping on boot)
-    if (Object.keys(projectState.materials).length === 0 && projectState.furniture.length === 0) return;
+    if (
+      Object.keys(projectState.materials).length === 0 &&
+      projectState.furniture.length === 0 &&
+      Object.keys(projectState.structural_edits || {}).length === 0
+    ) return;
 
     setSaveStatus('unsaved');
     localStorage.setItem(`hci_state_${activeJobId.current}`, JSON.stringify(projectState));
@@ -249,6 +261,59 @@ export const useProjectSync = (file) => {
     setTimeout(() => setToastMessage(null), 3000);
   };
 
+
+  // ─────────────────────────────────────────────────────────────
+  // ACTION: Record a structural (parametric resize) edit for a native
+  // IFC element. This is Delta-Based State Management — input.ifc is
+  // never rewritten. We only ever persist a scale ratio / offset delta
+  // per element, and re-apply it visually on load.
+  // ─────────────────────────────────────────────────────────────
+  const updateStructuralEdit = (entityId, transformType, axis, value) => {
+    if (!entityId) return;
+    if (transformType !== 'scale' && transformType !== 'offset') {
+      console.warn(`[ProjectSync] Unknown structural edit type: ${transformType}`);
+      return;
+    }
+
+    setProjectState(prev => {
+      const existingEdit = prev.structural_edits[entityId] || { scale: [1, 1, 1], offset: [0, 0, 0] };
+      const defaultVector = transformType === 'scale' ? [1, 1, 1] : [0, 0, 0];
+      const updatedVector = [...(existingEdit[transformType] || defaultVector)];
+      updatedVector[axis] = value;
+
+      return {
+        ...prev,
+        structural_edits: {
+          ...prev.structural_edits,
+          [entityId]: {
+            ...existingEdit,
+            [transformType]: updatedVector,
+          },
+        },
+      };
+    });
+  };
+
+  // ─────────────────────────────────────────────────────────────
+// ACTION: Adopt a freshly-isolated native IFC element into furniture state
+// ─────────────────────────────────────────────────────────────
+const adoptIsolatedAsset = (entityId, newInstanceId, fileUrl, assetName) => {
+  setProjectState(prev => ({
+    ...prev,
+    furniture: [
+      ...prev.furniture,
+      {
+        id: entityId,
+        instanceId: newInstanceId,
+        name: assetName || 'Isolated Element',
+        src: fileUrl,
+        position: [0, 0, 0],
+        rotation: [0, 0, 0],
+        scale: [1, 1, 1],
+      },
+    ],
+  }));
+};
   return {
     projectState,
     projectStateRef,
@@ -262,7 +327,9 @@ export const useProjectSync = (file) => {
     updateAsset,
     deleteAsset,
     spawnAsset,
-    applyTemplate, 
+    applyTemplate,
+    adoptIsolatedAsset,
+    updateStructuralEdit,
     setToastMessage,
     setCustomColor,
   };
