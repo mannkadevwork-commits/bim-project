@@ -414,6 +414,220 @@ app.post('/api/projects/:jobId/rescale', (req, res) => {
 // ==========================================
 
 // ==========================================
+// RENDER API (Fully Asynchronous)
+// ==========================================
+// app.post('/api/render', upload.single('ifcFile'), (req, res) => {
+//   try {
+//     const angle = req.body.angle || 'all';
+//     // const angle = 'top_down'; 
+//     // const angle = 'auto_rotation';
+//     const lighting = req.body.lighting || 'daylight';
+//     // const angle = req.body.angle || '360';
+//     // const lighting = req.body.lighting || 'daylight'; 
+    
+//     let jobDir, jobId;
+
+//     if (req.file) {
+//         jobDir = req.file.destination; 
+//         jobId = path.basename(jobDir); 
+//     } else if (req.body.jobId) {
+//         jobId = req.body.jobId;
+//         jobDir = path.join(jobsDir, jobId);
+//         if (!fs.existsSync(jobDir)) return res.status(404).json({ error: 'Job directory not found.' });
+//     } else {
+//         return res.status(400).json({ error: 'Missing IFC file or jobId for rendering.' });
+//     }
+
+//     const inputIfcPath = path.join(jobDir, 'input.ifc');
+//     if (!fs.existsSync(inputIfcPath)) {
+//         const generatedIfcPath = path.join(jobDir, `${jobId}_Generated.ifc`);
+//         if (fs.existsSync(generatedIfcPath)) {
+//             fs.copyFileSync(generatedIfcPath, inputIfcPath);
+//         } else {
+//             return res.status(400).json({ error: 'input.ifc or AI-generated IFC not found.' });
+//         }
+//     }
+
+//     const projectStatePath = path.join(jobDir, 'project_state.json');
+//     if (req.body.projectState) {
+//         const stateData = typeof req.body.projectState === 'string' 
+//             ? req.body.projectState 
+//             : JSON.stringify(req.body.projectState);
+//         fs.writeFileSync(projectStatePath, stateData);
+//     } else if (!fs.existsSync(projectStatePath)) {
+//         fs.writeFileSync(projectStatePath, JSON.stringify({ materials: {}, furniture: [] }));
+//     }
+    
+//     console.log(`\n--- Async Render Request | Angle: ${angle} | Lighting: ${lighting} | Job ID: ${jobId} ---`);
+
+//     const blenderScriptPath = path.join(__dirname, 'blender_render.py');
+//     // const resultImgPath = path.join(jobDir, 'result.png');
+//     let outputFileName = 'result.png';
+//     if (angle === 'top_down') outputFileName = 'top_down_plan.png';
+//     else if (angle === '360') outputFileName = 'pano_360.png';
+//     else if (angle === 'side') outputFileName = 'side_elevation.png';
+    
+//     const resultImgPath = path.join(jobDir, outputFileName);
+    
+//     // Using exec asynchronously so Node can keep serving furniture on port 3000!
+//     const { exec } = require('child_process');
+//     // FIX: this used to hard-code --angle "top_down" regardless of what the
+//     // frontend actually requested, AND blender_render.py had no --angle/
+//     // --lighting flags at all -- argparse rejected the command line before
+//     // any scene setup ran, so no new render ever happened; whatever
+//     // result.png/pano_render.html already existed in the job folder just
+//     // sat there, which is what made renders look "stuck" on a broken image.
+//     const blenderCmd = `blender --background --python "${blenderScriptPath}" -- --ifc "${inputIfcPath}" --state "${projectStatePath}" --output "${resultImgPath}" --job-dir "${jobDir}" --angle "${angle}" --lighting "${lighting}"`;
+
+//     exec(blenderCmd, { maxBuffer: 1024 * 1024 * 50 }, (pipelineError, stdout, stderr) => {
+//       if (pipelineError) {
+//         console.error("Blender pipeline failed:", pipelineError.message);
+//         if (stdout) console.error("--- BLENDER STDOUT ---\n", stdout.toString());
+//         if (stderr) console.error("--- BLENDER STDERR ---\n", stderr.toString());
+//         return res.status(500).json({ error: 'Failed to execute Blender render pipeline.' });
+//       }
+
+//       const resultLines = stdout.split('\n').filter(line => line.startsWith('RENDER_RESULT_JSON:'));
+//       if (resultLines.length === 0) {
+//         console.error('[Blender] No JSON payload found. STDOUT:', stdout);
+//         return res.status(500).json({ error: 'Blender produced no result payload.' });
+//       }
+
+//       const renderResult = JSON.parse(resultLines[resultLines.length - 1].slice('RENDER_RESULT_JSON:'.length));
+
+//       if (!renderResult.success) {
+//         console.error('[Blender] Render failed:', renderResult.error);
+//         return res.status(500).json({ error: renderResult.error || 'Blender render failed.' });
+//       }
+
+//       // ── 4. GENERATE A SEPARATE PANNELLUM VIEWER (DO NOT OVERWRITE 360_VIEWER.HTML) ──
+//       const htmlOutPath = path.join(jobDir, 'pano_render.html');
+//       const viewerHtml = `<!DOCTYPE HTML>
+// <html>
+// <head>
+//     <meta charset="utf-8">
+//     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+//     <title>High-Res 360 Render</title>
+//     <link rel="stylesheet" href="https://cdn.pannellum.org/2.5/pannellum.css"/>
+//     <script type="text/javascript" src="https://cdn.pannellum.org/2.5/pannellum.js"></script>
+//     <style>body { margin: 0; overflow: hidden; background: #000; } #panorama { width: 100vw; height: 100vh; }</style>
+// </head>
+// <body>
+//     <div id="panorama"></div>
+//     <script>
+//         pannellum.viewer('panorama', {
+//             "type": "equirectangular",
+//       "panorama": "${outputFileName}?v=${Date.now()}",
+//             "autoLoad": true,
+//             "compass": false,
+//             "showFullscreenCtrl": true,
+//             "mouseZoom": false
+//         });
+//     </script>
+// </body>
+// </html>`;
+      
+//       fs.writeFileSync(htmlOutPath, viewerHtml);
+
+//       // ── 5. RETURN NEW URL TO FRONTEND ──
+//       // ── 4. GENERATE COOHOM-STYLE MASTER PRESENTATION ──
+//       const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+//       const host = req.headers.host; 
+//       const baseUrl = `${protocol}://${host}`;
+
+//       const presentationHtmlPath = path.join(jobDir, 'presentation.html');
+      
+//       const presentationHtml = `<!DOCTYPE html>
+//         <html lang="en">
+//         <head>
+//             <meta charset="UTF-8">
+//             <meta name="viewport" content="width=device-width, initial-scale=1.0">
+//             <title>HC Interior - Final Presentation</title>
+            
+//             <link rel="stylesheet" href="https://cdn.pannellum.org/2.5/pannellum.css"/>
+//             <script type="text/javascript" src="https://cdn.pannellum.org/2.5/pannellum.js"></script>
+            
+//             <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js"></script>
+            
+//             <style>
+//                 body { margin: 0; font-family: 'Segoe UI', sans-serif; background-color: #1a1a1a; color: #fff; display: flex; height: 100vh; overflow: hidden; }
+//                 #sidebar { width: 260px; background-color: #222; padding: 20px; box-shadow: 2px 0 10px rgba(0,0,0,0.5); z-index: 10; display: flex; flex-direction: column; }
+//                 #sidebar h2 { font-size: 1.2rem; color: #00d2ff; margin-bottom: 25px; border-bottom: 1px solid #333; padding-bottom: 15px; }
+//                 .menu-btn { display: block; width: 100%; padding: 14px; margin-bottom: 12px; background-color: #333; color: #fff; border: 1px solid #444; border-radius: 6px; cursor: pointer; text-align: left; font-size: 15px; transition: 0.2s; }
+//                 .menu-btn:hover { background-color: #444; }
+//                 .menu-btn.active { background-color: #00d2ff; color: #000; font-weight: 600; border: none; }
+                
+//                 #viewer-container { flex-grow: 1; position: relative; background: #000; }
+//                 .view-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: none; }
+//                 .view-layer.active { display: block; }
+                
+//                 img.static-img { object-fit: contain; width: 100%; height: 100%; }
+//                 model-viewer { width: 100%; height: 100%; background-color: #222; }
+//             </style>
+//         </head>
+//         <body>
+//             <div id="sidebar">
+//                 <h2>HC Interior Deliverables</h2>
+//                 <button class="menu-btn active" onclick="switchView('view-3d', this)">🔄 Interactive 3D Model</button>
+//                 <button class="menu-btn" onclick="switchView('view-360', this)">🌐 360 Photoreal Walkthrough</button>
+//                 <button class="menu-btn" onclick="switchView('view-top', this)">🗺️ Top-Down Floor Plan</button>
+//             </div>
+            
+//             <div id="viewer-container">
+//                 <div id="view-3d" class="view-layer active">
+//                     <model-viewer src="model_interactive.glb?v=${Date.now()}" camera-controls auto-rotate shadow-intensity="1" exposure="1.2"></model-viewer>
+//                 </div>
+                
+//                 <div id="view-360" class="view-layer">
+//                     <div id="panorama" style="width:100%; height:100%;"></div>
+//                 </div>
+                
+//                 <div id="view-top" class="view-layer">
+//                     <img class="static-img" src="top_down_plan.png?v=${Date.now()}" />
+//                 </div>
+//             </div>
+
+//             <script>
+//                 // Initialize 360 viewer (loads in background)
+//                 pannellum.viewer('panorama', {
+//                     "type": "equirectangular",
+//                     "panorama": "pano_360.png?v=${Date.now()}",
+//                     "autoLoad": true,
+//                     "compass": false,
+//                     "mouseZoom": false
+//                 });
+
+//                 function switchView(viewId, btnElement) {
+//                     // Update buttons
+//                     document.querySelectorAll('.menu-btn').forEach(btn => btn.classList.remove('active'));
+//                     btnElement.classList.add('active');
+                    
+//                     // Switch layers
+//                     document.querySelectorAll('.view-layer').forEach(layer => layer.classList.remove('active'));
+//                     document.getElementById(viewId).classList.add('active');
+//                 }
+//             </script>
+//         </body>
+//         </html>`;
+
+//       fs.writeFileSync(presentationHtmlPath, presentationHtml);
+
+//       // ALWAYS return the Master Presentation HTML
+//       res.json({ 
+//           type: 'presentation', 
+//           url: `${baseUrl}/jobs/${jobId}/presentation.html`, 
+//           jobId: jobId 
+//       });
+    
+//     });
+
+//   } catch (error) {
+//     console.error("Render API Error:", error.message);
+//     res.status(500).json({ error: 'Failed to process render request' });
+//   }
+// });
+
+// ==========================================
 // RENDER API (Reverted to APS Pipeline)
 // ==========================================
 app.post('/api/render', upload.single('ifcFile'), (req, res) => {

@@ -18,11 +18,26 @@ Combines four sources of truth into ONE unified, render-ready mesh:
      render by applying a scale + offset delta on top of the pristine IFC
      mesh, matching what the frontend already shows live in the viewer.
 
-It then applies the Z-up -> Y-up axis correction 3ds Max / APS expects, and
+It then applies the Z-up -> Y-up axis correction 3ds Max / APS expects to
+the STRUCTURAL IFC geometry only (see 2026-07-08 fix note below), and
 writes a single merged OBJ (+ MTL) plus a JSON bounding-box sidecar (printed
 to stdout) that the caller (aps-pipeline.js) uses to park the interior
 camera in the middle of the room.
 
+--------------------------------------------------------------------------
+2026-07-08 fix note -- furniture floating outside/below the floor plan.
+Furniture position/rotation/scale in project_state.json is written by the
+frontend (Xeokit), which is Y-up. It was never Z-up and never needed an
+axis correction. The old code merged structural IFC geometry (Z-up) and
+furniture (Y-up) into one scene FIRST, then applied
+z_up_to_y_up_matrix() to the whole merged scene ONCE. That correctly fixed
+the structural geometry but ALSO rotated the furniture a second time --
+since furniture was already in the target Y-up space, that second rotation
+sent it flying off outside/below the floor plan. The fix: apply
+z_up_to_y_up_matrix() to each structural mesh individually, right after its
+structural-edit/material-override pass and BEFORE it is added to
+structural_named / merged with furniture. Furniture is now merged in
+untouched, and the merged scene is never rotated as a whole.
 --------------------------------------------------------------------------
 2026-07-05 fix notes (read this before touching apply_material_override or
 the merge step again):
@@ -156,10 +171,22 @@ def z_up_to_y_up_matrix():
     )
 
 
-def _sanitize_name(raw, fallback):
-    """OBJ 'o'/'usemtl' names should stay whitespace/slash-free and non-empty."""
+def _obj_safe_name(raw, fallback):
+    """
+    2026-07-08: this used to be _sanitize_name(), which replaced every
+    non-alnum/underscore/hyphen character (including IFC GlobalId's '$')
+    with '_'. That's exactly what broke direct name-based material lookup:
+    aps-pipeline.js now needs a mesh's exported "o" name to be an EXACT,
+    byte-for-byte match against a project_state.json["materials"] key (a
+    raw IFC GlobalId, '$' and all) -- no more MTL, no more fuzzy
+    sanitized-suffix matching on the JS side.
+
+    OBJ's 'o'/'g' lines only truly break on embedded whitespace or path
+    separators (they'd be read as a second token / a nested group), so this
+    only touches those, and otherwise passes the name through untouched.
+    """
     raw = str(raw or fallback)
-    cleaned = re.sub(r"[^A-Za-z0-9_\-]+", "_", raw).strip("_")
+    cleaned = re.sub(r"[\s/\\]+", "_", raw).strip()
     return cleaned or fallback
 
 
@@ -213,6 +240,14 @@ def load_ifc_as_named_meshes(ifc_path, warnings):
             mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
             mesh.metadata["global_id"] = global_id
             mesh.metadata["ifc_type"] = ifc_type
+            # "name" (not just "global_id") is what several trimesh export
+            # paths look at for a geometry's own identity; setting it here,
+            # on the raw ifcopenshell product's GlobalId, is what lets the
+            # exported OBJ's "o"/"g" line end up as the exact GlobalId string
+            # -- with no sanitization -- so aps-pipeline.js can look it up
+            # directly in project_state.json["materials"] with no fuzzy
+            # matching needed (see build_merged_scene()/main() below).
+            mesh.metadata["name"] = global_id
             meshes.append((global_id, ifc_type, mesh))
         except Exception as e:
             warnings.append(f"Skipped one IFC element due to geometry error: {e}")
@@ -362,6 +397,76 @@ def build_merged_scene(named_meshes):
 
 
 # --------------------------------------------------------------------------
+# Post-export MTL sanitation.
+#
+# apply_material_override() already builds every colored SimpleMaterial with
+# image=None, and build_merged_scene() avoids the concatenate() atlas-packer
+# that used to reset Kd to gray -- but any structural piece that never got a
+# material override (no entry in project_state.json["materials"]) still
+# falls back to whatever default material trimesh's OBJ exporter writes for
+# an untouched mesh, which can include a map_Kd/map_Ka texture reference
+# (trimesh's built-in default material image) or stray "illum"/"map_*"
+# lines a strict downstream parser (three.js MTLLoader) chokes on or
+# silently ignores in favor of a gray fallback.
+#
+# This rewrites the exported .mtl in place so every `newmtl` block is a
+# plain, texture-free block with a valid `Kd r g b` line -- exactly what
+# MTLLoader needs to hand back a real THREE.Color instead of defaulting to
+# gray. Never raises: a parse hiccup just leaves the original file in place.
+# --------------------------------------------------------------------------
+def sanitize_mtl_file(mtl_path, warnings):
+    if not os.path.exists(mtl_path):
+        return
+
+    try:
+        with open(mtl_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        DROP_PREFIXES = ("map_Kd", "map_Ka", "map_Ks", "map_d", "map_bump", "bump", "disp", "decal")
+        DEFAULT_KD = (0.8, 0.8, 0.8)
+
+        out_lines = []
+        current_block_has_kd = False
+        block_start_idx = None
+
+        def close_block():
+            # If the block we're leaving never got a Kd line, give it one
+            # explicitly rather than let a parser guess/default.
+            if block_start_idx is not None and not current_block_has_kd:
+                out_lines.insert(len(out_lines), f"Kd {DEFAULT_KD[0]:.6f} {DEFAULT_KD[1]:.6f} {DEFAULT_KD[2]:.6f}\n")
+
+        for line in lines:
+            stripped = line.strip()
+
+            if stripped.startswith(DROP_PREFIXES):
+                # Drop any texture-map reference outright -- there is never
+                # a real image file behind these (image=None throughout),
+                # so a dangling map_* line only gives a downstream loader a
+                # missing-texture path to fail on.
+                continue
+
+            if stripped.startswith("newmtl"):
+                close_block()
+                current_block_has_kd = False
+                block_start_idx = len(out_lines)
+                out_lines.append(line)
+                continue
+
+            if stripped.startswith("Kd "):
+                current_block_has_kd = True
+
+            out_lines.append(line)
+
+        close_block()
+
+        with open(mtl_path, "w", encoding="utf-8") as f:
+            f.writelines(out_lines)
+
+    except Exception as e:
+        warnings.append(f"MTL sanitation failed ({e}); using trimesh's raw export as-is.")
+
+
+# --------------------------------------------------------------------------
 # Resolving furniture asset URLs to local files.
 #
 #   - "/assets/xxx"                -> <project_root>/assets/xxx (server.js's
@@ -483,10 +588,26 @@ def load_furniture_pieces(local_path, warnings):
 
 def build_transform(position, rotation_deg, scale):
     """
-    Builds a 4x4 transform in the app's Z-up runtime space:
+    Builds a 4x4 transform in the app's Y-up runtime space:
     scale -> rotate (XYZ euler, degrees) -> translate.
     Matches the frontend convention: position/rotation/scale saved per
     furniture item in project_state.json.
+
+    2026-07-08 fix -- reverted a bad "left/right inversion" fix. An earlier
+    version of this function mirrored position on X and negated the Y (yaw)
+    rotation, on the theory that the merged OBJ space was mirrored relative
+    to Xeokit's frontend space. That theory was wrong: project_state.json's
+    position/rotation is already authored in this same Y-up, right-handed
+    space (see the "furniture floating outside/below the floor plan" note
+    above -- it was never Z-up and needs no axis correction here), so
+    mirroring it moved every furniture item to the wrong side of the room
+    instead of fixing anything -- that's the current "assets misplaced" bug.
+    The "wrong facing" symptom that mirroring was chasing actually came from
+    a different bug: .ifc/.obj furniture *meshes* staying in their native
+    Z-up authoring space. That's fixed separately, per-piece, right before
+    this transform is applied (see the "tipped onto its side/back" fix note
+    where z_up_to_y_up_matrix() is applied to furniture pieces below).
+    position/rotation_deg are used here exactly as saved -- no mirroring.
     """
     position = position or [0, 0, 0]
     rotation_deg = rotation_deg or [0, 0, 0]
@@ -650,6 +771,7 @@ def main():
         materials_applied = 0
         structural_edits_applied = 0
         structural_named = []
+        used_names = set()  # trimesh.Scene node/geom names must stay unique
         for idx, (global_id, ifc_type, mesh) in enumerate(structural_pieces):
             # 1. Delta-Based structural edit (resize/move), applied to the
             #    pristine per-element mesh BEFORE it joins the scene.
@@ -659,19 +781,55 @@ def main():
                 apply_structural_edit(mesh, edit_def, warnings, global_id)
                 structural_edits_applied += 1
 
-            # 2. Material override, as a pure Kd color (see fix notes above).
+            # 2. Material override, as a pure Kd color. NOTE: trimesh's
+            #    Scene->OBJ exporter turned out to still collapse every
+            #    element's material into one shared material regardless of
+            #    this (verified: a real render produced 36 "usemtl
+            #    material_0" lines against a single "newmtl material_0" in
+            #    the .mtl, even though 30+ distinct override colors were
+            #    requested). This Kd bake is kept only as a best-effort
+            #    fallback for any non-browser/non-Three.js consumer of the
+            #    OBJ+MTL pair; it is NOT what makes colors show up in
+            #    360_viewer.html anymore -- see the exact GlobalId naming
+            #    below and aps-pipeline.js's direct JSON color lookup,
+            #    which now bypasses the MTL entirely.
             mat_def = materials.get(global_id)
             if mat_def:
                 warnings_before = len(warnings)
                 apply_material_override(mesh, mat_def, warnings, global_id)
-                # apply_material_override() swallows its own exceptions and
-                # only records a warning -- only count it "applied" if it
-                # didn't add a new warning, so a real bake failure can't hide
-                # behind a "materials_applied": N success message.
                 if len(warnings) == warnings_before:
                     materials_applied += 1
 
-            name = _sanitize_name(f"struct_{idx:04d}_{global_id}", f"struct_{idx:04d}")
+            # 3. Axis fix: Z-up (raw IFC) -> Y-up (app/Xeokit runtime), applied
+            #    ONLY to structural geometry, and ONLY here -- BEFORE this
+            #    mesh ever touches furniture in the merged scene. Furniture
+            #    transforms below come straight out of project_state.json,
+            #    which the frontend (Xeokit, Y-up) already saved in Y-up
+            #    space. Rotating the *whole* merged scene after combining
+            #    both (the old approach) double-rotated furniture that was
+            #    never Z-up to begin with, sending it flying off outside/
+            #    below the floor plan. Structural IFC geometry, by contrast,
+            #    genuinely starts Z-up and needs exactly this one correction.
+            mesh.apply_transform(z_up_to_y_up_matrix())
+
+            # 4. Name this node with the RAW IFC GlobalId -- no "struct_NNNN_"
+            #    prefix, no character-mangling sanitization. This is what
+            #    lets aps-pipeline.js match child.name directly against
+            #    project_state.json["materials"] with a plain dict lookup
+            #    (see mesh.metadata["name"] note in load_ifc_as_named_meshes).
+            #    A GlobalId is unique within one IFC file, so no
+            #    disambiguation is expected here in practice; the used_names
+            #    guard is a last-resort safety net, not the common path.
+            name = _obj_safe_name(global_id, f"struct_{idx:04d}")
+            if name in used_names:
+                warnings.append(
+                    f"Duplicate structural element name '{name}' (GlobalId collision?); "
+                    f"disambiguating with a numeric suffix. Its material override, if any, "
+                    f"will only be found by the JS-side exact-name lookup on the first "
+                    f"occurrence."
+                )
+                name = f"{name}_{idx:04d}"
+            used_names.add(name)
             structural_named.append((name, mesh))
 
         log(f"[scene_merger] {len(structural_named)} structural element(s), "
@@ -693,12 +851,34 @@ def main():
                 local_path = resolve_asset_path(url, job_dir, project_root, args.asset_base_url, warnings)
                 pieces = load_furniture_pieces(local_path, warnings)
 
+                # 2026-07-08 fix -- furniture landing in the right spot but
+                # tipped onto its side/back. load_furniture_pieces() routes
+                # .ifc assets through load_ifc_as_named_meshes(), which --
+                # unlike the structural loop above -- never applies
+                # z_up_to_y_up_matrix(); the raw mesh vertices stay Z-up
+                # forever. Applying the item's Y-up position/rotation
+                # transform on top of still-Z-up geometry moves the piece to
+                # the correct spot but with its own "up" axis still pointing
+                # the wrong way -- i.e. correct position, wrong orientation.
+                # A plain OBJ furniture asset is Z-up for the same reason
+                # the raw IFC is (both are architectural/CAD conventions).
+                # GLB/GLTF assets are natively Y-up already and must NOT get
+                # this correction -- doing so would tip THEM over instead.
+                source_ext = os.path.splitext(local_path)[1].lower()
+                if source_ext in (".ifc", ".obj"):
+                    for piece in pieces:
+                        piece.apply_transform(z_up_to_y_up_matrix())
+
                 transform = build_transform(
                     item.get("position"), item.get("rotation"), item.get("scale"),
                 )
 
                 item_id = item.get("instanceId") or item.get("globalId") or item.get("id") or f"furniture_{i}"
-                mat_def = materials.get(item.get("globalId") or item.get("id"))
+                # This is the EXACT key apply_material_override looks up below,
+                # and therefore also the exact name a piece needs on the JS
+                # side for the direct JSON color lookup to find it.
+                materials_key = item.get("globalId") or item.get("id")
+                mat_def = materials.get(materials_key)
 
                 for p_idx, piece in enumerate(pieces):
                     piece.apply_transform(transform)
@@ -706,7 +886,35 @@ def main():
                         # A material override on a furniture instance recolors
                         # the WHOLE piece uniformly, same as the frontend does.
                         apply_material_override(piece, mat_def, warnings, item_id)
-                    name = _sanitize_name(f"furn_{i:04d}_{p_idx:02d}_{item_id}", f"furn_{i:04d}_{p_idx:02d}")
+
+                    if materials_key:
+                        # Give part 0 the bare materials_key so it matches
+                        # project_state.json["materials"] exactly on the JS
+                        # side; later parts of a multi-part asset (e.g. a
+                        # sofa's legs + cushions) get a numeric suffix since
+                        # they'd otherwise collide, but that means only part
+                        # 0 will pick up the override color there -- a known
+                        # limitation of exact-name matching for multi-part
+                        # furniture, not something project_state.json alone
+                        # can resolve (it only stores one color per item).
+                        base_name = _obj_safe_name(materials_key, f"furn_{i:04d}_{p_idx:02d}")
+                        name = base_name if p_idx == 0 else f"{base_name}_{p_idx:02d}"
+                    else:
+                        name = _obj_safe_name(f"furn_{i:04d}_{p_idx:02d}_{item_id}", f"furn_{i:04d}_{p_idx:02d}")
+
+                    if name in used_names:
+                        # Two placed instances of the same catalog asset
+                        # (same materials_key) -- disambiguate with the
+                        # instance id so the scene graph stays valid. Only
+                        # the first-placed instance's exact name will match
+                        # project_state.json["materials"]; later instances
+                        # of a shared catalog id keep archMat's default color
+                        # in the viewer instead of gray, which is still an
+                        # improvement over the old shared-material_0 bug.
+                        name = f"{name}__{item_id}"
+                        if name in used_names:
+                            name = f"{name}_{p_idx:04d}"
+                    used_names.add(name)
                     furniture_named.append((name, piece))
 
                 if mat_def:
@@ -719,22 +927,26 @@ def main():
         log(f"[scene_merger] {furniture_merged_count}/{len(furniture)} furniture item(s) merged "
             f"({len(furniture_named)} part(s) total).")
 
-        # --- 3. Merge everything (still Z-up) into a Scene, NOT a
-        #        concatenated single mesh -- see build_merged_scene()
-        #        docstring for why that distinction is the whole fix. ---
+        # --- 3. Merge everything into a Scene, NOT a concatenated single
+        #        mesh -- see build_merged_scene() docstring for why that
+        #        distinction matters for materials. Structural geometry is
+        #        already Y-up at this point (axis fix applied per-mesh,
+        #        above, before this merge); furniture is already Y-up
+        #        because it was never anything else. Do NOT re-apply
+        #        z_up_to_y_up_matrix() here -- that was the bug: rotating
+        #        the whole merged scene a second time sent furniture flying
+        #        outside/below the floor plan even though its own transform
+        #        was already correct. ---
         merged_scene = build_merged_scene(structural_named + furniture_named)
 
-        # --- 4. Axis fix: Z-up -> Y-up, applied ONCE to the whole scene ---
-        merged_scene.apply_transform(z_up_to_y_up_matrix())
-
-        # --- 5. Bounding box (post axis-fix, in the space APS/3ds Max will render) ---
+        # --- 4. Bounding box (scene is already in the space APS/3ds Max will render) ---
         bounds = merged_scene.bounds  # shape (2,3): [min, max]
         bbox_min = bounds[0].tolist()
         bbox_max = bounds[1].tolist()
         bbox_center = merged_scene.centroid.tolist() if len(merged_scene.geometry) else [0, 0, 0]
         bbox_size = (bounds[1] - bounds[0]).tolist()
 
-        # --- 6. Export merged OBJ (+ MTL). mtl_name is pinned to match the
+        # --- 5. Export merged OBJ (+ MTL). mtl_name is pinned to match the
         #        output file's own basename instead of trimesh's default
         #        "material.mtl", so concurrent render jobs writing into a
         #        shared directory can't clobber each other's materials. ---
@@ -742,6 +954,12 @@ def main():
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         mtl_name = os.path.splitext(os.path.basename(output_path))[0] + ".mtl"
         merged_scene.export(output_path, file_type="obj", mtl_name=mtl_name)
+
+        # Strip any texture-map references trimesh's default material may
+        # have written and guarantee a plain Kd line per material -- see
+        # sanitize_mtl_file() docstring above.
+        mtl_output_path = os.path.join(os.path.dirname(output_path), mtl_name)
+        sanitize_mtl_file(mtl_output_path, warnings)
 
         result = {
             "success": True,

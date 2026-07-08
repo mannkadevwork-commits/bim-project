@@ -16,22 +16,17 @@ const CAMERA_ANGLE = process.argv[2] || "top-front-right";
 const JOB_DIR = process.argv[3] || "."; 
 const JOB_ID = path.basename(JOB_DIR) || "default";
 
-// --- THE FIX: Absolute Dynamic Local Paths ---
+// --- Absolute Dynamic Local Paths ---
 const LOCAL_IFC_PATH = path.join(JOB_DIR, "input.ifc");
 const LOCAL_STATE_PATH = path.join(JOB_DIR, "project_state.json");
-// NOTE: this is now the MERGED scene (structural IFC + furniture + materials,
-// already Y-up) produced by scene_merger.py — not a raw IFC->OBJ dump.
 const LOCAL_OBJ_PATH = path.join(JOB_DIR, "input.obj");
-// trimesh writes this alongside input.obj (same basename) whenever the merged
-// scene has any painted/material-overridden faces — this is what carries the
-// red-wall (and every other) material override into 3ds Max.
 const LOCAL_MTL_PATH = path.join(JOB_DIR, "input.mtl");
 const CAMERA_JSON_PATH = path.join(JOB_DIR, "camera.json");
 const RESULT_PNG_PATH = path.join(JOB_DIR, "result.png");
 const HTML_OUT_PATH = path.join(JOB_DIR, "360_viewer.html");
-const LOCAL_BUNDLE_PATH = "./IFCRenderBundle.zip"; // Stays in root
+const LOCAL_BUNDLE_PATH = "./IFCRenderBundle.zip"; 
 
-// --- THE FIX: Unique Cloud Keys (Prevents multi-user collisions) ---
+// --- Unique Cloud Keys ---
 const CLOUD_OBJ_KEY = `${JOB_ID}_input.obj`;
 const CLOUD_MTL_KEY = `${JOB_ID}_input.mtl`;
 const CLOUD_CAM_KEY = `${JOB_ID}_camera.json`;
@@ -88,9 +83,31 @@ async function uploadFileToOSS(token, bucketKey, objectKey, filePath) {
 // --- 5. GENERATE 360 THREE.JS VIEWER ---
 function generate360Viewer(objPath, bboxCenter) {
     const objData = fs.readFileSync(objPath, 'utf-8');
+
+    // 2026-07-08: no longer reading/using the .mtl file here at all.
+    // Trimesh's Scene->OBJ exporter was verified to collapse every
+    // element's material into one shared "material_0" regardless of how
+    // many distinct override colors scene_merger.py wrote into each
+    // mesh (36 usemtl lines all pointing at a single newmtl block on a
+    // real job) -- so MTLLoader had nothing correct to parse in the first
+    // place. Colors now come directly from project_state.json, matched by
+    // the exact object ("o") name scene_merger.py gives each mesh (its raw
+    // IFC GlobalId for structural elements, or its materials_key for
+    // furniture -- see scene_merger.py's naming comments).
+    const statePath = path.join(path.dirname(objPath), 'project_state.json');
+    let projectState = { materials: {} };
+    if (fs.existsSync(statePath)) {
+        try {
+            projectState = JSON.parse(fs.readFileSync(statePath, 'utf-8')) || { materials: {} };
+        } catch (e) {
+            console.warn(`⚠️  Could not parse project_state.json for material colors: ${e.message}`);
+        }
+    }
+
     const cfg = JSON.parse(fs.readFileSync('./render-config.json', 'utf-8'));
     const c = (arr) => `0x${arr.map(v => v.toString(16).padStart(2,'0')).join('')}`;
     const cf = (arr) => arr.map(v => (v/255).toFixed(3));
+    
     const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -209,18 +226,46 @@ scene.add(grid);` : 'const grid = { position: { y: 0 } };'}
 
 let modelSize = 1;
 
-// Bounding-box center of the merged, Y-up scene (from scene_merger.py),
-// used to drop the camera inside the room for a true interior 360 look.
 const INTERIOR_CENTER = ${JSON.stringify(bboxCenter || null)};
 let interiorMode = false;
 
+// Inject OBJ text and project_state.json material overrides dynamically.
+// No .mtl is injected or loaded anymore -- see the note above generate360Viewer().
 const objText = ${JSON.stringify(objData)};
-const loader = new OBJLoader();
-const obj = loader.parse(objText);
+const projectState = ${JSON.stringify(projectState)};
+
+const objLoader = new OBJLoader();
+const obj = objLoader.parse(objText);
+
+// --- Direct color lookup: project_state.json is the ONLY source of truth ---
+//
+// scene_merger.py now names every OBJ object ("o" line) with the EXACT,
+// unmodified key that would appear in project_state.json["materials"] --
+// a structural element's raw IFC GlobalId, or a furniture item's
+// materials_key -- so child.name can be looked up in projectState.materials
+// directly, with no MTL parsing, no sanitization, and no fuzzy matching.
+const projectMaterials = (projectState && projectState.materials) || {};
 
 obj.traverse(child => {
     if (child.isMesh) {
-        child.material = archMat;
+        const matDef = projectMaterials[child.name];
+        const matClone = archMat.clone();
+
+        if (matDef && Array.isArray(matDef.rgb) && matDef.rgb.length >= 3) {
+            // project_state.json's "rgb" is already normalized 0-1, exactly
+            // what THREE.Color.setRGB expects -- no parsing needed.
+            const [r, g, b] = matDef.rgb;
+            matClone.color.setRGB(r, g, b);
+        }
+        // No matching entry (or a malformed one) -- keep archMat's default
+        // color rather than guessing; this mesh simply has no override.
+
+        if (Array.isArray(child.material)) {
+            child.material = child.material.map(() => matClone);
+        } else {
+            child.material = matClone;
+        }
+        
         child.castShadow = true;
         child.receiveShadow = true;
     }
@@ -272,23 +317,11 @@ function toggleAutoRotate() {
     controls.autoRotate = !controls.autoRotate;
 }
 
-// Drops the camera at the center of the merged scene's bounding box (the
-// same point APS/3ds Max uses for the interior render) and locks panning
-// and zoom so the only thing the user can do is look around — a true
-// walk-in 360 panorama rather than an exterior orbit.
 function enterInteriorView() {
     interiorMode = true;
     controls.autoRotate = false;
-
-    // NOTE: the obj.position.sub(center) call above already re-centers the
-    // merged scene on (0,0,0) using three.js's own bounding-box calculation,
-    // which is the same box scene_merger.py measured (just computed a
-    // second time here). So the room's center -- the point INTERIOR_CENTER
-    // describes -- IS the local origin post-recenter; we don't need to
-    // re-apply the raw coordinate here, just place the camera there.
     camera.position.set(0, 0, 0.001);
     controls.target.set(0, 0, 0);
-
     controls.enablePan = false;
     controls.enableZoom = false;
     controls.minDistance = 0.01;
@@ -318,7 +351,8 @@ window.addEventListener('resize', () => {
 </body>
 </html>`;
 
-    // THE FIX: Save directly to the dynamic JOB_DIR
+    // Save directly to the dynamic JOB_DIR
+    const HTML_OUT_PATH = require('path').join(process.argv[3] || ".", "360_viewer.html");
     fs.writeFileSync(HTML_OUT_PATH, html);
     console.log(`\n=================================================`);
     console.log(`360 VIEWER GENERATED!`);
@@ -340,8 +374,6 @@ async function runPipeline() {
             '--job-dir', JOB_DIR
         ], { encoding: 'utf-8' });
 
-        // scene_merger.py sends progress/diagnostics to stderr, and a single
-        // JSON result line to stdout. Surface the logs, but only trust stdout.
         if (merge.stderr && merge.stderr.trim()) {
             console.log(merge.stderr.trim());
         }
@@ -368,9 +400,6 @@ async function runPipeline() {
             mergeInfo.warnings.forEach(w => console.warn(`   ⚠️  ${w}`));
         }
 
-        // Bounding-box center of the FINAL, Y-up, merged scene — used to park
-        // the interior camera in the middle of the room instead of orbiting
-        // the outside of the building.
         const BBOX_CENTER = mergeInfo.bbox.center;
         const BBOX_SIZE = mergeInfo.bbox.size;
 
@@ -392,7 +421,6 @@ async function runPipeline() {
 
        console.log("\n--- Setting up AppBundle ---");
         
-        // --- NEW: ZIP FILE DEBUGGING ---
         if (!fs.existsSync(LOCAL_BUNDLE_PATH)) {
             throw new Error(`❌ MISSING ZIP FILE: Cannot find ${LOCAL_BUNDLE_PATH} in the current directory.`);
         }
@@ -401,7 +429,6 @@ async function runPipeline() {
         if (zipStats.size < 100) {
             throw new Error(`❌ INVALID ZIP FILE: File is only ${zipStats.size} bytes. It is empty or corrupted.`);
         }
-        // -------------------------------
 
         let bundleParams, bundleVer = 1;
         try {
@@ -433,9 +460,6 @@ async function runPipeline() {
             ],
             parameters: {
                 InputFile: { verb: "get", localName: "input.obj" },
-                // Optional: not every merged scene has material overrides
-                // (trimesh only emits an .mtl when at least one face has a
-                // material), so this must tolerate being absent.
                 MaterialFile: { verb: "get", localName: "input.mtl", required: false },
                 CameraConfig: { verb: "get", localName: "camera.json" },
                 OutputFile: { verb: "put", localName: "output.png", required: false },
@@ -468,13 +492,8 @@ async function runPipeline() {
                 { bucketKey: BUCKET_KEY, policyKey: 'transient' }, { headers: { 'Authorization': `Bearer ${token}` } });
         } catch (e) {}
         
-        // THE FIX: Use the unique CLOUD keys to prevent multi-user overwriting!
         await uploadFileToOSS(token, BUCKET_KEY, CLOUD_OBJ_KEY, LOCAL_OBJ_PATH);
 
-        // Upload the companion .mtl (paint/material overrides — the red
-        // walls, etc.) so it lands in the same workitem folder as input.obj
-        // and 3ds Max's OBJ importer picks it up automatically via the
-        // mtllib reference baked into input.obj by trimesh.
         const hasMtl = fs.existsSync(LOCAL_MTL_PATH);
         if (hasMtl) {
             await uploadFileToOSS(token, BUCKET_KEY, CLOUD_MTL_KEY, LOCAL_MTL_PATH);
@@ -485,13 +504,8 @@ async function runPipeline() {
 
         const renderCfg = JSON.parse(fs.readFileSync('./render-config.json', 'utf-8'));
         renderCfg.angle = CAMERA_ANGLE;
-        // Interior placement data for render.ms: park the camera in the
-        // middle of the merged, Y-up scene rather than computing its own
-        // (pre-fix, Z-up) bounding box. render.ms needs to be updated to
-        // read cfg.interiorCenter/cfg.interiorSize when positioning the
-        // camera for 360/interior shots — this only threads the data through.
-        renderCfg.interiorCenter = BBOX_CENTER; // [x, y, z], Y-up
-        renderCfg.interiorSize = BBOX_SIZE;     // [x, y, z] extents, Y-up
+        renderCfg.interiorCenter = BBOX_CENTER; 
+        renderCfg.interiorSize = BBOX_SIZE;     
         fs.writeFileSync(CAMERA_JSON_PATH, JSON.stringify(renderCfg));
         await uploadFileToOSS(token, BUCKET_KEY, CLOUD_CAM_KEY, CAMERA_JSON_PATH);
 
@@ -552,7 +566,6 @@ async function runPipeline() {
         const dlRes = await axios.get(downloadUrl, { headers: { 'Authorization': `Bearer ${token}` } });
         const fileRes = await axios.get(dlRes.data.url, { responseType: 'arraybuffer' });
         
-        // THE FIX: Save directly to the dynamic JOB_DIR
         fs.writeFileSync(RESULT_PNG_PATH, Buffer.from(fileRes.data));
 
         console.log(`\n=================================================`);
@@ -565,7 +578,6 @@ async function runPipeline() {
         console.error("🛑 CRITICAL PIPELINE FAILURE");
         console.error("=================================================");
 
-        // Log the exact response from Autodesk's servers
         if (err.response) {
             console.error(`HTTP Status: ${err.response.status} ${err.response.statusText}`);
             console.error(`Endpoint Failed: ${err.config.url}`);
@@ -573,7 +585,6 @@ async function runPipeline() {
             console.error(JSON.stringify(err.response.data, null, 2));
             console.error("------------------------------\n");
 
-            // Auto-diagnose common 403 errors
             if (err.response.status === 403) {
                 const errorStr = JSON.stringify(err.response.data);
                 if (errorStr.includes("Developer is not subscribed") || errorStr.includes("Not Authorized")) {
@@ -592,5 +603,4 @@ async function runPipeline() {
     }
 }
     
-
 runPipeline();
