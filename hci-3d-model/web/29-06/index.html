@@ -435,12 +435,6 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 .label-item.selected-item { background: rgba(74,222,128,0.12); }
 .label-item input[type=checkbox] { cursor:pointer; width:14px;height:14px; }
 .label-item.active-edit { background:rgba(251,146,60,0.18); border-left:3px solid var(--orange); }
-.ifc-pset-title { font-size:10px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;margin-top:8px; }
-.ifc-prop-row { display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:3px;align-items:center; }
-.ifc-prop-label { font-size:11px;color:var(--text-dim); }
-.ifc-prop-input { font-size:11px;padding:2px 5px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);width:100%; }
-.ifc-prop-input:focus { border-color:var(--accent);outline:none; }
-.correct-layout.ifc-open { grid-template-columns:2fr 1fr 280px !important; }
 .resize-handle {
   position:absolute; width:10px; height:10px; background:#fff;
   border:2px solid var(--accent); border-radius:2px; cursor:nwse-resize;
@@ -721,73 +715,17 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
               title="Click to enable draw mode, then drag a rectangle on the image">
               🖊 Draw Region
             </button>
-            <select id="drawClass" style="font-size:12px;padding:3px 6px;min-width:180px">
-              <optgroup label="── Spaces (IfcSpace) ──">
-                <option value="Room" data-subtype="Living Room">Room — Living Room</option>
-                <option value="Room" data-subtype="Dining Room">Room — Dining Room</option>
-                <option value="Room" data-subtype="Drawing Room">Room — Drawing Room</option>
-                <option value="Room" data-subtype="Bedroom">Room — Bedroom</option>
-                <option value="Room" data-subtype="Master Bedroom">Room — Master Bedroom</option>
-                <option value="Room" data-subtype="Kitchen">Room — Kitchen</option>
-                <option value="Room" data-subtype="Bathroom">Room — Bathroom</option>
-                <option value="Room" data-subtype="Toilet / WC">Room — Toilet / WC</option>
-                <option value="Room" data-subtype="Balcony">Room — Balcony</option>
-                <option value="Room" data-subtype="Entry / Foyer">Room — Entry / Foyer</option>
-                <option value="Room" data-subtype="Corridor">Room — Corridor</option>
-                <option value="Room" data-subtype="Utility / Wash">Room — Utility / Wash</option>
-                <option value="Room" data-subtype="Store Room">Room — Store Room</option>
-                <option value="Room" data-subtype="Study / Home Office">Room — Study / Home Office</option>
-                <option value="Room" data-subtype="Puja Room">Room — Puja Room</option>
-                <option value="Room" data-subtype="Parking / Garage">Room — Parking / Garage</option>
-                <option value="Room" data-subtype="Servant Room">Room — Servant Room</option>
-                <option value="Room" data-subtype="Gym">Room — Gym</option>
-              </optgroup>
-              <optgroup label="── Structure (IfcWall/Slab) ──">
-                <option value="Wall" data-subtype="Exterior">Wall — Exterior</option>
-                <option value="Wall" data-subtype="Interior">Wall — Interior</option>
-                <option value="Wall" data-subtype="Partition">Wall — Partition</option>
-                <option value="Slab">Slab</option>
-                <option value="Roof">Roof</option>
-                <option value="Column">Column</option>
-                <option value="Beam">Beam</option>
-                <option value="Railing">Railing</option>
-                <option value="CurtainWall">Curtain Wall</option>
-                <option value="Covering">Covering</option>
-              </optgroup>
-              <optgroup label="── Openings ──">
-                <option value="Door" data-subtype="Single Swing">Door — Single Swing</option>
-                <option value="Door" data-subtype="Double Swing">Door — Double Swing</option>
-                <option value="Door" data-subtype="Sliding">Door — Sliding</option>
-                <option value="Door" data-subtype="Folding">Door — Folding</option>
-                <option value="Window" data-subtype="Sliding">Window — Sliding</option>
-                <option value="Window" data-subtype="Casement">Window — Casement</option>
-                <option value="Window" data-subtype="Fixed">Window — Fixed</option>
-              </optgroup>
-              <optgroup label="── Vertical ──">
-                <option value="Stair" data-subtype="Straight">Stair — Straight</option>
-                <option value="Stair" data-subtype="L-shaped">Stair — L-shaped</option>
-                <option value="Stair" data-subtype="Spiral">Stair — Spiral</option>
-              </optgroup>
-              <optgroup label="── Furniture (IfcFurnishingElement) ──">
-                <option value="Furniture" data-subtype="Sofa">Furniture — Sofa</option>
-                <option value="Furniture" data-subtype="Bed">Furniture — Bed</option>
-                <option value="Furniture" data-subtype="Wardrobe">Furniture — Wardrobe</option>
-                <option value="Furniture" data-subtype="Dining Table">Furniture — Dining Table</option>
-                <option value="Furniture" data-subtype="TV Unit">Furniture — TV Unit</option>
-                <option value="Furniture" data-subtype="Cabinet">Furniture — Cabinet</option>
-              </optgroup>
-              <optgroup label="── MEP / Sanitary ──">
-                <option value="FlowTerminal" data-subtype="WC / Toilet">Plumbing — WC / Toilet</option>
-                <option value="FlowTerminal" data-subtype="Wash Basin">Plumbing — Wash Basin</option>
-                <option value="FlowTerminal" data-subtype="Kitchen Sink">Plumbing — Kitchen Sink</option>
-                <option value="FlowTerminal" data-subtype="Shower">Plumbing — Shower</option>
-                <option value="LightFixture" data-subtype="Ceiling Light">Light — Ceiling</option>
-                <option value="LightFixture" data-subtype="Recessed">Light — Recessed</option>
-                <option value="ElectricAppliance" data-subtype="AC Unit">Appliance — AC Unit</option>
-                <option value="ElectricAppliance" data-subtype="Refrigerator">Appliance — Refrigerator</option>
-                <option value="ElectricAppliance" data-subtype="Stove / Hob">Appliance — Stove / Hob</option>
-                <option value="EnergyConversionDevice">Energy Device</option>
-              </optgroup>
+            <select id="drawClass" style="font-size:12px;padding:3px 6px;min-width:120px">
+              <option value="Room">Room</option>
+              <option value="Door">Door</option>
+              <option value="Window">Window</option>
+              <option value="Wall">Wall</option>
+              <option value="Furniture">Furniture</option>
+              <option value="Stair">Stair</option>
+              <option value="Column">Column</option>
+              <option value="FlowTerminal">FlowTerminal</option>
+              <option value="LightFixture">LightFixture</option>
+              <option value="ElectricAppliance">ElectricAppliance</option>
             </select>
             <span id="drawStatus" style="font-size:11px;color:var(--text-dim)">Select class and click Draw Region</span>
             <div style="flex:1"></div>
@@ -843,22 +781,8 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
           </div>
 
           <!-- Label list -->
-          <div class="label-list" id="labelList" style="flex:1;overflow-y:auto;min-height:0">
+          <div class="label-list" id="labelList" style="flex:1;overflow-y:auto">
             <div style="padding:20px;text-align:center;color:var(--text-dim)">No labels loaded</div>
-          </div>
-        </div>
-
-        <!-- IFC Properties panel -->
-        <div id="ifcPropsPanel" style="display:none;flex-direction:column;overflow:hidden;min-height:0" class="card">
-          <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
-            <span style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;flex:1">IFC Properties</span>
-            <span id="ifcClassName" style="font-size:11px;color:var(--accent);font-weight:600"></span>
-            <button class="btn-secondary" style="font-size:10px;padding:2px 6px" onclick="closeIfcPanel()">x</button>
-          </div>
-          <div id="ifcPanelContent" style="flex:1;overflow-y:auto;min-height:0;font-size:12px"></div>
-          <div style="display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">
-            <button class="btn-success" style="flex:1;font-size:11px" onclick="saveIfcProps()">Save Props</button>
-            <button class="btn-secondary" style="font-size:11px;padding:3px 8px" onclick="exportIfcProps()">Export</button>
           </div>
         </div>
       </div>
@@ -1028,33 +952,6 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
         title="Weight-average two existing models">
         🔀 Merge Models
       </button>
-    </div>
-
-    <!-- Train scope selector -->
-    <div id="ftScopePanel" style="margin-bottom:12px;padding:10px 12px;background:var(--bg);border-radius:var(--radius);border:1px solid var(--border)">
-      <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Training Scope</div>
-      <div style="display:flex;gap:6px;margin-bottom:8px">
-        <button class="view-mode-btn active" id="ftScopeAll" onclick="setFtScope('all')"
-          title="Train on every labelled image in the dataset">
-          🗂 All Images
-        </button>
-        <button class="view-mode-btn" id="ftScopeCorrected" onclick="setFtScope('corrected')"
-          title="Train only on images you corrected this session">
-          ✏️ Corrected Only
-        </button>
-        <button class="view-mode-btn" id="ftScopeCustom" onclick="setFtScope('custom')"
-          title="Pick specific images from the list below">
-          ☑️ Custom Select
-        </button>
-      </div>
-      <!-- File checklist (shown for corrected + custom) -->
-      <div id="ftFileList" style="display:none;max-height:140px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);padding:4px 6px">
-        <div style="font-size:10px;color:var(--text-dim);padding:2px 0 4px">Select images to include:</div>
-        <div id="ftFileCheckboxes"></div>
-      </div>
-      <div id="ftScopeHint" style="font-size:10px;color:var(--text-dim);margin-top:4px">
-        All labelled images will be used for training.
-      </div>
     </div>
 
     <!-- Incremental / Scratch params -->
@@ -2690,10 +2587,7 @@ function _renderDrawRect() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!_drawRect) return;
 
-  const sel2  = document.getElementById('drawClass');
-  const cls    = sel2.value;
-  const sub2   = sel2.options[sel2.selectedIndex]?.dataset?.subtype || '';
-  const label  = sub2 ? cls + ' — ' + sub2 : cls;
+  const cls   = document.getElementById('drawClass').value;
   const color = CLASS_COLORS[cls] || '#6c8cff';
 
   ctx.strokeStyle = color;
@@ -2707,14 +2601,12 @@ function _renderDrawRect() {
   ctx.setLineDash([]);
   ctx.fillStyle = color;
   ctx.font = 'bold 13px sans-serif';
-  ctx.fillText(label, _drawRect.x + 4, _drawRect.y + 16);
+  ctx.fillText(cls, _drawRect.x + 4, _drawRect.y + 16);
 }
 
 async function _confirmDrawRect() {
   if (!_drawRect || !_correctBasename) return;
-  const sel     = document.getElementById('drawClass');
-  const cls      = sel.value;
-  const subtype  = sel.options[sel.selectedIndex]?.dataset?.subtype || '';
+  const cls = document.getElementById('drawClass').value;
 
   // Convert canvas coords → image pixel coords using pan-zoom state
   const s   = _pzGet('correctViewer');
@@ -2739,8 +2631,7 @@ async function _confirmDrawRect() {
   if (bw < 4 || bh < 4) { _exitDrawMode(); return; }
 
   const pct = `${Math.round(bx/imgW*100)}%,${Math.round(by/imgH*100)}% → ${Math.round((bx+bw)/imgW*100)}%,${Math.round((by+bh)/imgH*100)}%`;
-  const displayName = subtype ? `${cls} — ${subtype}` : cls;
-  if (!confirm(`Add ${displayName} at [${pct}]?\n\nThis will be saved immediately.`)) {
+  if (!confirm(`Add ${cls} at [${pct}]?\n\nThis will be saved immediately.`)) {
     _clearDrawCanvas(); _drawStart = null; _drawRect = null; return;
   }
 
@@ -2748,7 +2639,7 @@ async function _confirmDrawRect() {
   try {
     const res  = await fetch(API + '/api/section', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ basename: _correctBasename, label: cls, subtype: subtype, bbox: [bx, by, bw, bh] })
+      body: JSON.stringify({ basename: _correctBasename, label: cls, bbox: [bx, by, bw, bh] })
     });
     const data = await res.json();
     if (data.ok) {
@@ -2788,69 +2679,16 @@ window.addEventListener('resize', () => {
 // ═══════════════════════════════════════════════════════════════════
 // UPDATE MODEL FROM CORRECTIONS
 // ═══════════════════════════════════════════════════════════════════
-let _ftMode        = 'incremental';
-let _ftScope       = 'all';   // 'all' | 'corrected' | 'custom'
-let _ftAllFiles       = [];
-let _ftCorrectedFiles = [];
+let _ftMode = 'incremental';
 
-// ── Scope selector ────────────────────────────────────────────────
-function setFtScope(scope) {
-  _ftScope = scope;
-  ['ftScopeAll','ftScopeCorrected','ftScopeCustom'].forEach(id =>
-    document.getElementById(id).classList.remove('active'));
-  document.getElementById('ftScope' + scope.charAt(0).toUpperCase() + scope.slice(1)).classList.add('active');
-
-  const listEl  = document.getElementById('ftFileList');
-  const hintEl  = document.getElementById('ftScopeHint');
-  const boxesEl = document.getElementById('ftFileCheckboxes');
-
-  if (scope === 'all') {
-    listEl.style.display = 'none';
-    hintEl.textContent   = 'All labelled images will be used (' + _ftAllFiles.length + ' total).';
-  } else if (scope === 'corrected') {
-    listEl.style.display = 'block';
-    if (_ftCorrectedFiles.length === 0) {
-      hintEl.textContent = '⚠️ No corrections made this session — switch to All Images or Custom.';
-      boxesEl.innerHTML  = '<div style="color:var(--orange);font-size:11px;padding:4px">No corrected images found this session.</div>';
-    } else {
-      hintEl.textContent = _ftCorrectedFiles.length + ' image(s) corrected this session — all pre-checked.';
-      _renderFileCheckboxes(_ftCorrectedFiles, _ftCorrectedFiles);
-    }
-  } else {
-    listEl.style.display = 'block';
-    hintEl.textContent   = 'Check the images you want to include.';
-    _renderFileCheckboxes(_ftAllFiles, _ftCorrectedFiles);
-  }
-}
-
-function _renderFileCheckboxes(files, preChecked) {
-  const el      = document.getElementById('ftFileCheckboxes');
-  const checked = new Set(preChecked);
-  el.innerHTML  = files.map(f => {
-    const badge = _ftCorrectedFiles.includes(f)
-      ? '<span style="font-size:9px;background:rgba(74,222,128,0.2);color:var(--green);padding:1px 5px;border-radius:8px;margin-left:4px">✏️ corrected</span>'
-      : '';
-    return '<label style="display:flex;align-items:center;gap:6px;padding:3px 2px;cursor:pointer;font-size:12px">'
-      + '<input type="checkbox" id="ftFile_' + f + '" value="' + f + '" ' + (checked.has(f) ? 'checked' : '') + '>'
-      + '<span>' + f + '</span>' + badge + '</label>';
-  }).join('');
-}
-
-function _getSelectedFiles() {
-  if (_ftScope === 'all') return [];
-  return Array.from(document.querySelectorAll('#ftFileCheckboxes input[type=checkbox]:checked'))
-    .map(b => b.value);
-}
-
-// ── Mode selector ─────────────────────────────────────────────────
 function setFtMode(mode) {
   _ftMode = mode;
-  ['ftModeIncremental','ftModeScratch','ftModeMerge'].forEach(id =>
-    document.getElementById(id).classList.remove('active'));
+  ['ftModeIncremental','ftModeScratch','ftModeMerge'].forEach(id => {
+    document.getElementById(id).classList.remove('active');
+  });
   document.getElementById('ftMode' + mode.charAt(0).toUpperCase() + mode.slice(1)).classList.add('active');
   document.getElementById('ftParamsPanel').style.display = mode === 'merge' ? 'none' : 'block';
   document.getElementById('ftMergePanel').style.display  = mode === 'merge' ? 'block' : 'none';
-  document.getElementById('ftScopePanel').style.display  = mode === 'merge' ? 'none' : 'block';
   const btn = document.getElementById('btnStartFinetune');
   if (mode === 'merge') {
     btn.textContent = '🔀 Merge Models';
@@ -2866,35 +2704,25 @@ function setFtMode(mode) {
 }
 
 async function openUpdateModelPanel() {
-  _ftMode  = 'incremental';
-  _ftScope = 'all';
+  _ftMode = 'incremental';
   setFtMode('incremental');
   document.getElementById('updateModelPanel').style.display = 'flex';
-  document.getElementById('finetuneStatus').style.display   = 'none';
+  document.getElementById('finetuneStatus').style.display = 'none';
 
   const info = document.getElementById('updateModelInfo');
-  info.textContent = 'Loading...';
   try {
-    const [statusRes, versionsRes, correctedRes] = await Promise.all([
+    const [statusRes, versionsRes] = await Promise.all([
       fetchStatus(),
-      fetch(API + '/api/model_versions').then(r => r.json()),
-      fetch(API + '/api/corrected_files').then(r => r.json()),
+      fetch(API + '/api/model_versions').then(r => r.json())
     ]);
-
-    _ftAllFiles       = correctedRes.all       || [];
-    _ftCorrectedFiles = correctedRes.corrected || [];
-
     const lbl_count = (statusRes?.labelled_images || []).length;
     const best      = versionsRes.best_model ? versionsRes.best_model.split('/').pop() : 'None';
     const versions  = versionsRes.versions || [];
     info.innerHTML  = 'Active: <strong>' + best + '</strong>  ·  '
       + 'Labelled: <strong>' + lbl_count + '</strong>  ·  '
-      + 'Corrected this session: <strong style="color:var(--green)">' + _ftCorrectedFiles.length + '</strong>  ·  '
       + 'Versions: <strong>' + versions.length + '</strong>';
 
-    // Default scope: corrected if any, else all
-    setFtScope(_ftCorrectedFiles.length > 0 ? 'corrected' : 'all');
-
+    // Populate model dropdowns
     function fillSelect(selId, activeFirst) {
       const sel = document.getElementById(selId);
       sel.innerHTML = '<option value="">— select —</option>';
@@ -2962,36 +2790,24 @@ async function startFinetune() {
       data   = await res.json();
       logMsg = '🔀 Model merge started (α=' + alpha + ')';
     } else {
-      const baseModel   = _ftMode === 'scratch' ? '' : (document.getElementById('ftBaseModel').value || '');
-      const trainFiles  = _getSelectedFiles();
-      const scopeLabel  = _ftScope === 'all' ? 'all images'
-                        : _ftScope === 'corrected' ? 'corrected images (' + trainFiles.length + ')'
-                        : 'custom (' + trainFiles.length + ' selected)';
-      if (_ftScope !== 'all' && trainFiles.length === 0) {
-        status.textContent = '❌ No images selected — check at least one image or switch to All Images';
-        status.style.color = 'var(--red)';
-        btn.disabled = false; return;
-      }
+      const baseModel = _ftMode === 'scratch' ? '' : (document.getElementById('ftBaseModel').value || '');
       const body = {
-        epochs:      parseInt(document.getElementById('ftEpochs').value) || 5,
-        batch:       parseInt(document.getElementById('ftBatch').value)  || 2,
-        imgsz:       parseInt(document.getElementById('ftImgsz').value)  || 640,
-        mode:        _ftMode,
-        base_model:  baseModel,
-        train_scope: _ftScope,
-        train_files: trainFiles,
+        epochs:     parseInt(document.getElementById('ftEpochs').value) || 5,
+        batch:      parseInt(document.getElementById('ftBatch').value)  || 2,
+        imgsz:      parseInt(document.getElementById('ftImgsz').value)  || 640,
+        mode:       _ftMode,
+        base_model: baseModel,
       };
       status.textContent = _ftMode === 'scratch'
-        ? '⏳ Training from scratch on ' + scopeLabel + '...'
-        : '⏳ Fine-tuning from: ' + (baseModel ? baseModel.split('/').pop() : 'active model')
-          + ' — ' + scopeLabel + '...';
+        ? '⏳ Training from scratch...'
+        : '⏳ Fine-tuning from: ' + (baseModel ? baseModel.split('/').pop() : 'active model') + '...';
       res  = await fetch(API + '/api/train_from_corrections', {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify(body)
       });
       data   = await res.json();
       logMsg = (_ftMode === 'scratch' ? '🆕 Training from scratch' : '🔄 Fine-tune from ' + (data.base_model || '').split('/').pop())
-               + ' — ' + scopeLabel + ' (' + body.epochs + ' epochs)';
+               + ' (' + body.epochs + ' epochs)';
     }
 
     if (res.status === 409) {
@@ -3098,148 +2914,6 @@ function pollModelVersions() {
     }
   }, 4000);
   setTimeout(() => clearInterval(iv), 7200000);
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// IFC PROPERTIES
-// ═══════════════════════════════════════════════════════════════════
-let _ifcSchema = null;
-let _ifcMaterials = null;
-let _ifcCurrentKey = null;
-
-async function _loadIfcSchema() {
-  if (_ifcSchema) return;
-  try {
-    const d = await fetch(API + '/api/ifc/schema').then(r => r.json());
-    _ifcSchema = d.schema; _ifcMaterials = d.materials;
-  } catch(e) { _ifcSchema = {}; _ifcMaterials = {}; }
-}
-
-async function openIfcPanel(cls, idx) {
-  await _loadIfcSchema();
-  const schema = (_ifcSchema || {})[cls];
-  if (!schema) { appendLog('No IFC schema for ' + cls); return; }
-  _ifcCurrentKey = cls + '_' + idx;
-  document.getElementById('ifcClassName').textContent = schema.ifc_class + ' #' + idx;
-  let existing = {};
-  try {
-    const d = await fetch(API + '/api/ifc/props/' + encodeURIComponent(_correctBasename)).then(r => r.json());
-    existing = (d.props || {})[_ifcCurrentKey] || {};
-  } catch(e) {}
-  _renderIfcPanel(cls, idx, schema, existing);
-  document.getElementById('ifcPropsPanel').style.display = 'flex';
-  document.querySelector('.correct-layout').classList.add('ifc-open');
-}
-
-function closeIfcPanel() {
-  document.getElementById('ifcPropsPanel').style.display = 'none';
-  document.querySelector('.correct-layout').classList.remove('ifc-open');
-  _ifcCurrentKey = null;
-}
-
-function _renderIfcPanel(cls, idx, schema, existing) {
-  const psets = schema.psets || {};
-  const subtypes = schema.subtypes || [];
-  const existPsets = existing.psets || {};
-  let h = '';
-  // Subtype
-  h += '<div style="margin-bottom:8px"><label class="ifc-prop-label">Subtype</label>'
-    + '<select id="ifcSubtype" class="ifc-prop-input" style="width:100%;margin-top:2px">'
-    + subtypes.map(s => '<option' + (existing.subtype===s?' selected':'') + '>' + s + '</option>').join('')
-    + '</select></div>';
-  // Material + Color
-  const mats = Object.keys(_ifcMaterials || {});
-  h += '<div style="display:grid;grid-template-columns:1fr 80px;gap:6px;margin-bottom:8px">'
-    + '<div><label class="ifc-prop-label">Material</label>'
-    + '<select id="ifcMaterial" class="ifc-prop-input" style="width:100%;margin-top:2px">'
-    + '<option value="">none</option>'
-    + mats.map(m => '<option value="' + m + '"' + (existing.material===m?' selected':'') + '>' + m + '</option>').join('')
-    + '</select></div>'
-    + '<div><label class="ifc-prop-label">Color</label>'
-    + '<input type="color" id="ifcColor" class="ifc-prop-input" style="height:26px;padding:1px;margin-top:2px" value="' + (existing.color||'#888888') + '"></div>'
-    + '</div>';
-  // Dimensions
-  h += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-bottom:8px">'
-    + ['Width','Depth','Height'].map(d =>
-        '<div><label class="ifc-prop-label">' + d + '(m)</label>'
-        + '<input type="number" id="ifcDim' + d + '" class="ifc-prop-input" step="0.01" min="0" value="'
-        + ((existing.dimensions||{})[d]||'') + '" style="margin-top:2px"></div>').join('')
-    + '</div>';
-  // Psets
-  for (const [psetName, props] of Object.entries(psets)) {
-    h += '<div class="ifc-pset-title">' + psetName + '</div>';
-    const ep = existPsets[psetName] || {};
-    for (const [propName, meta] of Object.entries(props)) {
-      const val = ep[propName] !== undefined ? ep[propName] : (meta.default !== undefined ? meta.default : '');
-      const uid = 'ifcP_' + psetName.replace(/\W/g,'_') + '_' + propName.replace(/\W/g,'_');
-      const unit = meta.unit ? ' (' + meta.unit + ')' : '';
-      h += '<div class="ifc-prop-row"><span class="ifc-prop-label">' + propName + unit + '</span>';
-      if (meta.options && meta.options.length) {
-        h += '<select id="' + uid + '" class="ifc-prop-input"><option value="">-</option>'
-          + meta.options.map(o => '<option' + (val===o?' selected':'') + '>' + o + '</option>').join('') + '</select>';
-      } else if (meta.type === 'bool') {
-        h += '<select id="' + uid + '" class="ifc-prop-input"><option value="">-</option>'
-          + '<option value="true"' + (val===true||val==='true'?' selected':'') + '>Yes</option>'
-          + '<option value="false"' + (val===false||val==='false'?' selected':'') + '>No</option></select>';
-      } else if (meta.type === 'color') {
-        h += '<input type="color" id="' + uid + '" class="ifc-prop-input" style="height:22px;padding:1px" value="' + (val||'#888888') + '">';
-      } else {
-        h += '<input type="' + (meta.type==='number'?'number':'text') + '" id="' + uid + '" class="ifc-prop-input" value="' + val + '">';
-      }
-      h += '</div>';
-    }
-  }
-  document.getElementById('ifcPanelContent').innerHTML = h;
-}
-
-async function saveIfcProps() {
-  if (!_ifcCurrentKey || !_correctBasename) return;
-  const parts = _ifcCurrentKey.split('_');
-  const idx = parseInt(parts.pop());
-  const cls = parts.join('_');
-  const schema = (_ifcSchema||{})[cls] || {};
-  const psets = schema.psets || {};
-  const psetData = {};
-  for (const [psetName, props] of Object.entries(psets)) {
-    psetData[psetName] = {};
-    for (const propName of Object.keys(props)) {
-      const uid = 'ifcP_' + psetName.replace(/\W/g,'_') + '_' + propName.replace(/\W/g,'_');
-      const el = document.getElementById(uid);
-      if (el && el.value && el.value !== '-') psetData[psetName][propName] = el.value;
-    }
-  }
-  const body = {
-    cls_name: cls, idx,
-    subtype:  document.getElementById('ifcSubtype')?.value || '',
-    material: document.getElementById('ifcMaterial')?.value || '',
-    color:    document.getElementById('ifcColor')?.value || '',
-    dimensions: {
-      Width:  parseFloat(document.getElementById('ifcDimWidth')?.value)||null,
-      Depth:  parseFloat(document.getElementById('ifcDimDepth')?.value)||null,
-      Height: parseFloat(document.getElementById('ifcDimHeight')?.value)||null,
-    },
-    psets: psetData,
-  };
-  try {
-    const d = await fetch(API + '/api/ifc/props/' + encodeURIComponent(_correctBasename),
-      {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r=>r.json());
-    if (d.ok) {
-      document.getElementById('correctStatusBar').textContent = 'IFC props saved: ' + cls + ' #' + idx;
-      appendLog('IFC props saved: ' + d.ifc_class + ' #' + idx);
-    }
-  } catch(e) { appendLog('ERROR: ' + e.message); }
-}
-
-async function exportIfcProps() {
-  if (!_correctBasename) return;
-  try {
-    const d = await fetch(API + '/api/ifc/export/' + encodeURIComponent(_correctBasename)).then(r=>r.json());
-    const blob = new Blob([JSON.stringify(d,null,2)], {type:'application/json'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = _correctBasename + '_ifc.json';
-    a.click();
-  } catch(e) { appendLog('ERROR: ' + e.message); }
 }
 
 // ═══════════════════════════════════════════════════════════════════

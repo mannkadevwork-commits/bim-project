@@ -38,9 +38,6 @@ _analysis: dict       = {}          # basename -> {labelled, img, n_labels, labe
 _training_lock        = threading.Lock()
 _training_active      = False
 
-# ── Corrected-files tracker (for Update Model panel) ─────────────────────────
-_corrected_basenames: set = set()   # basenames that have been corrected this session
-
 def _push(msg: str, pct: float = None, status: str = None, metrics: dict = None):
     _log_queue.append(msg)
     if pct is not None:
@@ -479,8 +476,8 @@ def correct_label(body: dict):
     _rebuild_labels(basename, info)
     _push(msg, status=msg)
     labels_out = {k: len(v) for k, v in info["labelled"].items() if v}
+    # Sync _counts
     info["_counts"] = labels_out
-    _corrected_basenames.add(basename)
     return {"ok": True, "msg": msg, "labels": labels_out,
             "marked_b64": info.get("marked_b64", "")}
 
@@ -532,7 +529,6 @@ def _correct_label_lines(basename, info, action, cls_name, idx, new_cls):
     info["_counts"] = counts
 
     _push(msg, status=msg)
-    _corrected_basenames.add(basename)
     return {"ok": True, "msg": msg, "labels": counts,
             "marked_b64": info.get("marked_b64", "")}
 
@@ -673,11 +669,11 @@ async def detect(file: UploadFile = File(...),
             tr   = ckpt.get("train_results", {})
             map50_list = tr.get("metrics/mAP50(B)", [0])
             best_map50 = max(map50_list) if map50_list else 0
-            epochs_trained = len(tr.get("epoch", []))
-            if best_map50 < 0.01 or epochs_trained == 0:
+            epoch = ckpt.get("epoch", -1)
+            if best_map50 == 0 or epoch < 0:
                 model_quality = "undertrained"
-                model_warning = (f"⚠️ Model undertrained (mAP50={best_map50:.4f}, {epochs_trained} epochs). "
-                                 f"Need more images (100+ per class) for reliable detection. "
+                model_warning = (f"⚠️ Model undertrained (mAP50=0, epoch={epoch}). "
+                                 f"Need more epochs and images for reliable detection. "
                                  f"Showing heuristic fallback.")
             elif best_map50 < 0.3:
                 model_quality = "weak"
@@ -807,11 +803,12 @@ async def analyse_endpoint(file: UploadFile = File(...)):
 @app.get("/", response_class=HTMLResponse)
 def index():
     html_path = WEB_DIR / "index.html"
-    return html_path.read_text()
+    return html_path.read_text(encoding="utf-8")
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("server:app", host="localhost", port=3011, reload=False)
 
 # ── Raw image preview ─────────────────────────────────────────────────────────
 @app.get("/api/raw/{filename}")
@@ -910,7 +907,6 @@ def save_corrections(body: dict):
             if img is not None:
                 draw_labelled_image(img, info["labelled"], marked)
                 info["marked_b64"] = _cv_to_b64(cv2.imread(marked))
-    _corrected_basenames.add(basename)
     return {"ok": True, "saved": str(lbl_path), "n_labels": len(lines)}
 
 # ── Revert to original labels from disk backup ────────────────────────────────
@@ -1208,53 +1204,26 @@ def set_model(body: dict):
     return {"ok": True, "active": final}
 
 # ── Fine-tune from corrected labels ──────────────────────────────────────────
-@app.get("/api/corrected_files")
-def get_corrected_files():
-    """Return basenames corrected this session + all labelled basenames."""
-    lbl_dir  = DATASET_DIR / "labels" / "train"
-    all_lbls = sorted([f.stem for f in lbl_dir.glob("*.txt")]) if lbl_dir.exists() else []
-    return {
-        "corrected": sorted(_corrected_basenames),
-        "all":       all_lbls,
-    }
-
 @app.post("/api/train_from_corrections")
 def train_from_corrections(body: dict, background_tasks: BackgroundTasks):
     """
     Fine-tune FROM a chosen base model using corrected labels.
-    mode:        'incremental' = fine-tune from base_model
-                 'scratch'     = train from yolov8n-seg.pt
-    train_scope: 'corrected'   = only images corrected this session
-                 'all'         = all labelled images in dataset
-    train_files: explicit list of basenames (overrides train_scope)
+    mode: 'incremental' (default) = fine-tune from base_model
+          'scratch' = train from yolov8n-seg.pt
     """
     global _training_active
     if _training_active:
         return JSONResponse({"error": "Training already running"}, status_code=409)
 
-    epochs      = int(body.get("epochs", 5))
-    batch       = int(body.get("batch", 2))
-    imgsz       = int(body.get("imgsz", 640))
-    mode        = body.get("mode", "incremental")
-    base_model  = body.get("base_model", "")
-    train_scope = body.get("train_scope", "all")   # 'corrected' | 'all'
-    train_files = body.get("train_files", [])       # explicit list of basenames
+    epochs     = int(body.get("epochs", 5))
+    batch      = int(body.get("batch", 2))
+    imgsz      = int(body.get("imgsz", 640))
+    mode       = body.get("mode", "incremental")
+    base_model = body.get("base_model", "")   # explicit model path from UI
 
     lbl_dir = DATASET_DIR / "labels" / "train"
     if not lbl_dir.exists() or not list(lbl_dir.glob("*.txt")):
         return JSONResponse({"error": "No labels found. Run auto-label first."}, status_code=400)
-
-    # Resolve which files to train on
-    if train_files:
-        # Explicit list from UI checkboxes
-        selected = [b for b in train_files if (lbl_dir / (b + ".txt")).exists()]
-    elif train_scope == "corrected":
-        selected = [b for b in _corrected_basenames if (lbl_dir / (b + ".txt")).exists()]
-        if not selected:
-            return JSONResponse({"error": "No corrected images found this session. "
-                                          "Make corrections first, or choose 'All Images'."}, status_code=400)
-    else:
-        selected = []  # empty = all files
 
     if mode == "scratch":
         base = str(PROJECT_ROOT / "yolov8n-seg.pt")
@@ -1267,9 +1236,8 @@ def train_from_corrections(body: dict, background_tasks: BackgroundTasks):
         if not base:
             return JSONResponse({"error": "No trained model found. Run full training first."}, status_code=400)
 
-    background_tasks.add_task(_finetune_worker, epochs, batch, imgsz, base, selected)
-    return {"ok": True, "base_model": base, "mode": mode,
-            "train_scope": train_scope, "n_files": len(selected) if selected else "all"}
+    background_tasks.add_task(_finetune_worker, epochs, batch, imgsz, base)
+    return {"ok": True, "base_model": base, "mode": mode}
 
 
 @app.post("/api/merge_models")
@@ -1345,9 +1313,7 @@ def _merge_worker(model_a: str, model_b: str, alpha: float, name: str):
     except Exception as e:
         _push(f"ERROR merging: {e}\n{traceback.format_exc()}", status="Merge failed")
 
-def _finetune_worker(epochs: int, batch: int, imgsz: int, base_model: str,
-                     train_files: list = None):
-    """train_files: list of basenames to train on. Empty/None = all files."""
+def _finetune_worker(epochs: int, batch: int, imgsz: int, base_model: str):
     global _training_active
     _training_active = True
     yaml_path = DATASET_DIR / "dataset.yaml"
@@ -1369,74 +1335,28 @@ def _finetune_worker(epochs: int, batch: int, imgsz: int, base_model: str,
         size_mb = os.path.getsize(base_model) / 1024 / 1024
         _push(f"  Loaded: {Path(base_model).name}  ({size_mb:.1f}MB)")
 
-        # Validate base model
+        # Validate: check this model has been trained (not just base pretrained)
         try:
             ckpt = model.ckpt or {}
             tr   = ckpt.get("train_results", {})
-            epochs_trained = len(tr.get("epoch", []))
+            ep   = ckpt.get("epoch", -1)
             map50_list = tr.get("metrics/mAP50(B)", [])
             best_map50 = max(map50_list) if map50_list else 0
-            _push(f"  Base model stats: epochs_trained={epochs_trained}, best_mAP50={best_map50:.4f}")
-            if epochs_trained == 0:
-                _push(f"  ⚠️ WARNING: Base model has no training history — using pretrained weights only")
-            elif best_map50 < 0.01:
-                _push(f"  ⚠️ WARNING: mAP50={best_map50:.4f} is very low — need more images (100+ per class)")
+            _push(f"  Base model stats: epoch={ep}, best_mAP50={best_map50:.3f}")
+            if ep < 0 or best_map50 == 0:
+                _push(f"  ⚠️ WARNING: Base model appears undertrained (epoch={ep}, mAP50={best_map50})")
+                _push(f"  ⚠️ Consider using a better base model from Model Versions panel")
         except Exception as ve:
             _push(f"  Could not read model stats: {ve}")
 
-        # ── Resolve which label files to train on ──────────────────────────────────────────────────────────────
-        lbl_dir      = DATASET_DIR / "labels" / "train"
-        img_dir      = DATASET_DIR / "images" / "train"
-        all_lbl      = sorted(lbl_dir.glob("*.txt"))
-
-        if train_files:
-            # Filter to only the selected basenames
-            sel_set   = set(train_files)
-            use_files = [lf for lf in all_lbl if lf.stem in sel_set]
-            scope_tag = f"corrected ({len(use_files)} image(s))"
-        else:
-            use_files = all_lbl
-            scope_tag = f"all ({len(use_files)} image(s))"
-
-        n_images = len(use_files)
-        _push(f"  Training scope: {scope_tag}")
-        for lf in use_files:
+        # Count corrected images
+        lbl_dir = DATASET_DIR / "labels" / "train"
+        lbl_files = list(lbl_dir.glob("*.txt"))
+        n_images = len(lbl_files)
+        _push(f"  Training on {n_images} corrected image(s):")
+        for lf in sorted(lbl_files):
             n = len([l for l in lf.read_text().splitlines() if l.strip()])
             _push(f"    [{lf.stem}]  labels: {n}")
-
-        if n_images == 0:
-            _push("ERROR: No matching label files found", status="Error")
-            _training_active = False; return
-
-        # If training on a subset, create a temporary dataset.yaml pointing to a temp folder
-        import tempfile, datetime as _dt
-        if train_files:
-            tmp_dir  = Path(tempfile.mkdtemp(prefix="ft_subset_"))
-            tmp_imgs = tmp_dir / "images" / "train"
-            tmp_lbls = tmp_dir / "labels" / "train"
-            tmp_imgs.mkdir(parents=True); tmp_lbls.mkdir(parents=True)
-            for lf in use_files:
-                shutil.copy2(str(lf), str(tmp_lbls / lf.name))
-                # Copy matching image (try all extensions)
-                for ext in [".jpg", ".jpeg", ".png", ".bmp"]:
-                    src_img = img_dir / (lf.stem + ext)
-                    if src_img.exists():
-                        shutil.copy2(str(src_img), str(tmp_imgs / src_img.name))
-                        break
-            # Write temp yaml
-            tmp_yaml = tmp_dir / "dataset.yaml"
-            orig_yaml = yaml_path.read_text()
-            # Replace path line
-            new_yaml = "\n".join(
-                (f"path: {tmp_dir}" if l.startswith("path:") else l)
-                for l in orig_yaml.splitlines()
-            )
-            tmp_yaml.write_text(new_yaml)
-            active_yaml = str(tmp_yaml)
-            _push(f"  Temp dataset created at: {tmp_dir}")
-        else:
-            active_yaml = str(yaml_path)
-            tmp_dir = None
 
         metrics_final = {}
 
@@ -1467,21 +1387,24 @@ def _finetune_worker(epochs: int, batch: int, imgsz: int, base_model: str,
                  ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
         _push(f"  Device: {device}")
 
-        run_name    = f"finetune_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        import datetime
+        run_name = f"finetune_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         project_dir = str(DATASET_DIR / "runs")
 
+        # Fine-tuning config: freeze backbone, low LR, explicit optimizer
         model.train(
-            data=active_yaml, epochs=epochs, batch=batch, imgsz=imgsz,
+            data=str(yaml_path), epochs=epochs, batch=batch, imgsz=imgsz,
             device=device, project=project_dir, name=run_name,
             workers=0, amp=True, verbose=False,
-            optimizer="SGD", lr0=0.0005, lrf=0.01,
-            momentum=0.937, weight_decay=0.0005,
-            warmup_epochs=1, freeze=10, close_mosaic=0,
+            optimizer="SGD",      # explicit — prevents auto override of lr0
+            lr0=0.0005,           # very low LR for incremental fine-tuning
+            lrf=0.01,
+            momentum=0.937,
+            weight_decay=0.0005,
+            warmup_epochs=1,
+            freeze=10,            # freeze first 10 layers (backbone) — preserve learned features
+            close_mosaic=0,       # disable mosaic for small datasets
         )
-
-        # Clean up temp dir
-        if tmp_dir and tmp_dir.exists():
-            shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
         cands = glob.glob(os.path.join(project_dir, run_name, "weights", "best.pt"))
         if not cands:
@@ -1584,110 +1507,3 @@ def delete_metadata(body: dict):
         meta_path.unlink()
         return {"ok": True, "deleted": str(meta_path)}
     return {"ok": False, "error": "No metadata file found"}
-
-# ── IFC Properties ────────────────────────────────────────────────────────────
-from logic.ifc_properties import IFC_SCHEMA, MATERIALS, get_default_pset, validate_pset
-
-# In-memory store: basename -> {cls_idx_key -> {pset_name -> {prop -> value}}}
-_ifc_props: dict = {}
-
-@app.get("/api/ifc/schema")
-def get_ifc_schema():
-    """Return full IFC schema for all classes."""
-    return {"schema": IFC_SCHEMA, "materials": MATERIALS}
-
-@app.get("/api/ifc/schema/{cls_name}")
-def get_ifc_schema_for_class(cls_name: str):
-    """Return IFC schema for a specific class."""
-    from logic.ifc_properties import get_schema
-    schema = get_schema(cls_name)
-    if not schema:
-        return JSONResponse({"error": f"No schema for {cls_name}"}, status_code=404)
-    return {"cls_name": cls_name, "schema": schema,
-            "defaults": get_default_pset(cls_name)}
-
-@app.get("/api/ifc/props/{basename}")
-def get_ifc_props(basename: str):
-    """Get all IFC properties for a labelled image."""
-    props = _ifc_props.get(basename, {})
-    # Also load from disk if exists
-    props_path = DATASET_DIR / "metadata" / (basename + "_ifc_props.json")
-    if not props and props_path.exists():
-        try:
-            props = json.loads(props_path.read_text())
-            _ifc_props[basename] = props
-        except Exception:
-            pass
-    return {"basename": basename, "props": props}
-
-@app.post("/api/ifc/props/{basename}")
-def save_ifc_props(basename: str, body: dict):
-    """Save IFC properties for a specific label (cls + idx)."""
-    cls_name  = body.get("cls_name")
-    idx       = int(body.get("idx", 1))
-    subtype   = body.get("subtype", "")
-    pset_data = body.get("psets", {})
-    material  = body.get("material", "")
-    color     = body.get("color", "")
-    dims      = body.get("dimensions", {})
-
-    if not cls_name:
-        return JSONResponse({"error": "cls_name required"}, status_code=400)
-
-    # Validate psets against schema
-    cleaned = validate_pset(cls_name, pset_data)
-
-    key = f"{cls_name}_{idx}"
-    if basename not in _ifc_props:
-        _ifc_props[basename] = {}
-
-    _ifc_props[basename][key] = {
-        "cls_name":   cls_name,
-        "idx":        idx,
-        "ifc_class":  IFC_SCHEMA.get(cls_name, {}).get("ifc_class", "IfcBuildingElement"),
-        "subtype":    subtype,
-        "psets":      cleaned,
-        "material":   material,
-        "color":      color,
-        "dimensions": dims,
-        "updated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
-    }
-
-    # Persist to disk
-    props_path = DATASET_DIR / "metadata" / (basename + "_ifc_props.json")
-    props_path.parent.mkdir(parents=True, exist_ok=True)
-    props_path.write_text(json.dumps(_ifc_props[basename], indent=2))
-
-    return {"ok": True, "key": key, "ifc_class": _ifc_props[basename][key]["ifc_class"]}
-
-@app.delete("/api/ifc/props/{basename}/{key}")
-def delete_ifc_prop(basename: str, key: str):
-    """Delete IFC properties for a specific label."""
-    if basename in _ifc_props and key in _ifc_props[basename]:
-        del _ifc_props[basename][key]
-        props_path = DATASET_DIR / "metadata" / (basename + "_ifc_props.json")
-        if props_path.exists():
-            props_path.write_text(json.dumps(_ifc_props.get(basename, {}), indent=2))
-        return {"ok": True}
-    return JSONResponse({"error": "Not found"}, status_code=404)
-
-@app.get("/api/ifc/export/{basename}")
-def export_ifc_props(basename: str):
-    """Export IFC properties as structured JSON for IFC builder."""
-    props = _ifc_props.get(basename, {})
-    if not props:
-        props_path = DATASET_DIR / "metadata" / (basename + "_ifc_props.json")
-        if props_path.exists():
-            props = json.loads(props_path.read_text())
-
-    export = {
-        "basename": basename,
-        "elements": [],
-        "summary": {}
-    }
-    for key, data in props.items():
-        export["elements"].append(data)
-        cls = data.get("cls_name", "Unknown")
-        export["summary"][cls] = export["summary"].get(cls, 0) + 1
-
-    return export
