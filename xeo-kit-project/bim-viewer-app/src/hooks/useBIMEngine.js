@@ -327,6 +327,7 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
             }
             if (edit.scale) entity.scale = edit.scale;
             if (edit.offset) entity.offset = edit.offset;
+            if (edit.visible === false) entity.visible = false;
           });
         }
       });
@@ -791,39 +792,30 @@ const getCursorWorldPosition = (canvasPos) => {
     }
   };
 
- const isolateAndMakeMoveable = async (entityId, onAdoptCallback) => {
+ // Add `updateStructuralEdit` to the arguments
+  const isolateAndMakeMoveable = async (entityId, onAdoptCallback, updateStructuralEdit) => {
     if (!file) return;
-    
-    // Dynamically calculate the jobId exactly like useProjectSync.js does
     const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
 
     try {
-      // Use the API_BASE_URL to hit port 3000 instead of 5173
-      const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${entityId}/isolate`, {
-        method: 'POST',
-      });
-
-      if (!response.ok) {
-        console.error('[BIM Engine] Isolate request failed:', response.status);
-        return;
-      }
+      const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${entityId}/isolate`, { method: 'POST' });
+      if (!response.ok) return;
 
       const data = await response.json();
-      const { fileUrl } = data;
-      if (!fileUrl) {
-        console.error('[BIM Engine] Isolate response missing fileUrl.');
-        return;
-      }
-
-      // Hide the native element
+      
+      // Hide the native element AND save that action to state memory
       const nativeEntity = viewerRef.current?.scene.objects[entityId];
       if (nativeEntity) {
         nativeEntity.visible = false;
+        if (updateStructuralEdit) {
+            updateStructuralEdit(entityId, 'visible', null, false);
+        }
       }
 
-      // Load the new standalone asset
+      // (Leave the rest of the function untouched...)
       const newInstanceId = `${entityId}_isolated`;
-      await loadIFCAssetIntoScene(newInstanceId, fileUrl);
+      await loadIFCAssetIntoScene(newInstanceId, data.fileUrl);
+      
 
       // Update the metadata panel
       const metaObject = viewerRef.current?.metaScene.metaObjects[entityId];

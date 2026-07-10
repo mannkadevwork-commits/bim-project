@@ -268,18 +268,57 @@ export const useProjectSync = (file) => {
   // never rewritten. We only ever persist a scale ratio / offset delta
   // per element, and re-apply it visually on load.
   // ─────────────────────────────────────────────────────────────
+  // const updateStructuralEdit = (entityId, transformType, axis, value) => {
+  //   if (!entityId) return;
+  //   if (transformType !== 'scale' && transformType !== 'offset') {
+  //     console.warn(`[ProjectSync] Unknown structural edit type: ${transformType}`);
+  //     return;
+  //   }
+
+  //   setProjectState(prev => {
+  //     const existingEdit = prev.structural_edits[entityId] || { scale: [1, 1, 1], offset: [0, 0, 0] };
+  //     const defaultVector = transformType === 'scale' ? [1, 1, 1] : [0, 0, 0];
+  //     const updatedVector = [...(existingEdit[transformType] || defaultVector)];
+  //     updatedVector[axis] = value;
+
+  //     return {
+  //       ...prev,
+  //       structural_edits: {
+  //         ...prev.structural_edits,
+  //         [entityId]: {
+  //           ...existingEdit,
+  //           [transformType]: updatedVector,
+  //         },
+  //       },
+  //     };
+  //   });
+  // };
+
+
   const updateStructuralEdit = (entityId, transformType, axis, value) => {
     if (!entityId) return;
-    if (transformType !== 'scale' && transformType !== 'offset') {
+    if (transformType !== 'scale' && transformType !== 'offset' && transformType !== 'visible') {
       console.warn(`[ProjectSync] Unknown structural edit type: ${transformType}`);
       return;
     }
 
     setProjectState(prev => {
-      const existingEdit = prev.structural_edits[entityId] || { scale: [1, 1, 1], offset: [0, 0, 0] };
+      const existingEdit = prev.structural_edits[entityId] || { scale: [1, 1, 1], offset: [0, 0, 0], visible: true };
+      
+      // Handle direct visibility overrides
+      if (transformType === 'visible') {
+          return {
+            ...prev,
+            structural_edits: {
+              ...prev.structural_edits,
+              [entityId]: { ...existingEdit, visible: value },
+            },
+          };
+      }
+
       const defaultVector = transformType === 'scale' ? [1, 1, 1] : [0, 0, 0];
       const updatedVector = [...(existingEdit[transformType] || defaultVector)];
-      updatedVector[axis] = value;
+      if (axis !== null) updatedVector[axis] = value;
 
       return {
         ...prev,

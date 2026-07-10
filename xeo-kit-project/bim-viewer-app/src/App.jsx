@@ -20,17 +20,29 @@ function App() {
   };
 
   // Triggered when user confirms deletion in the popup
-  const confirmDelete = () => {
+  // Triggered when user confirms deletion in the popup
+  const confirmDelete = async () => {
     if (modelFile) {
-      // 1. Clear the specific local storage for this project
       const jobId = `job_${modelFile.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+      
+      // 1. Clear the specific local storage for this project
       localStorage.removeItem(`hci_state_${jobId}`);
+
+      // 2. Clear the backend server memory for this project
+      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+      try {
+        await fetch(`${API_BASE_URL}/api/projects/${jobId}`, {
+          method: 'DELETE'
+        });
+      } catch (err) {
+        console.error("Failed to delete project on backend:", err);
+      }
     }
     
-    // 2. Clear the model from the viewer
+    // 3. Clear the model from the viewer
     setModelFile(null);
     
-    // 3. Close the modal and reopen the Upload screen to add a blank layout
+    // 4. Close the modal and reopen the Upload screen to add a blank layout
     setIsDeleteModalOpen(false);
     setIsUploadOpen(true); 
   };

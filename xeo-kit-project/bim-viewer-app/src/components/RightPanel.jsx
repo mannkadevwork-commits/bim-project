@@ -278,11 +278,11 @@ export const RightPanel = ({
 
                                 {!activeAsset && selectedObject && (
                                   <button 
-                                    className="w-full mt-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition text-xs font-semibold"
-                                    onClick={() => engineActions.isolateAndMakeMoveable(selectedObject.id, adoptIsolatedAsset)}
-                                  >
-                                    Make Element Moveable
-                                  </button>
+  className="w-full mt-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition text-xs font-semibold"
+  onClick={() => engineActions.isolateAndMakeMoveable(selectedObject.id, adoptIsolatedAsset, updateStructuralEdit)}
+>
+  Make Element Moveable
+</button>
                                 )}
 
                                 {/* Rotation ONLY for Dynamically Dropped Assets */}
@@ -395,7 +395,7 @@ export const RightPanel = ({
                                                 Parametric editing disabled for complex mesh. Using 3D scaling.
                                             </div>
                                         )}
-                                        <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-1.5"><Maximize2 className="w-3.5 h-3.5"/> Scale / Resize</h4>
+                                        {/* <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-1.5"><Maximize2 className="w-3.5 h-3.5"/> Scale / Resize</h4>
                                         <div className="space-y-4">
                                             <div>
                                                 <label className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 flex justify-between mb-1">
@@ -415,7 +415,7 @@ export const RightPanel = ({
                                                 </label>
                                                 <input type="range" min={SCALE_RANGE[0]} max={SCALE_RANGE[1]} step="0.05" value={liveTransform.scaleZ} onChange={(e) => handleSlider(2, e.target.value, 'scale')} className="w-full accent-amber-500" />
                                             </div>
-                                        </div>
+                                        </div> */}
                                     </div>
                                 )}
 

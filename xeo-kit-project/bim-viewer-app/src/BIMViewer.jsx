@@ -10,7 +10,7 @@ import { RenderStudioModal } from './components/RenderStudioModal';
 import { MeasurementPanel } from './components/MeasurementPanel';
 
 import {
-  MousePointerClick, X, Ruler
+  MousePointerClick, X, Ruler,Hexagon,Loader2
 } from 'lucide-react';
 
 const BIMViewer = ({ file, onDelete, onAdd }) => {
@@ -370,6 +370,31 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         setRenderError={setRenderError}
       />
       
+      {/* ── LOADER OVERLAY (For Rescaling / AI Processing) ── */}
+      {engineState.isLoading && (
+        <div className="absolute inset-0 z-[200] flex flex-col items-center justify-center bg-slate-900/60 backdrop-blur-md animate-in fade-in duration-300">
+          <div className="relative flex flex-col items-center">
+            <div className="w-32 h-32 border-4 border-indigo-500/30 rounded-3xl flex items-center justify-center relative overflow-hidden shadow-[0_0_50px_rgba(99,102,241,0.3)] bg-slate-900/80">
+              <div className="absolute top-0 left-0 w-full h-1 bg-cyan-400 shadow-[0_0_30px_rgba(34,211,238,1)]" style={{ animation: 'scan 1.5s ease-in-out infinite alternate' }} />
+              <style>{`
+                @keyframes scan {
+                  0% { transform: translateY(0); }
+                  100% { transform: translateY(128px); }
+                }
+              `}</style>
+              <Hexagon className="w-14 h-14 text-indigo-400 animate-pulse" />
+            </div>
+            <h3 className="mt-8 text-2xl font-bold text-white tracking-wide drop-shadow-md">Recalculating 3D Matrix</h3>
+            <p className="mt-2 text-sm text-slate-300 font-medium max-w-sm text-center leading-relaxed">
+              Rebuilding geometry bounds and synchronizing structural scale proportions...
+            </p>
+            <div className="flex items-center gap-2 mt-5 text-cyan-400">
+              <Loader2 className="w-5 h-5 animate-spin" />
+              <span className="text-xs font-bold uppercase tracking-widest">Processing</span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

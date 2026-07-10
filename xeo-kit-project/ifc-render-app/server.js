@@ -501,6 +501,23 @@ app.post('/api/render', upload.single('ifcFile'), (req, res) => {
   }
 });
 
+app.delete('/api/projects/:jobId', (req, res) => {
+    try {
+        const jobId = req.params.jobId;
+        const jobDirPath = path.join(jobsDir, jobId);
+        
+        // Completely wipe the job folder from the server
+        if (fs.existsSync(jobDirPath)) {
+            fs.rmSync(jobDirPath, { recursive: true, force: true });
+        }
+        
+        res.json({ success: true, message: 'Project completely wiped from server' });
+    } catch (error) {
+        console.error("Delete Error:", error);
+        res.status(500).json({ error: 'Failed to delete project from server' });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 HC Interior Backend running on port ${PORT}`);
