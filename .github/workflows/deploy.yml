@@ -10,11 +10,12 @@ jobs:
     runs-on: self-hosted  # Tells GitHub to use the Windows runner on your server
     steps:
       
-      - name: 1. Pull Latest Code
+      - name: 1. Pull Latest Code (Force Reset)
         shell: powershell
         run: |
           cd C:\Projects\bim-project
-          git pull origin main
+          git fetch --all
+          git reset --hard origin/main
 
       - name: 2. Deploy React Frontend
         shell: powershell
