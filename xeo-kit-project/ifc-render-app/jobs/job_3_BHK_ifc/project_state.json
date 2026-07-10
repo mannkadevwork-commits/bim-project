@@ -1,4 +1,19 @@
 {
+  "structural_edits": {
+    "0YluNCasPDEQ9ou8lGzXFY": {
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": false
+    }
+  },
   "materials": {},
   "furniture": [
     {
@@ -17,6 +32,5 @@
         0
       ]
     }
-  ],
-  "structural_edits": {}
+  ]
 }
