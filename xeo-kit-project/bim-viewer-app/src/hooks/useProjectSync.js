@@ -233,12 +233,18 @@ export const useProjectSync = (file) => {
   // ─────────────────────────────────────────────────────────────
   // ACTION: Spawn a single asset (Drag & Drop or Click)
   // ─────────────────────────────────────────────────────────────
-  const spawnAsset = (asset, coordinates, loadIFCAssetIntoScene) => {
+  const spawnAsset = (asset, coordinates, loadIFCAssetIntoScene, rotation = [0, 0, 0]) => {
     const uniqueId = `${asset.id}_${Date.now()}`;
     const urlPath = asset.url || asset.src || `/assets/${asset.id}.ifc`;
     const fullAssetUrl = urlPath.startsWith('http')
       ? urlPath                         
       : `${API_BASE_URL}${urlPath}`;    
+
+      // --- ADD THESE LOGS ---
+    console.log("--- STATE SYNC DEBUG ---");
+    console.log("Furniture ID:", uniqueId);
+    console.log("Position saved to State:", coordinates);
+    // ----------------------
 
     setProjectState(prev => ({
       ...prev,
@@ -250,12 +256,12 @@ export const useProjectSync = (file) => {
           name: asset.name,
           src: fullAssetUrl,
           position: coordinates,
-          rotation: [0, 0, 0],
+          rotation: rotation,
         },
       ],
     }));
 
-    loadIFCAssetIntoScene(uniqueId, fullAssetUrl, coordinates, [0, 0, 0]);
+    loadIFCAssetIntoScene(uniqueId, fullAssetUrl, coordinates, rotation);
 
     setToastMessage(`${asset.name} placed!`);
     setTimeout(() => setToastMessage(null), 3000);

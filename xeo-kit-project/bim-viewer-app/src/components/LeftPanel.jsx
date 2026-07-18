@@ -7,6 +7,7 @@ export const LeftPanel = ({
   homeTemplates, onApplyTemplate ,fileName
 }) => {
   const [leftTab, setLeftTab] = useState('explorer');
+  const [activeCategory, setActiveCategory] = useState('All');
 
   return (
     <div className={`flex flex-col h-full bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 transition-all duration-300 z-20 ${isOpen ? 'w-80' : 'w-0 overflow-hidden border-none'}`}>
@@ -62,38 +63,62 @@ export const LeftPanel = ({
             <p className="text-xs text-slate-400 dark:text-slate-500 mb-3 text-center">
               Drag an asset onto the 3D view, or click to enter placement mode.
             </p>
-            <div className="grid grid-cols-2 gap-3">
-              {availableAssets.map(asset => (
-                <div
-                  key={asset.id}
-                  draggable={true}
-                  onDragStart={(e) => {
-                    const payload = JSON.stringify({
-                      id: asset.id,
-                      name: asset.name,
-                      url: asset.url || `/assets/${asset.id}.ifc`,
-                    });
-                    e.dataTransfer.setData('application/json', payload); 
-                    e.dataTransfer.effectAllowed = 'copy';
-                  }}
-                  onClick={() => { setPlacementMode(asset); resetSelection(); }}
-                  className={`flex flex-col items-center justify-center p-4 border rounded-xl transition-all group cursor-grab active:cursor-grabbing
-                    ${placementMode?.id === asset.id
-                      ? 'bg-indigo-50 border-indigo-500 dark:bg-indigo-900/30 dark:border-indigo-400 shadow-sm'
-                      : 'bg-slate-50 hover:bg-white dark:bg-slate-800/50 dark:hover:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-indigo-300 dark:hover:border-indigo-700'
-                    }`}
-                >
-                  <div className="mb-2 text-slate-500 group-hover:text-indigo-500 transition-colors pointer-events-none">
-                    <Database className="w-5 h-5" />
-                  </div>
-                  <span className="text-xs font-semibold text-slate-700 dark:text-slate-300 text-center pointer-events-none">
-                    {asset.name}
-                  </span>
-                </div>
-              ))}
+            
+
+           {/* --- NEW: Category Filter Pills --- */}
+      <div className="flex gap-2 mb-4 overflow-x-auto pb-1 scrollbar-hide">
+        {['All', 'Structural', 'Furniture'].map(cat => (
+          <button
+            key={cat}
+            onClick={() => setActiveCategory(cat)}
+            className={`px-3 py-1.5 rounded-full text-[10px] font-bold tracking-wide uppercase transition-colors shrink-0 cursor-pointer ${
+              activeCategory === cat 
+                ? 'bg-indigo-600 text-white shadow-sm' 
+                : 'bg-slate-100 text-slate-500 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-slate-700'
+            }`}
+          >
+            {cat}
+          </button>
+        ))}
+      </div>
+      {/* ----------------------------------- */}
+
+      <div className="grid grid-cols-2 gap-3">
+        {/* --- NEW: Filter the mapped assets --- */}
+        {availableAssets
+          .filter(asset => activeCategory === 'All' || asset.category === activeCategory)
+          .map(asset => (
+          <div
+            key={asset.id}
+            draggable={true}
+            onDragStart={(e) => {
+              const payload = JSON.stringify({
+                id: asset.id,
+                name: asset.name,
+                url: asset.url || `/assets/${asset.id}.ifc`,
+                type: asset.type // Important: ensure type is passed for the raycaster logic
+              });
+              e.dataTransfer.setData('application/json', payload);
+              e.dataTransfer.effectAllowed = 'copy';
+            }}
+            onClick={() => { setPlacementMode(asset); resetSelection(); }}
+            className={`flex flex-col items-center justify-center p-4 border rounded-xl transition-all group cursor-grab active:cursor-grabbing
+              ${placementMode?.id === asset.id
+                ? 'bg-indigo-50 border-indigo-500 dark:bg-indigo-900/30 dark:border-indigo-400 shadow-sm'
+                : 'bg-slate-50 hover:bg-white dark:bg-slate-800/50 dark:hover:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-indigo-300 dark:hover:border-indigo-700'
+              }`}
+          >
+            <div className="mb-2 text-slate-500 group-hover:text-indigo-500 transition-colors pointer-events-none">
+              <Database className="w-5 h-5" />
             </div>
-          </>
-        )}
+            <span className="text-xs font-semibold text-slate-700 dark:text-slate-300 text-center pointer-events-none">
+              {asset.name}
+            </span>
+          </div>
+        ))}
+      </div>
+    </>
+  )}
       </div>
 
       {/* Predefined Home Templates */}

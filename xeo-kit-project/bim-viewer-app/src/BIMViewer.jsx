@@ -2,35 +2,24 @@ import { useState, useRef, useEffect } from 'react';
 import { useBIMEngine } from './hooks/useBIMEngine';
 import { useProjectSync } from './hooks/useProjectSync';
 import { useCloudRender } from './hooks/useCloudRender';
-
 import { LeftPanel } from './components/LeftPanel';
 import { RightPanel } from './components/RightPanel';
 import { BottomDock } from './components/BottomDock';
 import { RenderStudioModal } from './components/RenderStudioModal';
 import { MeasurementPanel } from './components/MeasurementPanel';
-
-import {
-  MousePointerClick, X, Ruler,Hexagon,Loader2
-} from 'lucide-react';
+import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
 
 const BIMViewer = ({ file, onDelete, onAdd }) => {
   const containerRef = useRef(null);
   const tooltipRef = useRef(null);
-
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(true);
   const [isRightPanelOpen, setIsRightPanelOpen] = useState(true);
   const [isMaxView, setIsMaxView] = useState(false);
   const [rightTab, setRightTab] = useState('properties');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showRenderStudio, setShowRenderStudio] = useState(false);
-  
-  // Track manual saving state for button animation
   const [isManualSaving, setIsManualSaving] = useState(false);
-
-  // Manage Dark Mode locally
-  const [isDarkMode, setIsDarkMode] = useState(
-    document.documentElement.classList.contains('dark')
-  );
+  const [isDarkMode, setIsDarkMode] = useState(document.documentElement.classList.contains('dark'));
 
   const toggleTheme = () => {
     if (isDarkMode) {
@@ -42,31 +31,126 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     }
   };
 
-  // ── Custom Hooks ────────────────────────────────────────────
+  // --- 1. DESTRUCTURE setToastMessage ---
   const {
-    projectState, projectStateRef, saveStatus, lastSavedTime, 
+    projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, homeTemplates,
-    toastMessage, customColor, applyMaterial, updateAsset, 
+    toastMessage, customColor, applyMaterial, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
-    updateStructuralEdit
+    updateStructuralEdit, setToastMessage 
   } = useProjectSync(file);
 
+  // --- 2. ADD THE PHASE 4 INSERT DOOR LOGIC ---
+  const insertDoor = async (asset, wallSnapData) => {
+    if (!file) return;
+    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    
+    const { position, rotation, wallGlobalId } = wallSnapData;
+
+    // BUGFIX: this used to also subtract wallNormal * 0.075 here to
+    // "push into the wall center" — but ifc_element_editor.py's
+    // cmd_insert_door ALREADY does that same inward push, using the
+    // wall's real measured half-thickness (not a guessed 7.5cm
+    // constant). Doing it in both places stacked the two offsets, so
+    // the actual cut ended up centered somewhere other than where the
+    // door mesh below got drawn — that mismatch is what was showing up
+    // as doors rendering "inside"/"embedded in" the wall.
+    // Fix: send the RAW wall-surface click position, untouched on X/Z.
+    // Python is the single source of truth for centering across the
+    // wall's thickness, since it's the only side that actually knows
+    // the wall's real thickness. Floor-snapping (Y=0) is fine to keep
+    // here — Python uses Z exactly as passed, by design (Phase 3), so
+    // this is the one Y-adjustment that's supposed to happen frontend-side.
+    const doorSurfacePosition = [position[0], 0, position[2]];
+
+    // 2. Dimensions per door type — used for the door's own asset
+    // scale/rendering only. NOT the wall's thickness (a slab door's own
+    // leaf is 4-10cm; a real wall is usually 10-25cm — sending this as
+    // "wall thickness" was the other half of the original bug). Python
+    // now ignores this for the cut and always measures the real wall.
+    const doorDims = {
+      'door_single': { width: 0.9, height: 2.1, thickness: 0.05 },
+      'door_double': { width: 1.2, height: 2.1, thickness: 0.05 },
+      'door_sliding': { width: 2.0, height: 2.1, thickness: 0.05 },
+      'door_revolving': { width: 2.0, height: 2.1, thickness: 0.1 },
+      'door_fire': { width: 1.0, height: 2.1, thickness: 0.06 },
+      'door_3bhk': { width: 0.9, height: 2.1, thickness: 0.04 },
+    }[asset.id] || { width: 0.9, height: 2.1, thickness: 0.05 };
+
+    engineActions.setIsLoading(true);
+    setToastMessage(`Cutting void in wall...`);
+
+    try {
+      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+      const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${wallGlobalId}/insert-door`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          assetId: asset.id, 
+          position: doorSurfacePosition, 
+          rotation,
+          ...doorDims 
+        })
+      });
+
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error || 'Failed to insert door');
+
+      // Hide original native wall
+      if (refs.viewerRef.current?.scene.objects[wallGlobalId]) {
+        refs.viewerRef.current.scene.objects[wallGlobalId].visible = false;
+      }
+      updateStructuralEdit(wallGlobalId, 'visible', null, false);
+
+      // Pass `null` for targetPosition & rotation so the new cut wall
+      // spawns exactly at its native architectural coordinates.
+      const modifiedWallId = `${wallGlobalId}_cut_${Date.now()}`;
+      await engineActions.loadIFCAssetIntoScene(modifiedWallId, data.fileUrl, null, null);
+      adoptIsolatedAsset(wallGlobalId, modifiedWallId, data.fileUrl, 'Wall with Void');
+
+      // BUGFIX: place the door mesh using the backend's doorPlacement —
+      // the EXACT center Python cut the void at — rather than a
+      // frontend-guessed position. This is the single-source-of-truth
+      // fix: whatever centering math ran, it only ran once, and both
+      // the hole and the visual door now agree on where that is.
+      if (!data.doorPlacement) {
+        throw new Error('Backend did not return doorPlacement — check ifc_element_editor.py version.');
+      }
+      asset.hostWallId = wallGlobalId;
+      spawnAsset(asset, data.doorPlacement.position, engineActions.loadIFCAssetIntoScene, data.doorPlacement.rotation);
+
+    } catch (error) {
+      console.error('[BIMViewer] Door insertion failed:', error);
+      setToastMessage(`Error: ${error.message}`);
+    } finally {
+      engineActions.setIsLoading(false);
+    }
+  };
+
+  // --- 3. FORK THE PLACEMENT HANDLER ---
   const {
     refs, state: engineState, actions: engineActions,
   } = useBIMEngine(
     file,
     projectStateRef,
-    (asset, coords) => spawnAsset(asset, coords, engineActions.loadIFCAssetIntoScene),
+    (asset, data) => {
+      if (asset.type === 'door') {
+        insertDoor(asset, data);
+      } else {
+        spawnAsset(asset, data, engineActions.loadIFCAssetIntoScene);
+      }
+    },
     setIsRightPanelOpen,
     setRightTab
   );
 
+  // 👇 ADD THIS MISSING BLOCK BACK 👇
   const {
     state: renderState, config: renderConfig, setRenderConfig, executeRender,
     setRenderResult, setRenderError,
   } = useCloudRender(file, projectStateRef);
+  // 👆 ---------------------------- 👆
 
-  // ── Browser Fullscreen Handler ──
   useEffect(() => {
     const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
     document.addEventListener('fullscreenchange', handleFullscreenChange);
@@ -90,7 +174,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     const r = parseInt(hex.substring(1, 3), 16) / 255;
     const g = parseInt(hex.substring(3, 5), 16) / 255;
     const b = parseInt(hex.substring(5, 7), 16) / 255;
-
     const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
     applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b]);
     if (setCustomColor) setCustomColor(hex);
@@ -102,7 +185,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
 
   const updateCursorTooltip = (clientX, clientY, offsetX, offsetY) => {
     if (!tooltipRef.current || !engineActions.getCursorWorldPosition) return;
-    
     const canvasPos = [offsetX, offsetY];
     const worldPos = engineActions.getCursorWorldPosition(canvasPos);
     
@@ -127,16 +209,28 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
   const handlePointerLeave = () => { if (tooltipRef.current) tooltipRef.current.style.display = 'none'; };
   const handleDragEnter = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
 
-  const handleDrop = (e) => {
+  // --- 4. FORK THE DROP HANDLER ---
+  const handleDrop = async (e) => {
     e.preventDefault();
     try {
       const assetData = e.dataTransfer.getData('application/json');
       if (!assetData) return;
       const asset = JSON.parse(assetData);
       const canvasPos = [e.nativeEvent.offsetX, e.nativeEvent.offsetY];
-      const worldPos = engineActions.getDropPosition(canvasPos);
-      
-      spawnAsset(asset, worldPos, engineActions.loadIFCAssetIntoScene);
+
+      if (asset.type === 'door') {
+        const dropData = engineActions.getDropPosition(canvasPos, asset.type);
+        if (!dropData.snapped) {
+          setToastMessage("Please drop the door onto a vertical wall.");
+          setTimeout(() => setToastMessage(null), 3000);
+          return;
+        }
+        await insertDoor(asset, dropData);
+      } else {
+        const worldPos = engineActions.getDropPosition(canvasPos);
+        spawnAsset(asset, worldPos, engineActions.loadIFCAssetIntoScene);
+      }
+
       setIsRightPanelOpen(true);
       setRightTab('properties');
     } catch (error) {
@@ -144,14 +238,11 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     }
   };
 
-  // ── MANUAL SAVE TRIGGER ─────────────────────────────────────
   const handleManualSave = async () => {
     if (!file) return;
     setIsManualSaving(true);
-    
     const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
     const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-    
     try {
         await fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
             method: 'POST',
@@ -165,31 +256,26 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     }
   };
 
-  // ── AUTO SAVE LOOP ──────────────────────────────────────────
   useEffect(() => {
     if (!file) return;
     const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
     const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-
     const saveInterval = setInterval(() => {
       fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ projectState: projectStateRef.current })
       }).catch(err => console.error("Auto-save failed", err));
-    }, 15000); 
-
+    }, 15000);
     return () => clearInterval(saveInterval);
   }, [file]);
 
-  // ── FILE UPLOAD / RESET HANDLER ─────────────────────────────
   useEffect(() => {
     if (file) {
       projectStateRef.current = { materials: {}, furniture: [] };
       engineActions.setSelectedObject(null);
       engineActions.setSelectedAssetId(null);
       if (engineActions.clearMeasurements) engineActions.clearMeasurements();
-      
       setIsLeftPanelOpen(true);
       setIsRightPanelOpen(true);
     } else {
@@ -206,13 +292,12 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         ${engineState.placementMode || engineState.isMeasuring ? 'cursor-crosshair' : 'cursor-default'}
         ${isFullscreen ? 'z-[100]' : ''}`}
     >
-      <div 
-        ref={tooltipRef}
+      <div
+         ref={tooltipRef}
         className="fixed z-[999] pointer-events-none hidden px-3 py-2 bg-slate-900/95 backdrop-blur-xl border border-slate-700/50 rounded-xl shadow-2xl transition-opacity duration-75 text-xs font-mono"
         style={{ top: 0, left: 0, willChange: 'transform' }}
       />
-
-      {/* ── 1. THE 3D CANVAS ── */}
+      
       <div className={`absolute inset-0 z-0 ${!file ? 'opacity-0' : 'opacity-100 transition-opacity duration-1000'}`}>
         <canvas
           ref={refs.canvasRef}
@@ -229,7 +314,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         <canvas id="myNavCubeCanvas" ref={refs.navCubeCanvasRef} className="absolute bottom-16 right-6 z-10 w-[150px] h-[150px]" />
       </div>
 
-      {/* ── 2. ACTION PILLS (Placement & Measurement) ── */}
       {engineState.placementMode && !engineState.isMeasuring && (
         <div className="absolute top-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 px-5 py-2.5 bg-indigo-600 text-white rounded-full shadow-lg animate-in slide-in-from-top-2 fade-in duration-200">
           <MousePointerClick className="w-4 h-4 animate-pulse" />
@@ -278,7 +362,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         />
       )}
 
-      {/* ── 3. FULL-HEIGHT LEFT PANEL ── */}
       {file && (
         <div className={`absolute inset-y-0 left-0 w-80 z-30 transition-transform duration-300 ${isLeftPanelOpen ? 'translate-x-0' : '-translate-x-full'}`}>
           <LeftPanel
@@ -295,12 +378,11 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
               engineActions.setSelectedAssetId(null);
             }}
             fileName={file.name}
-            projectState={projectState} // <--- CRITICAL FIX: Passed projectState down so the Explorer sees the furniture
+            projectState={projectState} 
           />
         </div>
       )}
 
-      {/* ── 4. FULL-HEIGHT RIGHT PANEL ── */}
       {file && (
         <div className={`absolute inset-y-0 right-0 w-[340px] z-30 transition-transform duration-300 ${isRightPanelOpen ? 'translate-x-0' : 'translate-x-full'}`}>
           <RightPanel
@@ -322,8 +404,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
             engineActions={engineActions}
             adoptIsolatedAsset={adoptIsolatedAsset}
             updateStructuralEdit={updateStructuralEdit}
-            
-            // Global Header Props
             onDeleteProject={onDelete}
             isDarkMode={isDarkMode}
             toggleTheme={toggleTheme}
@@ -335,7 +415,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         </div>
       )}
 
-      {/* ── 5. BOTTOM DOCK (FIX: Snapped to bottom-0) ── */}
       {file && (
         <div className="absolute bottom-0 left-1/2 -translate-x-1/2 z-40 pb-4">
           <BottomDock
@@ -352,7 +431,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         </div>
       )}
 
-      {/* TOAST & MODALS */}
       {toastMessage && (
         <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-50 px-5 py-2.5 bg-slate-800/95 backdrop-blur-md text-white rounded-full shadow-2xl border border-slate-700 text-sm font-semibold animate-in slide-in-from-bottom-2 fade-in duration-200">
           {toastMessage}
@@ -370,7 +448,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         setRenderError={setRenderError}
       />
       
-      {/* ── LOADER OVERLAY (For Rescaling / AI Processing) ── */}
       {engineState.isLoading && (
         <div className="absolute inset-0 z-[200] flex flex-col items-center justify-center bg-slate-900/60 backdrop-blur-md animate-in fade-in duration-300">
           <div className="relative flex flex-col items-center">
@@ -384,9 +461,9 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
               `}</style>
               <Hexagon className="w-14 h-14 text-indigo-400 animate-pulse" />
             </div>
-            <h3 className="mt-8 text-2xl font-bold text-white tracking-wide drop-shadow-md">Recalculating 3D Matrix</h3>
+            <h3 className="mt-8 text-2xl font-bold text-white tracking-wide drop-shadow-md">Recalculating Geometry</h3>
             <p className="mt-2 text-sm text-slate-300 font-medium max-w-sm text-center leading-relaxed">
-              Rebuilding geometry bounds and synchronizing structural scale proportions...
+              Applying structural edits and updating constraints...
             </p>
             <div className="flex items-center gap-2 mt-5 text-cyan-400">
               <Loader2 className="w-5 h-5 animate-spin" />

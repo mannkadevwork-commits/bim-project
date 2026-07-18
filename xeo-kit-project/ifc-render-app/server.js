@@ -11,6 +11,8 @@ const app = express();
 app.use(cors());
 app.use(express.json()); 
 
+const { generate360ViewerFromGLB } = require('./aps-pipeline');
+
 // 1. Ensure dynamic directories exist
 const jobsDir = path.join(__dirname, 'jobs');
 const assetsDir = path.join(__dirname, 'assets'); 
@@ -43,12 +45,20 @@ const upload = multer({ storage: storage });
 // ==========================================
 app.get('/api/assets', (req, res) => {
     const catalog = [
-        { id: 'sofa', name: 'Modern Sofa', type: 'furniture', url: '/assets/sofa.ifc' },
-        { id: 'chair', name: 'Chair', type: 'furniture', url: '/assets/chair.ifc' },
-        { id: 'cabinet', name: 'Cabinet', type: 'furniture', url: '/assets/cabinet.ifc' },
-        { id: 'sink_mirror', name: 'Sink & Mirror', type: 'furniture', url: '/assets/sink_mirror.ifc' },
-        { id: 'commode', name: 'Commode', type: 'furniture', url: '/assets/commode.ifc' },
-        { id: 'wall', name: 'Wall', type: 'furniture', url: '/assets/wall.ifc' }
+        { id: 'sofa', name: 'Modern Sofa', type: 'furniture', category: 'Furniture', url: '/assets/sofa.ifc' },
+        { id: 'chair', name: 'Chair', type: 'furniture', category: 'Furniture', url: '/assets/chair.ifc' },
+        { id: 'cabinet', name: 'Cabinet', type: 'furniture', category: 'Furniture', url: '/assets/cabinet.ifc' },
+        { id: 'sink_mirror', name: 'Sink & Mirror', type: 'furniture', category: 'Furniture', url: '/assets/sink_mirror.ifc' },
+        { id: 'commode', name: 'Commode', type: 'furniture', category: 'Furniture', url: '/assets/commode.ifc' },
+        { id: 'wall', name: 'Wall', type: 'furniture', category: 'Furniture', url: '/assets/wall.ifc' },
+        
+
+        { id: 'door_3bhk', name: '3BHK Interior Door', type: 'door', category: 'Structural', url: '/assets/3BHK_Interior_Door.ifc' },
+        { id: 'door_single', name: 'Single Flush Door', type: 'door', category: 'Structural', url: '/assets/Single_Flush_Door.ifc' },
+        { id: 'door_double', name: 'Double Leaf Swing', type: 'door', category: 'Structural', url: '/assets/Double_Leaf_Swing_Door.ifc' },
+        { id: 'door_sliding', name: 'Auto Sliding Door', type: 'door', category: 'Structural', url: '/assets/Automatic_Sliding_Door.ifc' },
+        { id: 'door_revolving', name: 'Revolving Door', type: 'door', category: 'Structural', url: '/assets/Revolving_Commercial_Door.ifc' },
+        { id: 'door_fire', name: 'Fire-Rated Door', type: 'door', category: 'Structural', url: '/assets/Fire_Rated_Door.ifc' }
     ];
     res.json(catalog);
 });
@@ -227,6 +237,7 @@ const elementEditorScript = path.join(__dirname, 'ifc_element_editor.py');
 // edits turn out to be slow in practice on large IFC files, switch this
 // to the same async spawn + listener pattern used in /api/convert-floorplan.
 const { spawnSync } = require('child_process');
+const { log } = require('console');
 
 function runElementEditor(args) {
   const result = spawnSync('python', [elementEditorScript, ...args], { encoding: 'utf-8' });
@@ -354,6 +365,133 @@ app.post('/api/elements/:jobId/:globalId/isolate', (req, res) => {
 });
 
 
+// POST insert a door into a native wall via CSG boolean difference.
+// Node does NOT compute thickness/offset/bounding-box geometry — that's
+// Phase 3's job entirely inside ifc_element_editor.py. This route's only
+// responsibilities: validate the payload shape, relay it to Python
+// verbatim, and hand back a fileUrl. Same "edit a copy, never touch
+// input.ifc" pattern as /resize above.
+//
+// NOTE: spawn, not spawnSync. /resize, /isolate, and /rescale above all
+// use spawnSync because they're cheap attribute/matrix edits. A CSG
+// boolean difference against a wall's BRep is real geometry-kernel work
+// and can run into multi-second territory on a complex wall — spawnSync
+// would freeze the whole Node event loop (and every other in-flight
+// request on this server) for that entire duration. This mirrors the
+// async pattern already used for /api/convert-floorplan, which is the
+// other genuinely slow Python call in this file.
+app.post('/api/elements/:jobId/:globalId/insert-door', (req, res) => {
+  try {
+    const { jobId, globalId } = req.params;
+    const { assetId, position, rotation, width, height, thickness } = req.body;
+
+    console.log(`\n--- [CSG] Insert Door Request | Wall: ${globalId} | Asset: ${assetId} | Job: ${jobId} ---`);
+
+    if (!assetId) {
+      return res.status(400).json({ error: 'assetId is required.' });
+    }
+    const isVec3 = (v) => Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === 'number' && isFinite(n));
+    if (!isVec3(position)) {
+      return res.status(400).json({ error: 'position must be an array of 3 numbers [x, y, z].' });
+    }
+    if (!isVec3(rotation)) {
+      return res.status(400).json({ error: 'rotation must be an array of 3 numbers [x, y, z] in degrees.' });
+    }
+
+    const jobDirPath = path.join(jobsDir, jobId);
+    const inputIfcPath = path.join(jobDirPath, 'input.ifc');
+
+    if (!fs.existsSync(inputIfcPath)) {
+      return res.status(404).json({ error: 'input.ifc not found for this job.' });
+    }
+
+    const editsDir = path.join(jobDirPath, 'element_edits');
+    if (!fs.existsSync(editsDir)) fs.mkdirSync(editsDir, { recursive: true });
+
+    const outputFileName = `${globalId}_door_${Date.now()}.ifc`;
+    const outputPath = path.join(editsDir, outputFileName);
+
+    const args = [
+      elementEditorScript,
+      'insert-door',
+      '--input', inputIfcPath,
+      '--output', outputPath,
+      '--global-id', globalId,
+      '--asset-id', String(assetId),
+      '--position', position.join(','),
+      '--rotation', rotation.join(','),
+    ];
+
+    // Pass-through only — Node performs no math on these, and they're
+    // optional since Phase 3 may instead look dimensions up from
+    // asset_registry.json via assetId.
+    if (width !== undefined) args.push('--width', String(width));
+    if (height !== undefined) args.push('--height', String(height));
+    if (thickness !== undefined) args.push('--thickness', String(thickness));
+
+    console.log(`\n--- [CSG] Insert Door Request | Wall: ${globalId} | Asset: ${assetId} | Job: ${jobId} ---`);
+
+    const pythonProcess = spawn('python', args);
+
+    let stdoutData = '';
+    let stderrData = '';
+
+    pythonProcess.stdout.on('data', (data) => { stdoutData += data.toString(); });
+    pythonProcess.stderr.on('data', (data) => {
+      stderrData += data.toString();
+      console.error(`[Python Error]: ${data}`);
+    });
+
+    pythonProcess.on('error', (err) => {
+      console.error('[DoorInsert] Failed to launch ifc_element_editor.py:', err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: `Failed to launch Python: ${err.message}` });
+      }
+    });
+
+    pythonProcess.on('close', (code) => {
+      if (res.headersSent) return;
+
+      const trimmedStdout = stdoutData.trim();
+
+      if (code !== 0 || !fs.existsSync(outputPath)) {
+        return res.status(500).json({
+          error: 'Door insertion failed — no output IFC was produced.',
+          logs: stderrData || trimmedStdout,
+        });
+      }
+
+      // Tolerant JSON parse: the output file existing means the cut
+      // succeeded even if stdout wasn't clean JSON (e.g. stray banner
+      // text). Same spirit as the RENDER_RESULT_JSON: sentinel used
+      // elsewhere in this pipeline — worth adopting here too in Phase 3
+      // if ifc_element_editor.py starts printing anything besides JSON.
+      let parsed = {};
+      try {
+        parsed = trimmedStdout ? JSON.parse(trimmedStdout) : {};
+      } catch (e) {
+        console.warn('[DoorInsert] Non-JSON stdout from ifc_element_editor.py:', trimmedStdout);
+      }
+
+      if (parsed.error) {
+        return res.status(500).json({ error: parsed.error });
+      }
+
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+      const host = req.headers.host;
+
+      res.json({
+        ...parsed,
+        success: true,
+        fileUrl: `${protocol}://${host}/jobs/${jobId}/element_edits/${outputFileName}`,
+      });
+    });
+  } catch (error) {
+    console.error('[DoorInsert] Route exception:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==========================================
 // IFC GLOBAL RESCALE API
 // ==========================================
@@ -473,27 +611,71 @@ app.post('/api/render', upload.single('ifcFile'), (req, res) => {
     exec(blenderCmd, { maxBuffer: 1024 * 1024 * 50 }, (pipelineError, stdout, stderr) => { ... });
     */
 
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.headers.host;
+    const baseUrl = `${protocol}://${host}`;
+
     // ==========================================
-    // APS PIPELINE (RESTORED)
+    // NEW GLB COMPILER PIPELINE — 360 ONLY
+    // ==========================================
+    if (angle === "360") {
+
+    const compilerScriptPath = path.join(__dirname, "compiler", "compiler.ts");
+    const outputGlbPath = path.join(jobDir, "output.glb");
+
+    console.log(`\n--- [GLB COMPILER] Render Request | Job ID: ${jobId} ---`);
+
+    try {
+        execSync(
+            `npx tsx "${compilerScriptPath}" "${jobDir}" "${assetsDir}"`,
+            {
+                stdio: "inherit",
+                cwd: __dirname,
+                env: { ...process.env }
+            }
+        );
+    } catch (err) {
+        console.error("GLB compiler failed.", err.message);
+        return res.status(500).json({
+            error: "Failed to compile GLB scene."
+        });
+    }
+
+    if (!fs.existsSync(outputGlbPath)) {
+        return res.status(500).json({
+            error: "output.glb was not generated."
+        });
+    }
+
+    try {
+        generate360ViewerFromGLB(jobDir);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({
+            error: "Failed to generate 360 viewer."
+        });
+    }
+
+    return res.json({
+        type: "360",
+        url: `${baseUrl}/jobs/${jobId}/360_viewer.html`,
+        jobId
+    });
+}
+
+    // ==========================================
+    // APS PIPELINE — UNCHANGED, all non-360 angles
     // ==========================================
     try {
       // Execute the APS script exactly how it was running previously
-      execSync(`node aps-pipeline.js ${angle} "${jobDir}" ${lighting}`, { stdio: 'inherit' });
+      execSync(`node aps-pipeline.js ${angle} "${jobDir}" ${lighting}`, { stdio: 'inherit', env: { ...process.env, ASSET_DIR: assetsDir } });
     } catch (pipelineError) {
       console.error("APS Pipeline script failed.");
       return res.status(500).json({ error: 'Failed to execute Autodesk pipeline.' });
     }
 
-    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-    const host = req.headers.host; 
-    const baseUrl = `${protocol}://${host}`;
-
-    // Return the exact URLs the old frontend logic expects
-    if (angle === '360') {
-       res.json({ type: '360', url: `${baseUrl}/jobs/${jobId}/360_viewer.html`, jobId: jobId });
-    } else {
-       res.json({ type: 'image', url: `${baseUrl}/jobs/${jobId}/result.png`, jobId: jobId });
-    }
+    // Return the exact URL the old frontend logic expects for non-360
+    res.json({ type: 'image', url: `${baseUrl}/jobs/${jobId}/result.png`, jobId: jobId });
 
   } catch (error) {
     console.error("Render API Error:", error.message);

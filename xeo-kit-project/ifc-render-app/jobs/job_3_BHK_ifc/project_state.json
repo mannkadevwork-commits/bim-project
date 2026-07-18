@@ -1,4 +1,247 @@
 {
+  "materials": {
+    "3nlqX0Klr6wxpQ1lWge$Iv": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "0YluNCasPDEQ9ou8lGzXFY": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "1$7wI0n41EgxuHGv_ZNxM1": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "0Ll0j1iYX5$ud5W$y$4wJS": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "1OXIkBdoH5gerBveRz3FEt": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "1f9b9pZsD1kRxasRi8ZhNv": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "3uxNLLiMr5C8zIYTQq95Ld": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "0nRXe2GMz7aeZD7P7ZwtsU": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "1Jr7f8Qir6be8YQaTm68pv": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "1VQyi9hSz8aRaDoEOb3sXS": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "13tWtpfsj99uYcWARtmlzc": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "3o65ngk5n2wfbxEu67sAtA": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    },
+    "1ehY0D5oz6aPoCOIk7Ggxg": {
+      "color": "#6C3483",
+      "rgb": [
+        0.4235294117647059,
+        0.20392156862745098,
+        0.5137254901960784
+      ]
+    },
+    "3H3OmPiqrBI8W3UeJUznOq": {
+      "color": "#CD853F",
+      "rgb": [
+        0.803921568627451,
+        0.5215686274509804,
+        0.24705882352941178
+      ]
+    }
+  },
+  "furniture": [
+    {
+      "id": "0YluNCasPDEQ9ou8lGzXFY",
+      "instanceId": "0YluNCasPDEQ9ou8lGzXFY_cut_1784358079762",
+      "name": "Wall with Void",
+      "src": "http://localhost:3000/jobs/job_3_BHK_ifc/element_edits/0YluNCasPDEQ9ou8lGzXFY_door_1784358072531.ifc",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": "door_sliding",
+      "instanceId": "door_sliding_1784358080013",
+      "name": "Auto Sliding Door",
+      "src": "http://localhost:3000/assets/Automatic_Sliding_Door.ifc",
+      "position": [
+        6.45830033002701,
+        0,
+        -0.09999643597176956
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "sofa",
+      "instanceId": "sofa_1784358168161",
+      "name": "Modern Sofa",
+      "src": "http://localhost:3000/assets/sofa.ifc",
+      "position": [
+        5.24225338860753,
+        0.000023554192855851364,
+        -5.44193041482486
+      ],
+      "rotation": [
+        0,
+        91,
+        0
+      ]
+    },
+    {
+      "id": "3H3OmPiqrBI8W3UeJUznOq",
+      "instanceId": "3H3OmPiqrBI8W3UeJUznOq_cut_1784358222679",
+      "name": "Wall with Void",
+      "src": "http://localhost:3000/jobs/job_3_BHK_ifc/element_edits/3H3OmPiqrBI8W3UeJUznOq_door_1784358215488.ifc",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": "door_fire",
+      "instanceId": "door_fire_1784358222835",
+      "name": "Fire-Rated Door",
+      "src": "http://localhost:3000/assets/Fire_Rated_Door.ifc",
+      "position": [
+        11.699995569359402,
+        0,
+        -5.000306323927502
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    },
+    {
+      "id": "2Mr8zgxAr4s92DFF3tV4lm",
+      "instanceId": "2Mr8zgxAr4s92DFF3tV4lm_cut_1784358285497",
+      "name": "Wall with Void",
+      "src": "http://localhost:3000/jobs/job_3_BHK_ifc/element_edits/2Mr8zgxAr4s92DFF3tV4lm_door_1784358278473.ifc",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "id": "door_3bhk",
+      "instanceId": "door_3bhk_1784358285700",
+      "name": "3BHK Interior Door",
+      "src": "http://localhost:3000/assets/3BHK_Interior_Door.ifc",
+      "position": [
+        4.500207315942734,
+        0,
+        -6.724797492611828
+      ],
+      "rotation": [
+        0,
+        90,
+        0
+      ]
+    }
+  ],
   "structural_edits": {
     "0YluNCasPDEQ9ou8lGzXFY": {
       "scale": [
@@ -12,25 +255,45 @@
         0
       ],
       "visible": false
-    }
-  },
-  "materials": {},
-  "furniture": [
-    {
-      "id": "chair",
-      "instanceId": "chair_1783684918600",
-      "name": "Chair",
-      "src": "http://localhost:3000/assets/chair.ifc",
-      "position": [
-        5.9144163650106565,
-        0,
-        -4.919389729306697
+    },
+    "1ZvD$mC1nDIvokxzkvcIOE": {
+      "scale": [
+        1,
+        1,
+        1
       ],
-      "rotation": [
+      "offset": [
         0,
         0,
         0
-      ]
+      ],
+      "visible": false
+    },
+    "3H3OmPiqrBI8W3UeJUznOq": {
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": false
+    },
+    "2Mr8zgxAr4s92DFF3tV4lm": {
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": false
     }
-  ]
+  }
 }

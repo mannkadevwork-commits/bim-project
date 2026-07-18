@@ -143,6 +143,24 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
       if (isMeasuringRef.current) return;
 
       if (placementModeRef.current) {
+        if (placementModeRef.current.type === 'door') {
+          // Re-pick at this exact canvas position with pickSurface:true —
+          // the automatic cameraControl pick above doesn't include
+          // worldNormal, and we need it to confirm this is a wall.
+          const wallSnap = getWallSnapData(pickResult.canvasPos);
+          if (!wallSnap) {
+            // Deliberately a no-op rather than falling back to floor
+            // placement: a door dropped off a wall has no host element
+            // for the Phase 3 CSG cut, so silently placing it would
+            // create an unresolvable asset. Left as a hook for the UI
+            // to show a "click on a wall" toast.
+            return;
+          }
+          onAssetPlaced(placementModeRef.current, wallSnap);
+          setPlacementMode(null);
+          return;
+        }
+
         onAssetPlaced(placementModeRef.current, pickResult.worldPos || [0, 0, 0]);
         setPlacementMode(null);
         return;
@@ -708,9 +726,37 @@ const applyGlobalScale = (ratioVec) => {
     return [x, y, z];
   };
 
-  const getDropPosition = (canvasPos) => {
+  // NOTE: `assetType` is new and optional. Every existing caller that
+  // passes just `canvasPos` gets the exact same [x,y,z] array back as
+  // before — furniture placement is untouched. Only `assetType ===
+  // 'door'` takes the new branch, and it returns a different (richer)
+  // shape: { position, rotation, wallGlobalId, snapped } instead of a
+  // bare array, since callers need the rotation + wall id too. Wiring
+  // the drag-drop UI to read this new shape for doors is outside
+  // useBIMEngine.js (that's your drop handler component) — flagging so
+  // it doesn't get missed.
+  const getDropPosition = (canvasPos, assetType = null) => {
     const viewer = viewerRef.current;
-    if (!viewer) return [0, 0, 0];
+    if (!viewer) return assetType === 'door' ? { position: [0, 0, 0], rotation: [0, 0, 0], wallGlobalId: null, snapped: false } : [0, 0, 0];
+
+    if (assetType === 'door') {
+      const wallSnap = getWallSnapData(canvasPos);
+      if (wallSnap) {
+        return { ...wallSnap, snapped: true };
+      }
+      // No wall under the cursor — surface a non-snapped fallback so
+      // the drop UI can render a "no wall here" cue instead of
+      // silently placing on the floor like furniture would.
+      const cursorPick = viewer.scene.pick({ canvasPos, pickSurface: true });
+      return {
+        position: cursorPick?.worldPos
+          ? [cursorPick.worldPos[0], cursorPick.worldPos[1], cursorPick.worldPos[2]]
+          : [viewer.camera.look[0], 0, viewer.camera.look[2]],
+        rotation: [0, 0, 0],
+        wallGlobalId: null,
+        snapped: false,
+      };
+    }
 
     const cursorPick = viewer.scene.pick({
       canvasPos: canvasPos,
@@ -748,6 +794,60 @@ const getCursorWorldPosition = (canvasPos) => {
     return cursorPick?.worldPos || null;
   };
 
+  // ── Phase 1: Door Wall-Snapping ─────────────────────────────────────
+  // Distinct from getDropPosition's floor-snap. A door must land ON a
+  // vertical wall face, not the floor, and needs the wall's GlobalId so
+  // Phase 2/3 know which native IFC element to CSG-cut. We re-pick at
+  // the given canvasPos with pickSurface:true (same reason floorPick
+  // does its own separate pick above — the raw cameraControl 'picked'
+  // event doesn't carry worldNormal).
+  //
+  // Convention check (please verify visually before wiring Phase 2):
+  // rotationY = atan2(normal.x, normal.z) assumes the door asset's
+  // unrotated (Y=0) forward axis is +Z, matching how your furniture
+  // rotations are authored (e.g. tv_unit at [0,180,0] to face the
+  // opposite way). If door assets face a different local axis at
+  // rest, flip the sign or add 180.
+  const WALL_IFC_CLASSES = new Set(['IfcWall', 'IfcWallStandardCase', 'IfcCurtainWall']);
+
+  const getWallSnapData = (canvasPos) => {
+    const viewer = viewerRef.current;
+    if (!viewer || !canvasPos) return null;
+
+    const wallPick = viewer.scene.pick({
+      canvasPos,
+      pickSurface: true,
+    });
+
+    if (!wallPick?.worldPos || !wallPick?.worldNormal || !wallPick?.entity) {
+      return null;
+    }
+
+    const normal = wallPick.worldNormal;
+
+    // Vertical wall face = normal lies (mostly) flat in the XZ plane.
+    // Mirrors the floor check above (worldNormal[1] > 0.7 ⇒ floor);
+    // here we want the opposite — near-zero Y component.
+    const horizontalMag = Math.sqrt(normal[0] * normal[0] + normal[2] * normal[2]);
+    const isVertical = Math.abs(normal[1]) < 0.25 && horizontalMag > 0.9;
+    if (!isVertical) return null;
+
+    const metaObject = viewer.metaScene.metaObjects[wallPick.entity.id];
+    if (!metaObject || !WALL_IFC_CLASSES.has(metaObject.type)) {
+      return null;
+    }
+
+    const rotationYRad = Math.atan2(normal[0], normal[2]);
+    const rotationYDeg = rotationYRad * (180 / Math.PI);
+
+    return {
+      position: [wallPick.worldPos[0], wallPick.worldPos[1], wallPick.worldPos[2]],
+      rotation: [0, rotationYDeg, 0],
+      wallGlobalId: wallPick.entity.id,
+      wallNormal: [normal[0], normal[1], normal[2]],
+    };
+  };
+
   const loadIFCAssetIntoScene = async (instanceId, srcUrl, targetPosition, rotation) => {
     if (!loadersRef.current.ifc) return;
 
@@ -765,26 +865,98 @@ const getCursorWorldPosition = (canvasPos) => {
       });
 
    assetModel.on('loaded', () => {
+   console.log("");
+    console.log("======================================================");
+    console.log("FURNITURE LOAD DEBUG");
+    console.log("======================================================");
+
+    console.log("Instance:", instanceId);
+
     const gs = globalScaleFactorRef.current;
+
+    console.log("Incoming Target Position:", targetPosition);
+    console.log("Incoming Rotation:", rotation);
+    console.log("Incoming Global Scale:", gs);
     if (gs && (gs.x !== 1 || gs.y !== 1 || gs.z !== 1)) {
       assetModel.scale = [gs.x, gs.y, gs.z];
     }
 
+     console.log("");
+    console.log("AFTER SCALE");
+    console.log("----------------");
+
+    console.log("Scale:", assetModel.scale);
+
     const aabb = assetModel.aabb;
+
+    console.log("AABB:", aabb);
+
+
+    // const aabb = assetModel.aabb;
 
     if (aabb && targetPosition) {
       const centerX = (aabb[0] + aabb[3]) / 2;
       const centerZ = (aabb[2] + aabb[5]) / 2;
       const bottomY = aabb[1];
 
+    //    console.log("CenterX:", centerX);
+    // console.log("CenterY:", bottomY);
+    // console.log("CenterZ:", centerZ);
+
+    // console.log("BottomY:", bottomY);
+
+
       assetModel.position = [
         targetPosition[0] - centerX,
         targetPosition[1] - bottomY,
         targetPosition[2] - centerZ,
       ];
+
+
+      // console.log(assetModel);
+      // console.log("Model Origin:", assetModel.origin);
+
+// console.log("Model Position:", assetModel.position);
+
+// console.log("Model Matrix:", assetModel.matrix);
+
+// console.log("Model AABB:", assetModel.aabb);
+
+// // console.log("Scene AABB:", viewer.scene.aabb);
+
+// console.log("Asset Rotation:", assetModel.rotation);
+// console.log("Asset World Matrix:", assetModel.worldMatrix);
+//       console.log("AABB AFTER POSITION:", assetModel.aabb);
+
+//       console.log("Position After Assignment:", assetModel.position);
     }
 
     if (rotation) assetModel.rotation = rotation;
+
+    // console.log("AABB AFTER ROTATION:", assetModel.aabb);
+
+    // console.log("");
+    // console.log("FINAL MODEL STATE");
+    // console.log("----------------");
+
+    // console.log("Position:", assetModel.position);
+    // console.log("Rotation:", assetModel.rotation);
+    // console.log("Scale:", assetModel.scale);
+
+    // console.log("");
+
+    // console.log("Matrix:", assetModel.matrix);
+
+    // console.log("World Matrix:", assetModel.worldMatrix);
+
+    // console.log("");
+
+    // console.log("Entire Asset Model");
+
+    // console.dir(assetModel);
+
+    // console.log("======================================================");
+    // console.log("");
 });
 
     } catch (error) {
@@ -924,6 +1096,15 @@ const getCursorWorldPosition = (canvasPos) => {
           const newRot = [...(model.rotation || [0, 0, 0])];
           newRot[1] = value; // Y-Axis
           model.rotation = newRot;
+
+//           console.log("");
+// console.log("ROTATION CHANGED");
+// console.log("Rotation:", model.rotation);
+// console.log("Position:", model.position);
+// console.log("Scale:", model.scale);
+// console.log("Matrix:", model.matrix);
+// console.log("World Matrix:", model.worldMatrix);
+// console.log("");
       } else if (type === 'position') {
           const newPos = [...(model.position || [0, 0, 0])];
           newPos[axis] = value;
@@ -958,6 +1139,7 @@ const getCursorWorldPosition = (canvasPos) => {
       setPlacementMode,
       loadIFCAssetIntoScene,
       getDropPosition,
+      getWallSnapData,
       toggleMeasurementMode,
       clearMeasurements,
       deleteMeasurement,
@@ -975,9 +1157,7 @@ const getCursorWorldPosition = (canvasPos) => {
       isolateAndMakeMoveable,
       inspectNativeElement,
       getCursorWorldPosition,
+      setIsLoading,
     },
   };
 };
-
-
-

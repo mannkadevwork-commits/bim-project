@@ -5,7 +5,6 @@ const fs = require('fs');
 const { execSync, spawnSync } = require('child_process');
 const path = require('path');
 
-// --- 1. CONFIGURATION ---
 const BUNDLE_ID = "IFCRenderBundle_v2";
 const ACTIVITY_ID = "IFCRenderActivity_v2";
 const ALIAS = "prod";
@@ -13,10 +12,9 @@ const ENGINE = "Autodesk.3dsMax+2024";
 const BUCKET_KEY = (process.env.APS_CLIENT_ID + "_render_storage").toLowerCase();
 
 const CAMERA_ANGLE = process.argv[2] || "top-front-right";
-const JOB_DIR = process.argv[3] || "."; 
+const JOB_DIR = process.argv[3] || ".";
 const JOB_ID = path.basename(JOB_DIR) || "default";
 
-// --- Absolute Dynamic Local Paths ---
 const LOCAL_IFC_PATH = path.join(JOB_DIR, "input.ifc");
 const LOCAL_STATE_PATH = path.join(JOB_DIR, "project_state.json");
 const LOCAL_OBJ_PATH = path.join(JOB_DIR, "input.obj");
@@ -24,9 +22,8 @@ const LOCAL_MTL_PATH = path.join(JOB_DIR, "input.mtl");
 const CAMERA_JSON_PATH = path.join(JOB_DIR, "camera.json");
 const RESULT_PNG_PATH = path.join(JOB_DIR, "result.png");
 const HTML_OUT_PATH = path.join(JOB_DIR, "360_viewer.html");
-const LOCAL_BUNDLE_PATH = "./IFCRenderBundle.zip"; 
+const LOCAL_BUNDLE_PATH = "./IFCRenderBundle.zip";
 
-// --- Unique Cloud Keys ---
 const CLOUD_OBJ_KEY = `${JOB_ID}_input.obj`;
 const CLOUD_MTL_KEY = `${JOB_ID}_input.mtl`;
 const CLOUD_CAM_KEY = `${JOB_ID}_camera.json`;
@@ -42,34 +39,6 @@ if (!VALID_ANGLES.includes(CAMERA_ANGLE)) {
     process.exit(1);
 }
 
-// --- 2. GLOBAL DEBUG LOGGER ---
-axios.interceptors.request.use(request => {
-    console.log(`\n================= DEBUG: OUTGOING REQUEST =================`);
-    console.log(`METHOD/URL: [${request.method.toUpperCase()}] ${request.url}`);
-    return request;
-});
-
-axios.interceptors.response.use(response => {
-    console.log(`<<< RESPONSE: ${response.status} ${response.statusText}`);
-    return response;
-}, error => {
-    console.log(`<<< FAILED: ${error.response? error.response.status : 'NO_RESPONSE'}`);
-    return Promise.reject(error);
-});
-
-// --- 3. HELPER: ALIAS MANAGER ---
-async function ensureAlias(token, type, resourceId, aliasId, version) {
-    const url = `https://developer.api.autodesk.com/da/us-east/v3/${type}/${resourceId}/aliases`;
-    try {
-        await axios.post(url, { id: aliasId, version }, { headers: { 'Authorization': `Bearer ${token}` } });
-    } catch (err) {
-        if (err.response && err.response.status === 409) {
-            await axios.patch(`${url}/${aliasId}`, { version }, { headers: { 'Authorization': `Bearer ${token}` } });
-        } else throw err;
-    }
-}
-
-// --- 4. HELPER: DIRECT-TO-S3 OSS UPLOAD ---
 async function uploadFileToOSS(token, bucketKey, objectKey, filePath) {
     const getUrl = `https://developer.api.autodesk.com/oss/v2/buckets/${bucketKey}/objects/${objectKey}/signeds3upload`;
     const getRes = await axios.get(getUrl, { headers: { 'Authorization': `Bearer ${token}` } });
@@ -80,34 +49,16 @@ async function uploadFileToOSS(token, bucketKey, objectKey, filePath) {
     });
 }
 
-// --- 5. GENERATE 360 THREE.JS VIEWER ---
-function generate360Viewer(objPath, bboxCenter) {
-    const objData = fs.readFileSync(objPath, 'utf-8');
-
-    // 2026-07-08: no longer reading/using the .mtl file here at all.
-    // Trimesh's Scene->OBJ exporter was verified to collapse every
-    // element's material into one shared "material_0" regardless of how
-    // many distinct override colors scene_merger.py wrote into each
-    // mesh (36 usemtl lines all pointing at a single newmtl block on a
-    // real job) -- so MTLLoader had nothing correct to parse in the first
-    // place. Colors now come directly from project_state.json, matched by
-    // the exact object ("o") name scene_merger.py gives each mesh (its raw
-    // IFC GlobalId for structural elements, or its materials_key for
-    // furniture -- see scene_merger.py's naming comments).
-    const statePath = path.join(path.dirname(objPath), 'project_state.json');
-    let projectState = { materials: {} };
-    if (fs.existsSync(statePath)) {
-        try {
-            projectState = JSON.parse(fs.readFileSync(statePath, 'utf-8')) || { materials: {} };
-        } catch (e) {
-            console.warn(`⚠️  Could not parse project_state.json for material colors: ${e.message}`);
-        }
+function generate360ViewerFromGLB(jobDir) {
+    const outputGlbPath = path.join(jobDir, 'output.glb');
+    if (!fs.existsSync(outputGlbPath)) {
+        throw new Error(`generate360ViewerFromGLB: output.glb not found at ${outputGlbPath}`);
     }
 
-    const cfg = JSON.parse(fs.readFileSync('./render-config.json', 'utf-8'));
-    const c = (arr) => `0x${arr.map(v => v.toString(16).padStart(2,'0')).join('')}`;
-    const cf = (arr) => arr.map(v => (v/255).toFixed(3));
-    
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'render-config.json'), 'utf-8'));
+    const c = (arr) => `0x${arr.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+    const cf = (arr) => arr.map(v => (v / 255).toFixed(3));
+
     const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -122,19 +73,42 @@ function generate360Viewer(objPath, bboxCenter) {
     background: rgba(0,0,0,0.6); padding: 8px 20px; border-radius: 6px;
     pointer-events: none;
   }
+  #loading {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #fff; font-family: sans-serif; font-size: 16px;
+    background: rgba(0,0,0,0.7); padding: 14px 28px; border-radius: 6px;
+  }
   #controls {
     position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
-    display: flex; gap: 10px; align-items: center;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center;
   }
   button {
     padding: 8px 18px; border: none; border-radius: 4px;
     background: #4a9eff; color: #fff; cursor: pointer; font-size: 13px;
   }
   button:hover { background: #3a8eef; }
+  .nav-btn { background: #ff7300; font-weight: bold; }
+  .nav-btn:hover { background: #e06500; }
+  #room-panel {
+    position: absolute; top: 16px; right: 16px; width: 220px; max-height: 70vh;
+    background: rgba(0,0,0,0.65); border-radius: 6px; color: #fff;
+    font-family: sans-serif; font-size: 13px; overflow: hidden; display: none;
+  }
+  #room-panel.collapsed #room-list { display: none; }
+  #room-panel-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 12px; font-weight: bold; cursor: pointer; background: rgba(255,255,255,0.08);
+  }
+  #room-panel-toggle { background: transparent; border: none; color: #fff; font-size: 16px; cursor: pointer; padding: 0 4px; }
+  #room-list { list-style: none; margin: 0; padding: 6px; max-height: 60vh; overflow-y: auto; }
+  .room-item { padding: 8px 10px; border-radius: 4px; cursor: pointer; margin-bottom: 2px; }
+  .room-item:hover { background: rgba(255,255,255,0.12); }
+  .room-item.active { background: #ff7300; font-weight: bold; }
 </style>
 </head>
 <body>
-<div id="info">Drag to rotate | Scroll to zoom | Right-drag to pan</div>
+<div id="info">Follow the Glowing Path or Press WASD to Walk | Drag to Look</div>
+<div id="loading">Loading model&hellip;</div>
 <div id="controls">
   <button onclick="resetView()">Reset View</button>
   <button onclick="toggleAutoRotate()">Auto-Rotate</button>
@@ -142,7 +116,16 @@ function generate360Viewer(objPath, bboxCenter) {
   <button onclick="setView('front')">Front</button>
   <button onclick="setView('side')">Side</button>
   <button onclick="setView('perspective')">Perspective</button>
-  <button onclick="enterInteriorView()">Interior 360</button>
+  <button onclick="toggleFullscreen()">Fullscreen</button>
+  <button onclick="startNavigation()" class="nav-btn" id="tour-btn" style="display:none;">Start Tour</button>
+</div>
+
+<div id="room-panel">
+  <div id="room-panel-header">
+    <span>Rooms</span>
+    <button id="room-panel-toggle" title="Toggle room panel (R)">&minus;</button>
+  </div>
+  <ul id="room-list"></ul>
 </div>
 
 <script type="importmap">
@@ -157,7 +140,7 @@ function generate360Viewer(objPath, bboxCenter) {
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(${c(cfg.background.color)});
@@ -207,12 +190,6 @@ const backLight = new THREE.DirectionalLight(
 backLight.position.set(${cfg.lighting.backLight.position.join(',')}).normalize().multiplyScalar(30);
 scene.add(backLight);
 
-const archMat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(${cf(cfg.material.color).join(',')}),
-    roughness: ${cfg.material.roughness},
-    metalness: ${cfg.material.metalness}
-});
-
 ${cfg.ground.enabled ? `const ground = new THREE.Mesh(
     new THREE.PlaneGeometry(200, 200),
     new THREE.ShadowMaterial({ opacity: ${cfg.ground.shadowOpacity} })
@@ -225,69 +202,654 @@ ${cfg.ground.gridEnabled ? `const grid = new THREE.GridHelper(100, 40, 0xcccccc,
 scene.add(grid);` : 'const grid = { position: { y: 0 } };'}
 
 let modelSize = 1;
+let roomList = [];
 
-const INTERIOR_CENTER = ${JSON.stringify(bboxCenter || null)};
-let interiorMode = false;
+class NavigationGraph {
+    constructor() { this.nodes = []; }
+    getNode(id) { return this.nodes.find(n => n.id === id); }
+}
 
-// Inject OBJ text and project_state.json material overrides dynamically.
-// No .mtl is injected or loaded anymore -- see the note above generate360Viewer().
-const objText = ${JSON.stringify(objData)};
-const projectState = ${JSON.stringify(projectState)};
+class HotspotManager {
+    constructor(scene, camera, onClickCallback) {
+        this.scene = scene;
+        this.camera = camera;
+        this.onClickCallback = onClickCallback;
+        this.hotspots = [];
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+        this.arrowTexture = this._buildArrowTexture();
+        this.pathTexture = this._buildPathTexture();
 
-const objLoader = new OBJLoader();
-const obj = objLoader.parse(objText);
+        window.addEventListener('click', this._onClick.bind(this));
+        window.addEventListener('mousemove', this._onMouseMove.bind(this));
+    }
 
-// --- Direct color lookup: project_state.json is the ONLY source of truth ---
-//
-// scene_merger.py now names every OBJ object ("o" line) with the EXACT,
-// unmodified key that would appear in project_state.json["materials"] --
-// a structural element's raw IFC GlobalId, or a furniture item's
-// materials_key -- so child.name can be looked up in projectState.materials
-// directly, with no MTL parsing, no sanitization, and no fuzzy matching.
-const projectMaterials = (projectState && projectState.materials) || {};
+    _buildArrowTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 256; canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+        const cx = 128, cy = 128;
 
-obj.traverse(child => {
-    if (child.isMesh) {
-        const matDef = projectMaterials[child.name];
-        const matClone = archMat.clone();
+        const glow = ctx.createRadialGradient(cx, cy, 10, cx, cy, 112);
+        glow.addColorStop(0, 'rgba(255, 150, 20, 0.55)');
+        glow.addColorStop(0.6, 'rgba(255, 115, 0, 0.20)');
+        glow.addColorStop(1, 'rgba(255, 115, 0, 0)');
+        ctx.fillStyle = glow;
+        ctx.beginPath();
+        ctx.arc(cx, cy, 112, 0, Math.PI * 2);
+        ctx.fill();
 
-        if (matDef && Array.isArray(matDef.rgb) && matDef.rgb.length >= 3) {
-            // project_state.json's "rgb" is already normalized 0-1, exactly
-            // what THREE.Color.setRGB expects -- no parsing needed.
-            const [r, g, b] = matDef.rgb;
-            matClone.color.setRGB(r, g, b);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+        ctx.lineWidth = 22;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ctx.moveTo(cx - 46, cy + 32);
+        ctx.lineTo(cx, cy - 36);
+        ctx.lineTo(cx + 46, cy + 32);
+        ctx.stroke();
+
+        return new THREE.CanvasTexture(canvas);
+    }
+
+    _buildPathTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 64; canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+
+        const grad = ctx.createLinearGradient(0, 0, 0, 256);
+        grad.addColorStop(0, 'rgba(255,150,20,0)');
+        grad.addColorStop(0.2, 'rgba(255,150,20,0.18)');
+        grad.addColorStop(0.6, 'rgba(255,165,50,0.5)');
+        grad.addColorStop(1, 'rgba(255,200,110,0.85)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 64, 256);
+
+        ctx.fillStyle = 'rgba(255,255,255,0.4)';
+        for (let y = 10; y < 256; y += 40) {
+            ctx.fillRect(10, y, 44, 16);
         }
-        // No matching entry (or a malformed one) -- keep archMat's default
-        // color rather than guessing; this mesh simply has no override.
 
-        if (Array.isArray(child.material)) {
-            child.material = child.material.map(() => matClone);
-        } else {
-            child.material = matClone;
-        }
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        return tex;
+    }
+
+    createHotspots(currentNode, graph, floorY, hotspotSize, originPos) {
+        this.clearHotspots();
+        if (!currentNode || !currentNode.links) return Promise.resolve();
+
+        const start = originPos ? originPos.clone() : new THREE.Vector3().fromArray(currentNode.position);
+        start.y = floorY;
+
+        currentNode.links.forEach(linkId => {
+            const targetNode = graph.getNode(linkId);
+            if (!targetNode) return;
+
+            const end = new THREE.Vector3().fromArray(targetNode.position);
+            end.y = floorY;
+
+            const dir = new THREE.Vector3().subVectors(end, start);
+            const totalDist = dir.length();
+            if (totalDist < 0.01) return;
+            dir.normalize();
+
+            const placementDist = Math.min(totalDist * 0.35, hotspotSize * 2.2);
+            const group = new THREE.Group();
+            group.position.copy(start).add(dir.clone().multiplyScalar(placementDist));
+            group.position.y = floorY + hotspotSize * 0.6;
+
+            const material = new THREE.MeshBasicMaterial({
+                map: this.arrowTexture, transparent: true, depthWrite: false,
+                side: THREE.DoubleSide, opacity: 0
+            });
+            const size = hotspotSize * 0.9;
+            const mesh = new THREE.Mesh(new THREE.PlaneGeometry(size, size), material);
+            mesh.userData = { targetId: linkId };
+            group.add(mesh);
+
+            this.scene.add(group);
+
+            const pathLength = Math.max(placementDist - hotspotSize * 0.3, hotspotSize * 0.6);
+            const pathWidth = hotspotSize * 0.32;
+            const pathGeometry = new THREE.PlaneGeometry(pathWidth, pathLength);
+            pathGeometry.rotateX(-Math.PI / 2);
+
+            const pathMap = this.pathTexture.clone();
+            pathMap.needsUpdate = true;
+            pathMap.wrapS = THREE.RepeatWrapping;
+            pathMap.wrapT = THREE.RepeatWrapping;
+            pathMap.repeat.set(1, Math.max(pathLength / (hotspotSize * 0.8), 1));
+
+            const pathMaterial = new THREE.MeshBasicMaterial({
+                map: pathMap, transparent: true, depthWrite: false,
+                side: THREE.DoubleSide, opacity: 0, blending: THREE.AdditiveBlending
+            });
+
+            const pathMesh = new THREE.Mesh(pathGeometry, pathMaterial);
+            pathMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), dir);
+            pathMesh.position.copy(start).add(dir.clone().multiplyScalar(pathLength / 2));
+            pathMesh.position.y = floorY + 0.015;
+            pathMesh.renderOrder = 1;
+            this.scene.add(pathMesh);
+
+            this.hotspots.push({
+                group, mesh, material, targetId: linkId,
+                pathMesh, pathMaterial,
+                hovered: false, hoverT: 0, fadeOpacity: 0
+            });
+        });
+
+        return this.fadeIn();
+    }
+
+    update(time) {
+        this.hotspots.forEach(arrow => {
+            arrow.mesh.quaternion.copy(this.camera.quaternion);
+
+            const pulse = 1 + Math.sin(time * 0.003 + arrow.group.position.x * 3.1) * 0.06;
+
+            const hoverTarget = arrow.hovered ? 1 : 0;
+            arrow.hoverT += (hoverTarget - arrow.hoverT) * 0.15;
+            const hoverScale = 1 + arrow.hoverT * 0.25;
+
+            arrow.mesh.scale.setScalar(pulse * hoverScale);
+            arrow.material.opacity = arrow.fadeOpacity;
+
+            const brightness = 0.85 + arrow.hoverT * 0.25;
+            arrow.material.color.setScalar(brightness);
+
+            if (arrow.pathMaterial) {
+                arrow.pathMaterial.opacity = arrow.fadeOpacity * 0.85;
+                const flowSpeed = 0.0016 + arrow.hoverT * 0.0025;
+                arrow.pathMaterial.map.offset.y = (arrow.pathMaterial.map.offset.y + flowSpeed) % 1;
+                arrow.pathMaterial.color.setScalar(0.8 + arrow.hoverT * 0.35);
+            }
+        });
+    }
+
+    _onMouseMove(event) {
+        if (this.hotspots.length === 0) return;
+        this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+        const meshes = this.hotspots.map(a => a.mesh);
+        const intersects = this.raycaster.intersectObjects(meshes);
+        const hoveredMesh = intersects.length > 0 ? intersects[0].object : null;
+        this.hotspots.forEach(a => { a.hovered = (a.mesh === hoveredMesh); });
+        document.body.style.cursor = hoveredMesh ? 'pointer' : 'default';
+    }
+
+    _onClick(event) {
+        if (event.button !== 0 || this.hotspots.length === 0) return;
+        this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+        const meshes = this.hotspots.map(a => a.mesh);
+        const intersects = this.raycaster.intersectObjects(meshes);
+        if (intersects.length > 0) this.onClickCallback(intersects[0].object.userData.targetId);
+    }
+
+    fadeIn(duration = 300) {
+        return this._fade(1, duration);
+    }
+
+    fadeOut(duration = 220) {
+        return this._fade(0, duration);
+    }
+
+    _fade(targetOpacity, duration) {
+        if (this.hotspots.length === 0) return Promise.resolve();
+        const startOpacities = this.hotspots.map(a => a.fadeOpacity);
+        const startTime = performance.now();
+
+        return new Promise(resolve => {
+            const step = (time) => {
+                const elapsed = time - startTime;
+                let t = elapsed / duration;
+                if (t > 1) t = 1;
+                this.hotspots.forEach((arrow, i) => {
+                    arrow.fadeOpacity = startOpacities[i] + (targetOpacity - startOpacities[i]) * t;
+                });
+                if (t < 1) requestAnimationFrame(step);
+                else resolve();
+            };
+            requestAnimationFrame(step);
+        });
+    }
+
+    clearHotspots() {
+        this.hotspots.forEach(a => {
+            if (a.group.parent) this.scene.remove(a.group);
+            if (a.mesh.geometry) a.mesh.geometry.dispose();
+            if (a.material) a.material.dispose();
+            if (a.pathMesh) {
+                if (a.pathMesh.parent) this.scene.remove(a.pathMesh);
+                a.pathMesh.geometry.dispose();
+                if (a.pathMaterial.map) a.pathMaterial.map.dispose();
+                a.pathMaterial.dispose();
+            }
+        });
+        this.hotspots = [];
+        document.body.style.cursor = 'default';
+    }
+}
+
+class CameraAnimator {
+    constructor(camera, controls) {
+        this.camera = camera;
+        this.controls = controls;
+        this.animating = false;
+    }
+
+    animateTo(targetPosArr, lookAtArr, duration = 800) {
+        return new Promise(resolve => {
+            this.animating = true;
+            this.controls.enabled = false;
+
+            const startPos = this.camera.position.clone();
+            const endPos = new THREE.Vector3().fromArray(targetPosArr);
+            const endLookAt = new THREE.Vector3().fromArray(lookAtArr);
+
+            const startQuat = this.camera.quaternion.clone();
+            const lookMatrix = new THREE.Matrix4().lookAt(endPos, endLookAt, this.camera.up);
+            const endQuat = new THREE.Quaternion().setFromRotationMatrix(lookMatrix);
+
+            const startTime = performance.now();
+
+            const animate = (time) => {
+                const elapsed = time - startTime;
+                let t = elapsed / duration;
+                if (t > 1) t = 1;
+                
+                const easeT = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+                this.camera.position.lerpVectors(startPos, endPos, easeT);
+                this.camera.quaternion.slerpQuaternions(startQuat, endQuat, easeT);
+
+                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+                this.controls.target.copy(this.camera.position).add(forward);
+                this.controls.update();
+
+                if (t < 1.0) requestAnimationFrame(animate);
+                else { this.controls.enabled = true; this.animating = false; resolve(); }
+            };
+            requestAnimationFrame(animate);
+        });
+    }
+}
+
+class NavigationManager {
+    constructor(scene, camera, controls) {
+        this.graph = new NavigationGraph();
+        this.animator = new CameraAnimator(camera, controls);
+        this.hotspotManager = new HotspotManager(scene, camera, this.navigateTo.bind(this));
+        this.currentNode = null;
+        this.currentPosition = null;
+        this.model = null;
+        this.floorY = 0;
+        this.hotspotSize = 1;
+        this.onNodeChange = null;
         
-        child.castShadow = true;
-        child.receiveShadow = true;
+        window.addEventListener('keydown', (e) => {
+            if (!this.currentNode || this.animator.animating) return;
+            const links = this.currentNode.links;
+            if (!links || links.length === 0) return;
+
+            const camDir = new THREE.Vector3();
+            camera.getWorldDirection(camDir);
+            camDir.y = 0; camDir.normalize();
+
+            const targetDir = new THREE.Vector3();
+
+            if (e.key === 'ArrowUp' || e.key.toLowerCase() === 'w') {
+                targetDir.copy(camDir);
+            } else if (e.key === 'ArrowDown' || e.key.toLowerCase() === 's') {
+                targetDir.copy(camDir).negate();
+            } else if (e.key === 'ArrowLeft' || e.key.toLowerCase() === 'a') {
+                targetDir.set(camDir.z, 0, -camDir.x);
+            } else if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'd') {
+                targetDir.set(-camDir.z, 0, camDir.x);
+            } else {
+                return;
+            }
+
+            let bestNode = null;
+            let bestScore = -Infinity;
+            const currentPos = new THREE.Vector3().fromArray(this.currentNode.position);
+
+            links.forEach(linkId => {
+                const node = this.graph.getNode(linkId);
+                const dirToNode = new THREE.Vector3().fromArray(node.position).sub(currentPos);
+                dirToNode.y = 0; dirToNode.normalize();
+
+                const score = dirToNode.dot(targetDir);
+                if (score > 0.5 && score > bestScore) {
+                    bestScore = score;
+                    bestNode = linkId;
+                }
+            });
+
+            if (bestNode) this.navigateTo(bestNode);
+        });
+    }
+
+    setModel(model) {
+        this.model = model;
+    }
+
+    _resolveFloorY(x, z) {
+        if (!this.model) return this.floorY;
+        if (!this._downRay) this._downRay = new THREE.Raycaster();
+        this._downRay.set(new THREE.Vector3(x, this.floorY + 3, z), new THREE.Vector3(0, -1, 0));
+        this._downRay.far = 5;
+        const hits = this._downRay.intersectObject(this.model, true);
+        if (!hits.length) return this.floorY;
+        return hits.reduce((min, h) => Math.min(min, h.point.y), hits[0].point.y);
+    }
+
+    _comfortPosition(node) {
+        if (!this.model) return node.position.slice();
+
+        const eyeHeight = node.position[1] - this.floorY;
+        const clipTolerance = 0.35;
+        const rawFloor = this._resolveFloorY(node.position[0], node.position[2]);
+        if (rawFloor <= this.floorY + clipTolerance) return node.position.slice();
+
+        const neighborIds = node.links || [];
+        const avg = new THREE.Vector3();
+        let count = 0;
+        neighborIds.forEach(id => {
+            const n = this.graph.getNode(id);
+            if (!n) return;
+            avg.add(new THREE.Vector3().fromArray(n.position));
+            count++;
+        });
+        if (count === 0) return node.position.slice();
+        avg.divideScalar(count);
+
+        const nodePos = new THREE.Vector3().fromArray(node.position);
+        const toOpen = new THREE.Vector3().subVectors(avg, nodePos);
+        toOpen.y = 0;
+        if (toOpen.lengthSq() < 0.0001) return node.position.slice();
+        toOpen.normalize().multiplyScalar(0.4);
+
+        const candidate = nodePos.clone().add(toOpen);
+        const candidateFloor = this._resolveFloorY(candidate.x, candidate.z);
+        if (candidateFloor <= this.floorY + clipTolerance) {
+            candidate.y = this.floorY + eyeHeight;
+            return candidate.toArray();
+        }
+        return node.position.slice();
+    }
+
+    _avoidWallGaze(fromPos, facing) {
+        if (!this.model) return facing;
+        if (!this._fwdRay) this._fwdRay = new THREE.Raycaster();
+
+        const eye = fromPos.clone();
+        eye.y += 0.02;
+
+        const testDir = (dir) => {
+            this._fwdRay.set(eye, dir);
+            this._fwdRay.far = 0.6;
+            const hits = this._fwdRay.intersectObject(this.model, true);
+            return hits.length ? hits[0].distance : Infinity;
+        };
+
+        const wallThreshold = 0.5;
+        const forwardDist = testDir(facing);
+        if (forwardDist >= wallThreshold) return facing;
+
+        const left = new THREE.Vector3(facing.z, 0, -facing.x).normalize();
+        const right = left.clone().negate();
+        const leftDist = testDir(left);
+        const rightDist = testDir(right);
+        const side = leftDist >= rightDist ? left : right;
+
+        const openness = 1 - Math.min(forwardDist / wallThreshold, 1);
+        return facing.clone().lerp(side, 0.6 * openness).normalize();
+    }
+
+    _preservedOrientation(cam, fromPos, toPos) {
+        const moveDir = new THREE.Vector3().subVectors(toPos, fromPos);
+        moveDir.y = 0;
+
+        const currentForward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+        currentForward.y = 0; currentForward.normalize();
+
+        if (moveDir.lengthSq() < 0.0001) return this._avoidWallGaze(toPos, currentForward);
+        moveDir.normalize();
+
+        let facing = currentForward.clone();
+        if (currentForward.dot(moveDir) < -0.3) {
+            facing.lerp(moveDir, 0.5).normalize();
+        }
+
+        return this._avoidWallGaze(toPos, facing);
+    }
+
+    startAt(nodeId) {
+        const node = this.graph.getNode(nodeId);
+        if (!node) return;
+        this.currentNode = node;
+        if (this.onNodeChange) this.onNodeChange(this.currentNode.id);
+
+        controls.enablePan = false;
+        controls.enableZoom = false;
+        controls.minDistance = 0.001;
+        controls.maxDistance = 0.001;
+
+        const comfortPos = this._comfortPosition(node);
+        const offset = new THREE.Vector3().fromArray(comfortPos).sub(new THREE.Vector3().fromArray(node.position));
+        const pos = new THREE.Vector3().fromArray(comfortPos);
+        const look = new THREE.Vector3().fromArray(node.lookAt).add(offset);
+        const dir = new THREE.Vector3().subVectors(look, pos).normalize().multiplyScalar(0.001);
+
+        camera.position.copy(pos);
+        controls.target.copy(pos).add(dir);
+        controls.update();
+
+        this.currentPosition = comfortPos;
+        this.hotspotManager.createHotspots(this.currentNode, this.graph, this.floorY, this.hotspotSize, pos);
+    }
+
+    async navigateTo(nodeId) {
+        if (this.animator.animating) return;
+        const node = this.graph.getNode(nodeId);
+        if (!node) return;
+        this.hotspotManager.clearHotspots();
+
+        const curPos = new THREE.Vector3().fromArray(this.currentPosition || this.currentNode.position);
+        const comfortPos = this._comfortPosition(node);
+        const nextPos = new THREE.Vector3().fromArray(comfortPos);
+
+        const facing = this._preservedOrientation(camera, curPos, nextPos);
+        const lookAtTarget = nextPos.clone().add(facing);
+
+        await this.animator.animateTo(comfortPos, lookAtTarget.toArray(), 420);
+        this.currentNode = node;
+        this.currentPosition = comfortPos;
+        if (this.onNodeChange) this.onNodeChange(this.currentNode.id);
+        this.hotspotManager.createHotspots(this.currentNode, this.graph, this.floorY, this.hotspotSize, nextPos);
+    }
+
+    async jumpTo(nodeId) {
+        const node = this.graph.getNode(nodeId);
+        if (!node) return;
+        if (this.animator.animating) return;
+
+        if (!this.currentNode) {
+            this.startAt(nodeId);
+            return;
+        }
+
+        this.hotspotManager.clearHotspots();
+        const lookAtTarget = node.lookAt || node.position;
+        await this.animator.animateTo(node.position, lookAtTarget, 900);
+        this.currentNode = node;
+        this.currentPosition = node.position.slice();
+        if (this.onNodeChange) this.onNodeChange(this.currentNode.id);
+        this.hotspotManager.createHotspots(this.currentNode, this.graph, this.floorY, this.hotspotSize, new THREE.Vector3().fromArray(node.position));
+    }
+}
+
+const navManager = new NavigationManager(scene, camera, controls);
+
+const ROOM_SPLIT_GAP_THRESHOLD = 1.2;
+const ROOM_MIN_CLUSTER_SIZE = 3;
+
+function splitClusterByGaps(members) {
+    if (members.length <= ROOM_MIN_CLUSTER_SIZE) return [members];
+
+    function findAxisGapSplit(axisIndex) {
+        const sorted = members.slice().sort((a, b) => a.position[axisIndex] - b.position[axisIndex]);
+        let bestGap = 0;
+        let bestSplitIdx = -1;
+        for (let i = 1; i < sorted.length; i++) {
+            const gap = sorted[i].position[axisIndex] - sorted[i - 1].position[axisIndex];
+            if (gap > bestGap) {
+                bestGap = gap;
+                bestSplitIdx = i;
+            }
+        }
+        return { sorted, bestGap, bestSplitIdx };
+    }
+
+    const xSplit = findAxisGapSplit(0);
+    const zSplit = findAxisGapSplit(2);
+    const chosen = xSplit.bestGap >= zSplit.bestGap ? xSplit : zSplit;
+
+    if (
+        chosen.bestGap < ROOM_SPLIT_GAP_THRESHOLD ||
+        chosen.bestSplitIdx < ROOM_MIN_CLUSTER_SIZE ||
+        (chosen.sorted.length - chosen.bestSplitIdx) < ROOM_MIN_CLUSTER_SIZE
+    ) {
+        return [members];
+    }
+
+    const left = chosen.sorted.slice(0, chosen.bestSplitIdx);
+    const right = chosen.sorted.slice(chosen.bestSplitIdx);
+    return splitClusterByGaps(left).concat(splitClusterByGaps(right));
+}
+
+function clusterViewpointsIntoRooms(nodes) {
+    const byId = new Map(nodes.map(n => [n.id, n]));
+    const visited = new Set();
+    const rawClusters = [];
+
+    nodes.forEach(node => {
+        if (visited.has(node.id)) return;
+
+        const queue = [node.id];
+        visited.add(node.id);
+        const members = [];
+
+        while (queue.length > 0) {
+            const currentId = queue.shift();
+            const current = byId.get(currentId);
+            if (!current) continue;
+            members.push(current);
+
+            (current.links || []).forEach(linkId => {
+                if (!visited.has(linkId) && byId.has(linkId)) {
+                    visited.add(linkId);
+                    queue.push(linkId);
+                }
+            });
+        }
+
+        rawClusters.push(members);
+    });
+
+    const clusters = [];
+    rawClusters.forEach(members => {
+        splitClusterByGaps(members).forEach(sub => clusters.push(sub));
+    });
+
+    return clusters.map((members, idx) => {
+        const center = members.reduce((acc, m) => {
+            acc[0] += m.position[0];
+            acc[1] += m.position[1];
+            acc[2] += m.position[2];
+            return acc;
+        }, [0, 0, 0]).map(v => v / members.length);
+
+        let representative = members[0];
+        let bestDistSq = Infinity;
+        members.forEach(m => {
+            const dx = m.position[0] - center[0];
+            const dy = m.position[1] - center[1];
+            const dz = m.position[2] - center[2];
+            const distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq < bestDistSq) {
+                bestDistSq = distSq;
+                representative = m;
+            }
+        });
+
+        return {
+            roomId: 'room_' + (idx + 1),
+            label: 'Room ' + (idx + 1),
+            representativeId: representative.id,
+            center,
+            memberIds: members.map(m => m.id)
+        };
+    });
+}
+
+function buildRoomPanel(rooms) {
+    const panel = document.getElementById('room-panel');
+    const list = document.getElementById('room-list');
+    if (!panel || !list) return;
+
+    list.innerHTML = '';
+    rooms.forEach(room => {
+        const li = document.createElement('li');
+        li.className = 'room-item';
+        li.dataset.roomId = room.roomId;
+        li.textContent = room.label;
+        li.addEventListener('click', () => jumpToRoom(room));
+        list.appendChild(li);
+    });
+
+    panel.style.display = rooms.length > 0 ? 'block' : 'none';
+}
+
+function highlightActiveRoom(nodeId) {
+    const room = roomList.find(r => r.memberIds.includes(nodeId));
+    document.querySelectorAll('.room-item').forEach(el => {
+        el.classList.toggle('active', !!room && el.dataset.roomId === room.roomId);
+    });
+}
+
+function jumpToRoom(room) {
+    navManager.jumpTo(room.representativeId);
+}
+
+function toggleRoomPanel() {
+    const panel = document.getElementById('room-panel');
+    if (panel) panel.classList.toggle('collapsed');
+}
+
+navManager.onNodeChange = highlightActiveRoom;
+
+window.addEventListener('keydown', (e) => {
+    if (e.key.toLowerCase() === 'r' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        toggleRoomPanel();
     }
 });
 
-const box = new THREE.Box3().setFromObject(obj);
-const center = box.getCenter(new THREE.Vector3());
-const size = box.getSize(new THREE.Vector3());
-modelSize = Math.max(size.x, size.y, size.z);
-
-obj.position.sub(center);
-ground.position.y = -size.y / 2 - 0.01;
-grid.position.y = ground.position.y;
-
-const ss = modelSize * 2;
-keyLight.shadow.camera.left = -ss;
-keyLight.shadow.camera.right = ss;
-keyLight.shadow.camera.top = ss;
-keyLight.shadow.camera.bottom = -ss;
-keyLight.shadow.camera.updateProjectionMatrix();
-
-scene.add(obj);
+const roomPanelToggleBtn = document.getElementById('room-panel-toggle');
+if (roomPanelToggleBtn) {
+    roomPanelToggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleRoomPanel();
+    });
+}
+const roomPanelHeader = document.getElementById('room-panel-header');
+if (roomPanelHeader) roomPanelHeader.addEventListener('click', toggleRoomPanel);
 
 function setView(name) {
     const d = modelSize * 2;
@@ -300,41 +862,118 @@ function setView(name) {
     const p = views[name] || views.perspective;
     camera.position.set(p[0], p[1], p[2]);
     controls.target.set(0, 0, 0);
+    navManager.hotspotManager.clearHotspots();
     controls.update();
 }
 
 function resetView() {
-    interiorMode = false;
     controls.enablePan = true;
     controls.enableZoom = true;
     controls.minDistance = 0;
     controls.maxDistance = Infinity;
     controls.autoRotate = false;
+    navManager.hotspotManager.clearHotspots();
     setView('perspective');
 }
 
-function toggleAutoRotate() {
-    controls.autoRotate = !controls.autoRotate;
+function toggleAutoRotate() { controls.autoRotate = !controls.autoRotate; }
+
+function toggleFullscreen() {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+    else document.exitFullscreen();
 }
 
-function enterInteriorView() {
-    interiorMode = true;
-    controls.autoRotate = false;
-    camera.position.set(0, 0, 0.001);
-    controls.target.set(0, 0, 0);
-    controls.enablePan = false;
-    controls.enableZoom = false;
-    controls.minDistance = 0.01;
-    controls.maxDistance = 0.01;
-    controls.update();
+function startNavigation() {
+    if (navManager.graph.nodes.length > 0) {
+        controls.autoRotate = false;
+        navManager.startAt(navManager.graph.nodes[0].id);
+    }
 }
 
 window.resetView = resetView;
 window.toggleAutoRotate = toggleAutoRotate;
 window.setView = setView;
-window.enterInteriorView = enterInteriorView;
+window.toggleFullscreen = toggleFullscreen;
+window.startNavigation = startNavigation;
 
-setView('perspective');
+const loadingEl = document.getElementById('loading');
+const loader = new GLTFLoader();
+
+loader.load(
+    'output.glb',
+    (gltf) => {
+        const model = gltf.scene;
+        model.updateMatrixWorld(true);
+
+        model.traverse(child => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+
+        const box = new THREE.Box3().setFromObject(model);
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        modelSize = Math.max(size.x, size.y, size.z) || 1;
+
+        model.position.sub(center);
+        model.updateMatrixWorld(true);
+        box.setFromObject(model); 
+        
+        ground.position.y = -size.y / 2 - 0.01;
+        grid.position.y = ground.position.y;
+
+        const ss = modelSize * 2;
+        keyLight.shadow.camera.left = -ss;
+        keyLight.shadow.camera.right = ss;
+        keyLight.shadow.camera.top = ss;
+        keyLight.shadow.camera.bottom = -ss;
+        keyLight.shadow.camera.updateProjectionMatrix();
+
+        scene.add(model);
+        navManager.setModel(model);
+        setView('perspective');
+
+        navManager.floorY = ground.position.y + 0.05;
+        navManager.hotspotSize = Math.max(modelSize * 0.05, 0.2);
+
+        // --- FETCH DENSE GRID PRE-LINKED BY BACKEND ---
+        fetch('navigation.json')
+            .then(res => res.json())
+            .then(nodes => {
+                if (!nodes || nodes.length === 0) return;
+
+                // Sync coordinates with the centered GLB
+                nodes.forEach(node => {
+                    node.position[0] -= center.x;
+                    node.position[1] -= center.y;
+                    node.position[2] -= center.z;
+                    if (node.lookAt) {
+                        node.lookAt[0] -= center.x;
+                        node.lookAt[1] -= center.y;
+                        node.lookAt[2] -= center.z;
+                    }
+                });
+
+                navManager.graph.nodes = nodes;
+                
+                if (navManager.graph.nodes.length > 0) {
+                    document.getElementById('tour-btn').style.display = 'inline-block';
+                    roomList = clusterViewpointsIntoRooms(navManager.graph.nodes);
+                    buildRoomPanel(roomList);
+                }
+            })
+            .catch(err => console.log('Navigation JSON not found.', err));
+
+        if (loadingEl) loadingEl.remove();
+    },
+    undefined,
+    (error) => {
+        console.error('Failed to load output.glb:', error);
+        if (loadingEl) loadingEl.textContent = 'Failed to load model.';
+    }
+);
 
 window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -342,37 +981,50 @@ window.addEventListener('resize', () => {
     renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-(function animate() {
+(function animate(time) {
     requestAnimationFrame(animate);
     controls.update();
+    if (navManager.hotspotManager) navManager.hotspotManager.update(time);
     renderer.render(scene, camera);
 })();
 </script>
 </body>
 </html>`;
 
-    // Save directly to the dynamic JOB_DIR
-    const HTML_OUT_PATH = require('path').join(process.argv[3] || ".", "360_viewer.html");
-    fs.writeFileSync(HTML_OUT_PATH, html);
+    const htmlOutPath = path.join(jobDir, "360_viewer.html");
+    fs.writeFileSync(htmlOutPath, html);
     console.log(`\n=================================================`);
-    console.log(`360 VIEWER GENERATED!`);
-    console.log(`Output: ${HTML_OUT_PATH}`);
+    console.log(`360 VIEWER (GLB) GENERATED WITH NAVIGATION!`);
+    console.log(`Output: ${htmlOutPath}`);
     console.log(`=================================================`);
+
+    return htmlOutPath;
 }
 
-// --- 6. MAIN PIPELINE ---
+// --- MAIN PIPELINE LOGIC REMAINS UNCHANGED BELOW ---
 async function runPipeline() {
     try {
+        if (CAMERA_ANGLE === '360') {
+            generate360ViewerFromGLB(JOB_DIR);
+            return;
+        }
+
         console.log("\n--- Merging IFC + Furniture + Materials (Coohom-style compositor) ---");
         console.log("    Reads input.ifc + project_state.json, applies Z-up -> Y-up fix.");
 
-        const merge = spawnSync('python', [
+        const mergeArgs = [
             'scene_merger.py',
             '--ifc', LOCAL_IFC_PATH,
             '--state', LOCAL_STATE_PATH,
             '--output', LOCAL_OBJ_PATH,
             '--job-dir', JOB_DIR
-        ], { encoding: 'utf-8' });
+        ];
+
+        if (process.env.ASSET_DIR) {
+            mergeArgs.push('--asset-dir', process.env.ASSET_DIR);
+        }
+
+        const merge = spawnSync('python', mergeArgs, { encoding: 'utf-8' });
 
         if (merge.stderr && merge.stderr.trim()) {
             console.log(merge.stderr.trim());
@@ -403,11 +1055,6 @@ async function runPipeline() {
         const BBOX_CENTER = mergeInfo.bbox.center;
         const BBOX_SIZE = mergeInfo.bbox.size;
 
-        if (CAMERA_ANGLE === '360') {
-            generate360Viewer(LOCAL_OBJ_PATH, BBOX_CENTER);
-            return;
-        }
-
         const authBody = `client_id=${process.env.APS_CLIENT_ID}&client_secret=${process.env.APS_CLIENT_SECRET}&grant_type=client_credentials&scope=code:all data:write data:read bucket:create bucket:read`;
         const authRes = await axios.post('https://developer.api.autodesk.com/authentication/v2/token', authBody, {
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
@@ -420,7 +1067,7 @@ async function runPipeline() {
         const nickname = nickRes.data;
 
        console.log("\n--- Setting up AppBundle ---");
-        
+
         if (!fs.existsSync(LOCAL_BUNDLE_PATH)) {
             throw new Error(`❌ MISSING ZIP FILE: Cannot find ${LOCAL_BUNDLE_PATH} in the current directory.`);
         }
@@ -491,7 +1138,7 @@ async function runPipeline() {
             await axios.post('https://developer.api.autodesk.com/oss/v2/buckets',
                 { bucketKey: BUCKET_KEY, policyKey: 'transient' }, { headers: { 'Authorization': `Bearer ${token}` } });
         } catch (e) {}
-        
+
         await uploadFileToOSS(token, BUCKET_KEY, CLOUD_OBJ_KEY, LOCAL_OBJ_PATH);
 
         const hasMtl = fs.existsSync(LOCAL_MTL_PATH);
@@ -504,8 +1151,8 @@ async function runPipeline() {
 
         const renderCfg = JSON.parse(fs.readFileSync('./render-config.json', 'utf-8'));
         renderCfg.angle = CAMERA_ANGLE;
-        renderCfg.interiorCenter = BBOX_CENTER; 
-        renderCfg.interiorSize = BBOX_SIZE;     
+        renderCfg.interiorCenter = BBOX_CENTER;
+        renderCfg.interiorSize = BBOX_SIZE;
         fs.writeFileSync(CAMERA_JSON_PATH, JSON.stringify(renderCfg));
         await uploadFileToOSS(token, BUCKET_KEY, CLOUD_CAM_KEY, CAMERA_JSON_PATH);
 
@@ -565,7 +1212,7 @@ async function runPipeline() {
         const downloadUrl = `https://developer.api.autodesk.com/oss/v2/buckets/${BUCKET_KEY}/objects/${CLOUD_OUT_KEY}/signeds3download`;
         const dlRes = await axios.get(downloadUrl, { headers: { 'Authorization': `Bearer ${token}` } });
         const fileRes = await axios.get(dlRes.data.url, { responseType: 'arraybuffer' });
-        
+
         fs.writeFileSync(RESULT_PNG_PATH, Buffer.from(fileRes.data));
 
         console.log(`\n=================================================`);
@@ -602,5 +1249,9 @@ async function runPipeline() {
         }
     }
 }
-    
-runPipeline();
+
+module.exports = { generate360ViewerFromGLB };
+
+if (require.main === module) {
+    runPipeline();
+}

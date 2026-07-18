@@ -18,3 +18,5 @@ diag.txt
 
 # OS files
 .DS_Store
+
+jobs/
