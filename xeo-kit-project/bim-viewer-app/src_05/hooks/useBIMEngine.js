@@ -14,27 +14,6 @@ import * as WebIFC from 'web-ifc';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
-const AXIS_NAMES = ['X', 'Y', 'Z'];
-const AXIS_HANDLE_COLORS = {
-  X: [0.95, 0.25, 0.25],
-  Y: [0.25, 0.85, 0.35],
-  Z: [0.3, 0.5, 0.95],
-  XY: [0.95, 0.85, 0.25],
-  XZ: [0.9, 0.35, 0.9],
-  YZ: [0.25, 0.85, 0.9],
-  XYZ: [0.95, 0.95, 0.95],
-};
-const STRETCH_HANDLE_FACE_OPACITY = 0.85;
-const STRETCH_HANDLE_EDGE_OPACITY = 0.5;
-const STRETCH_HANDLE_CORNER_OPACITY = 0.3;
-const STRETCH_HANDLE_HOVER_SCALE = 1.22;
-const STRETCH_HANDLE_DRAG_SCALE = 1.38;
-const STRETCH_HANDLE_ANIM_MS = 150;
-const brightenColor = (color, factor = 1.25) => color.map(c => Math.min(1, c * factor));
-const axesKey = (axesList) =>
-  [...axesList].sort((a, b) => a.axis - b.axis).map(a => AXIS_NAMES[a.axis]).join('');
-const SELECTION_CAGE_COLOR = [0.35, 0.62, 1];
-
 export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPanelOpen, setRightTab) => {
   const canvasRef = useRef(null);
   const treeContainerRef = useRef(null);
@@ -64,18 +43,14 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
 
   // Stretch handle state
   const stretchHandlesRef = useRef([]);
-  const selectionCageRef = useRef(null);
-  const hoveredStretchMeshRef = useRef(null);
   const stretchDragRef = useRef(null);
   const isStretchingRef = useRef(false);
-  const stretchPersistCallbackRef = useRef(null);
-  const stretchFaceAdjacencyRef = useRef(new Map());
-  const revealedFaceKeyRef = useRef(null);
-  const revealedHandlesRef = useRef([]);
-  const stretchAnimFramesRef = useRef(new Set());
   const [isStretching, setIsStretching] = useState(false);
   const buildStretchHandlesRef = useRef(null);
   const destroyStretchHandlesRef = useRef(null);
+  const startStretchDragRef = useRef(null);
+  const updateStretchDragRef = useRef(null);
+  const endStretchDragRef = useRef(null);
 
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [measurementsList, setMeasurementsList] = useState([]); 
@@ -302,203 +277,25 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
         e.stopPropagation();
         e.preventDefault();
         viewer.cameraControl.active = false;
-        const meta = pick.entity._stretchMeta;
-        const { axes, targetId, isAsset } = meta;
-        // Read current scale: from matrix diagonal if matrix was set, else from _scale via position setter path
-        const getScale = (obj) => {
-          if (!obj) return [1, 1, 1];
-          const m = obj.matrix;
-          if (!m || m.length < 11) return [1, 1, 1];
-          const sx = Math.sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
-          const sy = Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]);
-          const sz = Math.sqrt(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]);
-          return [sx || 1, sy || 1, sz || 1];
-        };
-        let startScale, targetObj;
-        if (isAsset) {
-          targetObj = viewer.scene.models[targetId];
-        } else {
-          targetObj = viewer.scene.objects[targetId];
-        }
-        startScale = getScale(targetObj);
-        const startPosition = targetObj?.position ? [...targetObj.position] : [0, 0, 0];
-
-        let anchorWorld = null;
-        if (axes.length === 1 && targetObj?.aabb) {
-          const { axis, dir } = axes[0];
-          anchorWorld = dir > 0 ? targetObj.aabb[axis] : targetObj.aabb[axis + 3];
-        }
-
-        stretchDragRef.current = { axesList: axes, targetId, isAsset, startCanvasX: e.offsetX, startCanvasY: e.offsetY, startScale, startPosition, anchorWorld };
-        isStretchingRef.current = true;
-        setIsStretching(true);
-
-        hideRevealedGroup();
-        stretchHandlesRef.current.forEach(mesh => {
-          if (mesh === pick.entity) return;
-          if (mesh._stretchAnimId) {
-            cancelAnimationFrame(mesh._stretchAnimId);
-            stretchAnimFramesRef.current.delete(mesh._stretchAnimId);
-            mesh._stretchAnimId = null;
-          }
-          mesh.pickable = false;
-          mesh.visible = false;
-        });
-        animateHandleTo(pick.entity, { opacity: pick.entity._stretchMeta.restOpacity, scale: STRETCH_HANDLE_DRAG_SCALE });
-      }
-    };
-
-    const applyScale = (targetId, isAsset, scaleVec) => {
-      const [sx, sy, sz] = scaleVec;
-      // SceneModel.scale setter is a NOP (deprecated) — must use model.matrix
-      // Compose scale + existing translation so position is preserved
-      if (isAsset) {
-        const model = viewer.scene.models[targetId];
-        if (!model) return;
-        const p = model.position || [0, 0, 0];
-        model.matrix = [
-          sx, 0,  0,  0,
-          0,  sy, 0,  0,
-          0,  0,  sz, 0,
-          p[0], p[1], p[2], 1,
-        ];
-      } else {
-        const entity = viewer.scene.objects[targetId];
-        if (!entity) return;
-        const p = entity.position || [0, 0, 0];
-        entity.matrix = [
-          sx, 0,  0,  0,
-          0,  sy, 0,  0,
-          0,  0,  sz, 0,
-          p[0], p[1], p[2], 1,
-        ];
+        startStretchDragRef.current?.(canvasPos, pick.entity._stretchMeta);
       }
     };
 
     const onDocMouseMove = (e) => {
-      if (!isStretchingRef.current || !stretchDragRef.current) return;
-      const { axesList, targetId, isAsset, startCanvasX, startCanvasY, startScale, startPosition, anchorWorld } = stretchDragRef.current;
+      if (!isStretchingRef.current) return;
       const rect = canvas.getBoundingClientRect();
       const curX = e.clientX - rect.left;
       const curY = e.clientY - rect.top;
-      const s = [...startScale];
-      if (axesList.length === 1) {
-        const { axis, dir } = axesList[0];
-        const pixelDelta = axis === 1 ? (startCanvasY - curY) : (curX - startCanvasX);
-        s[axis] = Math.max(0.05, startScale[axis] + pixelDelta * 0.005 * dir);
-
-        if (anchorWorld !== null && startPosition && startScale[axis] !== 0) {
-          const target = isAsset ? viewer.scene.models[targetId] : viewer.scene.objects[targetId];
-          if (target) {
-            const newPosition = [...(target.position || startPosition)];
-            newPosition[axis] = anchorWorld - (s[axis] / startScale[axis]) * (anchorWorld - startPosition[axis]);
-            target.position = newPosition;
-          }
-        }
-      } else {
-        const sharedDelta = axesList.reduce((sum, { axis, dir }) => {
-          const pixelDelta = axis === 1 ? (startCanvasY - curY) : (curX - startCanvasX);
-          return sum + pixelDelta * dir;
-        }, 0) / axesList.length;
-        axesList.forEach(({ axis }) => {
-          s[axis] = Math.max(0.05, startScale[axis] + sharedDelta * 0.005);
-        });
-      }
-      applyScale(targetId, isAsset, s);
+      updateStretchDragRef.current?.([curX, curY]);
     };
 
     const onDocMouseUp = () => {
-      if (!isStretchingRef.current || !stretchDragRef.current) return;
-      const { axesList, targetId, isAsset } = stretchDragRef.current;
-      const getScale = (obj) => {
-        if (!obj) return [1, 1, 1];
-        const m = obj.matrix;
-        return [
-          Math.sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]),
-          Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]),
-          Math.sqrt(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]),
-        ];
-      };
-      const finalScale = isAsset
-        ? getScale(viewer.scene.models[targetId])
-        : getScale(viewer.scene.objects[targetId]);
-      if (stretchPersistCallbackRef.current) {
-        axesList.forEach(({ axis }) => {
-          stretchPersistCallbackRef.current(targetId, 'scale', axis, finalScale[axis]);
-        });
-      }
-      stretchDragRef.current = null;
-      isStretchingRef.current = false;
-      setIsStretching(false);
+      if (!isStretchingRef.current) return;
+      endStretchDragRef.current?.();
       viewer.cameraControl.active = true;
-      buildStretchHandlesRef.current?.(targetId, isAsset);
-    };
-
-    const resetHoveredStretchHandle = () => {
-      const prev = hoveredStretchMeshRef.current;
-      if (prev) {
-        try {
-          const base = prev._stretchMeta?.color || AXIS_HANDLE_COLORS.X;
-          prev.material.diffuse = base;
-          prev.material.emissive = base;
-          const restOpacity = prev._stretchMeta?.restOpacity ?? STRETCH_HANDLE_FACE_OPACITY;
-          animateHandleTo(prev, { opacity: restOpacity, scale: 1 });
-        } catch (_) {}
-        hoveredStretchMeshRef.current = null;
-      }
-    };
-
-    const cursorForAxes = (axesList) => {
-      if (axesList.length === 1) {
-        const { axis } = axesList[0];
-        return axis === 1 ? 'ns-resize' : axis === 0 ? 'ew-resize' : 'nwse-resize';
-      }
-      if (axesList.length === 2) {
-        const key = axesKey(axesList);
-        if (key === 'XY') {
-          const x = axesList.find(a => a.axis === 0).dir;
-          const y = axesList.find(a => a.axis === 1).dir;
-          return (x * y > 0) ? 'nwse-resize' : 'nesw-resize';
-        }
-        return 'move';
-      }
-      return 'move';
-    };
-
-    const onCanvasHoverMove = (e) => {
-      if (isStretchingRef.current) return;
-      if (!stretchHandlesRef.current.length) return;
-      const pick = viewer.scene.pick({ canvasPos: [e.offsetX, e.offsetY], pickSurface: false });
-      const meta = pick?.entity?._stretchMeta;
-      if (meta?.isStretchHandle) {
-        if (meta.type === 'face') {
-          const { axis, dir } = meta.axes[0];
-          const faceKey = axisDirKey(axis, dir);
-          if (revealedFaceKeyRef.current !== faceKey) {
-            hideRevealedGroup();
-            revealGroupForFace(faceKey);
-          }
-        }
-        if (hoveredStretchMeshRef.current !== pick.entity) {
-          resetHoveredStretchHandle();
-          const hoverColor = brightenColor(meta.color);
-          pick.entity.material.diffuse = hoverColor;
-          pick.entity.material.emissive = hoverColor;
-          animateHandleTo(pick.entity, { opacity: 1, scale: STRETCH_HANDLE_HOVER_SCALE });
-          hoveredStretchMeshRef.current = pick.entity;
-        }
-        canvas.style.cursor = cursorForAxes(meta.axes);
-      } else {
-        if (hoveredStretchMeshRef.current) {
-          resetHoveredStretchHandle();
-        }
-        hideRevealedGroup();
-        canvas.style.cursor = '';
-      }
     };
 
     canvas.addEventListener('mousedown', onCanvasMouseDown, { capture: true });
-    canvas.addEventListener('mousemove', onCanvasHoverMove);
     document.addEventListener('mousemove', onDocMouseMove);
     document.addEventListener('mouseup', onDocMouseUp);
 
@@ -515,7 +312,6 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
 
     return () => {
       canvas.removeEventListener('mousedown', onCanvasMouseDown, { capture: true });
-      canvas.removeEventListener('mousemove', onCanvasHoverMove);
       document.removeEventListener('mousemove', onDocMouseMove);
       document.removeEventListener('mouseup', onDocMouseUp);
       measurementsPluginRef.current = null;
@@ -1112,111 +908,9 @@ const getCursorWorldPosition = (canvasPos) => {
   };
 
   // ── Stretch Handles ─────────────────────────────────────────────────
-  const destroySelectionCage = () => {
-    if (selectionCageRef.current) {
-      try { selectionCageRef.current.destroy(); } catch (_) {}
-      selectionCageRef.current = null;
-    }
-  };
-
-  const buildSelectionCage = (aabb) => {
-    destroySelectionCage();
-    const viewer = viewerRef.current;
-    if (!viewer || !aabb) return;
-    const [xMin, yMin, zMin, xMax, yMax, zMax] = aabb;
-    const positions = [
-      xMin, yMin, zMin,  xMax, yMin, zMin,  xMax, yMax, zMin,  xMin, yMax, zMin,
-      xMin, yMin, zMax,  xMax, yMin, zMax,  xMax, yMax, zMax,  xMin, yMax, zMax,
-    ];
-    const indices = [
-      0, 1, 1, 2, 2, 3, 3, 0,
-      4, 5, 5, 6, 6, 7, 7, 4,
-      0, 4, 1, 5, 2, 6, 3, 7,
-    ];
-    selectionCageRef.current = new Mesh(viewer.scene, {
-      id: `sel_cage_${Date.now()}`,
-      geometry: new ReadableGeometry(viewer.scene, {
-        primitive: 'lines',
-        positions,
-        indices,
-      }),
-      material: new PhongMaterial(viewer.scene, {
-        diffuse: SELECTION_CAGE_COLOR,
-        emissive: SELECTION_CAGE_COLOR,
-        lineWidth: 1,
-      }),
-      pickable: false,
-      collidable: false,
-    });
-  };
-
-  const axisDirKey = (axis, dir) => `${axis}_${dir}`;
-
-  const animateHandleTo = (mesh, { opacity, scale, onComplete }) => {
-    if (!mesh) return;
-    if (mesh._stretchAnimId) {
-      cancelAnimationFrame(mesh._stretchAnimId);
-      stretchAnimFramesRef.current.delete(mesh._stretchAnimId);
-      mesh._stretchAnimId = null;
-    }
-    const startOpacity = mesh.material.opacity;
-    const startScale = Array.isArray(mesh.scale) ? mesh.scale[0] : 1;
-    const startTime = performance.now();
-    const tick = (now) => {
-      const t = Math.min(1, (now - startTime) / STRETCH_HANDLE_ANIM_MS);
-      try {
-        mesh.material.opacity = startOpacity + (opacity - startOpacity) * t;
-        const s = startScale + (scale - startScale) * t;
-        mesh.scale = [s, s, s];
-      } catch (_) {
-        stretchAnimFramesRef.current.delete(mesh._stretchAnimId);
-        mesh._stretchAnimId = null;
-        return;
-      }
-      if (t < 1) {
-        mesh._stretchAnimId = requestAnimationFrame(tick);
-        stretchAnimFramesRef.current.add(mesh._stretchAnimId);
-      } else {
-        mesh._stretchAnimId = null;
-        if (onComplete) onComplete();
-      }
-    };
-    mesh._stretchAnimId = requestAnimationFrame(tick);
-    stretchAnimFramesRef.current.add(mesh._stretchAnimId);
-  };
-
-  const revealGroupForFace = (faceKey) => {
-    const group = stretchFaceAdjacencyRef.current.get(faceKey) || [];
-    group.forEach(mesh => {
-      mesh.visible = true;
-      mesh.pickable = true;
-      animateHandleTo(mesh, { opacity: mesh._stretchMeta.restOpacity, scale: 1 });
-    });
-    revealedFaceKeyRef.current = faceKey;
-    revealedHandlesRef.current = group;
-  };
-
-  const hideRevealedGroup = () => {
-    if (!revealedFaceKeyRef.current) return;
-    revealedHandlesRef.current.forEach(mesh => {
-      mesh.pickable = false;
-      animateHandleTo(mesh, { opacity: 0, scale: 1, onComplete: () => { try { mesh.visible = false; } catch (_) {} } });
-    });
-    revealedFaceKeyRef.current = null;
-    revealedHandlesRef.current = [];
-  };
-
   const destroyStretchHandles = () => {
-    stretchAnimFramesRef.current.forEach(id => cancelAnimationFrame(id));
-    stretchAnimFramesRef.current.clear();
     stretchHandlesRef.current.forEach(mesh => { try { mesh.destroy(); } catch (_) {} });
     stretchHandlesRef.current = [];
-    destroySelectionCage();
-    hoveredStretchMeshRef.current = null;
-    revealedFaceKeyRef.current = null;
-    revealedHandlesRef.current = [];
-    stretchFaceAdjacencyRef.current = new Map();
-    if (canvasRef.current) canvasRef.current.style.cursor = '';
   };
   destroyStretchHandlesRef.current = destroyStretchHandles;
 
@@ -1237,98 +931,214 @@ const getCursorWorldPosition = (canvasPos) => {
     }
     if (!aabb) return;
 
-    buildSelectionCage(aabb);
-
     const [xMin, yMin, zMin, xMax, yMax, zMax] = aabb;
     const cx = (xMin + xMax) / 2;
     const cy = (yMin + yMax) / 2;
     const cz = (zMin + zMax) / 2;
-    const AXIS_MIN = [xMin, yMin, zMin];
-    const AXIS_MAX = [xMax, yMax, zMax];
-    const AXIS_CENTER = [cx, cy, cz];
-    const pointFor = (axesList) => {
-      const p = [...AXIS_CENTER];
-      axesList.forEach(({ axis, dir }) => { p[axis] = dir > 0 ? AXIS_MAX[axis] : AXIS_MIN[axis]; });
-      return p;
-    };
+    const handleSize = 0.15;
 
-    const FACE_SIZE = { 0: [0.07, 0.22, 0.07], 1: [0.22, 0.07, 0.07], 2: [0.22, 0.07, 0.07] };
-    const EDGE_SIZE = [0.075, 0.075, 0.075];
-    const CORNER_SIZE = [0.05, 0.05, 0.05];
+    const MAGENTA = [1, 0.2, 1];
 
-    const handleDefs = [];
-
-    for (let axis = 0; axis < 3; axis++) {
-      for (const dir of [+1, -1]) {
-        const axesList = [{ axis, dir }];
-        handleDefs.push({ pos: pointFor(axesList), size: FACE_SIZE[axis], axesList });
-      }
-    }
-
-    [[0, 1], [0, 2], [1, 2]].forEach(([a1, a2]) => {
-      for (const d1 of [+1, -1]) {
-        for (const d2 of [+1, -1]) {
-          const axesList = [{ axis: a1, dir: d1 }, { axis: a2, dir: d2 }];
-          handleDefs.push({ pos: pointFor(axesList), size: EDGE_SIZE, axesList });
-        }
-      }
-    });
-
-    for (const dx of [+1, -1]) {
-      for (const dy of [+1, -1]) {
-        for (const dz of [+1, -1]) {
-          const axesList = [{ axis: 0, dir: dx }, { axis: 1, dir: dy }, { axis: 2, dir: dz }];
-          handleDefs.push({ pos: pointFor(axesList), size: CORNER_SIZE, axesList });
-        }
-      }
-    }
-
-    stretchFaceAdjacencyRef.current = new Map();
-    for (let axis = 0; axis < 3; axis++) {
-      for (const dir of [+1, -1]) {
-        stretchFaceAdjacencyRef.current.set(axisDirKey(axis, dir), []);
-      }
-    }
+    const handleDefs = [
+      { type: 'face', pos: [xMax, cy, cz], axis: 0, dir: +1, color: [1, 0.2, 0.2] },
+      { type: 'face', pos: [xMin, cy, cz], axis: 0, dir: -1, color: [1, 0.2, 0.2] },
+      { type: 'face', pos: [cx, yMax, cz], axis: 1, dir: +1, color: [0.2, 1, 0.2] },
+      { type: 'face', pos: [cx, yMin, cz], axis: 1, dir: -1, color: [0.2, 1, 0.2] },
+      { type: 'face', pos: [cx, cy, zMax], axis: 2, dir: +1, color: [0.2, 0.4, 1] },
+      { type: 'face', pos: [cx, cy, zMin], axis: 2, dir: -1, color: [0.2, 0.4, 1] },
+      // Corner handles on the XZ plane
+      { type: 'corner', pos: [xMax, cy, zMax], xDir: +1, zDir: +1, color: MAGENTA },
+      { type: 'corner', pos: [xMax, cy, zMin], xDir: +1, zDir: -1, color: MAGENTA },
+      { type: 'corner', pos: [xMin, cy, zMax], xDir: -1, zDir: +1, color: MAGENTA },
+      { type: 'corner', pos: [xMin, cy, zMin], xDir: -1, zDir: -1, color: MAGENTA },
+    ];
 
     const ts = Date.now();
     handleDefs.forEach((def, i) => {
-      const [xSize, ySize, zSize] = def.size;
-      const color = AXIS_HANDLE_COLORS[axesKey(def.axesList)] || AXIS_HANDLE_COLORS.XYZ;
-      const type = def.axesList.length === 1 ? 'face' : def.axesList.length === 2 ? 'edge' : 'corner';
-      const isFaceHandle = type === 'face';
-      const restOpacity = type === 'face'
-        ? STRETCH_HANDLE_FACE_OPACITY
-        : type === 'edge'
-          ? STRETCH_HANDLE_EDGE_OPACITY
-          : STRETCH_HANDLE_CORNER_OPACITY;
       const mesh = new Mesh(viewer.scene, {
         id: `sh_${ts}_${i}`,
         geometry: new ReadableGeometry(viewer.scene, buildBoxGeometry({
-          xSize, ySize, zSize,
+          xSize: handleSize, ySize: handleSize, zSize: handleSize,
         })),
         material: new PhongMaterial(viewer.scene, {
-          diffuse: color,
-          emissive: color,
-          opacity: isFaceHandle ? restOpacity : 0,
+          diffuse: def.color,
+          emissive: def.color,
+          opacity: 0.9,
         }),
         position: def.pos,
-        visible: isFaceHandle,
-        pickable: isFaceHandle,
+        pickable: true,
       });
-      mesh._stretchMeta = { isStretchHandle: true, axes: def.axesList, targetId: entityId, isAsset, color, type, restOpacity };
+      mesh._stretchMeta = def.type === 'corner'
+        ? { isStretchHandle: true, type: 'corner', axes: [0, 2], xDir: def.xDir, zDir: def.zDir, targetId: entityId, isAsset }
+        : { isStretchHandle: true, type: 'face', axis: def.axis, dir: def.dir, targetId: entityId, isAsset };
       stretchHandlesRef.current.push(mesh);
-      if (!isFaceHandle) {
-        def.axesList.forEach(({ axis, dir }) => {
-          stretchFaceAdjacencyRef.current.get(axisDirKey(axis, dir))?.push(mesh);
-        });
-      }
     });
+    console.log('[Stretch] Built', stretchHandlesRef.current.length, 'handles for', entityId, 'aabb:', aabb);
   };
   buildStretchHandlesRef.current = buildStretchHandles;
 
-  const setStretchPersistCallback = (fn) => {
-    stretchPersistCallbackRef.current = fn;
+  const startStretchDrag = (canvasPos, stretchMeta) => {
+    const { axis, dir, axes, xDir, zDir, targetId, isAsset } = stretchMeta;
+    let startScale;
+    if (isAsset) {
+      const model = viewerRef.current?.scene.models[targetId];
+      startScale = model ? [...(model.scale || [1, 1, 1])] : [1, 1, 1];
+    } else {
+      const entity = viewerRef.current?.scene.objects[targetId];
+      startScale = entity ? [...(entity.scale || [1, 1, 1])] : [1, 1, 1];
+    }
+    stretchDragRef.current = { axis, dir, axes, xDir, zDir, targetId, isAsset, startCanvasX: canvasPos[0], startCanvasY: canvasPos[1], startScale };
+    isStretchingRef.current = true;
+    setIsStretching(true);
   };
+  startStretchDragRef.current = startStretchDrag;
+
+  const updateStretchDrag = (canvasPos) => {
+    if (!isStretchingRef.current) return;
+    const drag = stretchDragRef.current;
+    if (!drag) return;
+    const { axis, dir, axes, xDir, zDir, targetId, isAsset, startCanvasX, startCanvasY, startScale } = drag;
+
+    // Corner handles (XZ plane): proper world-space ray-plane math.
+    if (axes && axes.length === 2) {
+      const scene = viewerRef.current?.scene;
+      const camera = scene?.camera;
+      const canvasEl = scene?.canvas?.canvas;
+      if (!scene || !camera || !canvasEl) return;
+
+      const w = canvasEl.clientWidth;
+      const h = canvasEl.clientHeight;
+
+      // clip = proj * view * world  =>  world = inverse(proj * view) * clip
+      const mat4Mul = (a, b) => {
+        const o = new Array(16);
+        for (let c = 0; c < 4; c++) {
+          for (let r = 0; r < 4; r++) {
+            let s = 0;
+            for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+            o[c * 4 + r] = s;
+          }
+        }
+        return o;
+      };
+      const mat4Invert = (m) => {
+        const inv = new Array(16);
+        inv[0]=m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
+        inv[4]=-m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
+        inv[8]=m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
+        inv[12]=-m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
+        inv[1]=-m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
+        inv[5]=m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
+        inv[9]=-m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
+        inv[13]=m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
+        inv[2]=m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
+        inv[6]=-m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
+        inv[10]=m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
+        inv[14]=-m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
+        inv[3]=-m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
+        inv[7]=m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
+        inv[11]=-m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
+        inv[15]=m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
+        let det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+        if (!det) return null;
+        det = 1.0 / det;
+        return inv.map(v => v * det);
+      };
+      const transformVec4 = (m, v) => [
+        m[0]*v[0] + m[4]*v[1] + m[8]*v[2]  + m[12]*v[3],
+        m[1]*v[0] + m[5]*v[1] + m[9]*v[2]  + m[13]*v[3],
+        m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3],
+        m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3],
+      ];
+      const unprojectToWorld = (px, py, ndcZ, invViewProj) => {
+        const ndcX = (px / w) * 2 - 1;
+        const ndcY = 1 - (py / h) * 2;
+        const world = transformVec4(invViewProj, [ndcX, ndcY, ndcZ, 1]);
+        return [world[0] / world[3], world[1] / world[3], world[2] / world[3]];
+      };
+      const intersectXZPlane = (px, py, invViewProj, planeY) => {
+        const near = unprojectToWorld(px, py, -1, invViewProj);
+        const far = unprojectToWorld(px, py, 1, invViewProj);
+        const rd = [far[0] - near[0], far[1] - near[1], far[2] - near[2]];
+        if (Math.abs(rd[1]) < 1e-9) return null; // ray parallel to the XZ plane
+        const t = (planeY - near[1]) / rd[1];
+        return [near[0] + t * rd[0], near[1] + t * rd[1], near[2] + t * rd[2]];
+      };
+
+      // const invViewProj = mat4Invert(mat4Mul(camera.projMatrix, camera.viewMatrix));
+      // Inside updateStretchDrag (around line 671)
+      const invViewProj = mat4Invert(mat4Mul(camera.project.matrix, camera.viewMatrix));
+      if (!invViewProj) return;
+
+      const target = isAsset ? viewerRef.current?.scene.models[targetId] : viewerRef.current?.scene.objects[targetId];
+      const aabb = target?.aabb;
+      if (!aabb) return;
+      const planeY = (aabb[1] + aabb[4]) / 2; // object's local XZ plane, in world space
+
+      const startPoint = intersectXZPlane(startCanvasX, startCanvasY, invViewProj, planeY);
+      const currentPoint = intersectXZPlane(canvasPos[0], canvasPos[1], invViewProj, planeY);
+      if (!startPoint || !currentPoint) return;
+
+      const deltaWorldX = currentPoint[0] - startPoint[0];
+      const deltaWorldZ = currentPoint[2] - startPoint[2];
+
+      const SENSITIVITY = 0.5; // world units -> scale units
+      const newScaleX = Math.max(0.05, startScale[0] + deltaWorldX * xDir * SENSITIVITY);
+      const newScaleZ = Math.max(0.05, startScale[2] + deltaWorldZ * zDir * SENSITIVITY);
+
+      if (isAsset) {
+        const model = viewerRef.current?.scene.models[targetId];
+        if (model) {
+          const s = [...(model.scale || [1, 1, 1])];
+          s[0] = newScaleX; s[2] = newScaleZ;
+          model.scale = s;
+        }
+      } else {
+        const entity = viewerRef.current?.scene.objects[targetId];
+        if (entity) {
+          const s = [...(entity.scale || [1, 1, 1])];
+          s[0] = newScaleX; s[2] = newScaleZ;
+          entity.scale = s;
+        }
+      }
+      return;
+    }
+
+    // Face handles: unchanged pixel-delta mapping.
+    const pixelDelta = axis === 1
+      ? (startCanvasY - canvasPos[1])
+      : (canvasPos[0] - startCanvasX);
+    const newScaleOnAxis = Math.max(0.05, startScale[axis] + pixelDelta * 0.005 * dir);
+    if (isAsset) {
+      const model = viewerRef.current?.scene.models[targetId];
+      if (model) { const s = [...(model.scale || [1, 1, 1])]; s[axis] = newScaleOnAxis; model.scale = s; }
+    } else {
+      const entity = viewerRef.current?.scene.objects[targetId];
+      if (entity) { const s = [...(entity.scale || [1, 1, 1])]; s[axis] = newScaleOnAxis; entity.scale = s; }
+    }
+  };
+  updateStretchDragRef.current = updateStretchDrag;
+
+  const endStretchDrag = (persistCallback) => {
+    if (!isStretchingRef.current) return;
+    const drag = stretchDragRef.current;
+    if (!drag) return;
+    const { axis, targetId, isAsset } = drag;
+    let finalScale;
+    if (isAsset) {
+      const model = viewerRef.current?.scene.models[targetId];
+      finalScale = model?.scale || [1, 1, 1];
+    } else {
+      const entity = viewerRef.current?.scene.objects[targetId];
+      finalScale = entity?.scale || [1, 1, 1];
+    }
+    if (persistCallback) persistCallback(targetId, 'scale', axis, finalScale[axis]);
+    stretchDragRef.current = null;
+    isStretchingRef.current = false;
+    setIsStretching(false);
+    buildStretchHandlesRef.current?.(targetId, isAsset);
+  };
+  endStretchDragRef.current = endStretchDrag;
 
   const loadIFCAssetIntoScene = async (instanceId, srcUrl, targetPosition, rotation) => {
     if (!loadersRef.current.ifc) return;
@@ -1642,7 +1452,9 @@ const getCursorWorldPosition = (canvasPos) => {
       setIsLoading,
       buildStretchHandles,
       destroyStretchHandles,
-      setStretchPersistCallback,
+      startStretchDrag,
+      updateStretchDrag,
+      endStretchDrag,
     },
   };
 };

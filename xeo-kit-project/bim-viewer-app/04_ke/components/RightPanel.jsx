@@ -223,12 +223,6 @@ export const RightPanel = ({
 
                         {propertySubTab === 'design' && (selectedObject || activeAsset) && (
                             <div className="space-y-8 pb-8">
-                                {engineState.isStretching && (
-                                  <div className="flex items-center gap-2 px-3 py-2 bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-800 rounded-lg text-xs font-semibold text-indigo-600 dark:text-indigo-400 animate-pulse">
-                                    <span className="w-2 h-2 rounded-full bg-indigo-500 inline-block"></span>
-                                    Stretching — release mouse to apply
-                                  </div>
-                                )}
                                 {/* Material Paint */}
                                 <div>
                                     <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-1.5"><Palette className="w-3.5 h-3.5"/> Material Paint</h4>

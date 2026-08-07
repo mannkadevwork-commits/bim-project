@@ -1,13 +1,13 @@
 import { useState, useRef, useEffect } from 'react';
-import { useBIMEngine } from './engine/useBIMEngine';
+import { useBIMEngine } from './hooks/useBIMEngine';
 import { useProjectSync } from './hooks/useProjectSync';
 import { useCloudRender } from './hooks/useCloudRender';
+import { useStretchHandles } from './hooks/useStretchHandles';
 import { LeftPanel } from './components/LeftPanel';
 import { RightPanel } from './components/RightPanel';
 import { BottomDock } from './components/BottomDock';
 import { RenderStudioModal } from './components/RenderStudioModal';
 import { MeasurementPanel } from './components/MeasurementPanel';
-import { StretchTooltipOverlay } from './components/StretchTooltipOverlay';
 import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
 
 const BIMViewer = ({ file, onDelete, onAdd }) => {
@@ -20,8 +20,8 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [isManualSaving, setIsManualSaving] = useState(false);
-  
   const [isDarkMode, setIsDarkMode] = useState(document.documentElement.classList.contains('dark'));
+
   const toggleTheme = () => {
     if (isDarkMode) {
       document.documentElement.classList.remove('dark');
@@ -32,21 +32,43 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     }
   };
 
+  // --- 1. DESTRUCTURE setToastMessage ---
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, homeTemplates,
     toastMessage, customColor, applyMaterial, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
-    updateStructuralEdit, setToastMessage 
+    updateStructuralEdit, updateStretch, setToastMessage 
   } = useProjectSync(file);
 
+  // --- 2. ADD THE PHASE 4 INSERT DOOR LOGIC ---
   const insertDoor = async (asset, wallSnapData) => {
     if (!file) return;
     const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
     
     const { position, rotation, wallGlobalId } = wallSnapData;
+
+    // BUGFIX: this used to also subtract wallNormal * 0.075 here to
+    // "push into the wall center" — but ifc_element_editor.py's
+    // cmd_insert_door ALREADY does that same inward push, using the
+    // wall's real measured half-thickness (not a guessed 7.5cm
+    // constant). Doing it in both places stacked the two offsets, so
+    // the actual cut ended up centered somewhere other than where the
+    // door mesh below got drawn — that mismatch is what was showing up
+    // as doors rendering "inside"/"embedded in" the wall.
+    // Fix: send the RAW wall-surface click position, untouched on X/Z.
+    // Python is the single source of truth for centering across the
+    // wall's thickness, since it's the only side that actually knows
+    // the wall's real thickness. Floor-snapping (Y=0) is fine to keep
+    // here — Python uses Z exactly as passed, by design (Phase 3), so
+    // this is the one Y-adjustment that's supposed to happen frontend-side.
     const doorSurfacePosition = [position[0], 0, position[2]];
-    
+
+    // 2. Dimensions per door type — used for the door's own asset
+    // scale/rendering only. NOT the wall's thickness (a slab door's own
+    // leaf is 4-10cm; a real wall is usually 10-25cm — sending this as
+    // "wall thickness" was the other half of the original bug). Python
+    // now ignores this for the cut and always measures the real wall.
     const doorDims = {
       'door_single': { width: 0.9, height: 2.1, thickness: 0.05 },
       'door_double': { width: 1.2, height: 2.1, thickness: 0.05 },
@@ -55,10 +77,10 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
       'door_fire': { width: 1.0, height: 2.1, thickness: 0.06 },
       'door_3bhk': { width: 0.9, height: 2.1, thickness: 0.04 },
     }[asset.id] || { width: 0.9, height: 2.1, thickness: 0.05 };
-    
+
     engineActions.setIsLoading(true);
     setToastMessage(`Cutting void in wall...`);
-    
+
     try {
       const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
       const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${wallGlobalId}/insert-door`, {
@@ -71,24 +93,33 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
           ...doorDims 
         })
       });
+
       const data = await response.json();
       if (!response.ok || data.error) throw new Error(data.error || 'Failed to insert door');
-      
+
+      // Hide original native wall
       if (refs.viewerRef.current?.scene.objects[wallGlobalId]) {
         refs.viewerRef.current.scene.objects[wallGlobalId].visible = false;
       }
       updateStructuralEdit(wallGlobalId, 'visible', null, false);
-      
+
+      // Pass `null` for targetPosition & rotation so the new cut wall
+      // spawns exactly at its native architectural coordinates.
       const modifiedWallId = `${wallGlobalId}_cut_${Date.now()}`;
       await engineActions.loadIFCAssetIntoScene(modifiedWallId, data.fileUrl, null, null);
       adoptIsolatedAsset(wallGlobalId, modifiedWallId, data.fileUrl, 'Wall with Void');
-      
+
+      // BUGFIX: place the door mesh using the backend's doorPlacement —
+      // the EXACT center Python cut the void at — rather than a
+      // frontend-guessed position. This is the single-source-of-truth
+      // fix: whatever centering math ran, it only ran once, and both
+      // the hole and the visual door now agree on where that is.
       if (!data.doorPlacement) {
-        throw new Error('Backend did not return doorPlacement check ifc_element_editor.py version.');
+        throw new Error('Backend did not return doorPlacement — check ifc_element_editor.py version.');
       }
       asset.hostWallId = wallGlobalId;
       spawnAsset(asset, data.doorPlacement.position, engineActions.loadIFCAssetIntoScene, data.doorPlacement.rotation);
-      
+
     } catch (error) {
       console.error('[BIMViewer] Door insertion failed:', error);
       setToastMessage(`Error: ${error.message}`);
@@ -97,6 +128,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     }
   };
 
+  // --- 3. FORK THE PLACEMENT HANDLER ---
   const {
     refs, state: engineState, actions: engineActions,
   } = useBIMEngine(
@@ -113,10 +145,20 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     setRightTab
   );
 
+  // 👇 ADD THIS MISSING BLOCK BACK 👇
   const {
     state: renderState, config: renderConfig, setRenderConfig, executeRender,
     setRenderResult, setRenderError,
   } = useCloudRender(file, projectStateRef);
+  // 👆 ---------------------------- 👆
+
+  const { handleScreenPositions, onHandlePointerDown } = useStretchHandles(
+    refs.viewerRef,
+    refs.canvasRef,
+    engineState.selectedAssetId,
+    projectStateRef,
+    updateStretch
+  );
 
   useEffect(() => {
     const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
@@ -128,7 +170,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     if (!document.fullscreenElement) { containerRef.current?.requestFullscreen(); }
     else { document.exitFullscreen(); }
   };
-  
+
   const toggleMaxView = () => {
     const nextState = !isMaxView;
     setIsMaxView(nextState);
@@ -171,22 +213,12 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     }
   };
 
-  const handlePointerDown = (e) => {
-    refs.canvasRef.current?.focus();
-  };
-
-  const handlePointerUp = (e) => {
-    refs.canvasRef.current?.focus();
-  };
-  
-  const handlePointerMove = (e) => {
-    updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY);
-  };
-  
+  const handlePointerMove = (e) => updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY);
   const handleDragOver = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY); };
   const handlePointerLeave = () => { if (tooltipRef.current) tooltipRef.current.style.display = 'none'; };
   const handleDragEnter = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
 
+  // --- 4. FORK THE DROP HANDLER ---
   const handleDrop = async (e) => {
     e.preventDefault();
     try {
@@ -194,7 +226,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
       if (!assetData) return;
       const asset = JSON.parse(assetData);
       const canvasPos = [e.nativeEvent.offsetX, e.nativeEvent.offsetY];
-      
+
       if (asset.type === 'door') {
         const dropData = engineActions.getDropPosition(canvasPos, asset.type);
         if (!dropData.snapped) {
@@ -207,6 +239,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         const worldPos = engineActions.getDropPosition(canvasPos);
         spawnAsset(asset, worldPos, engineActions.loadIFCAssetIntoScene);
       }
+
       setIsRightPanelOpen(true);
       setRightTab('properties');
     } catch (error) {
@@ -265,32 +298,21 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     <div
       ref={containerRef}
       className={`relative w-full h-full bg-slate-100 dark:bg-[#090b14] overflow-hidden transition-colors duration-300
-        ${engineState.isStretching ? 'cursor-ew-resize' : engineState.placementMode || engineState.isMeasuring ? 'cursor-crosshair' : 'cursor-default'}
+        ${engineState.placementMode || engineState.isMeasuring ? 'cursor-crosshair' : 'cursor-default'}
         ${isFullscreen ? 'z-[100]' : ''}`}
     >
-      <div 
-        ref={tooltipRef}
+      <div
+         ref={tooltipRef}
         className="fixed z-[999] pointer-events-none hidden px-3 py-2 bg-slate-900/95 backdrop-blur-xl border border-slate-700/50 rounded-xl shadow-2xl transition-opacity duration-75 text-xs font-mono"
         style={{ top: 0, left: 0, willChange: 'transform' }}
       />
-      
-      {/* TOOLTIP OVERLAY FOR STRETCHING */}
-      {engineState.activeStretchData && (
-        <StretchTooltipOverlay 
-          visible={true}
-          x={engineState.activeStretchData.x}
-          y={engineState.activeStretchData.y}
-          label={engineState.activeStretchData.label}
-        />
-      )}
       
       <div className={`absolute inset-0 z-0 ${!file ? 'opacity-0' : 'opacity-100 transition-opacity duration-1000'}`}>
         <canvas
           ref={refs.canvasRef}
           tabIndex={0}
-          onPointerDown={handlePointerDown}
+          onPointerDown={() => refs.canvasRef.current?.focus()}
           onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp}
           onPointerLeave={handlePointerLeave}
           onDragEnter={handleDragEnter}
           onDragOver={handleDragOver}
@@ -299,6 +321,27 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
           style={{ width: '100%', height: '100%', display: 'block', outline: 'none', touchAction: 'none' }}
         />
         <canvas id="myNavCubeCanvas" ref={refs.navCubeCanvasRef} className="absolute bottom-16 right-6 z-10 w-[150px] h-[150px]" />
+
+        {handleScreenPositions && (
+          <div className="absolute inset-0 z-20 pointer-events-none">
+            {handleScreenPositions.filter(h => h.visible).map(h => (
+              <div
+                key={h.key}
+                onPointerDown={(e) => onHandlePointerDown(h.axis, e)}
+                className="absolute rounded-full shadow-lg cursor-pointer pointer-events-auto"
+                style={{
+                  left: h.x - 7,
+                  top: h.y - 7,
+                  width: 14,
+                  height: 14,
+                  backgroundColor: h.color,
+                  border: '2px solid white',
+                  touchAction: 'none',
+                }}
+              />
+            ))}
+          </div>
+        )}
       </div>
 
       {engineState.placementMode && !engineState.isMeasuring && (
