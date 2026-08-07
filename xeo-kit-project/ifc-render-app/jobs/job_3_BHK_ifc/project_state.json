@@ -77,6 +77,58 @@
         0
       ],
       "visible": true
+    },
+    "cat_18_1786105960836": {
+      "scale": [
+        1.1999999999999997,
+        1,
+        1.03
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": true
+    },
+    "cat_9_1786106159568": {
+      "scale": [
+        1,
+        1,
+        1.025
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": true
+    },
+    "cat_18_1786106238571": {
+      "scale": [
+        1,
+        1,
+        1.005
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": true
+    },
+    "0Ll0j1iYX5$ud5W$y$4wJS": {
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": false
     }
   },
   "materials": {},
@@ -130,23 +182,6 @@
       ]
     },
     {
-      "id": "bed_glb",
-      "instanceId": "bed_glb_1785842168044",
-      "name": "Bed (GLB)",
-      "src": "http://localhost:3000/assets/Bed.glb",
-      "position": [
-        5.41514414696087,
-        5.6874213813362485e-15,
-        -0.60762178830414
-      ],
-      "rotation": [
-        0,
-        0,
-        0
-      ],
-      "assetFormat": "glb"
-    },
-    {
       "id": "commode",
       "instanceId": "commode_1785842337784",
       "name": "Commode",
@@ -164,18 +199,52 @@
       "assetFormat": "ifc"
     },
     {
-      "id": "cat_18",
-      "instanceId": "cat_18_1786021333843",
+      "id": 18,
+      "instanceId": "18_1786106096330",
       "name": "Professional Bed",
-      "src": "http://localhost:3000/uploads/catalog/models/1786021072524_8948eg5kjcg.glb",
+      "src": "http://localhost:3000/assets/18.ifc",
       "position": [
-        2.67175296873098,
-        3.152594362346977,
-        -2.38324580236471
+        0,
+        0,
+        0
       ],
       "rotation": [
         0,
-        268,
+        0,
+        0
+      ],
+      "assetFormat": "ifc"
+    },
+    {
+      "id": "cat_9",
+      "instanceId": "cat_9_1786106159568",
+      "name": "Bed (GLB)",
+      "src": "http://localhost:3000/uploads/catalog/models/1786018339570_n90py4iqzwi.glb",
+      "position": [
+        2.0649251222024,
+        0.15264808237498262,
+        -0.4372132767993122
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ],
+      "assetFormat": "glb"
+    },
+    {
+      "id": "cat_18",
+      "instanceId": "cat_18_1786106238571",
+      "name": "Professional Bed",
+      "src": "http://localhost:3000/uploads/catalog/models/1786021072524_8948eg5kjcg.glb",
+      "position": [
+        5.7069733459494,
+        0.15264808475882574,
+        -2.69240579348655
+      ],
+      "rotation": [
+        0,
+        269,
         0
       ],
       "assetFormat": "glb"
