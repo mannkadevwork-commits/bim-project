@@ -5,27 +5,29 @@ import { animateHandleTo } from './StretchHandles';
 export const applyScale = (viewerRef, targetId, isAsset, scaleVec) => {
   const viewer = viewerRef.current;
   const [sx, sy, sz] = scaleVec;
-  if (isAsset) {
-    const model = viewer.scene.models[targetId];
-    if (!model) return;
-    const p = model.position || [0, 0, 0];
-    model.matrix = [
-      sx, 0,  0,  0,
-      0,  sy, 0,  0,
-      0,  0,  sz, 0,
-      p[0], p[1], p[2], 1,
+
+  // Helper function to build a TRS (Translation, Rotation, Scale) Matrix
+  const applyTransform = (obj) => {
+    if (!obj) return;
+    const p = obj.position || [0, 0, 0];
+    const r = obj.rotation || [0, 0, 0]; // Xeokit stores rotation in degrees
+
+    // Convert the Y-axis rotation from degrees to radians
+    const radY = r[1] * (Math.PI / 180);
+    const cosY = Math.cos(radY);
+    const sinY = Math.sin(radY);
+
+    // Build the column-major 4x4 matrix combining Scale + Y-Rotation + Translation
+    obj.matrix = [
+      sx * cosY,  0,  -sx * sinY, 0,
+      0,          sy, 0,          0,
+      sz * sinY,  0,  sz * cosY,  0,
+      p[0],       p[1], p[2],     1
     ];
-  } else {
-    const entity = viewer.scene.objects[targetId];
-    if (!entity) return;
-    const p = entity.position || [0, 0, 0];
-    entity.matrix = [
-      sx, 0,  0,  0,
-      0,  sy, 0,  0,
-      0,  0,  sz, 0,
-      p[0], p[1], p[2], 1,
-    ];
-  }
+  };
+
+  if (isAsset) applyTransform(viewer.scene.models[targetId]);
+  else applyTransform(viewer.scene.objects[targetId]);
 };
 
 export const resetHoveredStretchHandle = (hoveredStretchMeshRef, stretchAnimFramesRef) => {

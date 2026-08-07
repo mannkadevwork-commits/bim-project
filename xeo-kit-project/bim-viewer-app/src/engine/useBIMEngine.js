@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { math } from '@xeokit/xeokit-sdk/src/viewer/scene/math/math';
 import { Viewer } from '@xeokit/xeokit-sdk/src/viewer/Viewer';
 import { XKTLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/XKTLoaderPlugin/XKTLoaderPlugin';
 import { WebIFCLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/WebIFCLoaderPlugin/WebIFCLoaderPlugin';
@@ -371,16 +372,43 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       }
 
       // --- SCALE HANDLER ---
+     // --- SCALE HANDLER ---
       const { axesList, targetId, isAsset, startCanvasX, startCanvasY, startScale, startPosition, anchorWorld } = dragData;
       const curY = e.clientY - rect.top;
       const s = [...startScale];
       const targetObj = isAsset ? viewer.scene.models[targetId] : viewer.scene.objects[targetId];
+
+      // --- NEW: Camera-Aware Projection Logic ---
+      const viewMatrix = viewer.scene.camera.viewMatrix;
       
+      // Calculate raw mouse delta. (HTML Y goes down, so Screen Up is startY - curY)
+      const deltaScreenX = curX - startCanvasX;
+      const deltaScreenY = startCanvasY - curY; 
+
+      // Helper to calculate camera-corrected drag delta
+      const getEffectiveDelta = (axis, dir) => {
+        // Extract the 2D screen direction of the targeted 3D world axis
+        const screenDirX = axis === 0 ? viewMatrix[0] : axis === 1 ? viewMatrix[4] : viewMatrix[8];
+        const screenDirY = axis === 0 ? viewMatrix[1] : axis === 1 ? viewMatrix[5] : viewMatrix[9];
+
+        // Normalize the projected 2D vector
+        const len = Math.hypot(screenDirX, screenDirY) || 1;
+        const nx = screenDirX / len;
+        const ny = screenDirY / len;
+
+        // Dot product: projects mouse movement directly onto the visual handle axis
+        return (deltaScreenX * nx + deltaScreenY * ny) * dir;
+      };
+
       if (axesList.length === 1) {
         const { axis, dir } = axesList[0];
-        const pixelDelta = axis === 1 ? (startCanvasY - curY) : (curX - startCanvasX);
-        s[axis] = Math.max(0.05, startScale[axis] + pixelDelta * 0.005 * dir);
         
+        // Replace old pixelDelta with the effective camera-aware delta
+        const effectivePixelDelta = getEffectiveDelta(axis, dir);
+        
+        // Note: 'dir' is already factored into getEffectiveDelta, so we remove it from here
+        s[axis] = Math.max(0.05, startScale[axis] + effectivePixelDelta * 0.005);
+
         if (anchorWorld !== null && startPosition && startScale[axis] !== 0) {
           if (targetObj) {
             const newPosition = [...(targetObj.position || startPosition)];
@@ -388,7 +416,8 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
             targetObj.position = newPosition;
           }
         }
-
+        
+        // UI Overlay Update
         if (targetObj && targetObj.aabb) {
            const currentAABB = targetObj.aabb;
            const lengthMeters = Math.abs(currentAABB[axis + 3] - currentAABB[axis]);
@@ -400,15 +429,16 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
            });
         }
       } else if (axesList.length === 2) {
+        // Update 2D dual-axis corner stretch
         const sharedDelta = axesList.reduce((sum, { axis, dir }) => {
-          const pixelDelta = axis === 1 ? (startCanvasY - curY) : (curX - startCanvasX);
-          return sum + pixelDelta * dir;
+          return sum + getEffectiveDelta(axis, dir);
         }, 0) / axesList.length;
-        
+
         axesList.forEach(({ axis }) => {
           s[axis] = Math.max(0.05, startScale[axis] + sharedDelta * 0.005);
         });
-
+        
+        // UI Overlay Update
         if (targetObj && targetObj.aabb) {
            const currentAABB = targetObj.aabb;
            const ax1 = axesList[0].axis;

@@ -1,22 +1,62 @@
 {
+  "structural_edits": {
+    "0nRXe2GMz7aeZD7P7ZwtsU": {
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": false
+    }
+  },
   "materials": {},
   "furniture": [
     {
       "id": "sofa",
-      "instanceId": "sofa_1786035832130",
+      "instanceId": "sofa_1786119488586",
       "name": "Modern Sofa",
       "src": "http://localhost:3000/assets/sofa.ifc",
       "position": [
-        6.13346473859063,
-        0.000023554192855851364,
-        -5.73999357389262
+        6.896849378976279,
+        0,
+        -5.1361955242828214
+      ],
+      "rotation": [
+        0,
+        267.19999999999993,
+        0
+      ],
+      "scale": [
+        0.690214300379611,
+        0.9977305354656103,
+        1.0390189710011293
+      ]
+    },
+    {
+      "id": "0nRXe2GMz7aeZD7P7ZwtsU",
+      "instanceId": "0nRXe2GMz7aeZD7P7ZwtsU_isolated",
+      "name": "ext_top_2",
+      "src": "http://localhost:3000/jobs/job_3_BHK_ifc/element_edits/0nRXe2GMz7aeZD7P7ZwtsU_isolated.ifc",
+      "position": [
+        0,
+        0,
+        0
       ],
       "rotation": [
         0,
         0,
         0
+      ],
+      "scale": [
+        1,
+        1,
+        1
       ]
     }
-  ],
-  "structural_edits": {}
+  ]
 }

@@ -263,4 +263,34 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
       };
       stretchHandlesRef.current.push(rotMesh);
   });
+
+  // --- NEW: Central Move/Translate Handle ---
+  const MOVE_HANDLE_COLOR = [1, 0.78, 0.2]; // Amber, distinct from scale (axis colors) and rotate (cyan)
+
+  const moveHandle = new Mesh(viewer.scene, {
+      id: `sh_${ts}_move`,
+      geometry: new ReadableGeometry(viewer.scene, buildBoxGeometry({
+          xSize: 0.22, ySize: 0.04, zSize: 0.22,
+      })),
+      material: new PhongMaterial(viewer.scene, {
+          diffuse: MOVE_HANDLE_COLOR,
+          emissive: MOVE_HANDLE_COLOR,
+          opacity: 0.85,
+      }),
+      position: [cx, yMax + 0.15, cz], // floats just above the asset's top
+      visible: true,
+      pickable: true,
+  });
+
+  moveHandle._stretchMeta = {
+      isStretchHandle: true,
+      type: 'move',
+      axes: [],
+      targetId: entityId,
+      isAsset,
+      color: MOVE_HANDLE_COLOR,
+      restOpacity: 0.85,
+  };
+
+  stretchHandlesRef.current.push(moveHandle);
 };

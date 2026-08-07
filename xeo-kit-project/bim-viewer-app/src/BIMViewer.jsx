@@ -9,6 +9,7 @@ import { RenderStudioModal } from './components/RenderStudioModal';
 import { MeasurementPanel } from './components/MeasurementPanel';
 import { StretchTooltipOverlay } from './components/StretchTooltipOverlay';
 import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
+import { AssetContextMenu } from './components/AssetContextMenu';
 
 const BIMViewer = ({ file, onDelete, onAdd }) => {
   const containerRef = useRef(null);
@@ -261,6 +262,20 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     }
   }, [file]);
 
+
+  // Sync Engine Visual Transforms -> React State (so it saves to the cloud)
+  useEffect(() => {
+    engineActions.setStretchPersistCallback((targetId, type, axis, value) => {
+      if (type === 'position') {
+        updateAsset(refs.viewerRef, targetId, axis, value, false, false);
+      } else if (type === 'rotation') {
+        updateAsset(refs.viewerRef, targetId, axis, value, true, false);
+      } else if (type === 'scale') {
+        updateAsset(refs.viewerRef, targetId, axis, value, false, true);
+      }
+    });
+  }, [engineActions, updateAsset]);
+
   return (
     <div
       ref={containerRef}
@@ -385,7 +400,12 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
             updateSelectedAsset={(axis, val, rot) =>
               updateAsset(refs.viewerRef, engineState.selectedAssetId, axis, val, rot)
             }
-            deleteSelectedAsset={() => deleteAsset(refs.viewerRef, engineState.selectedAssetId)}
+            deleteSelectedAsset={() => {
+  deleteAsset(refs.viewerRef, engineState.selectedAssetId);
+  engineActions.destroyStretchHandles();
+  engineActions.setSelectedAssetId(null);
+  engineActions.setSelectedObject(null);
+}}
             projectState={projectState}
             engineState={engineState}
             engineActions={engineActions}
