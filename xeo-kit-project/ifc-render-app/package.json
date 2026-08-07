@@ -12,6 +12,7 @@
     "form-data": "^4.0.0",
     "ioredis": "^5.11.1",
     "multer": "^2.1.1",
+    "pg": "^8.22.0",
     "recast-navigation": "^0.43.1",
     "three": "^0.185.1",
     "web-ifc": "^0.0.77"

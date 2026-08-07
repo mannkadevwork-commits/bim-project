@@ -233,18 +233,14 @@ export const useProjectSync = (file) => {
   // ─────────────────────────────────────────────────────────────
   // ACTION: Spawn a single asset (Drag & Drop or Click)
   // ─────────────────────────────────────────────────────────────
-  const spawnAsset = (asset, coordinates, loadIFCAssetIntoScene, rotation = [0, 0, 0]) => {
+  const spawnAsset = (asset, coordinates, loadIFCAssetIntoScene, rotation = [0, 0, 0], loadGLBAssetIntoScene = null) => {
     const uniqueId = `${asset.id}_${Date.now()}`;
     const urlPath = asset.url || asset.src || `/assets/${asset.id}.ifc`;
     const fullAssetUrl = urlPath.startsWith('http')
-      ? urlPath                         
-      : `${API_BASE_URL}${urlPath}`;    
+      ? urlPath
+      : `${API_BASE_URL}${urlPath}`;
 
-      // --- ADD THESE LOGS ---
-    console.log("--- STATE SYNC DEBUG ---");
-    console.log("Furniture ID:", uniqueId);
-    console.log("Position saved to State:", coordinates);
-    // ----------------------
+    const isGLB = urlPath.toLowerCase().endsWith('.glb');
 
     setProjectState(prev => ({
       ...prev,
@@ -257,11 +253,16 @@ export const useProjectSync = (file) => {
           src: fullAssetUrl,
           position: coordinates,
           rotation: rotation,
+          assetFormat: isGLB ? 'glb' : 'ifc',
         },
       ],
     }));
 
-    loadIFCAssetIntoScene(uniqueId, fullAssetUrl, coordinates, rotation);
+    if (isGLB && loadGLBAssetIntoScene) {
+      loadGLBAssetIntoScene(uniqueId, fullAssetUrl, coordinates, rotation);
+    } else {
+      loadIFCAssetIntoScene(uniqueId, fullAssetUrl, coordinates, rotation);
+    }
 
     setToastMessage(`${asset.name} placed!`);
     setTimeout(() => setToastMessage(null), 3000);

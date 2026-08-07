@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { useBIMEngine } from './hooks/useBIMEngine';
 import { useProjectSync } from './hooks/useProjectSync';
 import { useCloudRender } from './hooks/useCloudRender';
+import { useCatalog } from './hooks/useCatalog';
 import { LeftPanel } from './components/LeftPanel';
 import { RightPanel } from './components/RightPanel';
 import { BottomDock } from './components/BottomDock';
@@ -32,6 +33,8 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
   };
 
   // --- 1. DESTRUCTURE setToastMessage ---
+  const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
+
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, homeTemplates,
@@ -137,7 +140,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
       if (asset.type === 'door') {
         insertDoor(asset, data);
       } else {
-        spawnAsset(asset, data, engineActions.loadIFCAssetIntoScene);
+        spawnAsset(asset, data, engineActions.loadIFCAssetIntoScene, [0, 0, 0], engineActions.loadGLBAssetIntoScene);
       }
     },
     setIsRightPanelOpen,
@@ -204,7 +207,31 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     }
   };
 
-  const handlePointerMove = (e) => updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY);
+  const handlePointerDown = (e) => {
+    refs.canvasRef.current?.focus();
+    if (!engineState.selectedObject && !engineState.selectedAssetId) return;
+    const viewer = refs.viewerRef.current;
+    if (!viewer) return;
+    const canvasPos = [e.nativeEvent.offsetX, e.nativeEvent.offsetY];
+    const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
+    if (pick?.entity?._stretchMeta?.isStretchHandle) {
+      e.stopPropagation();
+      // Disable camera orbit so mouse drag stretches instead of rotating
+      viewer.cameraControl.active = false;
+      engineActions.startStretchDrag(canvasPos, pick.entity._stretchMeta);
+    }
+  };
+
+  const handlePointerMove = (e) => {
+    updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY);
+    engineActions.updateStretchDrag([e.nativeEvent.offsetX, e.nativeEvent.offsetY]);
+  };
+
+  const handlePointerUp = () => {
+    const viewer = refs.viewerRef.current;
+    if (viewer) viewer.cameraControl.active = true;
+    engineActions.endStretchDrag(updateStructuralEdit);
+  };
   const handleDragOver = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY); };
   const handlePointerLeave = () => { if (tooltipRef.current) tooltipRef.current.style.display = 'none'; };
   const handleDragEnter = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
@@ -228,7 +255,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         await insertDoor(asset, dropData);
       } else {
         const worldPos = engineActions.getDropPosition(canvasPos);
-        spawnAsset(asset, worldPos, engineActions.loadIFCAssetIntoScene);
+        spawnAsset(asset, worldPos, engineActions.loadIFCAssetIntoScene, [0, 0, 0], engineActions.loadGLBAssetIntoScene);
       }
 
       setIsRightPanelOpen(true);
@@ -289,7 +316,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     <div
       ref={containerRef}
       className={`relative w-full h-full bg-slate-100 dark:bg-[#090b14] overflow-hidden transition-colors duration-300
-        ${engineState.placementMode || engineState.isMeasuring ? 'cursor-crosshair' : 'cursor-default'}
+        ${engineState.isStretching ? 'cursor-ew-resize' : engineState.placementMode || engineState.isMeasuring ? 'cursor-crosshair' : 'cursor-default'}
         ${isFullscreen ? 'z-[100]' : ''}`}
     >
       <div
@@ -302,8 +329,9 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
         <canvas
           ref={refs.canvasRef}
           tabIndex={0}
-          onPointerDown={() => refs.canvasRef.current?.focus()}
+          onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
           onPointerLeave={handlePointerLeave}
           onDragEnter={handleDragEnter}
           onDragOver={handleDragOver}
@@ -369,6 +397,9 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
             onClose={() => { setIsLeftPanelOpen(false); setIsMaxView(false); }}
             treeRef={refs.treeContainerRef}
             availableAssets={availableAssets}
+            catalogTree={catalogTree}
+            catalogLoading={catalogLoading}
+            catalogError={catalogError}
             homeTemplates={homeTemplates}
             onApplyTemplate={(templateId) => applyTemplate(templateId, engineActions.loadIFCAssetIntoScene)}
             placementMode={engineState.placementMode}

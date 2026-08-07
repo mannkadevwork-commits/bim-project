@@ -2,10 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { Viewer } from '@xeokit/xeokit-sdk/src/viewer/Viewer';
 import { XKTLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/XKTLoaderPlugin/XKTLoaderPlugin';
 import { WebIFCLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/WebIFCLoaderPlugin/WebIFCLoaderPlugin';
+import { GLTFLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/GLTFLoaderPlugin/GLTFLoaderPlugin';
 import { TreeViewPlugin } from '@xeokit/xeokit-sdk/src/plugins/TreeViewPlugin/TreeViewPlugin';
 import { NavCubePlugin } from '@xeokit/xeokit-sdk/src/plugins/NavCubePlugin/NavCubePlugin';
 import { SectionPlanesPlugin } from '@xeokit/xeokit-sdk/src/plugins/SectionPlanesPlugin/SectionPlanesPlugin';
 import { DistanceMeasurementsPlugin } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsPlugin';
+import { Mesh } from '@xeokit/xeokit-sdk/src/viewer/scene/mesh/Mesh';
+import { ReadableGeometry } from '@xeokit/xeokit-sdk/src/viewer/scene/geometry/ReadableGeometry';
+import { buildBoxGeometry } from '@xeokit/xeokit-sdk/src/viewer/scene/geometry/builders/buildBoxGeometry';
+import { PhongMaterial } from '@xeokit/xeokit-sdk/src/viewer/scene/materials/PhongMaterial';
 import * as WebIFC from 'web-ifc';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
@@ -36,6 +41,14 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
   const [selectedAssetId, setSelectedAssetId] = useState(null);
   const [placementMode, setPlacementMode] = useState(null);
   const placementModeRef = useRef(null);
+
+  // Stretch handle state
+  const stretchHandlesRef = useRef([]);
+  const stretchDragRef = useRef(null);
+  const isStretchingRef = useRef(false);
+  const [isStretching, setIsStretching] = useState(false);
+  const buildStretchHandlesRef = useRef(null);
+  const destroyStretchHandlesRef = useRef(null);
 
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [measurementsList, setMeasurementsList] = useState([]); 
@@ -108,6 +121,7 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
 
     sectionPlanesRef.current = new SectionPlanesPlugin(viewer);
     loadersRef.current.xkt = new XKTLoaderPlugin(viewer);
+    loadersRef.current.gltf = new GLTFLoaderPlugin(viewer);
 
     measurementsPluginRef.current = new DistanceMeasurementsPlugin(viewer, {
         containerElement: canvasRef.current.parentElement,
@@ -141,6 +155,8 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
 
     viewer.cameraControl.on('picked', (pickResult) => {
       if (isMeasuringRef.current) return;
+      // If a stretch handle was clicked, don't re-select — the pointerdown handler owns this
+      if (pickResult.entity?._stretchMeta?.isStretchHandle) return;
 
       if (placementModeRef.current) {
         if (placementModeRef.current.type === 'door') {
@@ -177,6 +193,7 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
         const assetModel = viewer.scene.models[entity.model.id];
         if (assetModel) assetModel.selected = true;
         setSelectedAssetId(entity.model.id);
+        buildStretchHandlesRef.current?.(entity.model.id, true);
 
         const assetMetaObject = viewer.metaScene.metaObjects[entity.id];
         if (assetMetaObject) {
@@ -214,6 +231,8 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
       setSelectedAssetId(null);
       viewer.scene.setObjectsSelected(viewer.scene.selectedObjectIds, false);
       entity.selected = true;
+      // Native IFC entities cannot be individually scaled (geometry is GPU-baked)
+      // Only show stretch handles for dropped asset models
 
       const metaObject = viewer.metaScene.metaObjects[entity.id];
       if (metaObject) {
@@ -247,14 +266,123 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
       }
     });
 
+    // ── Stretch handle mouse events (native listeners, bypass cameraControl) ──
+    const canvas = canvasRef.current;
+
+    const onCanvasMouseDown = (e) => {
+      const canvasPos = [e.offsetX, e.offsetY];
+      const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
+      console.log('[Stretch] mousedown pick:', pick?.entity?.id, pick?.entity?._stretchMeta);
+      if (pick?.entity?._stretchMeta?.isStretchHandle) {
+        e.stopPropagation();
+        e.preventDefault();
+        viewer.cameraControl.active = false;
+        const meta = pick.entity._stretchMeta;
+        const { axis, dir, targetId, isAsset } = meta;
+        // Read current scale: from matrix diagonal if matrix was set, else from _scale via position setter path
+        const getScale = (obj) => {
+          if (!obj) return [1, 1, 1];
+          const m = obj.matrix;
+          if (!m || m.length < 11) return [1, 1, 1];
+          const sx = Math.sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
+          const sy = Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]);
+          const sz = Math.sqrt(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]);
+          return [sx || 1, sy || 1, sz || 1];
+        };
+        let startScale;
+        if (isAsset) {
+          startScale = getScale(viewer.scene.models[targetId]);
+        } else {
+          startScale = getScale(viewer.scene.objects[targetId]);
+        }
+        stretchDragRef.current = { axis, dir, targetId, isAsset, startCanvasX: e.offsetX, startCanvasY: e.offsetY, startScale };
+        isStretchingRef.current = true;
+        setIsStretching(true);
+        console.log('[Stretch] Drag started on axis', axis, 'dir', dir, 'target', targetId);
+      }
+    };
+
+    const applyScale = (targetId, isAsset, scaleVec) => {
+      const [sx, sy, sz] = scaleVec;
+      // SceneModel.scale setter is a NOP (deprecated) — must use model.matrix
+      // Compose scale + existing translation so position is preserved
+      if (isAsset) {
+        const model = viewer.scene.models[targetId];
+        if (!model) return;
+        const p = model.position || [0, 0, 0];
+        model.matrix = [
+          sx, 0,  0,  0,
+          0,  sy, 0,  0,
+          0,  0,  sz, 0,
+          p[0], p[1], p[2], 1,
+        ];
+      } else {
+        const entity = viewer.scene.objects[targetId];
+        if (!entity) return;
+        const p = entity.position || [0, 0, 0];
+        entity.matrix = [
+          sx, 0,  0,  0,
+          0,  sy, 0,  0,
+          0,  0,  sz, 0,
+          p[0], p[1], p[2], 1,
+        ];
+      }
+    };
+
+    const onDocMouseMove = (e) => {
+      if (!isStretchingRef.current || !stretchDragRef.current) return;
+      const { axis, dir, targetId, isAsset, startCanvasX, startCanvasY, startScale } = stretchDragRef.current;
+      const rect = canvas.getBoundingClientRect();
+      const curX = e.clientX - rect.left;
+      const curY = e.clientY - rect.top;
+      const pixelDelta = axis === 1 ? (startCanvasY - curY) : (curX - startCanvasX);
+      const newScaleOnAxis = Math.max(0.05, startScale[axis] + pixelDelta * 0.005 * dir);
+      const s = [...startScale]; s[axis] = newScaleOnAxis;
+      applyScale(targetId, isAsset, s);
+    };
+
+    const onDocMouseUp = () => {
+      if (!isStretchingRef.current || !stretchDragRef.current) return;
+      const { axis, targetId, isAsset } = stretchDragRef.current;
+      const getScale = (obj) => {
+        if (!obj) return [1, 1, 1];
+        const m = obj.matrix;
+        return [
+          Math.sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]),
+          Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]),
+          Math.sqrt(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]),
+        ];
+      };
+      const finalScale = isAsset
+        ? getScale(viewer.scene.models[targetId])
+        : getScale(viewer.scene.objects[targetId]);
+      console.log('[Stretch] Drag ended, finalScale axis', axis, '=', finalScale[axis]);
+      stretchDragRef.current = null;
+      isStretchingRef.current = false;
+      setIsStretching(false);
+      viewer.cameraControl.active = true;
+      buildStretchHandlesRef.current?.(targetId, isAsset);
+    };
+
+    canvas.addEventListener('mousedown', onCanvasMouseDown, { capture: true });
+    document.addEventListener('mousemove', onDocMouseMove);
+    document.addEventListener('mouseup', onDocMouseUp);
+
     viewer.cameraControl.on('pickedNothing', () => {
       if (placementModeRef.current) { setPlacementMode(null); return; }
       viewer.scene.setObjectsSelected(viewer.scene.selectedObjectIds, false);
       setSelectedObject(null);
       setSelectedAssetId(null);
+      destroyStretchHandlesRef.current?.();
+      stretchDragRef.current = null;
+      isStretchingRef.current = false;
+      setIsStretching(false);
     });
 
     return () => {
+      canvas.removeEventListener('mousedown', onCanvasMouseDown, { capture: true });
+      document.removeEventListener('mousemove', onDocMouseMove);
+      document.removeEventListener('mouseup', onDocMouseUp);
       measurementsPluginRef.current = null;
       viewerRef.current = null;
       viewer.destroy();
@@ -327,7 +455,11 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
         if (projectStateRef.current.furniture) {
           projectStateRef.current.furniture.forEach(item => {
             if (!viewerRef.current.scene.models[item.instanceId]) {
-              loadIFCAssetIntoScene(item.instanceId, item.src, item.position, item.rotation);
+              if (item.assetFormat === 'glb') {
+                loadGLBAssetIntoScene(item.instanceId, item.src, item.position, item.rotation);
+              } else {
+                loadIFCAssetIntoScene(item.instanceId, item.src, item.position, item.rotation);
+              }
             }
           });
         }
@@ -848,6 +980,149 @@ const getCursorWorldPosition = (canvasPos) => {
     };
   };
 
+  // ── Stretch Handles ─────────────────────────────────────────────────
+  const destroyStretchHandles = () => {
+    stretchHandlesRef.current.forEach(mesh => { try { mesh.destroy(); } catch (_) {} });
+    stretchHandlesRef.current = [];
+  };
+  destroyStretchHandlesRef.current = destroyStretchHandles;
+
+  const buildStretchHandles = (entityId, isAsset) => {
+    destroyStretchHandles();
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+
+    let aabb;
+    if (isAsset) {
+      const model = viewer.scene.models[entityId];
+      if (!model) return;
+      aabb = model.aabb;
+    } else {
+      const entity = viewer.scene.objects[entityId];
+      if (!entity) return;
+      aabb = entity.aabb;
+    }
+    if (!aabb) return;
+
+    const [xMin, yMin, zMin, xMax, yMax, zMax] = aabb;
+    const cx = (xMin + xMax) / 2;
+    const cy = (yMin + yMax) / 2;
+    const cz = (zMin + zMax) / 2;
+    const handleSize = 0.15;
+
+    const handleDefs = [
+      { pos: [xMax, cy, cz], axis: 0, dir: +1, color: [1, 0.2, 0.2] },
+      { pos: [xMin, cy, cz], axis: 0, dir: -1, color: [1, 0.2, 0.2] },
+      { pos: [cx, yMax, cz], axis: 1, dir: +1, color: [0.2, 1, 0.2] },
+      { pos: [cx, yMin, cz], axis: 1, dir: -1, color: [0.2, 1, 0.2] },
+      { pos: [cx, cy, zMax], axis: 2, dir: +1, color: [0.2, 0.4, 1] },
+      { pos: [cx, cy, zMin], axis: 2, dir: -1, color: [0.2, 0.4, 1] },
+    ];
+
+    const ts = Date.now();
+    handleDefs.forEach((def, i) => {
+      const mesh = new Mesh(viewer.scene, {
+        id: `sh_${ts}_${i}`,
+        geometry: new ReadableGeometry(viewer.scene, buildBoxGeometry({
+          xSize: handleSize, ySize: handleSize, zSize: handleSize,
+        })),
+        material: new PhongMaterial(viewer.scene, {
+          diffuse: def.color,
+          emissive: def.color,
+          opacity: 0.9,
+        }),
+        position: def.pos,
+        pickable: true,
+      });
+      mesh._stretchMeta = { isStretchHandle: true, axis: def.axis, dir: def.dir, targetId: entityId, isAsset };
+      stretchHandlesRef.current.push(mesh);
+    });
+    console.log('[Stretch] Built', stretchHandlesRef.current.length, 'handles for', entityId, 'aabb:', aabb);
+  };
+  buildStretchHandlesRef.current = buildStretchHandles;
+
+  const startStretchDrag = (canvasPos, stretchMeta) => {
+    const { axis, dir, targetId, isAsset } = stretchMeta;
+    let startScale;
+    if (isAsset) {
+      const model = viewerRef.current?.scene.models[targetId];
+      startScale = model ? [...(model.scale || [1, 1, 1])] : [1, 1, 1];
+    } else {
+      const entity = viewerRef.current?.scene.objects[targetId];
+      startScale = entity ? [...(entity.scale || [1, 1, 1])] : [1, 1, 1];
+    }
+    stretchDragRef.current = { axis, dir, targetId, isAsset, startCanvasX: canvasPos[0], startCanvasY: canvasPos[1], startScale };
+    isStretchingRef.current = true;
+    setIsStretching(true);
+  };
+
+  const updateStretchDrag = (canvasPos) => {
+    if (!isStretchingRef.current) return;
+    const drag = stretchDragRef.current;
+    if (!drag) return;
+    const { axis, dir, targetId, isAsset, startCanvasX, startCanvasY, startScale } = drag;
+    const pixelDelta = axis === 1
+      ? (startCanvasY - canvasPos[1])
+      : (canvasPos[0] - startCanvasX);
+    const newScaleOnAxis = Math.max(0.05, startScale[axis] + pixelDelta * 0.005 * dir);
+    if (isAsset) {
+      const model = viewerRef.current?.scene.models[targetId];
+      if (model) { const s = [...(model.scale || [1, 1, 1])]; s[axis] = newScaleOnAxis; model.scale = s; }
+    } else {
+      const entity = viewerRef.current?.scene.objects[targetId];
+      if (entity) { const s = [...(entity.scale || [1, 1, 1])]; s[axis] = newScaleOnAxis; entity.scale = s; }
+    }
+  };
+
+  const endStretchDrag = (persistCallback) => {
+    if (!isStretchingRef.current) return;
+    const drag = stretchDragRef.current;
+    if (!drag) return;
+    const { axis, targetId, isAsset } = drag;
+    let finalScale;
+    if (isAsset) {
+      const model = viewerRef.current?.scene.models[targetId];
+      finalScale = model?.scale || [1, 1, 1];
+    } else {
+      const entity = viewerRef.current?.scene.objects[targetId];
+      finalScale = entity?.scale || [1, 1, 1];
+    }
+    if (persistCallback) persistCallback(targetId, 'scale', axis, finalScale[axis]);
+    stretchDragRef.current = null;
+    isStretchingRef.current = false;
+    setIsStretching(false);
+    buildStretchHandlesRef.current?.(targetId, isAsset);
+  };
+
+  const loadGLBAssetIntoScene = async (instanceId, srcUrl, targetPosition, rotation) => {
+    if (!loadersRef.current.gltf) return;
+    try {
+      const assetModel = loadersRef.current.gltf.load({
+        id: instanceId,
+        src: srcUrl,
+        edges: true,
+      });
+
+      assetModel.on('loaded', () => {
+        const gs = globalScaleFactorRef.current;
+        if (gs && (gs.x !== 1 || gs.y !== 1 || gs.z !== 1)) {
+          assetModel.scale = [gs.x, gs.y, gs.z];
+        }
+        const aabb = assetModel.aabb;
+        if (aabb && targetPosition) {
+          assetModel.position = [
+            targetPosition[0] - (aabb[0] + aabb[3]) / 2,
+            targetPosition[1] - aabb[1],
+            targetPosition[2] - (aabb[2] + aabb[5]) / 2,
+          ];
+        }
+        if (rotation) assetModel.rotation = rotation;
+      });
+    } catch (error) {
+      console.error('[BIM Engine] GLB placement failure:', error);
+    }
+  };
+
   const loadIFCAssetIntoScene = async (instanceId, srcUrl, targetPosition, rotation) => {
     if (!loadersRef.current.ifc) return;
 
@@ -1129,6 +1404,7 @@ const getCursorWorldPosition = (canvasPos) => {
       axisBreakdownVisible,
       totalMeasuredLength,
       sceneScaleFactor,
+      isStretching,
     },
     actions: {
       toggleXRay,
@@ -1138,6 +1414,7 @@ const getCursorWorldPosition = (canvasPos) => {
       setSelectedAssetId,
       setPlacementMode,
       loadIFCAssetIntoScene,
+      loadGLBAssetIntoScene,
       getDropPosition,
       getWallSnapData,
       toggleMeasurementMode,
@@ -1145,19 +1422,23 @@ const getCursorWorldPosition = (canvasPos) => {
       deleteMeasurement,
       scaleModelByMeasurement,
       calibrateWallHeight,
-
       flyToMeasurement,
       toggleSnapping,
       toggleAxisBreakdown,
       setMeasurementUnit,
       formatLength,
-      updateNativeOffset,     
-      updateDynamicTransform, 
+      updateNativeOffset,
+      updateDynamicTransform,
       updateStructuralTransform,
       isolateAndMakeMoveable,
       inspectNativeElement,
       getCursorWorldPosition,
       setIsLoading,
+      buildStretchHandles,
+      destroyStretchHandles,
+      startStretchDrag,
+      updateStretchDrag,
+      endStretchDrag,
     },
   };
 };
