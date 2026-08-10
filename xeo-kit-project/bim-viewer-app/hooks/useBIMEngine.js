@@ -59,16 +59,6 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
 
   const [selectedObject, setSelectedObject] = useState(null);
   const [selectedAssetId, setSelectedAssetId] = useState(null);
-
-  // Explicit transform interaction mode. The tooltip is the single source
-  // of truth for which interaction is enabled.
-  const [transformMode, setTransformMode] = useState('move');
-  const transformModeRef = useRef('move');
-  const selectedAssetIdRef = useRef(null);
-  useEffect(() => { selectedAssetIdRef.current = selectedAssetId; }, [selectedAssetId]);
-  useEffect(() => {
-    transformModeRef.current = transformMode;
-  }, [transformMode]);
   const [placementMode, setPlacementMode] = useState(null);
   const placementModeRef = useRef(null);
 
@@ -229,13 +219,7 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
         const assetModel = viewer.scene.models[entity.model.id];
         if (assetModel) assetModel.selected = true;
         setSelectedAssetId(entity.model.id);
-        selectedAssetIdRef.current = entity.model.id;
-        setTransformMode('move');
-        transformModeRef.current = 'move';
         buildStretchHandlesRef.current?.(entity.model.id, true);
-        // Selection defaults to Move; stretch handles remain hidden until
-        // the user explicitly chooses Stretch in the tooltip.
-        setTimeout(() => handleTransformModeChange('move'), 0);
 
         const assetMetaObject = viewer.metaScene.metaObjects[entity.id];
         if (assetMetaObject) {
@@ -271,10 +255,6 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
       }
 
       setSelectedAssetId(null);
-      selectedAssetIdRef.current = null;
-      setTransformMode('move');
-      transformModeRef.current = 'move';
-      destroyStretchHandlesRef.current?.();
       viewer.scene.setObjectsSelected(viewer.scene.selectedObjectIds, false);
       entity.selected = true;
       // Native IFC entities cannot be individually scaled (geometry is GPU-baked)
@@ -312,322 +292,149 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
       }
     });
 
-    // ── Unified transform interaction ─────────────────────────────────
-    // The previous implementation treated every picked helper mesh as a
-    // stretch interaction. That made the UI mode switch cosmetic only.
-    // Here the selected mode explicitly owns the pointer interaction:
-    //   move    -> drag selected asset over the floor plane
-    //   rotate  -> horizontal drag rotates around world Y
-    //   stretch -> drag the actual stretch face handles
+    // ── Stretch handle mouse events (native listeners, bypass cameraControl) ──
     const canvas = canvasRef.current;
-
-    const getTarget = (targetId, isAsset = true) => {
-      if (!viewer) return null;
-      return isAsset ? viewer.scene.models[targetId] : viewer.scene.objects[targetId];
-    };
-
-    const getScale = (obj) => {
-      if (!obj) return [1, 1, 1];
-      if (Array.isArray(obj.scale) && obj.scale.length >= 3) {
-        return [Number(obj.scale[0]) || 1, Number(obj.scale[1]) || 1, Number(obj.scale[2]) || 1];
-      }
-      const m = obj.matrix;
-      if (!m || m.length < 11) return [1, 1, 1];
-      return [
-        Math.hypot(m[0], m[1], m[2]) || 1,
-        Math.hypot(m[4], m[5], m[6]) || 1,
-        Math.hypot(m[8], m[9], m[10]) || 1,
-      ];
-    };
-
-    const setTargetScale = (target, scale) => {
-      if (!target) return;
-      // Use xeokit's transform property. Do not rebuild target.matrix:
-      // rebuilding it is what previously discarded rotation.
-      target.scale = [...scale];
-    };
-
-    const getFloorPoint = (canvasPos, planeY) => {
-      try {
-        const camera = viewer.scene.camera;
-        const w = canvas.clientWidth;
-        const h = canvas.clientHeight;
-        const viewProj = mat4Mul(camera.project.matrix, camera.viewMatrix);
-        const inv = mat4Invert(viewProj);
-        if (!inv) return null;
-        return intersectXZPlane(canvasPos[0], canvasPos[1], inv, planeY, w, h);
-      } catch (_) {
-        return null;
-      }
-    };
-
-    const startMove = (canvasPos, targetId, isAsset) => {
-      const target = getTarget(targetId, isAsset);
-      if (!target) return false;
-      const position = [...(target.position || [0, 0, 0])];
-      const floorY = target.aabb ? target.aabb[1] : position[1];
-      const pointerWorld = getFloorPoint(canvasPos, floorY);
-      if (!pointerWorld) return false;
-
-      stretchDragRef.current = {
-        kind: 'move',
-        targetId,
-        isAsset,
-        startPosition: position,
-        startPointerWorld: pointerWorld,
-        floorY,
-      };
-      isStretchingRef.current = true;
-      setIsStretching(true);
-      return true;
-    };
-
-    const startRotate = (canvasPos, targetId, isAsset) => {
-      const target = getTarget(targetId, isAsset);
-      if (!target) return false;
-      const position = [...(target.position || [0, 0, 0])];
-      const center = target.aabb
-        ? [
-            (target.aabb[0] + target.aabb[3]) / 2,
-            (target.aabb[1] + target.aabb[4]) / 2,
-            (target.aabb[2] + target.aabb[5]) / 2,
-          ]
-        : position;
-
-      const dx = center[0] - position[0];
-      const dz = center[2] - position[2];
-      const currentRotation = [...(target.rotation || [0, 0, 0])];
-
-      stretchDragRef.current = {
-        kind: 'rotate',
-        targetId,
-        isAsset,
-        startCanvasX: canvasPos[0],
-        startRotation: currentRotation,
-        center,
-        // Rotation sensitivity is deliberately moderate; 180px ≈ 90°.
-        rotationSensitivity: Math.PI / 360,
-      };
-      isStretchingRef.current = true;
-      setIsStretching(true);
-      return true;
-    };
-
-    const startStretch = (canvasPos, meta) => {
-      const { axes, targetId, isAsset } = meta;
-      const target = getTarget(targetId, isAsset);
-      if (!target || !axes?.length) return false;
-
-      const startScale = getScale(target);
-      const startPosition = [...(target.position || [0, 0, 0])];
-      const startRotation = [...(target.rotation || [0, 0, 0])];
-      const rotationY = (Number(startRotation[1]) || 0) * Math.PI / 180;
-      const c = Math.cos(rotationY);
-      const s = Math.sin(rotationY);
-
-      // Xeokit Y rotation: local X/Z axes expressed in world XZ.
-      const localAxes = [
-        [c, 0, -s],
-        [0, 1, 0],
-        [s, 0, c],
-      ];
-
-      // Compute a world-space center/half-extent from the current AABB.
-      // The AABB is used only to establish a stable stretch scale; the
-      // actual drag direction is projected onto the rotated local axis.
-      const aabb = target.aabb;
-      const halfExtent = aabb
-        ? [
-            Math.max(1e-6, (aabb[3] - aabb[0]) / 2),
-            Math.max(1e-6, (aabb[4] - aabb[1]) / 2),
-            Math.max(1e-6, (aabb[5] - aabb[2]) / 2),
-          ]
-        : [1, 1, 1];
-
-      const startPointerWorld = getFloorPoint(canvasPos, aabb ? aabb[1] : startPosition[1]);
-
-      stretchDragRef.current = {
-        kind: 'stretch',
-        axesList: axes,
-        targetId,
-        isAsset,
-        startCanvasX: canvasPos[0],
-        startCanvasY: canvasPos[1],
-        startScale,
-        startPosition,
-        startRotation,
-        localAxes,
-        halfExtent,
-        startPointerWorld,
-      };
-      isStretchingRef.current = true;
-      setIsStretching(true);
-      return true;
-    };
 
     const onCanvasMouseDown = (e) => {
       const canvasPos = [e.offsetX, e.offsetY];
-      const mode = transformModeRef.current;
-
-      // Stretch handles are only active in Stretch mode.
       const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
-      const meta = pick?.entity?._stretchMeta;
-
-      if (mode === 'stretch' && meta?.isStretchHandle && meta.transformMode !== 'rotate' && meta.transformMode !== 'move') {
+      if (pick?.entity?._stretchMeta?.isStretchHandle) {
         e.stopPropagation();
         e.preventDefault();
-        if (startStretch(canvasPos, meta)) {
-          viewer.cameraControl.active = false;
-          hideRevealedGroup();
-          stretchHandlesRef.current.forEach(mesh => {
-            if (mesh === pick.entity) return;
-            mesh.pickable = false;
-            mesh.visible = false;
-          });
-          animateHandleTo(pick.entity, {
-            opacity: pick.entity._stretchMeta.restOpacity,
-            scale: STRETCH_HANDLE_DRAG_SCALE
-          });
+        viewer.cameraControl.active = false;
+        const meta = pick.entity._stretchMeta;
+        const { axes, targetId, isAsset } = meta;
+        // Read current scale: from matrix diagonal if matrix was set, else from _scale via position setter path
+        const getScale = (obj) => {
+          if (!obj) return [1, 1, 1];
+          const m = obj.matrix;
+          if (!m || m.length < 11) return [1, 1, 1];
+          const sx = Math.sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
+          const sy = Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]);
+          const sz = Math.sqrt(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]);
+          return [sx || 1, sy || 1, sz || 1];
+        };
+        let startScale, targetObj;
+        if (isAsset) {
+          targetObj = viewer.scene.models[targetId];
+        } else {
+          targetObj = viewer.scene.objects[targetId];
         }
-        return;
+        startScale = getScale(targetObj);
+        const startPosition = targetObj?.position ? [...targetObj.position] : [0, 0, 0];
+
+        let anchorWorld = null;
+        if (axes.length === 1 && targetObj?.aabb) {
+          const { axis, dir } = axes[0];
+          anchorWorld = dir > 0 ? targetObj.aabb[axis] : targetObj.aabb[axis + 3];
+        }
+
+        stretchDragRef.current = { axesList: axes, targetId, isAsset, startCanvasX: e.offsetX, startCanvasY: e.offsetY, startScale, startPosition, anchorWorld };
+        isStretchingRef.current = true;
+        setIsStretching(true);
+
+        hideRevealedGroup();
+        stretchHandlesRef.current.forEach(mesh => {
+          if (mesh === pick.entity) return;
+          if (mesh._stretchAnimId) {
+            cancelAnimationFrame(mesh._stretchAnimId);
+            stretchAnimFramesRef.current.delete(mesh._stretchAnimId);
+            mesh._stretchAnimId = null;
+          }
+          mesh.pickable = false;
+          mesh.visible = false;
+        });
+        animateHandleTo(pick.entity, { opacity: pick.entity._stretchMeta.restOpacity, scale: STRETCH_HANDLE_DRAG_SCALE });
       }
+    };
 
-      // Move/rotate only operate on the currently selected dropped asset.
-      const selectedId = selectedAssetIdRef.current;
-      if (!selectedId) return;
-
-      const selectedModel = viewer.scene.models[selectedId];
-      if (!selectedModel) return;
-
-      // Don't steal clicks on the transform tooltip; it lives outside canvas.
-      if (mode === 'move' && (pick?.entity?.id === selectedId || pick?.entity?.model?.id === selectedId || pick?.entity === selectedModel)) {
-        e.stopPropagation();
-        e.preventDefault();
-        if (startMove(canvasPos, selectedId, true)) viewer.cameraControl.active = false;
-      } else if (mode === 'rotate' && (pick?.entity?.id === selectedId || pick?.entity?.model?.id === selectedId || pick?.entity === selectedModel)) {
-        e.stopPropagation();
-        e.preventDefault();
-        if (startRotate(canvasPos, selectedId, true)) viewer.cameraControl.active = false;
+    const applyScale = (targetId, isAsset, scaleVec) => {
+      const [sx, sy, sz] = scaleVec;
+      // SceneModel.scale setter is a NOP (deprecated) — must use model.matrix
+      // Compose scale + existing translation so position is preserved
+      if (isAsset) {
+        const model = viewer.scene.models[targetId];
+        if (!model) return;
+        const p = model.position || [0, 0, 0];
+        model.matrix = [
+          sx, 0,  0,  0,
+          0,  sy, 0,  0,
+          0,  0,  sz, 0,
+          p[0], p[1], p[2], 1,
+        ];
+      } else {
+        const entity = viewer.scene.objects[targetId];
+        if (!entity) return;
+        const p = entity.position || [0, 0, 0];
+        entity.matrix = [
+          sx, 0,  0,  0,
+          0,  sy, 0,  0,
+          0,  0,  sz, 0,
+          p[0], p[1], p[2], 1,
+        ];
       }
     };
 
     const onDocMouseMove = (e) => {
       if (!isStretchingRef.current || !stretchDragRef.current) return;
-      const drag = stretchDragRef.current;
+      const { axesList, targetId, isAsset, startCanvasX, startCanvasY, startScale, startPosition, anchorWorld } = stretchDragRef.current;
       const rect = canvas.getBoundingClientRect();
       const curX = e.clientX - rect.left;
       const curY = e.clientY - rect.top;
+      const s = [...startScale];
+      if (axesList.length === 1) {
+        const { axis, dir } = axesList[0];
+        const pixelDelta = axis === 1 ? (startCanvasY - curY) : (curX - startCanvasX);
+        s[axis] = Math.max(0.05, startScale[axis] + pixelDelta * 0.005 * dir);
 
-      const target = getTarget(drag.targetId, drag.isAsset);
-      if (!target) return;
-
-      if (drag.kind === 'move') {
-        const currentWorld = getFloorPoint([curX, curY], drag.floorY);
-        if (!currentWorld || !drag.startPointerWorld) return;
-
-        const delta = [
-          currentWorld[0] - drag.startPointerWorld[0],
-          0,
-          currentWorld[2] - drag.startPointerWorld[2],
-        ];
-
-        target.position = [
-          drag.startPosition[0] + delta[0],
-          drag.startPosition[1],
-          drag.startPosition[2] + delta[2],
-        ];
-        return;
-      }
-
-      if (drag.kind === 'rotate') {
-        const deltaX = curX - drag.startCanvasX;
-        const nextRotation = [...drag.startRotation];
-        nextRotation[1] = drag.startRotation[1] + deltaX * drag.rotationSensitivity * 180 / Math.PI;
-        target.rotation = nextRotation;
-        return;
-      }
-
-      if (drag.kind === 'stretch') {
-        const s = [...drag.startScale];
-
-        // Stretch is evaluated along the asset's LOCAL axis. This is the
-        // crucial difference from the old world-axis implementation.
-        drag.axesList.forEach(({ axis, dir }) => {
-          let scalarDelta = 0;
-
-          if (axis === 1) {
-            scalarDelta = (drag.startCanvasY - curY) * 0.005 * dir;
-          } else {
-            const axisWorld = drag.localAxes[axis];
-            const startP = drag.startPointerWorld;
-            const currentP = getFloorPoint([curX, curY], drag.startPointerWorld?.[1] ?? drag.startPosition[1]);
-
-            if (startP && currentP) {
-              const dx = currentP[0] - startP[0];
-              const dz = currentP[2] - startP[2];
-              scalarDelta = (dx * axisWorld[0] + dz * axisWorld[2]) * 0.5 * dir;
-            } else {
-              scalarDelta = (curX - drag.startCanvasX) * 0.005 * dir;
-            }
+        if (anchorWorld !== null && startPosition && startScale[axis] !== 0) {
+          const target = isAsset ? viewer.scene.models[targetId] : viewer.scene.objects[targetId];
+          if (target) {
+            const newPosition = [...(target.position || startPosition)];
+            newPosition[axis] = anchorWorld - (s[axis] / startScale[axis]) * (anchorWorld - startPosition[axis]);
+            target.position = newPosition;
           }
-
-          s[axis] = Math.max(0.05, drag.startScale[axis] + scalarDelta);
-        });
-
-        setTargetScale(target, s);
-
-        // Keep the opposite side anchored in the object's LOCAL coordinate
-        // system. This prevents "stretch" from becoming translation.
-        if (drag.axesList.length === 1) {
-          const { axis, dir } = drag.axesList[0];
-          const deltaScale = s[axis] - drag.startScale[axis];
-          const worldAxis = drag.localAxes[axis];
-          const correction = worldAxis.map(v =>
-            v * (deltaScale * drag.halfExtent[axis] * dir)
-          );
-
-          target.position = [
-            drag.startPosition[0] + correction[0],
-            drag.startPosition[1] + correction[1],
-            drag.startPosition[2] + correction[2],
-          ];
         }
+      } else {
+        const sharedDelta = axesList.reduce((sum, { axis, dir }) => {
+          const pixelDelta = axis === 1 ? (startCanvasY - curY) : (curX - startCanvasX);
+          return sum + pixelDelta * dir;
+        }, 0) / axesList.length;
+        axesList.forEach(({ axis }) => {
+          s[axis] = Math.max(0.05, startScale[axis] + sharedDelta * 0.005);
+        });
       }
+      applyScale(targetId, isAsset, s);
     };
 
     const onDocMouseUp = () => {
       if (!isStretchingRef.current || !stretchDragRef.current) return;
-      const drag = stretchDragRef.current;
-      const target = getTarget(drag.targetId, drag.isAsset);
-
-      if (target && stretchPersistCallbackRef.current) {
-        if (drag.kind === 'move') {
-          const p = target.position || drag.startPosition;
-          [0, 1, 2].forEach(axis =>
-            stretchPersistCallbackRef.current(drag.targetId, 'position', axis, p[axis])
-          );
-        } else if (drag.kind === 'rotate') {
-          const r = target.rotation || drag.startRotation;
-          stretchPersistCallbackRef.current(drag.targetId, 'rotation', 1, r[1]);
-        } else if (drag.kind === 'stretch') {
-          const s = getScale(target);
-          drag.axesList.forEach(({ axis }) =>
-            stretchPersistCallbackRef.current(drag.targetId, 'scale', axis, s[axis])
-          );
-        }
+      const { axesList, targetId, isAsset } = stretchDragRef.current;
+      const getScale = (obj) => {
+        if (!obj) return [1, 1, 1];
+        const m = obj.matrix;
+        return [
+          Math.sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]),
+          Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]),
+          Math.sqrt(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]),
+        ];
+      };
+      const finalScale = isAsset
+        ? getScale(viewer.scene.models[targetId])
+        : getScale(viewer.scene.objects[targetId]);
+      if (stretchPersistCallbackRef.current) {
+        axesList.forEach(({ axis }) => {
+          stretchPersistCallbackRef.current(targetId, 'scale', axis, finalScale[axis]);
+        });
       }
-
       stretchDragRef.current = null;
       isStretchingRef.current = false;
       setIsStretching(false);
       viewer.cameraControl.active = true;
-      if (drag.kind === 'stretch') {
-        buildStretchHandlesRef.current?.(drag.targetId, drag.isAsset);
-      }
+      buildStretchHandlesRef.current?.(targetId, isAsset);
     };
 
     const resetHoveredStretchHandle = () => {
-
       const prev = hoveredStretchMeshRef.current;
       if (prev) {
         try {
@@ -660,16 +467,6 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
 
     const onCanvasHoverMove = (e) => {
       if (isStretchingRef.current) return;
-      if (transformModeRef.current !== 'stretch') {
-        if (hoveredStretchMeshRef.current) resetHoveredStretchHandle();
-        hideRevealedGroup();
-        canvas.style.cursor = transformModeRef.current === 'move'
-          ? 'move'
-          : transformModeRef.current === 'rotate'
-            ? 'crosshair'
-            : '';
-        return;
-      }
       if (!stretchHandlesRef.current.length) return;
       const pick = viewer.scene.pick({ canvasPos: [e.offsetX, e.offsetY], pickSurface: false });
       const meta = pick?.entity?._stretchMeta;
@@ -710,9 +507,6 @@ const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
       viewer.scene.setObjectsSelected(viewer.scene.selectedObjectIds, false);
       setSelectedObject(null);
       setSelectedAssetId(null);
-      selectedAssetIdRef.current = null;
-      setTransformMode('move');
-      transformModeRef.current = 'move';
       destroyStretchHandlesRef.current?.();
       stretchDragRef.current = null;
       isStretchingRef.current = false;
@@ -1532,49 +1326,6 @@ const getCursorWorldPosition = (canvasPos) => {
   };
   buildStretchHandlesRef.current = buildStretchHandles;
 
-  const applyTransformModeVisuals = (mode) => {
-    const viewer = viewerRef.current;
-    if (!viewer) return;
-    const selectedId = selectedAssetIdRef.current;
-    stretchHandlesRef.current.forEach(mesh => {
-      const meta = mesh._stretchMeta;
-      if (!meta) return;
-      if (meta.transformMode === 'stretch' || !meta.transformMode) {
-        const isStretch = mode === 'stretch';
-        mesh.visible = isStretch && (meta.type === 'face' || meta.type === 'edge' || meta.type === 'corner');
-        mesh.pickable = mesh.visible;
-      } else {
-        mesh.visible = false;
-        mesh.pickable = false;
-      }
-    });
-    if (selectedId && mode === 'stretch') {
-      buildStretchHandlesRef.current?.(selectedId, true);
-    }
-  };
-
-  const handleTransformModeChange = (mode) => {
-    if (!['move', 'rotate', 'stretch'].includes(mode)) return;
-    transformModeRef.current = mode;
-    setTransformMode(mode);
-    if (isStretchingRef.current) {
-      stretchDragRef.current = null;
-      isStretchingRef.current = false;
-      setIsStretching(false);
-      if (viewerRef.current) viewerRef.current.cameraControl.active = true;
-    }
-    if (mode === 'stretch') {
-      const id = selectedAssetIdRef.current;
-      if (id) buildStretchHandlesRef.current?.(id, true);
-    } else {
-      stretchHandlesRef.current.forEach(mesh => {
-        mesh.visible = false;
-        mesh.pickable = false;
-      });
-      hideRevealedGroup();
-    }
-  };
-
   const setStretchPersistCallback = (fn) => {
     stretchPersistCallbackRef.current = fn;
   };
@@ -1861,7 +1612,6 @@ const getCursorWorldPosition = (canvasPos) => {
       totalMeasuredLength,
       sceneScaleFactor,
       isStretching,
-      transformMode,
     },
     actions: {
       toggleXRay,
@@ -1893,7 +1643,6 @@ const getCursorWorldPosition = (canvasPos) => {
       buildStretchHandles,
       destroyStretchHandles,
       setStretchPersistCallback,
-      setTransformMode: handleTransformModeChange,
     },
   };
 };

@@ -8,7 +8,6 @@ import { BottomDock } from './components/BottomDock';
 import { RenderStudioModal } from './components/RenderStudioModal';
 import { MeasurementPanel } from './components/MeasurementPanel';
 import { StretchTooltipOverlay } from './components/StretchTooltipOverlay';
-import { TransformModeTooltip } from './components/TransformModeTooltip';
 import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
 import { AssetContextMenu } from './components/AssetContextMenu';
 
@@ -281,7 +280,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     <div
       ref={containerRef}
       className={`relative w-full h-full bg-slate-100 dark:bg-[#090b14] overflow-hidden transition-colors duration-300
-        ${engineState.isStretching ? (engineState.transformMode === 'move' ? 'cursor-move' : engineState.transformMode === 'rotate' ? 'cursor-grabbing' : 'cursor-ew-resize') : engineState.placementMode || engineState.isMeasuring ? 'cursor-crosshair' : 'cursor-default'}
+        ${engineState.isStretching ? 'cursor-ew-resize' : engineState.placementMode || engineState.isMeasuring ? 'cursor-crosshair' : 'cursor-default'}
         ${isFullscreen ? 'z-[100]' : ''}`}
     >
       <div 
@@ -297,13 +296,6 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
           x={engineState.activeStretchData.x}
           y={engineState.activeStretchData.y}
           label={engineState.activeStretchData.label}
-        />
-      )}
-      {engineState.selectedAssetId && !engineState.isStretching && (
-        <TransformModeTooltip
-          mode={engineState.transformMode}
-          onModeChange={engineActions.setTransformMode}
-          assetName={activeAsset?.name || 'Selected element'}
         />
       )}
       

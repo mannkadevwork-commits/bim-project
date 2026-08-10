@@ -4,28 +4,10 @@ import { animateHandleTo } from './StretchHandles';
 
 export const applyScale = (viewerRef, targetId, isAsset, scaleVec) => {
   const viewer = viewerRef.current;
-  const [sx, sy, sz] = scaleVec;
-  if (isAsset) {
-    const model = viewer.scene.models[targetId];
-    if (!model) return;
-    const p = model.position || [0, 0, 0];
-    model.matrix = [
-      sx, 0,  0,  0,
-      0,  sy, 0,  0,
-      0,  0,  sz, 0,
-      p[0], p[1], p[2], 1,
-    ];
-  } else {
-    const entity = viewer.scene.objects[targetId];
-    if (!entity) return;
-    const p = entity.position || [0, 0, 0];
-    entity.matrix = [
-      sx, 0,  0,  0,
-      0,  sy, 0,  0,
-      0,  0,  sz, 0,
-      p[0], p[1], p[2], 1,
-    ];
-  }
+  if (!viewer) return;
+  const target = isAsset ? viewer.scene.models[targetId] : viewer.scene.objects[targetId];
+  if (!target) return;
+  target.scale = [...scaleVec];
 };
 
 export const resetHoveredStretchHandle = (hoveredStretchMeshRef, stretchAnimFramesRef) => {
