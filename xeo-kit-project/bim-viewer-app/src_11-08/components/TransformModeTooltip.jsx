@@ -13,13 +13,18 @@ export const TransformModeTooltip = ({ mode, onModeChange, assetName }) => (
       {assetName}
     </div>
     <div className="w-px h-6 bg-slate-700" />
+    
     {MODES.map(({ id, label, Icon }) => {
       const active = mode === id;
       return (
         <button
           key={id}
           type="button"
-          onClick={() => onModeChange(id)}
+          onPointerDown={(e) => e.stopPropagation()} // Stop Xeokit from stealing clicks
+          onClick={(e) => {
+            e.stopPropagation();
+            if (onModeChange) onModeChange(id);
+          }}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors ${
             active ? 'bg-cyan-500 text-slate-950' : 'text-slate-300 hover:bg-slate-800 hover:text-white'
           }`}

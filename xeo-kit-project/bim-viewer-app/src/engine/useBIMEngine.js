@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Viewer } from '@xeokit/xeokit-sdk/src/viewer/Viewer';
 import { XKTLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/XKTLoaderPlugin/XKTLoaderPlugin';
+import { GLTFLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/GLTFLoaderPlugin/GLTFLoaderPlugin';
 import { WebIFCLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/WebIFCLoaderPlugin/WebIFCLoaderPlugin';
 import { TreeViewPlugin } from '@xeokit/xeokit-sdk/src/plugins/TreeViewPlugin/TreeViewPlugin';
 import { NavCubePlugin } from '@xeokit/xeokit-sdk/src/plugins/NavCubePlugin/NavCubePlugin';
@@ -153,6 +154,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     
     sectionPlanesRef.current = new SectionPlanesPlugin(viewer);
     loadersRef.current.xkt = new XKTLoaderPlugin(viewer);
+    loadersRef.current.gltf = new GLTFLoaderPlugin(viewer);
     
     measurementsPluginRef.current = new DistanceMeasurementsPlugin(viewer, {
         containerElement: canvasRef.current.parentElement,
@@ -218,11 +220,14 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         setTimeout(() => configureTransformHandles('move'), 0);
         
         const assetMetaObject = viewer.metaScene.metaObjects[entity.id];
+        const furnitureItem = (projectStateRef.current.furniture || [])
+          .find(item => item.instanceId === entity.model.id);
+
         if (assetMetaObject) {
           const groupedProps = {};
           groupedProps['General Details'] = [
-            { name: 'Element Name', value: assetMetaObject.name || 'Unnamed' },
-            { name: 'IFC Class', value: assetMetaObject.type || 'Unknown' },
+            { name: 'Element Name', value: assetMetaObject.name || furnitureItem?.name || 'Unnamed' },
+            { name: 'IFC Class', value: assetMetaObject.type || 'GLB Asset' },
             { name: 'Global ID', value: assetMetaObject.id },
           ];
           if (assetMetaObject.propertySets) {
@@ -237,15 +242,26 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
             });
           }
           setSelectedObject({
-            id: entity.id,
-            name: assetMetaObject.name || 'Unnamed Asset',
-            type: assetMetaObject.type || 'Generic Furniture',
+            id: entity.model.id,
+            name: assetMetaObject.name || furnitureItem?.name || 'Unnamed Asset',
+            type: assetMetaObject.type || 'GLB Furniture',
             groupedProperties: groupedProps,
           });
         } else {
-          setSelectedObject(null);
-        }
-        return;
+          setSelectedObject({
+            id: entity.model.id,
+            name: furnitureItem?.name || viewer.scene.models[entity.model.id]?._assetMeta?.fileType?.toUpperCase() || '3D Asset',
+            type: furnitureItem?.fileType === 'glb' || furnitureItem?.file_type === 'glb'
+              ? 'GLB Furniture'
+              : '3D Asset',
+            groupedProperties: {
+              'Asset Details': [
+                { name: 'Format', value: furnitureItem?.fileType || furnitureItem?.file_type || viewer.scene.models[entity.model.id]?._assetMeta?.fileType || 'unknown' },
+                { name: 'Instance ID', value: entity.model.id },
+              ],
+            },
+          });
+        }        return;
       }
       
       setSelectedAssetId(null);
@@ -630,22 +646,50 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       return;
     }
 
-    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
-    const formData = new FormData();
-    formData.append('file', file);
-    
-    fetch(`${API_BASE_URL}/api/projects/${jobId}/upload-ifc`, {
-      method: 'POST',
-      body: formData
-    }).catch(err => console.error('[BIM Engine] Backend file sync failed:', err));
-    
-    setIsLoading(true);
-    
-    if (currentModelRef.current) currentModelRef.current.destroy();
     const fileExtension = file.name.split('.').pop().toLowerCase();
-    
-    const loadMainModel = (buffer) => {
+
+    // Only IFC files are synchronized with the backend CSG/IFC pipeline.
+    // Standalone GLB/glTF files are rendered directly in the browser.
+    if (fileExtension === 'ifc') {
+      const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+      const formData = new FormData();
+      formData.append('file', file);
+
+      fetch(`${API_BASE_URL}/api/projects/${jobId}/upload-ifc`, {
+        method: 'POST',
+        body: formData
+      }).catch(err => console.error('[BIM Engine] Backend IFC sync failed:', err));
+    }
+
+    setIsLoading(true);
+
+    if (currentModelRef.current) currentModelRef.current.destroy();
+
+    const waitForLoader = async (key) => {
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (loadersRef.current[key]) return loadersRef.current[key];
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+
+    const loadMainModel = async (buffer) => {
+      const requiredLoader = fileExtension === 'ifc'
+        ? 'ifc'
+        : fileExtension === 'xkt'
+          ? 'xkt'
+          : (fileExtension === 'glb' || fileExtension === 'gltf')
+            ? 'gltf'
+            : null;
+
+      if (requiredLoader && !(await waitForLoader(requiredLoader))) {
+        console.error(`[BIM Engine] Timed out waiting for ${requiredLoader} loader.`);
+        setIsLoading(false);
+        return;
+      }
+
       const ifcData = new Uint8Array(buffer);
+
       if (fileExtension === 'ifc' && loadersRef.current.ifc) {
         currentModelRef.current = loadersRef.current.ifc.load({
           id: 'main_structure',
@@ -659,7 +703,22 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           xkt: buffer,
           edges: true,
         });
+      } else if ((fileExtension === 'glb' || fileExtension === 'gltf') && loadersRef.current.gltf) {
+        const objectUrl = URL.createObjectURL(new Blob([buffer], {
+          type: fileExtension === 'glb' ? 'model/gltf-binary' : 'model/gltf+json',
+        }));
+
+        currentModelRef.current = loadersRef.current.gltf.load({
+          id: 'main_structure',
+          src: objectUrl,
+          edges: true,
+          pbrEnabled: true,
+          colorTextureEnabled: true,
+        });
+
+        currentModelRef.current.on('destroyed', () => URL.revokeObjectURL(objectUrl));
       } else {
+        console.error(`[BIM Engine] No loader for main model type: ${fileExtension}`);
         setIsLoading(false);
         return;
       }
@@ -667,20 +726,43 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       currentModelRef.current.on('loaded', async () => {
         viewerRef.current.cameraFlight.flyTo(currentModelRef.current);
         setIsLoading(false);
-        
+
         if (projectStateRef.current.materials) {
-          Object.entries(projectStateRef.current.materials).forEach(([entityId, matData]) => {
-            const entity = viewerRef.current.scene.objects[entityId];
-            if (entity) entity.colorize = matData.rgb;
+          Object.entries(projectStateRef.current.materials).forEach(([targetId, matData]) => {
+            const entity = viewerRef.current.scene.objects[targetId];
+            if (entity) {
+              entity.colorize = matData.rgb;
+              return;
+            }
+
+            Object.values(viewerRef.current.scene.objects || {}).forEach(object => {
+              if (object.model?.id === targetId) object.colorize = matData.rgb;
+            });
           });
         }
+
         if (projectStateRef.current.furniture) {
           projectStateRef.current.furniture.forEach(item => {
             if (!viewerRef.current.scene.models[item.instanceId]) {
-              loadIFCAssetIntoScene(loadersRef, globalScaleFactorRef, item.instanceId, item.src, item.position, item.rotation);
+              loadIFCAssetIntoScene(
+                loadersRef,
+                globalScaleFactorRef,
+                item.instanceId,
+                item.src,
+                item.position,
+                item.rotation,
+                {
+                  fileType: item.fileType || item.file_type,
+                  scale: item.scale || [1, 1, 1],
+                }
+              ).catch(error =>
+                console.error('[BIM Engine] Failed to restore asset:', item.instanceId, error)
+              );
             }
           });
         }
+
+        // Structural edits remain deltas on native IFC entities.
         if (projectStateRef.current.structural_edits) {
           Object.entries(projectStateRef.current.structural_edits).forEach(([entityId, edit]) => {
             const entity = viewerRef.current.scene.objects[entityId];
@@ -695,9 +777,11 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         }
       });
     };
+
     const reader = new FileReader();
     reader.onload = (e) => loadMainModel(e.target.result);
     reader.readAsArrayBuffer(file);
+
   }, [file]);
 
   const toggleXRay = () => {
@@ -768,7 +852,8 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       setSelectedObject,
       setSelectedAssetId,
       setPlacementMode,
-      loadIFCAssetIntoScene: (i, s, t, r) => loadIFCAssetIntoScene(loadersRef, globalScaleFactorRef, i, s, t, r),
+      loadIFCAssetIntoScene: (i, s, t, r, options) =>
+        loadIFCAssetIntoScene(loadersRef, globalScaleFactorRef, i, s, t, r, options),
       getDropPosition: (c, a) => getDropPosition(viewerRef, projectStateRef, c, a),
       getWallSnapData: (c) => getWallSnapData(viewerRef, c),
       toggleMeasurementMode: () => toggleMeasurementMode(isMeasuring, setIsMeasuring, setPlacementMode, setSelectedObject, setSelectedAssetId, viewerRef),

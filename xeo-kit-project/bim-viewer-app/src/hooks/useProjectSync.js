@@ -2,6 +2,39 @@ import { useState, useEffect, useRef } from 'react';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
+const inferFileType = (url, explicitType) => {
+  if (explicitType) return String(explicitType).toLowerCase();
+  const clean = String(url || '').split('?')[0].split('#')[0];
+  const ext = clean.split('.').pop()?.toLowerCase();
+  return ['ifc', 'glb', 'gltf', 'xkt'].includes(ext) ? ext : 'ifc';
+};
+
+const applyColorToSceneTarget = (viewer, targetId, rgb) => {
+  if (!viewer || !targetId || !Array.isArray(rgb)) return false;
+
+  const entity = viewer.scene.objects[targetId];
+  if (entity) {
+    entity.colorize = rgb;
+    return true;
+  }
+
+  const model = viewer.scene.models[targetId];
+  if (!model) return false;
+
+  let changed = false;
+  Object.values(viewer.scene.objects || {}).forEach(object => {
+    if (object.model?.id === targetId) {
+      object.colorize = rgb;
+      changed = true;
+    }
+  });
+
+  // Some GLB files expose no named child entities. Keep the model-level
+  // reference marked so the state remains associated with the asset.
+  return changed;
+};
+
+
 // ── PREDEFINED ROOM LAYOUTS ─────────────────────────────
 // Users can inject these specific room setups into their 1 BHK / 3 BHK empty structures
 const MOCK_ROOM_TEMPLATES = [
@@ -126,8 +159,9 @@ export const useProjectSync = (file) => {
   // ─────────────────────────────────────────────────────────────
   const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray) => {
     if (!selectedObject || !viewerRef.current) return;
-    const entity = viewerRef.current.scene.objects[selectedObject.id];
-    if (entity) entity.colorize = rgbArray;
+
+    applyColorToSceneTarget(viewerRef.current, selectedObject.id, rgbArray);
+
     setCustomColor(hexColor);
     setProjectState(prev => ({
       ...prev,
@@ -147,11 +181,15 @@ export const useProjectSync = (file) => {
     if (!assetModel) return;
 
     const numValue = parseFloat(value);
-    let updatedPos, updatedRot, updatedScale;
+    if (!Number.isFinite(numValue)) return;
+
+    let updatedPos;
+    let updatedRot;
+    let updatedScale;
 
     if (isScale) {
       updatedScale = [...(assetModel.scale || [1, 1, 1])];
-      updatedScale[axis] = numValue;
+      updatedScale[axis] = Math.max(0.001, numValue);
       assetModel.scale = updatedScale;
     } else if (isRotation) {
       updatedRot = [...(assetModel.rotation || [0, 0, 0])];
@@ -167,11 +205,11 @@ export const useProjectSync = (file) => {
       ...prev,
       furniture: prev.furniture.map(f =>
         f.instanceId === selectedAssetId
-          ? { 
-              ...f, 
-              position: updatedPos || f.position, 
-              rotation: updatedRot || f.rotation,
-              scale: updatedScale || f.scale
+          ? {
+              ...f,
+              position: updatedPos || f.position || [0, 0, 0],
+              rotation: updatedRot || f.rotation || [0, 0, 0],
+              scale: updatedScale || f.scale || [1, 1, 1],
             }
           : f
       ),
@@ -208,15 +246,17 @@ export const useProjectSync = (file) => {
       const fullAssetUrl = item.url.startsWith('http') ? item.url : `${API_BASE_URL}${item.url}`;
 
       // Trigger the 3D Engine to load the asset at the predefined coordinates
-      loadIFCAssetIntoScene(uniqueId, fullAssetUrl, item.position, item.rotation);
+      loadIFCAssetIntoScene(uniqueId, fullAssetUrl, item.position, item.rotation, { fileType: inferFileType(item.url, item.file_type), scale: item.scale || [1, 1, 1] });
 
       return {
         id: item.id,
         instanceId: uniqueId,
         name: item.name,
         src: fullAssetUrl,
-        position: item.position,
-        rotation: item.rotation,
+        fileType: inferFileType(item.url, item.file_type),
+        position: item.position || [0, 0, 0],
+        rotation: item.rotation || [0, 0, 0],
+        scale: item.scale || [1, 1, 1],
       };
     });
 
@@ -237,33 +277,54 @@ export const useProjectSync = (file) => {
     const uniqueId = `${asset.id}_${Date.now()}`;
     const urlPath = asset.url || asset.src || `/assets/${asset.id}.ifc`;
     const fullAssetUrl = urlPath.startsWith('http')
-      ? urlPath                         
-      : `${API_BASE_URL}${urlPath}`;    
+      ? urlPath
+      : `${API_BASE_URL}${urlPath}`;
 
-      // --- ADD THESE LOGS ---
-    console.log("--- STATE SYNC DEBUG ---");
-    console.log("Furniture ID:", uniqueId);
-    console.log("Position saved to State:", coordinates);
-    // ----------------------
+    const fileType = inferFileType(urlPath, asset.file_type || asset.fileType);
+    const scale = Array.isArray(asset.scale) ? asset.scale : [1, 1, 1];
+    const position = Array.isArray(coordinates) ? coordinates : [0, 0, 0];
+    const safeRotation = Array.isArray(rotation) ? rotation : [0, 0, 0];
+
+    console.log('[ProjectSync] Spawning asset:', {
+      instanceId: uniqueId,
+      fileType,
+      src: fullAssetUrl,
+      position,
+      rotation: safeRotation,
+      scale,
+    });
+
+    const furnitureItem = {
+      id: asset.id,
+      instanceId: uniqueId,
+      name: asset.name || asset.id,
+      src: fullAssetUrl,
+      fileType,
+      position,
+      rotation: safeRotation,
+      scale,
+    };
 
     setProjectState(prev => ({
       ...prev,
-      furniture: [
-        ...prev.furniture,
-        {
-          id: asset.id,
-          instanceId: uniqueId,
-          name: asset.name,
-          src: fullAssetUrl,
-          position: coordinates,
-          rotation: rotation,
-        },
-      ],
+      furniture: [...prev.furniture, furnitureItem],
     }));
 
-    loadIFCAssetIntoScene(uniqueId, fullAssetUrl, coordinates, rotation);
+    loadIFCAssetIntoScene(
+      uniqueId,
+      fullAssetUrl,
+      position,
+      safeRotation,
+      { fileType, scale }
+    ).catch(error => {
+      console.error('[ProjectSync] Failed to load placed asset:', error);
+      setProjectState(prev => ({
+        ...prev,
+        furniture: prev.furniture.filter(f => f.instanceId !== uniqueId),
+      }));
+    });
 
-    setToastMessage(`${asset.name} placed!`);
+    setToastMessage(`${furnitureItem.name} placed!`);
     setTimeout(() => setToastMessage(null), 3000);
   };
 
@@ -352,6 +413,7 @@ const adoptIsolatedAsset = (entityId, newInstanceId, fileUrl, assetName) => {
         instanceId: newInstanceId,
         name: assetName || 'Isolated Element',
         src: fileUrl,
+        fileType: 'ifc',
         position: [0, 0, 0],
         rotation: [0, 0, 0],
         scale: [1, 1, 1],

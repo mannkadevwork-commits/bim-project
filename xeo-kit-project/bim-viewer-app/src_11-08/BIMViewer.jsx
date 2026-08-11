@@ -11,6 +11,7 @@ import { StretchTooltipOverlay } from './components/StretchTooltipOverlay';
 import { TransformModeTooltip } from './components/TransformModeTooltip';
 import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
 import { AssetContextMenu } from './components/AssetContextMenu';
+import { useCatalog } from './hooks/useCatalog';
 
 const BIMViewer = ({ file, onDelete, onAdd }) => {
   const containerRef = useRef(null);
@@ -22,6 +23,9 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [isManualSaving, setIsManualSaving] = useState(false);
+
+  // Add the useCatalog hook call[cite: 1]
+  const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
   
   const [isDarkMode, setIsDarkMode] = useState(document.documentElement.classList.contains('dark'));
   const toggleTheme = () => {
@@ -375,11 +379,19 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
       {file && (
         <div className={`absolute inset-y-0 left-0 w-80 z-30 transition-transform duration-300 ${isLeftPanelOpen ? 'translate-x-0' : '-translate-x-full'}`}>
           <LeftPanel
+            // isOpen={isLeftPanelOpen}
+            // onClose={() => { setIsLeftPanelOpen(false); setIsMaxView(false); }}
+            // treeRef={refs.treeContainerRef}
+            // availableAssets={availableAssets}
+            // homeTemplates={homeTemplates}
             isOpen={isLeftPanelOpen}
-            onClose={() => { setIsLeftPanelOpen(false); setIsMaxView(false); }}
-            treeRef={refs.treeContainerRef}
-            availableAssets={availableAssets}
-            homeTemplates={homeTemplates}
+        onClose={() => { setIsLeftPanelOpen(false); setIsMaxView(false); }}
+        treeRef={refs.treeContainerRef}
+        availableAssets={availableAssets}
+        catalogTree={catalogTree} //[cite: 1]
+        catalogLoading={catalogLoading} //[cite: 1]
+        catalogError={catalogError} //[cite: 1]
+        homeTemplates={homeTemplates}
             onApplyTemplate={(templateId) => applyTemplate(templateId, engineActions.loadIFCAssetIntoScene)}
             placementMode={engineState.placementMode}
             setPlacementMode={engineActions.setPlacementMode}

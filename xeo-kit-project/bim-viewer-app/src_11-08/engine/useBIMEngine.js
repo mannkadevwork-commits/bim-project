@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import { math } from '@xeokit/xeokit-sdk/src/viewer/scene/math/math';
 import { Viewer } from '@xeokit/xeokit-sdk/src/viewer/Viewer';
 import { XKTLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/XKTLoaderPlugin/XKTLoaderPlugin';
 import { WebIFCLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/WebIFCLoaderPlugin/WebIFCLoaderPlugin';
@@ -29,19 +28,19 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
   const currentPlaneRef = useRef(null);
   const measurementsPluginRef = useRef(null);
   const isMeasuringRef = useRef(false);
+
   const globalScaleFactorRef = useRef({ x: 1, y: 1, z: 1 });
   const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
-  
+
   const [isLoading, setIsLoading] = useState(false);
   const [isXRay, setIsXRay] = useState(false);
   const [isClipping, setIsClipping] = useState(false);
   const [navMode, setNavMode] = useState('orbit');
-  
   const [selectedObject, setSelectedObject] = useState(null);
   const [selectedAssetId, setSelectedAssetId] = useState(null);
   const [placementMode, setPlacementMode] = useState(null);
   const placementModeRef = useRef(null);
-  
+
   const stretchHandlesRef = useRef([]);
   const selectionCageRef = useRef(null);
   const hoveredStretchMeshRef = useRef(null);
@@ -52,23 +51,24 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
   const revealedFaceKeyRef = useRef(null);
   const revealedHandlesRef = useRef([]);
   const stretchAnimFramesRef = useRef(new Set());
-  const hideTimeoutRef = useRef(null); 
+  const hideTimeoutRef = useRef(null);
   
   const [isStretching, setIsStretching] = useState(false);
   const [activeStretchData, setActiveStretchData] = useState(null);
+  
   const [transformMode, setTransformMode] = useState('move');
   const transformModeRef = useRef('move');
   
   const buildStretchHandlesRef = useRef(null);
   const destroyStretchHandlesRef = useRef(null);
-  
+
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [measurementsList, setMeasurementsList] = useState([]); 
   const [measurementUnit, setMeasurementUnit] = useState('m'); 
   const [snappingEnabled, setSnappingEnabled] = useState(true);
   const [axisBreakdownVisible, setAxisBreakdownVisible] = useState(false);
   const measurementPollRef = useRef(null);
-  
+
   const stretchCtx = {
     viewerRef, stretchHandlesRef, selectionCageRef, stretchFaceAdjacencyRef,
     revealedFaceKeyRef, revealedHandlesRef, stretchAnimFramesRef,
@@ -77,7 +77,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
 
   useEffect(() => { placementModeRef.current = placementMode; }, [placementMode]);
   useEffect(() => { transformModeRef.current = transformMode; }, [transformMode]);
-  
+
   const configureTransformHandles = (mode) => {
     stretchHandlesRef.current.forEach(mesh => {
       const meta = mesh._stretchMeta;
@@ -86,6 +86,10 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       mesh.visible = active;
       mesh.pickable = active && meta.type !== 'rotateRing';
     });
+
+    if (selectionCageRef.current) {
+    selectionCageRef.current.visible = mode === 'stretch';
+  }
   };
 
   useEffect(() => {
@@ -149,6 +153,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     
     sectionPlanesRef.current = new SectionPlanesPlugin(viewer);
     loadersRef.current.xkt = new XKTLoaderPlugin(viewer);
+    
     measurementsPluginRef.current = new DistanceMeasurementsPlugin(viewer, {
         containerElement: canvasRef.current.parentElement,
         distanceLineColor: '#22d3ee',      
@@ -171,7 +176,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           IfcAPI: ifcAPI,
         });
       } catch (error) {
-        console.error('[BIM Engine]   Failed to boot IFC Engine.', error);
+        console.error('[BIM Engine] Failed to boot IFC Engine.', error);
       }
     };
     initializeIFCEngine();
@@ -205,7 +210,12 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         const assetModel = viewer.scene.models[entity.model.id];
         if (assetModel) assetModel.selected = true;
         setSelectedAssetId(entity.model.id);
+        
         buildStretchHandlesRef.current?.(stretchCtx, entity.model.id, true);
+        
+        transformModeRef.current = 'move';
+        setTransformMode('move');
+        setTimeout(() => configureTransformHandles('move'), 0);
         
         const assetMetaObject = viewer.metaScene.metaObjects[entity.id];
         if (assetMetaObject) {
@@ -241,6 +251,9 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       setSelectedAssetId(null);
       viewer.scene.setObjectsSelected(viewer.scene.selectedObjectIds, false);
       entity.selected = true;
+      destroyStretchHandlesRef.current?.(stretchCtx);
+      transformModeRef.current = 'move';
+      setTransformMode('move');
       
       const metaObject = viewer.metaScene.metaObjects[entity.id];
       if (metaObject) {
@@ -277,17 +290,17 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       const canvasPos = [e.offsetX, e.offsetY];
       const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
       const meta = pick?.entity?._stretchMeta;
-
+      
       if (!meta?.isStretchHandle) return;
-
+      
       const mode = transformModeRef.current;
       if (meta.transformMode !== mode) return;
-
+      
       e.stopPropagation();
       e.preventDefault();
       viewer.cameraControl.active = false;
-
       const { targetId, isAsset, type, axes } = meta;
+      
       const targetObj = isAsset ? viewer.scene.models[targetId] : viewer.scene.objects[targetId];
       if (!targetObj) return;
 
@@ -296,12 +309,10 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           ? [...(targetObj.position || [0, 0, 0])]
           : [...(targetObj.offset || [0, 0, 0])];
         const startGrab = calculateGrabPoint(viewerRef, canvas, canvasPos, startPosition[1]);
-
         if (!startGrab) {
           viewer.cameraControl.active = true;
           return;
         }
-
         stretchDragRef.current = {
           type: 'move',
           targetId,
@@ -319,13 +330,13 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         const center = targetObj.aabb
           ? [(targetObj.aabb[0] + targetObj.aabb[3]) / 2, (targetObj.aabb[1] + targetObj.aabb[4]) / 2, (targetObj.aabb[2] + targetObj.aabb[5]) / 2]
           : [...(targetObj.position || [0, 0, 0])];
+        
         const startGrab = calculateGrabPoint(viewerRef, canvas, canvasPos, center[1]);
-
         if (!startGrab) {
           viewer.cameraControl.active = true;
           return;
         }
-
+        
         stretchDragRef.current = {
           type: 'rotate',
           targetId,
@@ -334,6 +345,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           startGrab: [...startGrab],
           startRotationY: targetObj.rotation?.[1] || 0,
         };
+        
         isStretchingRef.current = true;
         setIsStretching(true);
         setActiveStretchData({ label: 'Rotate', x: e.clientX, y: e.clientY });
@@ -349,7 +361,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           [0, 1, 0],
           [sn, 0, c],
         ];
-
+        
         const startAabb = targetObj.aabb;
         const startHalf = startAabb
           ? [
@@ -358,7 +370,20 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
               (startAabb[5] - startAabb[2]) / 2,
             ]
           : [1, 1, 1];
+          
+        const getScale = (obj) => {
+          if (!obj) return [1, 1, 1];
+          const m = obj.matrix;
+          if (!m || m.length < 11) return [1, 1, 1];
+          const sx = Math.sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
+          const sy = Math.sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]);
+          const sz = Math.sqrt(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]);
+          return [sx || 1, sy || 1, sz || 1];
+        };
 
+        const startScale = getScale(targetObj);
+        const startPosition = targetObj.position ? [...targetObj.position] : (targetObj.offset ? [...targetObj.offset] : [0, 0, 0]);
+          
         stretchDragRef.current = {
           type: 'scale',
           axesList: axes,
@@ -366,8 +391,8 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           isAsset,
           startCanvasX: e.offsetX,
           startCanvasY: e.offsetY,
-          startScale: [...(targetObj.scale || [1, 1, 1])],
-          startPosition: isAsset ? [...(targetObj.position || [0, 0, 0])] : [...(targetObj.offset || [0, 0, 0])],
+          startScale,
+          startPosition,
           startHalf,
           localAxes,
         };
@@ -375,94 +400,100 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         setIsStretching(true);
         return;
       }
-
       viewer.cameraControl.active = true;
     };
 
     const onDocMouseMove = (e) => {
       if (!isStretchingRef.current || !stretchDragRef.current) return;
-
-      const drag = stretchDragRef.current;
+      const dragData = stretchDragRef.current;
       const rect = canvas.getBoundingClientRect();
       const curX = e.clientX - rect.left;
       const curY = e.clientY - rect.top;
-      const targetObj = drag.isAsset ? viewer.scene.models[drag.targetId] : viewer.scene.objects[drag.targetId];
+      
+      const targetObj = dragData.isAsset ? viewer.scene.models[dragData.targetId] : viewer.scene.objects[dragData.targetId];
       if (!targetObj) return;
 
-      if (drag.type === 'move') {
-        const currentGrab = calculateGrabPoint(viewerRef, canvas, [curX, curY], drag.startPosition[1]);
+      if (dragData.type === 'move') {
+        const currentGrab = calculateGrabPoint(viewerRef, canvas, [curX, curY], dragData.startPosition[1]);
         if (!currentGrab) return;
-
         const next = [
-          drag.startPosition[0] + currentGrab[0] - drag.startGrab[0],
-          drag.startPosition[1],
-          drag.startPosition[2] + currentGrab[2] - drag.startGrab[2],
+          dragData.startPosition[0] + currentGrab[0] - dragData.startGrab[0],
+          dragData.startPosition[1],
+          dragData.startPosition[2] + currentGrab[2] - dragData.startGrab[2],
         ];
-
-        if (drag.isAsset) targetObj.position = next;
+        if (dragData.isAsset) targetObj.position = next;
         else targetObj.offset = next;
-
         setActiveStretchData({ label: 'Move', x: e.clientX, y: e.clientY });
         return;
       }
 
-      if (drag.type === 'rotate') {
-        const currentGrab = calculateGrabPoint(viewerRef, canvas, [curX, curY], drag.center[1]);
+      if (dragData.type === 'rotate') {
+        const currentGrab = calculateGrabPoint(viewerRef, canvas, [curX, curY], dragData.center[1]);
         if (!currentGrab) return;
-
+        
+        // Restore correct rotational mapping calculation
         const startAngle = Math.atan2(
-          drag.startGrab[2] - drag.center[2],
-          drag.startGrab[0] - drag.center[0]
+          dragData.startGrab[2] - dragData.center[2],
+          dragData.startGrab[0] - dragData.center[0]
         );
         const currentAngle = Math.atan2(
-          currentGrab[2] - drag.center[2],
-          currentGrab[0] - drag.center[0]
+          currentGrab[2] - dragData.center[2],
+          currentGrab[0] - dragData.center[0]
         );
-
-        let delta = (currentAngle - startAngle) * 180 / Math.PI;
+        
+        let delta = (startAngle - currentAngle) * 180 / Math.PI; 
         while (delta > 180) delta -= 360;
         while (delta < -180) delta += 360;
-
-        const nextRotation = drag.startRotationY + delta;
+        
+        let nextRotation = dragData.startRotationY + delta;
+        if (nextRotation < 0) nextRotation += 360;
+        nextRotation = nextRotation % 360;
+        
         const currentRotation = targetObj.rotation ? [...targetObj.rotation] : [0, 0, 0];
         targetObj.rotation = [currentRotation[0], nextRotation, currentRotation[2]];
-
+        
         setActiveStretchData({ label: `Rotate: ${nextRotation.toFixed(1)}°`, x: e.clientX, y: e.clientY });
         return;
       }
 
-      const deltaScreenX = curX - drag.startCanvasX;
-      const deltaScreenY = drag.startCanvasY - curY;
+      // RESTORED: Proper localized axis stretch mapping
+      const deltaScreenX = curX - dragData.startCanvasX;
+      const deltaScreenY = dragData.startCanvasY - curY; // HTML Y is inverted
       const viewMatrix = viewer.scene.camera.viewMatrix;
-      const s = [...drag.startScale];
-
-      let nextPosition = [...drag.startPosition];
-
-      drag.axesList.forEach(({ axis, dir }) => {
-        const v = drag.localAxes[axis];
+      
+      const s = [...dragData.startScale];
+      let nextPosition = [...dragData.startPosition];
+      
+      dragData.axesList.forEach(({ axis, dir }) => {
+        const v = dragData.localAxes[axis];
+        
+        // Project 3D local axis to 2D screen space
         const screenX = viewMatrix[0] * v[0] + viewMatrix[4] * v[1] + viewMatrix[8] * v[2];
         const screenY = viewMatrix[1] * v[0] + viewMatrix[5] * v[1] + viewMatrix[9] * v[2];
         const len = Math.hypot(screenX, screenY) || 1;
+        
+        // Dot product drag projection
         const effectiveDelta = (deltaScreenX * screenX / len + deltaScreenY * screenY / len) * dir;
-        s[axis] = Math.max(0.05, drag.startScale[axis] + effectiveDelta * 0.005);
-
-        // Keep the opposite face anchored. The center moves along the
-        // object's local axis, never along world X/Z after rotation.
-        const startHalf = drag.startHalf[axis];
-        const scaleRatio = s[axis] / (drag.startScale[axis] || 1);
+        
+        s[axis] = Math.max(0.05, dragData.startScale[axis] + effectiveDelta * 0.005);
+        
+        // RESTORED: Correct positional sliding calculation to anchor opposite face
+        const startHalf = dragData.startHalf[axis];
+        const scaleRatio = s[axis] / (dragData.startScale[axis] || 1);
         const halfDelta = startHalf * (scaleRatio - 1);
+        
         nextPosition[0] += v[0] * halfDelta * dir;
         nextPosition[1] += v[1] * halfDelta * dir;
         nextPosition[2] += v[2] * halfDelta * dir;
       });
-
-      applyScale(viewerRef, drag.targetId, drag.isAsset, s);
-      if (drag.isAsset) targetObj.position = nextPosition;
+      
+      applyScale(viewerRef, dragData.targetId, dragData.isAsset, s);
+      if (dragData.isAsset) targetObj.position = nextPosition;
       else targetObj.offset = nextPosition;
-
-      const names = drag.axesList.map(({ axis }) => axis === 0 ? 'Width' : axis === 1 ? 'Height' : 'Depth');
+      
+      const names = dragData.axesList.map(({ axis }) => axis === 0 ? 'Width' : axis === 1 ? 'Height' : 'Depth');
       setActiveStretchData({
-        label: `${names.join(' + ')}: ${drag.axesList.map(({ axis }) => s[axis].toFixed(2)).join(' × ')}`,
+        label: `${names.join(' + ')}: ${dragData.axesList.map(({ axis }) => s[axis].toFixed(2)).join(' × ')}`,
         x: e.clientX,
         y: e.clientY,
       });
@@ -470,33 +501,31 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
 
     const onDocMouseUp = () => {
       if (!isStretchingRef.current || !stretchDragRef.current) return;
-
-      const drag = stretchDragRef.current;
-      const targetObj = drag.isAsset ? viewer.scene.models[drag.targetId] : viewer.scene.objects[drag.targetId];
-
+      const dragData = stretchDragRef.current;
+      const targetObj = dragData.isAsset ? viewer.scene.models[dragData.targetId] : viewer.scene.objects[dragData.targetId];
+      
       if (targetObj && stretchPersistCallbackRef.current) {
-        if (drag.type === 'move') {
-          const position = drag.isAsset ? (targetObj.position || [0, 0, 0]) : (targetObj.offset || [0, 0, 0]);
+        if (dragData.type === 'move') {
+          const position = dragData.isAsset ? (targetObj.position || [0, 0, 0]) : (targetObj.offset || [0, 0, 0]);
           position.forEach((value, axis) => {
-            stretchPersistCallbackRef.current(drag.targetId, 'position', axis, value);
+            stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value);
           });
-        } else if (drag.type === 'rotate') {
-          stretchPersistCallbackRef.current(drag.targetId, 'rotation', 1, targetObj.rotation?.[1] || 0);
+        } else if (dragData.type === 'rotate') {
+          stretchPersistCallbackRef.current(dragData.targetId, 'rotation', 1, targetObj.rotation?.[1] || 0);
         } else {
           const scale = targetObj.scale || [1, 1, 1];
-          drag.axesList.forEach(({ axis }) => {
-            stretchPersistCallbackRef.current(drag.targetId, 'scale', axis, scale[axis]);
+          dragData.axesList.forEach(({ axis }) => {
+            stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, scale[axis]);
           });
         }
       }
-
+      
       stretchDragRef.current = null;
       isStretchingRef.current = false;
       setIsStretching(false);
       setActiveStretchData(null);
       viewer.cameraControl.active = true;
-
-      buildStretchHandlesRef.current?.(stretchCtx, drag.targetId, drag.isAsset);
+      buildStretchHandlesRef.current?.(stretchCtx, dragData.targetId, dragData.isAsset);
       setTimeout(() => configureTransformHandles(transformModeRef.current), 0);
     };
 
@@ -512,7 +541,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           clearTimeout(hideTimeoutRef.current);
           hideTimeoutRef.current = null;
         }
-
+        
         if (meta.type === 'face') {
           const { axis, dir } = meta.axes[0];
           const faceKey = `${axis}_${dir}`;
@@ -521,7 +550,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
             revealGroupForFace(faceKey, stretchFaceAdjacencyRef, revealedFaceKeyRef, revealedHandlesRef, stretchAnimFramesRef);
           }
         }
-
+        
         if (hoveredStretchMeshRef.current !== pick.entity) {
           resetHoveredStretchHandle(hoveredStretchMeshRef, stretchAnimFramesRef);
           
@@ -538,13 +567,11 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         } else {
           canvas.style.cursor = cursorForAxes(meta.axes);
         }
-
       } else {
         if (hoveredStretchMeshRef.current) {
           resetHoveredStretchHandle(hoveredStretchMeshRef, stretchAnimFramesRef);
         }
         canvas.style.cursor = '';
-
         if (revealedFaceKeyRef.current && !hideTimeoutRef.current) {
           hideTimeoutRef.current = setTimeout(() => {
             hideRevealedGroup(revealedFaceKeyRef, revealedHandlesRef, stretchAnimFramesRef);
@@ -568,7 +595,10 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       stretchDragRef.current = null;
       isStretchingRef.current = false;
       setIsStretching(false);
-      setActiveStretchData(null); 
+      setActiveStretchData(null);
+      
+      transformModeRef.current = 'move';
+      setTransformMode('move');
       
       if (hideTimeoutRef.current) {
           clearTimeout(hideTimeoutRef.current);
@@ -590,7 +620,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
   useEffect(() => {
     if (viewerRef.current) viewerRef.current.cameraControl.navMode = navMode;
   }, [navMode]);
-  
+
   useEffect(() => {
     if (!viewerRef.current) return;
     if (!file) {
@@ -599,6 +629,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       setSelectedAssetId(null);
       return;
     }
+
     const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
     const formData = new FormData();
     formData.append('file', file);
@@ -632,9 +663,11 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         setIsLoading(false);
         return;
       }
+
       currentModelRef.current.on('loaded', async () => {
         viewerRef.current.cameraFlight.flyTo(currentModelRef.current);
         setIsLoading(false);
+        
         if (projectStateRef.current.materials) {
           Object.entries(projectStateRef.current.materials).forEach(([entityId, matData]) => {
             const entity = viewerRef.current.scene.objects[entityId];
@@ -672,7 +705,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     scene.setObjectsXRayed(scene.objectIds, !isXRay);
     setIsXRay(!isXRay);
   };
-  
+
   const toggleClipping = () => {
     const nextState = !isClipping;
     if (nextState) {
@@ -693,7 +726,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     }
     setIsClipping(nextState);
   };
-  
+
   const calibrationCtx = {
     viewerRef, currentModelRef, globalScaleFactorRef, setSceneScaleFactor,
     measurementsPluginRef, setMeasurementsList, setIsLoading,
@@ -703,10 +736,10 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
   const assetCtx = {
     file, viewerRef, loadersRef, globalScaleFactorRef, setSelectedAssetId, setSelectedObject
   };
-  
+
   buildStretchHandlesRef.current = buildStretchHandles;
   destroyStretchHandlesRef.current = destroyStretchHandles;
-  
+
   return {
     refs: { canvasRef, treeContainerRef, navCubeCanvasRef, viewerRef },
     state: {
@@ -725,8 +758,8 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       totalMeasuredLength: measurementsList.reduce((sum, m) => sum + m.lengthMeters, 0),
       sceneScaleFactor,
       isStretching,
-      activeStretchData,
-       transformMode,
+      activeStretchData, 
+      transformMode,
     },
     actions: {
       toggleXRay,
@@ -758,6 +791,11 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       buildStretchHandles: (e, a) => buildStretchHandles(stretchCtx, e, a),
       destroyStretchHandles: () => destroyStretchHandles(stretchCtx),
       setStretchPersistCallback: (fn) => { stretchPersistCallbackRef.current = fn; },
+      setTransformMode: (mode) => {
+        if (!['move', 'rotate', 'stretch'].includes(mode)) return;
+        transformModeRef.current = mode;
+        setTransformMode(mode);
+      },
     },
   };
 };
