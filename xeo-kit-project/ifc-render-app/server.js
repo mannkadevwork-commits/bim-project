@@ -6,6 +6,9 @@ const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const db = require('./db');
+const catalogRoutes = require('./catalog-routes');
+const adminRoutes = require('./admin-routes');
 
 const app = express();
 app.use(cors());
@@ -21,7 +24,16 @@ if (!fs.existsSync(assetsDir)) fs.mkdirSync(assetsDir);
 
 // 2. Serve static folders publicly
 app.use('/jobs', express.static(jobsDir));
-app.use('/assets', express.static(assetsDir)); 
+app.use('/assets', express.static(assetsDir));
+
+// Serve uploaded catalog files
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+app.use('/uploads', express.static(uploadsDir));
+
+// Mount catalog and admin API routes
+app.use('/api/catalog', catalogRoutes);
+app.use('/api/admin', adminRoutes);
 
 // 3. Configure Multer for Dynamic Folders
 const storage = multer.diskStorage({
@@ -58,7 +70,9 @@ app.get('/api/assets', (req, res) => {
         { id: 'door_double', name: 'Double Leaf Swing', type: 'door', category: 'Structural', url: '/assets/Double_Leaf_Swing_Door.ifc' },
         { id: 'door_sliding', name: 'Auto Sliding Door', type: 'door', category: 'Structural', url: '/assets/Automatic_Sliding_Door.ifc' },
         { id: 'door_revolving', name: 'Revolving Door', type: 'door', category: 'Structural', url: '/assets/Revolving_Commercial_Door.ifc' },
-        { id: 'door_fire', name: 'Fire-Rated Door', type: 'door', category: 'Structural', url: '/assets/Fire_Rated_Door.ifc' }
+        { id: 'door_fire', name: 'Fire-Rated Door', type: 'door', category: 'Structural', url: '/assets/Fire_Rated_Door.ifc' },
+        { id: 'bed_glb', name: 'Bed (GLB)', type: 'furniture', category: 'Furniture', url: '/assets/Bed.glb' },
+
     ];
     res.json(catalog);
 });
@@ -141,7 +155,7 @@ app.post('/api/projects/:jobId/upload-ifc', tempUpload.single('file'), (req, res
 
 // Toggle between the legacy Gemini python script (spawn, blocking) and the
 // new FastAPI YOLOv8 + IFC microservice (webhook, async).
-const USE_ML_MODULE = true;
+const USE_ML_MODULE = false;
 const ML_MODULE_URL = process.env.ML_MODULE_URL || 'http://localhost:8001';
 
 // jobId -> { resolve, reject, timeout }
@@ -170,7 +184,7 @@ const uploadFloorplan = multer({ storage: floorplanStorage });
 // ------------------------------------------
 function runGeminiPipeline({ jobId, jobDir, imagePath, ifcFileName, ifcOutputPath }) {
   return new Promise((resolve, reject) => {
-    const scriptPath = path.join(__dirname, 'latest_interior_v1', 'automated_bim_v4_connected.py');
+    const scriptPath = path.join(__dirname, 'latest_interior_v2', 'automated_bim_v4_connected.py');
     const cachePath = path.join(jobDir, `${jobId}_cache.json`);
 
     console.log(`\n--- [ASYNC][GEMINI] AI Conversion Request | Job ID: ${jobId} ---`);
@@ -180,6 +194,7 @@ function runGeminiPipeline({ jobId, jobDir, imagePath, ifcFileName, ifcOutputPat
       '--image', imagePath,
       '--output', ifcOutputPath,
       '--cache', cachePath,
+      '--assets', assetsDir,
     ]);
 
     let pythonLogs = '';
@@ -831,4 +846,11 @@ app.delete('/api/projects/:jobId', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 HC Interior Backend running on port ${PORT}`);
+});
+
+// Verify DB connection on startup
+db.query('SELECT 1').then(() => {
+  console.log('✅ PostgreSQL connected');
+}).catch(err => {
+  console.error('❌ PostgreSQL connection failed:', err.message);
 });

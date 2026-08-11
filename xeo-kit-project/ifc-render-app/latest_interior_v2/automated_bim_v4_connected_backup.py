@@ -105,22 +105,11 @@ class WallData(BaseModel):
     height: float = 3.0
     unit: str = "m"
 
-class SlabData(BaseModel):
-    slab_id: str = "slab_ground"
-    slab_type: str = Field(default="FLOOR", description="IFC slab type: FLOOR, ROOF, LANDING, or BASESLAB")
-    thickness: float = Field(default=0.15, description="Slab thickness in unit")
-    elevation: float = Field(default=-0.15, description="Z offset from storey level. Default -0.15 places slab below walls so it does not obscure the floor plan in the viewer.")
-    outline_pts: List[List[float]] = Field(default_factory=list, description="2D polygon boundary points [[x,y], ...]. Auto-derived from walls if empty.")
-    material: str = Field(default="RCC", description="Slab material e.g. RCC, Precast, Composite")
-    finish: str = Field(default="Smooth", description="Top surface finish e.g. Smooth, Rough, Polished")
-    unit: str = "m"
-
 class BuildingAnalysis(BaseModel):
     building_name: str = "1 BHK Detailed Plan"
     walls: List[WallData]
     openings: List[OpeningComponent] = Field(default_factory=list)
     interiors: List[InteriorComponent] = Field(default_factory=list)
-    slabs: List[SlabData] = Field(default_factory=list, description="Floor/roof slabs. If empty, a ground floor slab is auto-generated from wall extents.")
 
 
 def find_ifc_properties_files(search_root: str = None) -> List[str]:
@@ -946,11 +935,7 @@ def _build_extraction_prompt(image_path: str, repair_summary: dict = None, expec
         "dimensions=[1.8,0.4,0.55], properties=[{\"name\":\"TVSizeCompatible\",\"value\":\"Up to 55 inch\",\"pset\":\"Pset_TVUnitTypeCommon\"}].\n"
         "   - Toilet/WC: category=sanitary, type=WC, material=Ceramic, color=[1.0,1.0,1.0], "
         "dimensions=[0.7,0.4,0.4], properties=[{\"name\":\"FlushType\",\"value\":\"Dual Flush\"}].\n\n"
-        "Return the complete results in structured JSON according to the schema.\n\n"
-        "5. If the plan shows a clear outer boundary or floor plate, extract it as a slab entry under 'slabs'.\n"
-        "   - Set slab_type=FLOOR, thickness=0.15, elevation=0.0, material=RCC, finish=Smooth.\n"
-        "   - outline_pts should be a list of [x, y] polygon points tracing the outer floor boundary.\n"
-        "   - If the boundary is not clearly visible, leave 'slabs' as an empty list; a slab will be auto-generated.\n"
+        "Return the complete results in structured JSON according to the schema."
     )
 
 
@@ -1334,87 +1319,6 @@ def build_detailed_ifc(data: BuildingAnalysis, output_filepath: str, props_modul
             (start_pt[0] + perp_x * t2, start_pt[1] + perp_y * t2),
         ]
         walls_polygons.append(wp)
-
-    # --- 1b. SLABS (Floor / Base) ---
-    slab_list = getattr(data, "slabs", []) or []
-    if not slab_list:
-        # Auto-generate a ground floor slab from wall extents when AI did not extract one
-        slab_list = [SlabData()]
-        print("[Slab] No slabs in extraction — auto-generating ground floor slab from wall extents.")
-
-    for slab in slab_list:
-        slab_unit = getattr(slab, "unit", "m") or "m"
-        slab_thickness = _convert_to_meters(slab.thickness, slab_unit)
-        slab_elevation = _convert_to_meters(slab.elevation, slab_unit)
-
-        slab_origin = model.create_entity("IfcCartesianPoint", Coordinates=(0., 0., slab_elevation))
-        slab_ax = model.create_entity("IfcAxis2Placement3D", Location=slab_origin)
-        slab_loc = model.create_entity("IfcLocalPlacement", PlacementRelTo=stry_pl, RelativePlacement=slab_ax)
-
-        # Use AI-extracted outline if provided, else derive bounding box from all wall endpoints
-        if slab.outline_pts:
-            pts_2d = [_normalize_point(p, slab_unit) for p in slab.outline_pts]
-        else:
-            all_x = [coord for w in data.walls for coord in [w.start_pt[0], w.end_pt[0]]]
-            all_y = [coord for w in data.walls for coord in [w.start_pt[1], w.end_pt[1]]]
-            if not all_x:
-                print(f"[Slab] Skipping {slab.slab_id} — no wall data to derive extents from.")
-                continue
-            margin = 0.25
-            minx, maxx = min(all_x) - margin, max(all_x) + margin
-            miny, maxy = min(all_y) - margin, max(all_y) + margin
-            pts_2d = [[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy]]
-            if debug:
-                print(f"  [Slab] Auto-bbox for {slab.slab_id}: ({minx:.2f},{miny:.2f}) → ({maxx:.2f},{maxy:.2f})")
-
-        ifc_pts = [model.create_entity("IfcCartesianPoint", Coordinates=(p[0], p[1])) for p in pts_2d]
-        ifc_pts.append(ifc_pts[0])  # close the polygon loop
-        profile = model.create_entity(
-            "IfcArbitraryClosedProfileDef",
-            ProfileType="AREA",
-            OuterCurve=model.create_entity("IfcPolyline", Points=ifc_pts),
-        )
-        slab_solid = model.create_entity(
-            "IfcExtrudedAreaSolid",
-            SweptArea=profile,
-            Position=world_pl,
-            ExtrudedDirection=model.create_entity("IfcDirection", DirectionRatios=(0., 0., 1.)),
-            Depth=slab_thickness,
-        )
-        slab_color = _material_color(slab.material, props_module) or [0.75, 0.75, 0.72]
-        assign_surface_style(model, slab_solid, slab_color, style_name=f"{slab.slab_id}_Style")
-        slab_rep = model.create_entity(
-            "IfcShapeRepresentation",
-            ContextOfItems=context,
-            RepresentationIdentifier="Body",
-            RepresentationType="SweptSolid",
-            Items=[slab_solid],
-        )
-        ifc_slab = model.create_entity(
-            "IfcSlab",
-            GlobalId=ifcopenshell.guid.new(),
-            OwnerHistory=owner_h,
-            Name=slab.slab_id,
-            ObjectPlacement=slab_loc,
-            PredefinedType=slab.slab_type,
-        )
-        ifc_slab.Representation = model.create_entity("IfcProductDefinitionShape", Representations=[slab_rep])
-
-        slab_overrides = {
-            "Pset_SlabCommon": {
-                "Material": slab.material,
-                "Thickness": slab_thickness * 1000.0,  # stored in mm per IFC convention
-                "Finish": slab.finish,
-            }
-        }
-        assign_default_ifc_properties(
-            model, owner_h, ifc_slab, "Slab", props_module,
-            custom_overrides=slab_overrides, debug=debug,
-        )
-        assign_material(model, owner_h, ifc_slab, slab.material)
-        create_archicad_name_pset(model, owner_h, ifc_slab, slab.slab_id)
-        elements.append(ifc_slab)
-        print(f"[Slab] Created {slab.slab_id} ({slab.slab_type}) thickness={slab_thickness*1000:.0f}mm material={slab.material}")
 
     # --- 2. OPENINGS ---
     for op in data.openings:

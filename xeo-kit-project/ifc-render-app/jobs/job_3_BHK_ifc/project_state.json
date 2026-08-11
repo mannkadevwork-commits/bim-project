@@ -1,27 +1,86 @@
 {
+  "structural_edits": {
+    "1qMib0DOH4iP$2Q$PHrMV6": {
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": false
+    },
+    "0nRXe2GMz7aeZD7P7ZwtsU": {
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "visible": false
+    }
+  },
   "materials": {},
   "furniture": [
     {
-      "id": "sofa",
-      "instanceId": "sofa_1786359522581",
-      "name": "Modern Sofa",
-      "src": "http://localhost:3000/assets/sofa.ifc",
+      "id": "cat_9",
+      "instanceId": "cat_9_1786429010933",
+      "name": "Bed (GLB)",
+      "src": "http://localhost:3000/uploads/catalog/models/1786018339570_n90py4iqzwi.glb",
       "position": [
-        5.794234517682695,
-        0.000023554192855851364,
-        -5.272018970982156
+        5.909807893817222,
+        0.1526480823742986,
+        -5.476034288734066
       ],
       "rotation": [
         0,
-        187.59010107687783,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "cat_9",
+      "instanceId": "cat_9_1786429066753",
+      "name": "Bed (GLB)",
+      "src": "http://localhost:3000/uploads/catalog/models/1786018339570_n90py4iqzwi.glb",
+      "position": [
+        4.944885734508263,
+        0.15264808237475336,
+        -5.142625256673991
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "cat_1",
+      "instanceId": "cat_1_1786429185277",
+      "name": "Modern Sofa",
+      "src": "http://localhost:3000/assets/sofa.ifc",
+      "position": [
+        6.421415864760776,
+        0.15267163656783658,
+        -7.262459967442618
+      ],
+      "rotation": [
+        0,
+        177.0471745793113,
         0
       ],
       "scale": [
-        0.655430037998816,
-        1,
-        1.6457411127264876
+        1.2592603071625885,
+        0.43499999999999994,
+        2.46616118544323
       ]
     }
-  ],
-  "structural_edits": {}
+  ]
 }
