@@ -1,0 +1,63 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('IFC4 Wall Geometric Model'),'2;1');
+FILE_NAME('wall_model.ifc','2026-06-25T12:00:00',('AI Assistant'),('Architecture Corp'),'Processor','AI Generator','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+
+DATA;
+/* 1. Project and Spatial Structure */
+#1 = IFCPROJECT('3c3ZkX7w18vO7X2X8z5a1k', $, 'Project Wall 15x10', 'Example Wall Project', $, $, $, (#10), #20);
+#2 = IFCSITE('1t$wY1_7b0OBL9X2Y8z5a1', $, 'Site', 'Project Site', $, $, $, $, .ELEMENT., $, $, $, $, $);
+#3 = IFCBUILDING('0a$wY1_7b0OBL9X2Y8z5a1', $, 'Building', 'Project Building', $, $, $, $, .ELEMENT., $, $, $);
+#4 = IFCBUILDINGSTOREY('2a$wY1_7b0OBL9X2Y8z5a1', $, 'Ground Floor', 'Level 0', $, $, $, $, .ELEMENT., 0.0);
+
+/* 2. Spatial Aggregation */
+#5 = IFCRELAGGREGATES('3$1X0Y8vO7X2X8z5a1k1a1', $, 'ProjectToSite', $, #1, (#2));
+#6 = IFCRELAGGREGATES('3$1X0Y8vO7X2X8z5a1k1a2', $, 'SiteToBuilding', $, #2, (#3));
+#7 = IFCRELCONTAINEDINSPATIALSTRUCTURE('3$1X0Y8vO7X2X8z5a1k1a3', $, 'BuildingToStorey', $, (#100), #4);
+
+/* 3. Global Units and Contexts */
+#10 = IFCGEOMETRICREPRESENTATIONCONTEXT($, 'Model', 3, 1.E-5, #11, $);
+#11 = IFCAXIS2PLACEMENT3D(#12, #13, #14);
+#12 = IFCCARTESIANPOINT((0.0, 0.0, 0.0));
+#13 = IFCDIRECTION((0.0, 0.0, 1.0));
+#14 = IFCDIRECTION((1.0, 0.0, 0.0));
+
+#20 = IFCUNITASSIGNMENT((#21, #22, #23));
+#21 = IFCSIUNIT(*, .LENGTHUNIT., $, .METRE.);
+#22 = IFCSIUNIT(*, .AREAUNIT., $, .SQUARE_METRE.);
+#23 = IFCSIUNIT(*, .VOLUMEUNIT., $, .CUBIC_METRE.);
+
+/* 4. Wall Product Definition */
+#100 = IFCWALL('1A2B3C4D5E6F7G8H9I0J1K', $, 'Standard Wall', 'Wall 15ft x 10ft x 9mm', $, #110, #120, $, $);
+
+/* 5. Wall Placement and Local Coordinate System */
+#110 = IFCLOCALPLACEMENT($, #111);
+#111 = IFCAXIS2PLACEMENT3D(#112, #113, #114);
+#112 = IFCCARTESIANPOINT((0.0, 0.0, 0.0));
+#113 = IFCDIRECTION((0.0, 0.0, 1.0));
+#114 = IFCDIRECTION((1.0, 0.0, 0.0));
+
+/* 6. Wall Geometry (Swept Solid Extrusion) */
+#120 = IFCPRODUCTDEFINITIONSHAPE($, $, (#121));
+#121 = IFCSHAPEREPRESENTATION(#10, 'Body', 'SweptSolid', (#130));
+
+/* Profile Definition (Arbitrary Closed Profile for Thickness & Length) */
+/* Length = 4.572m (15ft), Thickness = 0.009m (9mm) */
+#130 = IFCEXTRUDEDAREASOLID(#140, #150, #153, 3.048);
+#140 = IFCARBITRARYCLOSEDPROFILEDEF(.AREA., 'WallProfile', #141);
+#141 = IFCPOLYLINE((#142, #143, #144, #145, #142));
+#142 = IFCCARTESIANPOINT((0.0, 0.0));
+#143 = IFCCARTESIANPOINT((4.572, 0.0));
+#144 = IFCCARTESIANPOINT((4.572, 0.009));
+#145 = IFCCARTESIANPOINT((0.0, 0.009));
+
+/* Extrusion Direction and Height = 3.048m (10ft) */
+#150 = IFCAXIS2PLACEMENT3D(#151, #152, $);
+#151 = IFCCARTESIANPOINT((0.0, 0.0, 0.0));
+#152 = IFCDIRECTION((0.0, 0.0, 1.0));
+#153 = IFCDIRECTION((0.0, 0.0, 1.0));
+
+ENDSEC;
+END-ISO-10303-21;

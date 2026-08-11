@@ -1,12 +1,14 @@
 import { useState } from 'react';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import BIMViewer from './BIMViewer';
+import AdminPanel from './pages/AdminPanel';
 import Navbar from './components/Navbar';
 import Footer from './components/Footer';
 import UploadModal from './components/UploadModal';
 import ContactForm from './components/ContactForm';
 import { AlertTriangle } from 'lucide-react';
 
-function App() {
+function ViewerApp() {
   const [isUploadOpen, setIsUploadOpen] = useState(true);
   const [isContactOpen, setIsContactOpen] = useState(false);
   const [modelFile, setModelFile] = useState(null);
@@ -118,5 +120,19 @@ function App() {
     </div>
   );
 }
+
+
+function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<ViewerApp />} />
+        <Route path="/admin" element={<AdminPanel />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+
 
 export default App;
