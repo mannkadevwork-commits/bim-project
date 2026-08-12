@@ -8,6 +8,7 @@ import { NavCubePlugin } from '@xeokit/xeokit-sdk/src/plugins/NavCubePlugin/NavC
 import { SectionPlanesPlugin } from '@xeokit/xeokit-sdk/src/plugins/SectionPlanesPlugin/SectionPlanesPlugin';
 import { DistanceMeasurementsPlugin } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsPlugin';
 import * as WebIFC from 'web-ifc';
+
 import { API_BASE_URL, AXIS_HANDLE_COLORS, STRETCH_HANDLE_DRAG_SCALE, STRETCH_HANDLE_HOVER_SCALE } from './utils/constants';
 import { brightenColor } from './utils/helpers';
 import { animateHandleTo, buildStretchHandles, destroyStretchHandles, hideRevealedGroup, revealGroupForFace } from './stretch/StretchHandles';
@@ -18,7 +19,9 @@ import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './plac
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
 import { calculateGrabPoint } from './stretch/TranslationController';
 
-export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPanelOpen, setRightTab) => {
+export const useBIMEngine = (activeProject, projectStateRef, projectState, onAssetPlaced, setIsRightPanelOpen, setRightTab) => {
+  const { file, jobId, fileName } = activeProject || {};
+
   const canvasRef = useRef(null);
   const treeContainerRef = useRef(null);
   const navCubeCanvasRef = useRef(null);
@@ -29,10 +32,12 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
   const currentPlaneRef = useRef(null);
   const measurementsPluginRef = useRef(null);
   const isMeasuringRef = useRef(false);
-
   const globalScaleFactorRef = useRef({ x: 1, y: 1, z: 1 });
-  const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
+  
+  // Hard rendering boundary lock
+  const isModelLoadedRef = useRef(false);
 
+  const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
   const [isLoading, setIsLoading] = useState(false);
   const [isXRay, setIsXRay] = useState(false);
   const [isClipping, setIsClipping] = useState(false);
@@ -53,16 +58,13 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
   const revealedHandlesRef = useRef([]);
   const stretchAnimFramesRef = useRef(new Set());
   const hideTimeoutRef = useRef(null);
-  
   const [isStretching, setIsStretching] = useState(false);
   const [activeStretchData, setActiveStretchData] = useState(null);
-  
   const [transformMode, setTransformMode] = useState('move');
   const transformModeRef = useRef('move');
-  
   const buildStretchHandlesRef = useRef(null);
   const destroyStretchHandlesRef = useRef(null);
-
+  
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [measurementsList, setMeasurementsList] = useState([]); 
   const [measurementUnit, setMeasurementUnit] = useState('m'); 
@@ -76,6 +78,94 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     hoveredStretchMeshRef, canvasRef
   };
 
+  const restoreProjectStateToScene = (stateOverride) => {
+    if (!viewerRef.current || !currentModelRef.current) return;
+    const state = stateOverride || projectStateRef.current;
+    if (!state) return;
+
+    if (state.materials) {
+      Object.entries(state.materials).forEach(([targetId, matData]) => {
+        const entity = viewerRef.current.scene.objects[targetId];
+        
+        // DEVELOPMENT LOG: Verify exactly what we are applying to and if it exists
+        console.log('[Material][RESTORE]', {
+          targetId,
+          directMatch: !!entity,
+          modelMatch: false 
+        });
+
+        if (entity) {
+          entity.colorize = matData.rgb;
+        } else {
+          let matched = false;
+          Object.values(viewerRef.current.scene.objects || {}).forEach(object => {
+            if (object.model?.id === targetId) {
+              object.colorize = matData.rgb;
+              matched = true;
+            }
+          });
+          
+          if (matched) {
+            console.log('[Material][RESTORE]', {
+              targetId,
+              directMatch: false,
+              modelMatch: true
+            });
+          } else {
+            const availableMatchingIds = Object.keys(viewerRef.current.scene.objects)
+              .filter(id => id.includes(targetId.split('#').pop()))
+              .slice(0, 5);
+              
+            console.log('[Material][MISS]', {
+              targetId,
+              availableMatchingIds
+            });
+          }
+        }
+      });
+    }
+
+    if (state.furniture) {
+      state.furniture.forEach(item => {
+        if (!viewerRef.current.scene.models[item.instanceId]) {
+          loadIFCAssetIntoScene(
+            loadersRef,
+            globalScaleFactorRef,
+            item.instanceId,
+            item.src,
+            item.position,
+            item.rotation,
+            {
+              fileType: item.fileType || item.file_type,
+              scale: item.scale || [1, 1, 1],
+            }
+          ).catch(error =>
+            console.error('[BIM Engine] Failed to restore asset:', item.instanceId, error)
+          );
+        }
+      });
+    }
+
+    if (state.structural_edits) {
+      Object.entries(state.structural_edits).forEach(([entityId, edit]) => {
+        const entity = viewerRef.current.scene.objects[entityId];
+        if (!entity) return;
+        if (edit.scale) entity.scale = edit.scale;
+        if (edit.offset) entity.offset = edit.offset;
+        if (edit.visible === false) entity.visible = false;
+      });
+    }
+  };
+
+  // Strictly controlled effect: Never process the state until the scene finishes loading completely.
+  // This physically prevents race conditions where the state load finishes slightly before the 
+  // geometry finishes being instantiated into `viewerRef.current.scene.objects`.
+  useEffect(() => {
+    if (isModelLoadedRef.current) {
+      restoreProjectStateToScene(projectState);
+    }
+  }, [projectState]);
+
   useEffect(() => { placementModeRef.current = placementMode; }, [placementMode]);
   useEffect(() => { transformModeRef.current = transformMode; }, [transformMode]);
 
@@ -87,10 +177,9 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       mesh.visible = active;
       mesh.pickable = active && meta.type !== 'rotateRing';
     });
-
     if (selectionCageRef.current) {
-    selectionCageRef.current.visible = mode === 'stretch';
-  }
+      selectionCageRef.current.visible = mode === 'stretch';
+    }
   };
 
   useEffect(() => {
@@ -124,6 +213,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
 
   useEffect(() => {
     if (!canvasRef.current) return;
+
     const viewer = new Viewer({
       canvasElement: canvasRef.current,
       transparent: true,
@@ -181,6 +271,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         console.error('[BIM Engine] Failed to boot IFC Engine.', error);
       }
     };
+
     initializeIFCEngine();
     viewerRef.current = viewer;
     
@@ -261,7 +352,8 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
               ],
             },
           });
-        }        return;
+        }
+       return;
       }
       
       setSelectedAssetId(null);
@@ -329,6 +421,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           viewer.cameraControl.active = true;
           return;
         }
+
         stretchDragRef.current = {
           type: 'move',
           targetId,
@@ -412,6 +505,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           startHalf,
           localAxes,
         };
+
         isStretchingRef.current = true;
         setIsStretching(true);
         return;
@@ -432,13 +526,16 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       if (dragData.type === 'move') {
         const currentGrab = calculateGrabPoint(viewerRef, canvas, [curX, curY], dragData.startPosition[1]);
         if (!currentGrab) return;
+
         const next = [
           dragData.startPosition[0] + currentGrab[0] - dragData.startGrab[0],
           dragData.startPosition[1],
           dragData.startPosition[2] + currentGrab[2] - dragData.startGrab[2],
         ];
+
         if (dragData.isAsset) targetObj.position = next;
         else targetObj.offset = next;
+
         setActiveStretchData({ label: 'Move', x: e.clientX, y: e.clientY });
         return;
       }
@@ -447,7 +544,6 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         const currentGrab = calculateGrabPoint(viewerRef, canvas, [curX, curY], dragData.center[1]);
         if (!currentGrab) return;
         
-        // Restore correct rotational mapping calculation
         const startAngle = Math.atan2(
           dragData.startGrab[2] - dragData.center[2],
           dragData.startGrab[0] - dragData.center[0]
@@ -472,9 +568,9 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         return;
       }
 
-      // RESTORED: Proper localized axis stretch mapping
       const deltaScreenX = curX - dragData.startCanvasX;
-      const deltaScreenY = dragData.startCanvasY - curY; // HTML Y is inverted
+      const deltaScreenY = dragData.startCanvasY - curY;
+
       const viewMatrix = viewer.scene.camera.viewMatrix;
       
       const s = [...dragData.startScale];
@@ -483,17 +579,14 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       dragData.axesList.forEach(({ axis, dir }) => {
         const v = dragData.localAxes[axis];
         
-        // Project 3D local axis to 2D screen space
         const screenX = viewMatrix[0] * v[0] + viewMatrix[4] * v[1] + viewMatrix[8] * v[2];
         const screenY = viewMatrix[1] * v[0] + viewMatrix[5] * v[1] + viewMatrix[9] * v[2];
         const len = Math.hypot(screenX, screenY) || 1;
         
-        // Dot product drag projection
         const effectiveDelta = (deltaScreenX * screenX / len + deltaScreenY * screenY / len) * dir;
         
         s[axis] = Math.max(0.05, dragData.startScale[axis] + effectiveDelta * 0.005);
         
-        // RESTORED: Correct positional sliding calculation to anchor opposite face
         const startHalf = dragData.startHalf[axis];
         const scaleRatio = s[axis] / (dragData.startScale[axis] || 1);
         const halfDelta = startHalf * (scaleRatio - 1);
@@ -504,6 +597,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       });
       
       applyScale(viewerRef, dragData.targetId, dragData.isAsset, s);
+      
       if (dragData.isAsset) targetObj.position = nextPosition;
       else targetObj.offset = nextPosition;
       
@@ -541,6 +635,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       setIsStretching(false);
       setActiveStretchData(null);
       viewer.cameraControl.active = true;
+
       buildStretchHandlesRef.current?.(stretchCtx, dragData.targetId, dragData.isAsset);
       setTimeout(() => configureTransformHandles(transformModeRef.current), 0);
     };
@@ -588,6 +683,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           resetHoveredStretchHandle(hoveredStretchMeshRef, stretchAnimFramesRef);
         }
         canvas.style.cursor = '';
+
         if (revealedFaceKeyRef.current && !hideTimeoutRef.current) {
           hideTimeoutRef.current = setTimeout(() => {
             hideRevealedGroup(revealedFaceKeyRef, revealedHandlesRef, stretchAnimFramesRef);
@@ -639,22 +735,31 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
 
   useEffect(() => {
     if (!viewerRef.current) return;
-    if (!file) {
-      if (currentModelRef.current) { currentModelRef.current.destroy(); currentModelRef.current = null; }
+
+    const clearScene = () => {
+      if (viewerRef.current && viewerRef.current.scene) {
+        Object.keys(viewerRef.current.scene.models).forEach(id => {
+          try { viewerRef.current.scene.models[id].destroy(); } catch (e) {}
+        });
+      }
+      currentModelRef.current = null;
+      // Clear the render boundary lock to wait for the new model
+      isModelLoadedRef.current = false;
+    };
+
+    if (!file || !jobId || !fileName) {
+      clearScene();
       setSelectedObject(null);
       setSelectedAssetId(null);
       return;
     }
 
-    const fileExtension = file.name.split('.').pop().toLowerCase();
+    clearScene();
+    const fileExtension = fileName.split('.').pop().toLowerCase();
 
-    // Only IFC files are synchronized with the backend CSG/IFC pipeline.
-    // Standalone GLB/glTF files are rendered directly in the browser.
     if (fileExtension === 'ifc') {
-      const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
       const formData = new FormData();
       formData.append('file', file);
-
       fetch(`${API_BASE_URL}/api/projects/${jobId}/upload-ifc`, {
         method: 'POST',
         body: formData
@@ -662,8 +767,6 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
     }
 
     setIsLoading(true);
-
-    if (currentModelRef.current) currentModelRef.current.destroy();
 
     const waitForLoader = async (key) => {
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -707,7 +810,6 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
         const objectUrl = URL.createObjectURL(new Blob([buffer], {
           type: fileExtension === 'glb' ? 'model/gltf-binary' : 'model/gltf+json',
         }));
-
         currentModelRef.current = loadersRef.current.gltf.load({
           id: 'main_structure',
           src: objectUrl,
@@ -715,7 +817,6 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
           pbrEnabled: true,
           colorTextureEnabled: true,
         });
-
         currentModelRef.current.on('destroyed', () => URL.revokeObjectURL(objectUrl));
       } else {
         console.error(`[BIM Engine] No loader for main model type: ${fileExtension}`);
@@ -725,64 +826,22 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
 
       currentModelRef.current.on('loaded', async () => {
         viewerRef.current.cameraFlight.flyTo(currentModelRef.current);
+        
         setIsLoading(false);
-
-        if (projectStateRef.current.materials) {
-          Object.entries(projectStateRef.current.materials).forEach(([targetId, matData]) => {
-            const entity = viewerRef.current.scene.objects[targetId];
-            if (entity) {
-              entity.colorize = matData.rgb;
-              return;
-            }
-
-            Object.values(viewerRef.current.scene.objects || {}).forEach(object => {
-              if (object.model?.id === targetId) object.colorize = matData.rgb;
-            });
-          });
-        }
-
-        if (projectStateRef.current.furniture) {
-          projectStateRef.current.furniture.forEach(item => {
-            if (!viewerRef.current.scene.models[item.instanceId]) {
-              loadIFCAssetIntoScene(
-                loadersRef,
-                globalScaleFactorRef,
-                item.instanceId,
-                item.src,
-                item.position,
-                item.rotation,
-                {
-                  fileType: item.fileType || item.file_type,
-                  scale: item.scale || [1, 1, 1],
-                }
-              ).catch(error =>
-                console.error('[BIM Engine] Failed to restore asset:', item.instanceId, error)
-              );
-            }
-          });
-        }
-
-        // Structural edits remain deltas on native IFC entities.
-        if (projectStateRef.current.structural_edits) {
-          Object.entries(projectStateRef.current.structural_edits).forEach(([entityId, edit]) => {
-            const entity = viewerRef.current.scene.objects[entityId];
-            if (!entity) {
-              console.warn(`[BIM Engine] Structural edit skipped, entity not found: ${entityId}`);
-              return;
-            }
-            if (edit.scale) entity.scale = edit.scale;
-            if (edit.offset) entity.offset = edit.offset;
-            if (edit.visible === false) entity.visible = false;
-          });
-        }
+        
+        // IMPORTANT: Unlocking the hard rendering boundary.
+        // We know for a fact that the viewer scene has all initial native elements now.
+        isModelLoadedRef.current = true;
+        
+        // Only safely trigger state logic exactly when model becomes ready
+        restoreProjectStateToScene(projectStateRef.current);
       });
     };
 
     const reader = new FileReader();
     reader.onload = (e) => loadMainModel(e.target.result);
     reader.readAsArrayBuffer(file);
-
-  }, [file]);
+  }, [jobId, file]);
 
   const toggleXRay = () => {
     const scene = viewerRef.current.scene;
@@ -814,11 +873,11 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
   const calibrationCtx = {
     viewerRef, currentModelRef, globalScaleFactorRef, setSceneScaleFactor,
     measurementsPluginRef, setMeasurementsList, setIsLoading,
-    loadersRef, projectStateRef, file, inspectNativeElement
+    loadersRef, projectStateRef, activeProject, inspectNativeElement
   };
-  
+
   const assetCtx = {
-    file, viewerRef, loadersRef, globalScaleFactorRef, setSelectedAssetId, setSelectedObject
+    activeProject, viewerRef, loadersRef, globalScaleFactorRef, setSelectedAssetId, setSelectedObject
   };
 
   buildStretchHandlesRef.current = buildStretchHandles;
@@ -842,7 +901,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       totalMeasuredLength: measurementsList.reduce((sum, m) => sum + m.lengthMeters, 0),
       sceneScaleFactor,
       isStretching,
-      activeStretchData, 
+      activeStretchData,
       transformMode,
     },
     actions: {
@@ -870,7 +929,7 @@ export const useBIMEngine = (file, projectStateRef, onAssetPlaced, setIsRightPan
       updateDynamicTransform: (id, t, ax, val) => updateDynamicTransform(viewerRef, id, t, ax, val),
       updateStructuralTransform: (id, t, ax, val) => updateStructuralTransform(viewerRef, id, t, ax, val),
       isolateAndMakeMoveable: (e, onA, uSE) => isolateAndMakeMoveable(assetCtx, e, onA, uSE),
-      inspectNativeElement: (e) => inspectNativeElement(file, e),
+      inspectNativeElement: (e) => inspectNativeElement(activeProject, e),
       getCursorWorldPosition: (c) => getCursorWorldPosition(viewerRef, c),
       setIsLoading,
       buildStretchHandles: (e, a) => buildStretchHandles(stretchCtx, e, a),

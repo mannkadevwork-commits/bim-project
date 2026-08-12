@@ -231,16 +231,16 @@ export const updateDynamicTransform = (viewerRef, modelId, type, axis, value) =>
 
 export const isolateAndMakeMoveable = async (ctx, entityId, onAdoptCallback, updateStructuralEdit) => {
   const {
-    file,
+    activeProject,
     viewerRef,
     loadersRef,
     globalScaleFactorRef,
     setSelectedAssetId,
     setSelectedObject,
   } = ctx;
+  if (!activeProject || !activeProject.jobId) return;
 
-  if (!file) return;
-  const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+  const jobId = activeProject.jobId;
 
   try {
     const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${entityId}/isolate`, {
@@ -297,10 +297,9 @@ export const isolateAndMakeMoveable = async (ctx, entityId, onAdoptCallback, upd
   }
 };
 
-export const inspectNativeElement = async (file, entityId) => {
-  if (!file || !entityId) return { error: true };
-
-  const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+export const inspectNativeElement = async (activeProject, entityId) => {
+  if (!activeProject || !activeProject.jobId || !entityId) return { error: true };
+  const jobId = activeProject.jobId;
 
   try {
     const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${entityId}/inspect`);

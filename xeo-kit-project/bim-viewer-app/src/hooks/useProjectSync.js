@@ -11,16 +11,13 @@ const inferFileType = (url, explicitType) => {
 
 const applyColorToSceneTarget = (viewer, targetId, rgb) => {
   if (!viewer || !targetId || !Array.isArray(rgb)) return false;
-
   const entity = viewer.scene.objects[targetId];
   if (entity) {
     entity.colorize = rgb;
     return true;
   }
-
   const model = viewer.scene.models[targetId];
   if (!model) return false;
-
   let changed = false;
   Object.values(viewer.scene.objects || {}).forEach(object => {
     if (object.model?.id === targetId) {
@@ -28,15 +25,9 @@ const applyColorToSceneTarget = (viewer, targetId, rgb) => {
       changed = true;
     }
   });
-
-  // Some GLB files expose no named child entities. Keep the model-level
-  // reference marked so the state remains associated with the asset.
   return changed;
 };
 
-
-// ── PREDEFINED ROOM LAYOUTS ─────────────────────────────
-// Users can inject these specific room setups into their 1 BHK / 3 BHK empty structures
 const MOCK_ROOM_TEMPLATES = [
   {
     id: 'room_master_bedroom',
@@ -60,129 +51,165 @@ const MOCK_ROOM_TEMPLATES = [
   }
 ];
 
-export const useProjectSync = (file) => {
+export const useProjectSync = (activeProject) => {
+  const { file, jobId } = activeProject || {};
   const [projectState, setProjectState] = useState({ materials: {}, furniture: [], structural_edits: {} });
   const projectStateRef = useRef(projectState);
-
+  
   const [availableAssets, setAvailableAssets] = useState([]);
-  const [homeTemplates, setHomeTemplates] = useState(MOCK_ROOM_TEMPLATES); // Renamed conceptually
+  const [homeTemplates, setHomeTemplates] = useState(MOCK_ROOM_TEMPLATES);
   const [saveStatus, setSaveStatus] = useState('saved');
   const [lastSavedTime, setLastSavedTime] = useState(null);
   const [toastMessage, setToastMessage] = useState(null);
-  const activeJobId = useRef('job_default_01');
   const [customColor, setCustomColor] = useState('#ffffff');
+
+  // Concurrency controls for saving
+  const isSavingRef = useRef(false);
+  const pendingSaveRef = useRef(null);
 
   useEffect(() => { projectStateRef.current = projectState; }, [projectState]);
 
-  // ─────────────────────────────────────────────────────────────
-  // LOAD: Fetch initial project state & asset catalog on startup
-  // ─────────────────────────────────────────────────────────────
+  // 1. LOAD: Fetch initial project state & asset catalog on startup
   useEffect(() => {
-    if (file) {
-      // Reset memory completely before reading the new file's state
+    if (file && jobId) {
       setProjectState({ materials: {}, furniture: [], structural_edits: {} });
 
-      activeJobId.current = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
-      const localState = localStorage.getItem(`hci_state_${activeJobId.current}`);
-
-      if (localState) {
-        try {
-          const parsed = JSON.parse(localState);
-          // Backfill structural_edits for state saved before this key existed
-          setProjectState({ structural_edits: {}, ...parsed });
-        } catch (e) {
-          console.warn('[ProjectSync] Failed to parse local state, starting fresh.');
-        }
-      } else {
-        fetch(`${API_BASE_URL}/api/projects/${activeJobId.current}/load`)
-          .then(res => res.ok ? res.json() : null)
-          .then(data => {
-            if (
-              data &&
-              (Object.keys(data.materials || {}).length > 0 ||
-                (data.furniture || []).length > 0 ||
-                Object.keys(data.structural_edits || {}).length > 0)
-            ) {
-              // Backfill structural_edits for state saved before this key existed
-              setProjectState({ structural_edits: {}, ...data });
+      fetch(`${API_BASE_URL}/api/projects/${jobId}/load`)
+        .then(res => {
+          if (!res.ok) throw new Error('Failed to load from server');
+          return res.json();
+        })
+        .then(data => {
+          if (data) {
+            setProjectState(prev => ({
+              ...prev,
+              materials: data.materials || prev.materials,
+              furniture: data.furniture || prev.furniture,
+              structural_edits: data.structural_edits || prev.structural_edits
+            }));
+          }
+        })
+        .catch(() => {
+          const localState = localStorage.getItem(`hci_state_${jobId}`);
+          if (localState) {
+            try {
+              const parsed = JSON.parse(localState);
+              setProjectState(prev => ({
+                ...prev,
+                materials: parsed.materials || prev.materials,
+                furniture: parsed.furniture || prev.furniture,
+                structural_edits: parsed.structural_edits || prev.structural_edits
+              }));
+            } catch (e) {
+              console.warn('[ProjectSync] Failed to parse local state, starting fresh.');
             }
-          })
-          .catch(() => console.warn('[ProjectSync] No previous cloud state found, starting fresh.'));
-      }
+          }
+        });
     } else {
-      // Wipes memory when file is deleted
       setProjectState({ materials: {}, furniture: [], structural_edits: {} });
     }
 
-    // Fetch the asset catalog from the backend
     fetch(`${API_BASE_URL}/api/assets`)
       .then(res => res.json())
       .then(data => setAvailableAssets(data))
       .catch(err => console.error('[ProjectSync] Failed to load asset catalog:', err));
-  }, [file]);
+  }, [file, jobId]);
 
-  // ─────────────────────────────────────────────────────────────
-  // AUTO-SAVE: Debounced save to localStorage + cloud
-  // ─────────────────────────────────────────────────────────────
+  // 2. AUTO-SAVE: Safe sequential queue
+  const processSaveQueue = async () => {
+    if (isSavingRef.current || !pendingSaveRef.current) return;
+
+    const { state, targetJobId } = pendingSaveRef.current;
+    pendingSaveRef.current = null;
+    isSavingRef.current = true;
+    setSaveStatus('saving');
+
+    try {
+      localStorage.setItem(`hci_state_${targetJobId}`, JSON.stringify(state));
+      await fetch(`${API_BASE_URL}/api/projects/${targetJobId}/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(state),
+      });
+      setSaveStatus('saved');
+      setLastSavedTime(new Date());
+    } catch (err) {
+      console.error('[ProjectSync] Cloud auto-save failed:', err);
+      setSaveStatus('error');
+    } finally {
+      isSavingRef.current = false;
+      if (pendingSaveRef.current) {
+        processSaveQueue();
+      }
+    }
+  };
+
   useEffect(() => {
-    // If state is completely empty, do not overwrite valid saves (prevents wiping on boot)
     if (
-      Object.keys(projectState.materials).length === 0 &&
-      projectState.furniture.length === 0 &&
+      Object.keys(projectState.materials || {}).length === 0 &&
+      (projectState.furniture || []).length === 0 &&
       Object.keys(projectState.structural_edits || {}).length === 0
     ) return;
 
+    if (!jobId) return;
+
     setSaveStatus('unsaved');
-    localStorage.setItem(`hci_state_${activeJobId.current}`, JSON.stringify(projectState));
+    pendingSaveRef.current = { state: projectState, targetJobId: jobId };
+    processSaveQueue();
+  }, [projectState, jobId]);
 
-    const delayCloudSave = setTimeout(async () => {
-      setSaveStatus('saving');
-      try {
-        await fetch(`${API_BASE_URL}/api/projects/${activeJobId.current}/save`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(projectState),
-        });
-        setSaveStatus('saved');
-        setLastSavedTime(new Date());
-      } catch (err) {
-        console.error('[ProjectSync] Cloud auto-save failed:', err);
-        setSaveStatus('error');
-      }
-    }, 1500);
+  const saveNow = async (stateOverride) => {
+    if (!jobId) return;
+    const stateToSave = stateOverride || projectStateRef.current;
+    setSaveStatus('saving');
+    try {
+      localStorage.setItem(`hci_state_${jobId}`, JSON.stringify(stateToSave));
+      await fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(stateToSave),
+      });
+      setSaveStatus('saved');
+      setLastSavedTime(new Date());
+    } catch (err) {
+      console.error('[ProjectSync] Manual save failed:', err);
+      setSaveStatus('error');
+    }
+  };
 
-    return () => clearTimeout(delayCloudSave);
-  }, [projectState]);
-
-  // ─────────────────────────────────────────────────────────────
-  // ACTION: Apply material color to a selected building element
-  // ─────────────────────────────────────────────────────────────
+  // ACTION: Apply material color
   const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray) => {
     if (!selectedObject || !viewerRef.current) return;
+    
+    // DEVELOPMENT LOG: Verify exactly what is being sent to persistence
+    console.log('[Material][SAVE]', {
+      targetId: selectedObject.id,
+      targetObjectType: selectedObject.type,
+      modelId: viewerRef.current.scene.objects[selectedObject.id]?.model?.id,
+      entityId: selectedObject.id,
+      rgb: rgbArray
+    });
 
     applyColorToSceneTarget(viewerRef.current, selectedObject.id, rgbArray);
-
     setCustomColor(hexColor);
+    
     setProjectState(prev => ({
       ...prev,
       materials: {
-        ...prev.materials,
+        ...(prev.materials || {}),
         [selectedObject.id]: { color: hexColor, rgb: rgbArray },
       },
     }));
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // ACTION: Update asset transform (Position, Scale, Rotation)
-  // ─────────────────────────────────────────────────────────────
+  // ACTION: Update asset transform
   const updateAsset = (viewerRef, selectedAssetId, axis, value, isRotation = false, isScale = false) => {
     if (!selectedAssetId || !viewerRef.current) return;
     const assetModel = viewerRef.current.scene.models[selectedAssetId];
     if (!assetModel) return;
-
     const numValue = parseFloat(value);
     if (!Number.isFinite(numValue)) return;
-
+    
     let updatedPos;
     let updatedRot;
     let updatedScale;
@@ -203,7 +230,7 @@ export const useProjectSync = (file) => {
 
     setProjectState(prev => ({
       ...prev,
-      furniture: prev.furniture.map(f =>
+      furniture: (prev.furniture || []).map(f =>
         f.instanceId === selectedAssetId
           ? {
               ...f,
@@ -216,9 +243,6 @@ export const useProjectSync = (file) => {
     }));
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // ACTION: Delete a furniture asset from the scene
-  // ─────────────────────────────────────────────────────────────
   const deleteAsset = (viewerRef, selectedAssetId) => {
     if (!selectedAssetId || !viewerRef.current) return;
     const assetModel = viewerRef.current.scene.models[selectedAssetId];
@@ -226,28 +250,22 @@ export const useProjectSync = (file) => {
       assetModel.destroy();
       setProjectState(prev => ({
         ...prev,
-        furniture: prev.furniture.filter(f => f.instanceId !== selectedAssetId),
+        furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
       }));
     }
     setToastMessage('Asset removed.');
     setTimeout(() => setToastMessage(null), 3000);
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // ACTION: Apply Predefined Room Layout (Batch load furniture)
-  // ─────────────────────────────────────────────────────────────
   const applyTemplate = (templateId, loadIFCAssetIntoScene) => {
     const template = homeTemplates.find(t => t.id === templateId);
     if (!template) return;
-
     const newFurnitureItems = template.items.map(item => {
-      // Generate unique ID for the instanced asset
       const uniqueId = `${item.id}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
       const fullAssetUrl = item.url.startsWith('http') ? item.url : `${API_BASE_URL}${item.url}`;
-
-      // Trigger the 3D Engine to load the asset at the predefined coordinates
+      
       loadIFCAssetIntoScene(uniqueId, fullAssetUrl, item.position, item.rotation, { fileType: inferFileType(item.url, item.file_type), scale: item.scale || [1, 1, 1] });
-
+      
       return {
         id: item.id,
         instanceId: uniqueId,
@@ -260,39 +278,22 @@ export const useProjectSync = (file) => {
       };
     });
 
-    // Save batch into project state
     setProjectState(prev => ({
       ...prev,
-      furniture: [...prev.furniture, ...newFurnitureItems],
+      furniture: [...(prev.furniture || []), ...newFurnitureItems],
     }));
-
     setToastMessage(`${template.name} Applied!`);
     setTimeout(() => setToastMessage(null), 3000);
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // ACTION: Spawn a single asset (Drag & Drop or Click)
-  // ─────────────────────────────────────────────────────────────
   const spawnAsset = (asset, coordinates, loadIFCAssetIntoScene, rotation = [0, 0, 0]) => {
     const uniqueId = `${asset.id}_${Date.now()}`;
     const urlPath = asset.url || asset.src || `/assets/${asset.id}.ifc`;
-    const fullAssetUrl = urlPath.startsWith('http')
-      ? urlPath
-      : `${API_BASE_URL}${urlPath}`;
-
+    const fullAssetUrl = urlPath.startsWith('http') ? urlPath : `${API_BASE_URL}${urlPath}`;
     const fileType = inferFileType(urlPath, asset.file_type || asset.fileType);
     const scale = Array.isArray(asset.scale) ? asset.scale : [1, 1, 1];
     const position = Array.isArray(coordinates) ? coordinates : [0, 0, 0];
     const safeRotation = Array.isArray(rotation) ? rotation : [0, 0, 0];
-
-    console.log('[ProjectSync] Spawning asset:', {
-      instanceId: uniqueId,
-      fileType,
-      src: fullAssetUrl,
-      position,
-      rotation: safeRotation,
-      scale,
-    });
 
     const furnitureItem = {
       id: asset.id,
@@ -307,7 +308,7 @@ export const useProjectSync = (file) => {
 
     setProjectState(prev => ({
       ...prev,
-      furniture: [...prev.furniture, furnitureItem],
+      furniture: [...(prev.furniture || []), furnitureItem],
     }));
 
     loadIFCAssetIntoScene(
@@ -320,77 +321,36 @@ export const useProjectSync = (file) => {
       console.error('[ProjectSync] Failed to load placed asset:', error);
       setProjectState(prev => ({
         ...prev,
-        furniture: prev.furniture.filter(f => f.instanceId !== uniqueId),
+        furniture: (prev.furniture || []).filter(f => f.instanceId !== uniqueId),
       }));
     });
-
     setToastMessage(`${furnitureItem.name} placed!`);
     setTimeout(() => setToastMessage(null), 3000);
   };
 
-
-  // ─────────────────────────────────────────────────────────────
-  // ACTION: Record a structural (parametric resize) edit for a native
-  // IFC element. This is Delta-Based State Management — input.ifc is
-  // never rewritten. We only ever persist a scale ratio / offset delta
-  // per element, and re-apply it visually on load.
-  // ─────────────────────────────────────────────────────────────
-  // const updateStructuralEdit = (entityId, transformType, axis, value) => {
-  //   if (!entityId) return;
-  //   if (transformType !== 'scale' && transformType !== 'offset') {
-  //     console.warn(`[ProjectSync] Unknown structural edit type: ${transformType}`);
-  //     return;
-  //   }
-
-  //   setProjectState(prev => {
-  //     const existingEdit = prev.structural_edits[entityId] || { scale: [1, 1, 1], offset: [0, 0, 0] };
-  //     const defaultVector = transformType === 'scale' ? [1, 1, 1] : [0, 0, 0];
-  //     const updatedVector = [...(existingEdit[transformType] || defaultVector)];
-  //     updatedVector[axis] = value;
-
-  //     return {
-  //       ...prev,
-  //       structural_edits: {
-  //         ...prev.structural_edits,
-  //         [entityId]: {
-  //           ...existingEdit,
-  //           [transformType]: updatedVector,
-  //         },
-  //       },
-  //     };
-  //   });
-  // };
-
-
   const updateStructuralEdit = (entityId, transformType, axis, value) => {
     if (!entityId) return;
-    if (transformType !== 'scale' && transformType !== 'offset' && transformType !== 'visible') {
-      console.warn(`[ProjectSync] Unknown structural edit type: ${transformType}`);
-      return;
-    }
-
+    if (transformType !== 'scale' && transformType !== 'offset' && transformType !== 'visible') return;
+    
     setProjectState(prev => {
-      const existingEdit = prev.structural_edits[entityId] || { scale: [1, 1, 1], offset: [0, 0, 0], visible: true };
+      const existingEdit = (prev.structural_edits || {})[entityId] || { scale: [1, 1, 1], offset: [0, 0, 0], visible: true };
       
-      // Handle direct visibility overrides
       if (transformType === 'visible') {
           return {
             ...prev,
             structural_edits: {
-              ...prev.structural_edits,
+              ...(prev.structural_edits || {}),
               [entityId]: { ...existingEdit, visible: value },
             },
           };
       }
-
       const defaultVector = transformType === 'scale' ? [1, 1, 1] : [0, 0, 0];
       const updatedVector = [...(existingEdit[transformType] || defaultVector)];
       if (axis !== null) updatedVector[axis] = value;
-
       return {
         ...prev,
         structural_edits: {
-          ...prev.structural_edits,
+          ...(prev.structural_edits || {}),
           [entityId]: {
             ...existingEdit,
             [transformType]: updatedVector,
@@ -400,34 +360,32 @@ export const useProjectSync = (file) => {
     });
   };
 
-  // ─────────────────────────────────────────────────────────────
-// ACTION: Adopt a freshly-isolated native IFC element into furniture state
-// ─────────────────────────────────────────────────────────────
-const adoptIsolatedAsset = (entityId, newInstanceId, fileUrl, assetName) => {
-  setProjectState(prev => ({
-    ...prev,
-    furniture: [
-      ...prev.furniture,
-      {
-        id: entityId,
-        instanceId: newInstanceId,
-        name: assetName || 'Isolated Element',
-        src: fileUrl,
-        fileType: 'ifc',
-        position: [0, 0, 0],
-        rotation: [0, 0, 0],
-        scale: [1, 1, 1],
-      },
-    ],
-  }));
-};
+  const adoptIsolatedAsset = (entityId, newInstanceId, fileUrl, assetName) => {
+    setProjectState(prev => ({
+      ...prev,
+      furniture: [
+        ...(prev.furniture || []),
+        {
+          id: entityId,
+          instanceId: newInstanceId,
+          name: assetName || 'Isolated Element',
+          src: fileUrl,
+          fileType: 'ifc',
+          position: [0, 0, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+        },
+      ],
+    }));
+  };
+
   return {
     projectState,
     projectStateRef,
     saveStatus,
     lastSavedTime,
     availableAssets,
-    homeTemplates, // Bound to the "Layouts" tab in LeftPanel
+    homeTemplates,
     toastMessage,
     customColor,
     applyMaterial,
@@ -439,5 +397,6 @@ const adoptIsolatedAsset = (entityId, newInstanceId, fileUrl, assetName) => {
     updateStructuralEdit,
     setToastMessage,
     setCustomColor,
+    saveNow,
   };
 };

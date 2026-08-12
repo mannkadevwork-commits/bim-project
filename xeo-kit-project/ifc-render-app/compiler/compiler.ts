@@ -38,6 +38,7 @@ interface FurnitureItem {
   rotation: [number, number, number];
   scale: [number, number, number];
   type?: AssetType;
+  assetFormat?: 'glb' | 'ifc';
 }
 
 interface StructuralEditEntry {
@@ -427,6 +428,23 @@ export async function compileScene(
   const PROJECT_STATE_PATH = path.join(jobDirectory, "project_state.json");
   const OUTPUT_GLB_PATH = path.join(jobDirectory, "output.glb");
 
+    function resolveGlbPath(src: string): string {
+      // src is a full URL like http://localhost:3000/uploads/catalog/models/xxx.glb
+      // or a relative path like /uploads/catalog/models/xxx.glb
+      let pathname: string;
+      try {
+        pathname = new URL(src).pathname;
+      } catch {
+        pathname = src;
+      }
+      // Map /uploads/... to the uploads folder sitting next to the compiler's server root
+      if (pathname.startsWith("/uploads/")) {
+        return path.join(ROOT_DIR, "..", pathname);
+      }
+      // Fallback: treat as absolute path
+      return pathname;
+    }
+
     function resolveIfcPath(src: string): string {
     const url = new URL(src);
 
@@ -557,133 +575,188 @@ if (url.pathname.startsWith("/jobs/")) {
 
     scene.addChild(structureNode);
 
+    const io = new NodeIO();
+
     for (const item of projectState.furniture) {
-      const assetType = classifyAsset(item, structuralEdits);
-      const behavior = ASSET_TYPE_BEHAVIOR[assetType];
+      const isGlb =
+        item.assetFormat === 'glb' ||
+        item.src.toLowerCase().endsWith('.glb');
+
       try {
-        
-        const assetPath = resolveIfcPath(item.src);
-        console.log(
-    "[compiler] Loading:",
-    item.name,
-    assetPath
-);
+        if (isGlb) {
+          // ── GLB branch ──────────────────────────────────────────────
+          const assetPath = resolveGlbPath(item.src);
+          console.log(`[compiler] Loading GLB: ${item.name} -> ${assetPath}`);
 
-console.log(
-    "Mounted:",
-    item.instanceId
-);
+          if (!fs.existsSync(assetPath)) {
+            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): GLB not found at ${assetPath}`);
+            continue;
+          }
 
-        if (!fs.existsSync(assetPath)) {
-          console.warn(
-            `[compiler] Skipping "${item.instanceId}" (${item.name}): ` +
-              `asset not found at ${assetPath}`
-          );
-          continue;
-        }
+          let glbDoc: Document;
+          try {
+            const glbBytes = fs.readFileSync(assetPath);
+            glbDoc = await io.readBinary(new Uint8Array(glbBytes.buffer, glbBytes.byteOffset, glbBytes.byteLength));
+          } catch (err) {
+            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): failed to read GLB - ${(err as Error).message}`);
+            continue;
+          }
 
-        let assetBytes: Uint8Array;
-        try {
-          assetBytes = readFileAsUint8Array(assetPath);
-        } catch (err) {
-          console.warn(
-            `[compiler] Skipping "${item.instanceId}" (${item.name}): ` +
-              `failed to read asset file - ${(err as Error).message}`
-          );
-          continue;
-        }
+          // Clone all meshes/accessors/materials from glbDoc into output doc
+          const clonedRoot = doc.createNode(`${item.instanceId}_geometry`);
 
-        let assetModelId: number;
-        try {
-          assetModelId = ifcApi.OpenModel(assetBytes, {
-            COORDINATE_TO_ORIGIN: false,
-          });
-          openModelIds.push(assetModelId);
-        } catch (err) {
-          console.warn(
-            `[compiler] Skipping "${item.instanceId}" (${item.name}): ` +
-              `web-ifc failed to open asset - ${(err as Error).message}`
-          );
-          continue;
-        }
+          function cloneNode(srcNode: GltfNode, parentDst: GltfNode): void {
+            const dstNode = doc.createNode(srcNode.getName());
+            dstNode.setTranslation(srcNode.getTranslation());
+            dstNode.setRotation(srcNode.getRotation());
+            dstNode.setScale(srcNode.getScale());
 
-        let tempSubtree: GltfNode;
-        try {
-          tempSubtree = extractGeometry(
-            ifcApi,
-            assetModelId,
-            doc,
-            buffer,
-            `${item.instanceId}_geometry`,
-            behavior.applyMaterialOverrides
-              ? { materialOverrides: materials }
-              : {}
-          );
-          console.log(
-    "Loaded IFC:",
-    item.name,
-    assetPath
-);
-        } catch (err) {
-          console.warn(
-            `[compiler] Skipping "${item.instanceId}" (${item.name}): ` +
-              `extractGeometry failed - ${(err as Error).message}`
-          );
-          continue;
-        }
+            const srcMesh = srcNode.getMesh();
+            if (srcMesh) {
+              const dstMesh = doc.createMesh(srcMesh.getName());
+              for (const srcPrim of srcMesh.listPrimitives()) {
+                const dstPrim = doc.createPrimitive();
+                dstPrim.setMode(srcPrim.getMode());
 
-        let finalX: number;
-        let finalY: number;
-        let finalZ: number;
+                // Clone indices
+                const srcIdx = srcPrim.getIndices();
+                if (srcIdx) {
+                  const srcArr = srcIdx.getArray();
+                  if (srcArr) {
+                    dstPrim.setIndices(
+                      doc.createAccessor()
+                        .setType(srcIdx.getType())
+                        .setArray(srcArr.slice())
+                        .setBuffer(buffer)
+                    );
+                  }
+                }
 
-        if (behavior.preservePlacement) {
+                // Clone attributes
+                for (const semantic of srcPrim.listSemantics()) {
+                  const srcAttr = srcPrim.getAttribute(semantic)!;
+                  const srcArr = srcAttr.getArray();
+                  if (srcArr) {
+                    dstPrim.setAttribute(
+                      semantic,
+                      doc.createAccessor()
+                        .setType(srcAttr.getType())
+                        .setArray(srcArr.slice())
+                        .setBuffer(buffer)
+                    );
+                  }
+                }
 
-          finalX = item.position[0];
-          finalY = item.position[1];
-          finalZ = item.position[2];
+                // Clone material
+                const srcMat = srcPrim.getMaterial();
+                if (srcMat) {
+                  const [r, g, b, a] = srcMat.getBaseColorFactor();
+                  const dstMat = doc.createMaterial(srcMat.getName())
+                    .setBaseColorFactor([r, g, b, a])
+                    .setRoughnessFactor(srcMat.getRoughnessFactor())
+                    .setMetallicFactor(srcMat.getMetallicFactor())
+                    .setDoubleSided(srcMat.getDoubleSided());
+                  dstPrim.setMaterial(dstMat);
+                }
+
+                dstMesh.addPrimitive(dstPrim);
+              }
+              dstNode.setMesh(dstMesh);
+            }
+
+            parentDst.addChild(dstNode);
+
+            for (const child of srcNode.listChildren()) {
+              cloneNode(child, dstNode);
+            }
+          }
+
+          const glbScenes = glbDoc.getRoot().listScenes();
+          for (const glbScene of glbScenes) {
+            for (const rootNode of glbScene.listChildren()) {
+              cloneNode(rootNode, clonedRoot);
+            }
+          }
+
+          const [centerX, bottomY, centerZ] = computeAssetPivotOffset(clonedRoot);
+          const finalX = item.position[0] - centerX;
+          const finalY = item.position[1] - bottomY;
+          const finalZ = item.position[2] - centerZ;
+
+          const instanceWrapper = doc.createNode(item.instanceId).addChild(clonedRoot);
+          instanceWrapper.setTranslation([finalX, finalY, finalZ]);
+          instanceWrapper.setRotation(eulerToQuaternion(degTupleToRadTuple(item.rotation)));
+          instanceWrapper.setScale(Array.isArray(item.scale) ? item.scale : [1, 1, 1]);
+
+          scene.addChild(instanceWrapper);
+          console.log(`[compiler] Mounted GLB "${item.instanceId}" (${item.name}) at [${finalX.toFixed(3)}, ${finalY.toFixed(3)}, ${finalZ.toFixed(3)}]`);
 
         } else {
+          // ── IFC branch (unchanged) ───────────────────────────────────
+          const assetType = classifyAsset(item, structuralEdits);
+          const behavior = ASSET_TYPE_BEHAVIOR[assetType];
 
-          const [centerX, bottomY, centerZ] =
-            computeAssetPivotOffset(tempSubtree);
+          const assetPath = resolveIfcPath(item.src);
+          console.log(`[compiler] Loading IFC: ${item.name} -> ${assetPath}`);
 
-          finalX = item.position[0] - centerX;
-          finalY = item.position[1] - bottomY;
-          finalZ = item.position[2] - centerZ;
+          if (!fs.existsSync(assetPath)) {
+            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): asset not found at ${assetPath}`);
+            continue;
+          }
+
+          let assetBytes: Uint8Array;
+          try {
+            assetBytes = readFileAsUint8Array(assetPath);
+          } catch (err) {
+            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): failed to read asset - ${(err as Error).message}`);
+            continue;
+          }
+
+          let assetModelId: number;
+          try {
+            assetModelId = ifcApi.OpenModel(assetBytes, { COORDINATE_TO_ORIGIN: false });
+            openModelIds.push(assetModelId);
+          } catch (err) {
+            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): web-ifc failed - ${(err as Error).message}`);
+            continue;
+          }
+
+          let tempSubtree: GltfNode;
+          try {
+            tempSubtree = extractGeometry(
+              ifcApi, assetModelId, doc, buffer,
+              `${item.instanceId}_geometry`,
+              behavior.applyMaterialOverrides ? { materialOverrides: materials } : {}
+            );
+          } catch (err) {
+            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): extractGeometry failed - ${(err as Error).message}`);
+            continue;
+          }
+
+          let finalX: number, finalY: number, finalZ: number;
+          if (behavior.preservePlacement) {
+            [finalX, finalY, finalZ] = item.position;
+          } else {
+            const [centerX, bottomY, centerZ] = computeAssetPivotOffset(tempSubtree);
+            finalX = item.position[0] - centerX;
+            finalY = item.position[1] - bottomY;
+            finalZ = item.position[2] - centerZ;
+          }
+
+          const instanceWrapper = doc.createNode(item.instanceId).addChild(tempSubtree);
+          instanceWrapper.setTranslation([finalX, finalY, finalZ]);
+          instanceWrapper.setRotation(eulerToQuaternion(degTupleToRadTuple(item.rotation)));
+          instanceWrapper.setScale(Array.isArray(item.scale) ? item.scale : [1, 1, 1]);
+
+          scene.addChild(instanceWrapper);
+          console.log(`[compiler] Mounted IFC "${item.instanceId}" (${item.name}) [${assetType}] at [${finalX.toFixed(3)}, ${finalY.toFixed(3)}, ${finalZ.toFixed(3)}]`);
         }
-
-        const instanceWrapper = doc
-          .createNode(item.instanceId)
-          .addChild(tempSubtree);
-
-        instanceWrapper.setTranslation([finalX, finalY, finalZ]);
-
-        const rotationRad = degTupleToRadTuple(item.rotation);
-        const quat = eulerToQuaternion(rotationRad);
-        instanceWrapper.setRotation(quat);
-
-        instanceWrapper.setScale(
-          Array.isArray(item.scale) ? item.scale : [1, 1, 1]
-        );
-
-        scene.addChild(instanceWrapper);
-
-        console.log(
-          `[compiler] Mounted "${item.instanceId}" (${item.name}) [${assetType}] at ` +
-            `[${finalX.toFixed(3)}, ${finalY.toFixed(3)}, ${finalZ.toFixed(
-              3
-            )}]`
-        );
       } catch (err) {
-        console.warn(
-          `[compiler] Unexpected error processing "${item.instanceId ?? "unknown"}": ` +
-            `${(err as Error).message}. Skipping.`
-        );
+        console.warn(`[compiler] Unexpected error processing "${item.instanceId ?? 'unknown'}": ${(err as Error).message}. Skipping.`);
         continue;
       }
     }
 
-    const io = new NodeIO();
     const glbBuffer = await io.writeBinary(doc);
     fs.writeFileSync(OUTPUT_GLB_PATH, Buffer.from(glbBuffer));
 

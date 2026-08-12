@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import BIMViewer from './BIMViewer';
 import AdminPanel from './pages/AdminPanel';
@@ -11,71 +11,136 @@ import { AlertTriangle } from 'lucide-react';
 function ViewerApp() {
   const [isUploadOpen, setIsUploadOpen] = useState(true);
   const [isContactOpen, setIsContactOpen] = useState(false);
-  const [modelFile, setModelFile] = useState(null);
   
-  // New state for the delete confirmation popup
+  // NEW: Canonical project state holding { jobId, file, fileName }
+  const [activeProject, setActiveProject] = useState(null);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [isResettingProject, setIsResettingProject] = useState(false);
 
-  // Triggered by the delete button in BottomDock
+  // Resume active project on refresh
+  useEffect(() => {
+    const resumeProject = async () => {
+      const saved = localStorage.getItem('hci_active_project');
+      if (saved) {
+        try {
+          const { jobId, fileName } = JSON.parse(saved);
+          const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+          
+          // Reconstruct the File object from the backend's original IFC copy
+          const res = await fetch(`${API_BASE_URL}/jobs/${jobId}/original.ifc`);
+          if (!res.ok) throw new Error('Could not fetch original ifc from backend');
+          
+          const blob = await res.blob();
+          const file = new File([blob], fileName, { type: 'application/octet-stream' });
+          
+          setActiveProject({ jobId, file, fileName });
+          setIsUploadOpen(false);
+        } catch (err) {
+          console.error("[App] Failed to resume project. Starting fresh.", err);
+          localStorage.removeItem('hci_active_project');
+        }
+      }
+    };
+    resumeProject();
+  }, []);
+
+  const handleProjectUpload = (projectData) => {
+    setActiveProject(projectData);
+    localStorage.setItem('hci_active_project', JSON.stringify({
+      jobId: projectData.jobId,
+      fileName: projectData.fileName
+    }));
+    setIsUploadOpen(false);
+  };
+
   const handleDeleteRequest = () => {
     setIsDeleteModalOpen(true);
   };
 
-  // Triggered when user confirms deletion in the popup
-  // Triggered when user confirms deletion in the popup
   const confirmDelete = async () => {
-    if (modelFile) {
-      const jobId = `job_${modelFile.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
-      
-      // 1. Clear the specific local storage for this project
+    if (!activeProject?.jobId) {
+      setIsDeleteModalOpen(false);
+      return;
+    }
+
+    const { jobId, fileName } = activeProject;
+    const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
+    setIsDeleteModalOpen(false);
+    setIsResettingProject(true);
+
+    try {
+      // Backend archives the current project and returns a brand-new jobId.
+      const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}`, {
+        method: 'DELETE',
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => ({}));
+        throw new Error(errorBody.error || `Project reset failed (${response.status})`);
+      }
+
+      const data = await response.json();
+      if (!data.success || !data.newJobId) {
+        throw new Error('Backend did not return a new project jobId.');
+      }
+
+      const newJobId = data.newJobId;
+      const resIfc = await fetch(`${API_BASE_URL}/jobs/${newJobId}/original.ifc`, {
+        cache: 'no-store',
+      });
+      if (!resIfc.ok) {
+        throw new Error('Fresh project was created, but its original IFC could not be loaded.');
+      }
+
+      const blob = await resIfc.blob();
+      const file = new File([blob], fileName, { type: 'application/octet-stream' });
+
+      // Remove only the old project's browser cache. The backend project itself
+      // is intentionally retained as archived history.
       localStorage.removeItem(`hci_state_${jobId}`);
 
-      // 2. Clear the backend server memory for this project
-      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-      try {
-        await fetch(`${API_BASE_URL}/api/projects/${jobId}`, {
-          method: 'DELETE'
-        });
-      } catch (err) {
-        console.error("Failed to delete project on backend:", err);
-      }
+      const nextProject = { jobId: newJobId, file, fileName };
+      localStorage.setItem('hci_active_project', JSON.stringify({
+        jobId: newJobId,
+        fileName,
+      }));
+      setActiveProject(nextProject);
+    } catch (error) {
+      console.error('[App] Failed to reset project:', error);
+      // Do not silently pretend reset succeeded. Keep the existing project
+      // active so a failed reset cannot make the UI lose the user's work.
+      alert(`Failed to reset project: ${error.message}`);
+    } finally {
+      setIsResettingProject(false);
     }
-    
-    // 3. Clear the model from the viewer
-    setModelFile(null);
-    
-    // 4. Close the modal and reopen the Upload screen to add a blank layout
-    setIsDeleteModalOpen(false);
-    setIsUploadOpen(true); 
   };
+
 
   return (
     <div className="relative w-screen h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-50 transition-colors duration-300 overflow-hidden flex flex-col">
-      
-      {/* ── LANDING PAGE ELEMENTS (Hidden when a model is active) ── */}
-      {!modelFile && (
+      {!activeProject && (
         <Navbar
           onOpenUpload={() => setIsUploadOpen(true)}
           onOpenContact={() => setIsContactOpen(true)}
         />
       )}
 
-      {/* ── FULL SCREEN VIEWER ── */}
       <div className="flex-1 relative h-full">
         <BIMViewer
-          file={modelFile}
+          key={activeProject?.jobId || 'no-active-project'}
+          activeProject={activeProject}
           onDelete={handleDeleteRequest} 
           onAdd={() => setIsUploadOpen(true)}
         />
       </div>
 
-      {/* ── LANDING PAGE FOOTER ── */}
-      {!modelFile && <Footer />}
+      {!activeProject && <Footer />}
 
       <UploadModal
         isOpen={isUploadOpen}
-        onClose={() => setIsUploadOpen(false)}
-        onFileUpload={(file) => setModelFile(file)}
+        onClose={() => { if (activeProject) setIsUploadOpen(false); }}
+        onProjectCreated={handleProjectUpload}
       />
 
       <ContactForm
@@ -83,7 +148,16 @@ function ViewerApp() {
         onClose={() => setIsContactOpen(false)}
       />
 
-      {/* DELETE CONFIRMATION MODAL */}
+      {isResettingProject && (
+        <div className="fixed inset-0 z-[250] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
+          <div className="rounded-2xl bg-slate-900 border border-slate-700 px-8 py-7 text-center shadow-2xl">
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-indigo-400 animate-spin" />
+            <p className="text-white font-semibold">Resetting project…</p>
+            <p className="mt-1 text-sm text-slate-400">Creating a fresh workspace from the original IFC.</p>
+          </div>
+        </div>
+      )}
+
       {isDeleteModalOpen && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-slate-900/50 backdrop-blur-sm">
           <div className="bg-white dark:bg-slate-900 w-full max-w-md p-6 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 animate-in fade-in zoom-in-95 duration-200">
@@ -94,11 +168,10 @@ function ViewerApp() {
               <div>
                 <h3 className="text-lg font-bold text-slate-900 dark:text-white">Delete Current Project?</h3>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                  This will remove the current structural layout and clear all placed furniture and unsaved progress from your browser. This action cannot be undone.
+                  This will reset the current workspace to a fresh copy of the original IFC. Your current project will be archived on the server and kept for future project history.
                 </p>
               </div>
             </div>
-            
             <div className="flex gap-3 mt-6">
               <button 
                 onClick={() => setIsDeleteModalOpen(false)}
@@ -108,19 +181,18 @@ function ViewerApp() {
               </button>
               <button 
                 onClick={confirmDelete}
+                disabled={isResettingProject}
                 className="flex-1 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold transition-colors shadow-sm"
               >
-                Yes, Delete Project
+                {isResettingProject ? 'Resetting...' : 'Yes, Delete Project'}
               </button>
             </div>
           </div>
         </div>
       )}
-      
     </div>
   );
 }
-
 
 function App() {
   return (
@@ -132,7 +204,5 @@ function App() {
     </BrowserRouter>
   );
 }
-
-
 
 export default App;

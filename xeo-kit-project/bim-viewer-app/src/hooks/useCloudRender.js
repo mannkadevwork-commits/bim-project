@@ -2,7 +2,8 @@ import { useState } from 'react';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
-export const useCloudRender = (file, projectStateRef) => {
+export const useCloudRender = (activeProject, projectStateRef) => {
+  const { file, jobId } = activeProject || {};
   const [isRendering, setIsRendering] = useState(false);
   const [renderResult, setRenderResult] = useState(null);
   const [renderTime, setRenderTime] = useState(null);
@@ -10,7 +11,8 @@ export const useCloudRender = (file, projectStateRef) => {
   const [renderConfig, setRenderConfig] = useState({ type: '360', quality: 'high', lighting: 'daylight' });
 
   const executeRender = async () => {
-    if (!file) return;
+    if (!file || !jobId) return;
+
     setIsRendering(true);
     setRenderError(null);
     setRenderResult(null);
@@ -18,7 +20,8 @@ export const useCloudRender = (file, projectStateRef) => {
 
     const formData = new FormData();
     formData.append('ifcFile', file);
-    
+    formData.append('jobId', jobId); // Include canonical jobId mapped directly to backend
+
     const actualAngle = renderConfig.type === 'static' ? 'top-front-right' : renderConfig.type;
     formData.append('angle', actualAngle);
     formData.append('lighting', renderConfig.lighting);

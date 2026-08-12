@@ -20,25 +20,52 @@ const PREDEFINED_PLANS = [
   }
 ];
 
-const UploadModal = ({ isOpen, onClose, onFileUpload }) => {
+const UploadModal = ({ isOpen, onClose, onProjectCreated }) => {
   const fileInputRef = useRef(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
 
   if (!isOpen) return null;
 
-  // ── Handle Manual Uploads ──
+  // Create Project on Backend Helper
+  const createProject = async (fileToUpload) => {
+    setIsProcessing(true);
+    setStatusMessage('Initializing project workspace...');
+    try {
+      const formData = new FormData();
+      formData.append('ifcFile', fileToUpload);
+      
+      const response = await fetch(`${API_BASE_URL}/api/projects`, {
+        method: 'POST',
+        body: formData
+      });
+      
+      const data = await response.json();
+      if (data.success && data.jobId) {
+        onProjectCreated({ jobId: data.jobId, file: fileToUpload, fileName: fileToUpload.name });
+      } else {
+        throw new Error(data.error || 'Failed to create project on backend');
+      }
+    } catch (error) {
+      console.error("Project Creation Error:", error);
+      alert(`Failed to initialize project: ${error.message}`);
+    } finally {
+      setIsProcessing(false);
+      setStatusMessage('');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  //   Handle Manual Uploads  
   const handleFileChange = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-
     const fileType = file.type;
     const isImage = fileType.startsWith('image/');
     
-    // If it's a native 3D file, bypass the backend and load directly
+    // If it's a native 3D file, create project directly
     if (!isImage) {
-      onFileUpload(file);
-      onClose();
+      await createProject(file);
       return;
     }
 
@@ -63,15 +90,13 @@ const UploadModal = ({ isOpen, onClose, onFileUpload }) => {
 
       setStatusMessage('Downloading generated 3D model...');
       const data = await response.json();
-
       if (data.success && data.fileUrl) {
         const fileResponse = await fetch(data.fileUrl);
         const blob = await fileResponse.blob();
         
         const generatedFile = new File([blob], `${data.jobId}_Generated.ifc`, { type: 'application/octet-stream' });
         
-        onFileUpload(generatedFile);
-        onClose();
+        await createProject(generatedFile);
       } else {
         throw new Error(data.error || 'Conversion failed');
       }
@@ -99,8 +124,7 @@ const UploadModal = ({ isOpen, onClose, onFileUpload }) => {
       // Convert the fetched blob into a standard File object so BIMViewer can read it normally
       const file = new File([blob], plan.fileUrl.split('/').pop(), { type: 'application/octet-stream' });
       
-      onFileUpload(file);
-      onClose();
+      await createProject(file);
     } catch (error) {
       console.error("Predefined Plan Error:", error);
       alert(`Failed to load predefined plan: ${error.message}. Ensure the file exists in your backend assets folder.`);

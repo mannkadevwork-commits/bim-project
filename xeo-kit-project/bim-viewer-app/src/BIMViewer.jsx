@@ -13,7 +13,8 @@ import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
 import { AssetContextMenu } from './components/AssetContextMenu';
 import { useCatalog } from './hooks/useCatalog';
 
-const BIMViewer = ({ file, onDelete, onAdd }) => {
+const BIMViewer = ({ activeProject, onDelete, onAdd }) => {
+  const { file, jobId, fileName } = activeProject || {};
   const containerRef = useRef(null);
   const tooltipRef = useRef(null);
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(true);
@@ -23,6 +24,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [isManualSaving, setIsManualSaving] = useState(false);
+  const [lastClickPos, setLastClickPos] = useState({ x: 0, y: 0 });
 
   // Add the useCatalog hook call[cite: 1]
   const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
@@ -43,12 +45,11 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
     availableAssets, homeTemplates,
     toastMessage, customColor, applyMaterial, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
-    updateStructuralEdit, setToastMessage 
-  } = useProjectSync(file);
+    updateStructuralEdit, setToastMessage, saveNow
+  } = useProjectSync(activeProject);
 
   const insertDoor = async (asset, wallSnapData) => {
-    if (!file) return;
-    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    if (!file || !jobId) return;
     
     const { position, rotation, wallGlobalId } = wallSnapData;
     const doorSurfacePosition = [position[0], 0, position[2]];
@@ -106,8 +107,9 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
   const {
     refs, state: engineState, actions: engineActions,
   } = useBIMEngine(
-    file,
+    activeProject,
     projectStateRef,
+    projectState,
     (asset, data) => {
       if (asset.type === 'door') {
         insertDoor(asset, data);
@@ -122,7 +124,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
   const {
     state: renderState, config: renderConfig, setRenderConfig, executeRender,
     setRenderResult, setRenderError,
-  } = useCloudRender(file, projectStateRef);
+  } = useCloudRender(activeProject, projectStateRef);
 
   useEffect(() => {
     const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
@@ -179,6 +181,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
 
   const handlePointerDown = (e) => {
     refs.canvasRef.current?.focus();
+    setLastClickPos({ x: e.clientX, y: e.clientY });
   };
 
   const handlePointerUp = (e) => {
@@ -221,40 +224,23 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
   };
 
   const handleManualSave = async () => {
-    if (!file) return;
+    if (!file || !jobId) return;
     setIsManualSaving(true);
-    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
-    const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
     try {
-        await fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ projectState: projectStateRef.current })
-        });
-        setTimeout(() => setIsManualSaving(false), 1000);
+      await saveNow(projectStateRef.current);
+      setTimeout(() => setIsManualSaving(false), 500);
     } catch (err) {
-        console.error("Manual save failed", err);
-        setIsManualSaving(false);
+      console.error('[BIMViewer] Manual save failed:', err);
+      setIsManualSaving(false);
     }
   };
 
-  useEffect(() => {
-    if (!file) return;
-    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
-    const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-    const saveInterval = setInterval(() => {
-      fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectState: projectStateRef.current })
-      }).catch(err => console.error("Auto-save failed", err));
-    }, 15000);
-    return () => clearInterval(saveInterval);
-  }, [file]);
+  // Project changes are persisted by useProjectSync immediately after every
+  // committed state change. There is intentionally no second interval-based
+  // save loop here; one owner prevents duplicate/racing save pipelines.
 
   useEffect(() => {
-    if (file) {
-      projectStateRef.current = { materials: {}, furniture: [] };
+    if (file && jobId) {
       engineActions.setSelectedObject(null);
       engineActions.setSelectedAssetId(null);
       if (engineActions.clearMeasurements) engineActions.clearMeasurements();
@@ -265,7 +251,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
       setIsRightPanelOpen(false);
       setShowRenderStudio(false);
     }
-  }, [file]);
+  }, [file, jobId]);
 
 
   // Sync Engine Visual Transforms -> React State (so it saves to the cloud)
@@ -303,11 +289,46 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
           label={engineState.activeStretchData.label}
         />
       )}
-      {engineState.selectedAssetId && !engineState.isStretching && (
+      {/* TOOLTIP OVERLAY FOR EDITING */}
+      {(engineState.selectedAssetId || engineState.selectedObject) && !engineState.isStretching && (
         <TransformModeTooltip
           mode={engineState.transformMode}
           onModeChange={engineActions.setTransformMode}
-          assetName={activeAsset?.name || 'Selected element'}
+          assetName={activeAsset?.name || engineState.selectedObject?.name || 'Selected element'}
+          x={lastClickPos.x}
+          y={lastClickPos.y}
+          isNative={!!engineState.selectedObject && !activeAsset}
+          onIsolate={() => {
+            if (engineState.selectedObject && !activeAsset) {
+              engineActions.isolateAndMakeMoveable(
+                engineState.selectedObject.id, 
+                adoptIsolatedAsset, 
+                updateStructuralEdit
+              );
+            }
+          }}
+          onColorChange={(hex) => {
+            const r = parseInt(hex.substring(1, 3), 16) / 255;
+            const g = parseInt(hex.substring(3, 5), 16) / 255;
+            const b = parseInt(hex.substring(5, 7), 16) / 255;
+            const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
+            applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b]);
+            if (setCustomColor) setCustomColor(hex);
+          }}
+          onDelete={() => {
+            if (engineState.selectedAssetId) {
+              deleteAsset(refs.viewerRef, engineState.selectedAssetId);
+            } else if (engineState.selectedObject) {
+              // Gracefully hide native elements to simulate deletion
+              updateStructuralEdit(engineState.selectedObject.id, 'visible', null, false);
+              if (refs.viewerRef.current?.scene.objects[engineState.selectedObject.id]) {
+                refs.viewerRef.current.scene.objects[engineState.selectedObject.id].visible = false;
+              }
+            }
+            engineActions.destroyStretchHandles();
+            engineActions.setSelectedAssetId(null);
+            engineActions.setSelectedObject(null);
+          }}
         />
       )}
       
@@ -379,19 +400,14 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
       {file && (
         <div className={`absolute inset-y-0 left-0 w-80 z-30 transition-transform duration-300 ${isLeftPanelOpen ? 'translate-x-0' : '-translate-x-full'}`}>
           <LeftPanel
-            // isOpen={isLeftPanelOpen}
-            // onClose={() => { setIsLeftPanelOpen(false); setIsMaxView(false); }}
-            // treeRef={refs.treeContainerRef}
-            // availableAssets={availableAssets}
-            // homeTemplates={homeTemplates}
             isOpen={isLeftPanelOpen}
-        onClose={() => { setIsLeftPanelOpen(false); setIsMaxView(false); }}
-        treeRef={refs.treeContainerRef}
-        availableAssets={availableAssets}
-        catalogTree={catalogTree} //[cite: 1]
-        catalogLoading={catalogLoading} //[cite: 1]
-        catalogError={catalogError} //[cite: 1]
-        homeTemplates={homeTemplates}
+            onClose={() => { setIsLeftPanelOpen(false); setIsMaxView(false); }}
+            treeRef={refs.treeContainerRef}
+            availableAssets={availableAssets}
+            catalogTree={catalogTree} 
+            catalogLoading={catalogLoading} 
+            catalogError={catalogError} 
+            homeTemplates={homeTemplates}
             onApplyTemplate={(templateId) => applyTemplate(templateId, engineActions.loadIFCAssetIntoScene)}
             placementMode={engineState.placementMode}
             setPlacementMode={engineActions.setPlacementMode}
@@ -399,7 +415,7 @@ const BIMViewer = ({ file, onDelete, onAdd }) => {
               engineActions.setSelectedObject(null);
               engineActions.setSelectedAssetId(null);
             }}
-            fileName={file.name}
+            fileName={fileName}
             projectState={projectState} 
           />
         </div>
