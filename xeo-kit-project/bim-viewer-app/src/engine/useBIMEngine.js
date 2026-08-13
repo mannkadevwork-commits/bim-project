@@ -33,6 +33,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const measurementsPluginRef = useRef(null);
   const isMeasuringRef = useRef(false);
   const globalScaleFactorRef = useRef({ x: 1, y: 1, z: 1 });
+
+  // NEW: Concurrency lock for async asset loading
+  const loadingModelsRef = useRef(new Set());
   
   // Hard rendering boundary lock
   const isModelLoadedRef = useRef(false);
@@ -127,7 +130,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     if (state.furniture) {
       state.furniture.forEach(item => {
-        if (!viewerRef.current.scene.models[item.instanceId]) {
+        if (!viewerRef.current.scene.models[item.instanceId] && !loadingModelsRef.current.has(item.instanceId)) {
+          // Set the lock
+          loadingModelsRef.current.add(item.instanceId);
+
           loadIFCAssetIntoScene(
             loadersRef,
             globalScaleFactorRef,
@@ -139,7 +145,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
               fileType: item.fileType || item.file_type,
               scale: item.scale || [1, 1, 1],
             }
-          ).catch(error =>
+          ).then(() => {
+            // Release lock on success
+            loadingModelsRef.current.delete(item.instanceId);
+          }).catch(error =>
             console.error('[BIM Engine] Failed to restore asset:', item.instanceId, error)
           );
         }
@@ -911,8 +920,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       setSelectedObject,
       setSelectedAssetId,
       setPlacementMode,
-      loadIFCAssetIntoScene: (i, s, t, r, options) =>
-        loadIFCAssetIntoScene(loadersRef, globalScaleFactorRef, i, s, t, r, options),
+      // loadIFCAssetIntoScene: (i, s, t, r, options) =>
+      //   loadIFCAssetIntoScene(loadersRef, globalScaleFactorRef, i, s, t, r, options),
+      
       getDropPosition: (c, a) => getDropPosition(viewerRef, projectStateRef, c, a),
       getWallSnapData: (c) => getWallSnapData(viewerRef, c),
       toggleMeasurementMode: () => toggleMeasurementMode(isMeasuring, setIsMeasuring, setPlacementMode, setSelectedObject, setSelectedAssetId, viewerRef),
