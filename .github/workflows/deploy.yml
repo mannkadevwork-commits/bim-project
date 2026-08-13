@@ -23,7 +23,7 @@ jobs:
           cd C:\Projects\bim-project\xeo-kit-project\bim-viewer-app
           npm install
           npm run build
-          pm2 restart react-frontend
+          pm2 restart bim-frontend
 
       - name: 3. Deploy Node Backend
         shell: powershell

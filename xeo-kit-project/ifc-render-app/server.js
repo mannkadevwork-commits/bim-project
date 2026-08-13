@@ -107,6 +107,117 @@ app.get('/api/assets', (req, res) => {
     res.json(catalog);
 });
 
+
+// ==========================================
+// PREDEFINED IFC LAYOUTS API
+// ==========================================
+
+// These are the same IFC files used by the initial UploadModal.
+const PREDEFINED_LAYOUTS = [
+    {
+        id: '1bhk',
+        name: '1 BHK Layout',
+        description: 'Compact single bedroom structure',
+        fileName: '1_BHK_Detailed.ifc',
+        assetPath: path.join(assetsDir, '1_BHK_Detailed.ifc'),
+        fileUrl: '/assets/1_BHK_Detailed.ifc',
+    },
+    {
+        id: '3bhk',
+        name: '3 BHK Layout',
+        description: 'Spacious three bedroom family home',
+        fileName: '3_BHK.ifc',
+        assetPath: path.join(assetsDir, '3_BHK.ifc'),
+        fileUrl: '/assets/3_BHK.ifc',
+    },
+];
+
+app.get('/api/layouts', (req, res) => {
+    res.json({
+        layouts: PREDEFINED_LAYOUTS.map(({ assetPath, ...layout }) => ({
+            ...layout,
+            available: fs.existsSync(assetPath),
+        })),
+    });
+});
+
+// ==========================================
+// SWITCH PROJECT LAYOUT API
+// ==========================================
+// ==========================================
+// SWITCH PROJECT LAYOUT API
+// ==========================================
+app.post('/api/projects/:jobId/layout', (req, res) => {
+    try {
+        const oldJobId = req.params.jobId;
+        const { layoutId } = req.body;
+
+        const layout = PREDEFINED_LAYOUTS.find(l => l.id === layoutId);
+        if (!layout) {
+            return res.status(404).json({ error: 'Requested layout not found.' });
+        }
+
+        const oldJobDir = path.join(jobsDir, oldJobId);
+
+        if (fs.existsSync(oldJobDir)) {
+            const oldManifest = readManifest(oldJobDir) || {
+                jobId: oldJobId,
+                originalFileName: null,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                status: 'active'
+            };
+
+            if (oldManifest.status !== 'archived') {
+                oldManifest.status = 'archived';
+                oldManifest.updatedAt = new Date().toISOString();
+                writeManifest(oldJobDir, oldManifest);
+            }
+        }
+
+        const newJobId = generateJobId();
+        const newJobDir = path.join(jobsDir, newJobId);
+        fs.mkdirSync(newJobDir, { recursive: true });
+
+        if (fs.existsSync(layout.assetPath)) {
+            fs.copyFileSync(layout.assetPath, path.join(newJobDir, 'original.ifc'));
+            fs.copyFileSync(layout.assetPath, path.join(newJobDir, 'input.ifc'));
+        } else {
+            return res.status(500).json({ error: `Layout IFC file missing on server: ${layout.fileName}` });
+        }
+
+        fs.writeFileSync(
+            path.join(newJobDir, 'project_state.json'),
+            JSON.stringify({ materials: {}, furniture: [] }, null, 2)
+        );
+
+        const now = new Date().toISOString();
+        writeManifest(newJobDir, {
+            jobId: newJobId,
+            originalFileName: layout.fileName,
+            createdAt: now,
+            updatedAt: now,
+            status: 'active'
+        });
+
+        // Construct absolute URL so frontend routes to port 3000 instead of 5173
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        const host = req.headers.host;
+        
+        res.json({ 
+            success: true, 
+            archivedJobId: oldJobId, 
+            newJobId: newJobId,
+            fileName: layout.fileName,
+            fileUrl: `${protocol}://${host}/jobs/${newJobId}/original.ifc`
+        });
+
+    } catch (error) {
+        console.error("Layout Switch Error:", error);
+        res.status(500).json({ error: 'Failed to switch layout' });
+    }
+});
+
 // ==========================================
 // PROJECT LIFECYCLE API
 // ==========================================

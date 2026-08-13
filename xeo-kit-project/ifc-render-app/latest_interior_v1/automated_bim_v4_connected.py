@@ -184,7 +184,7 @@ def analyze_floor_plan_detailed(image_path: str) -> BuildingAnalysis:
     
     print(f"[API] Running Detailed Visual Extraction...")
     response = client.models.generate_content(
-        model='gemini-3-flash-preview',
+        model='gemini-2.5-flash-preview',
         contents=[image_part, _build_extraction_prompt(image_path)],
         config=types.GenerateContentConfig(
             response_mime_type="application/json", response_schema=BuildingAnalysis, temperature=0.0

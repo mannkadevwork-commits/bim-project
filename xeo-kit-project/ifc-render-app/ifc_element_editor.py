@@ -587,16 +587,19 @@ def cmd_insert_door(args):
     # from the geometry pipeline's perspective — see docstring. ──
     rel_voids = ifcopenshell.api.feature.add_feature(source, feature=opening, element=wall)
 
-    # ── Write a minimal standalone file: project context + the wall +
-    # the new opening + the relationship — same "isolated copy" pattern
-    # cmd_isolate/cmd_resize already use above. ──
-    target = ifcopenshell.file(schema=source.schema)
-    for project in source.by_type("IfcProject"):
-        target.add(project)
-    target.add(wall)
-    target.add(opening)
-    target.add(rel_voids)
-    target.write(args.output)
+    # ── Write the full source IFC (with the new opening baked in).
+    # Writing the complete file — rather than a minimal isolated copy —
+    # guarantees that:
+    #   1. The wall's original IfcLocalPlacement is preserved, so the
+    #      frontend can load this file with no position override and the
+    #      wall appears exactly where it was in the original building.
+    #   2. All IfcGeometricRepresentationContext entities referenced by
+    #      the new opening's geometry are present (they live in the
+    #      project context which is already in source).
+    #   3. web-ifc / WebIFCLoaderPlugin resolves the IfcRelVoidsElement
+    #      opening subtraction automatically because both the wall and
+    #      the opening are in the same file with the same context. ──
+    source.write(args.output)
 
     logger.info(f"Door void written to: {args.output}")
 

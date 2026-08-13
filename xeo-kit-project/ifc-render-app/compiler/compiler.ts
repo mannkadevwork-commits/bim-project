@@ -5,7 +5,7 @@ import { Document, NodeIO, Node as GltfNode, Primitive } from "@gltf-transform/c
 import * as THREE from "three";
 
 import { extractGeometry } from "./geometry";
-import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
+import { eulerToQuaternion } from "./math";
 import { fileURLToPath, pathToFileURL } from "url";
 
 enum AssetType {
@@ -39,6 +39,7 @@ interface FurnitureItem {
   scale: [number, number, number];
   type?: AssetType;
   assetFormat?: 'glb' | 'ifc';
+  fileType?: string;
 }
 
 interface StructuralEditEntry {
@@ -580,6 +581,7 @@ if (url.pathname.startsWith("/jobs/")) {
     for (const item of projectState.furniture) {
       const isGlb =
         item.assetFormat === 'glb' ||
+        item.fileType === 'glb' ||
         item.src.toLowerCase().endsWith('.glb');
 
       try {
@@ -602,7 +604,6 @@ if (url.pathname.startsWith("/jobs/")) {
             continue;
           }
 
-          // Clone all meshes/accessors/materials from glbDoc into output doc
           const clonedRoot = doc.createNode(`${item.instanceId}_geometry`);
 
           function cloneNode(srcNode: GltfNode, parentDst: GltfNode): void {
@@ -618,7 +619,6 @@ if (url.pathname.startsWith("/jobs/")) {
                 const dstPrim = doc.createPrimitive();
                 dstPrim.setMode(srcPrim.getMode());
 
-                // Clone indices
                 const srcIdx = srcPrim.getIndices();
                 if (srcIdx) {
                   const srcArr = srcIdx.getArray();
@@ -632,7 +632,6 @@ if (url.pathname.startsWith("/jobs/")) {
                   }
                 }
 
-                // Clone attributes
                 for (const semantic of srcPrim.listSemantics()) {
                   const srcAttr = srcPrim.getAttribute(semantic)!;
                   const srcArr = srcAttr.getArray();
@@ -647,7 +646,6 @@ if (url.pathname.startsWith("/jobs/")) {
                   }
                 }
 
-                // Clone material
                 const srcMat = srcPrim.getMaterial();
                 if (srcMat) {
                   const [r, g, b, a] = srcMat.getBaseColorFactor();
@@ -678,21 +676,21 @@ if (url.pathname.startsWith("/jobs/")) {
             }
           }
 
-          const [centerX, bottomY, centerZ] = computeAssetPivotOffset(clonedRoot);
-          const finalX = item.position[0] - centerX;
-          const finalY = item.position[1] - bottomY;
-          const finalZ = item.position[2] - centerZ;
+          // Position is already the final AABB-corrected world position saved
+          // by the frontend — use it directly, no pivot math needed.
+          const [finalX, finalY, finalZ] = item.position;
 
           const instanceWrapper = doc.createNode(item.instanceId).addChild(clonedRoot);
           instanceWrapper.setTranslation([finalX, finalY, finalZ]);
-          instanceWrapper.setRotation(eulerToQuaternion(degTupleToRadTuple(item.rotation)));
+          // instanceWrapper.setRotation(eulerToQuaternion(degTupleToRadTuple(item.rotation)));
+          eulerToQuaternion(item.rotation)
           instanceWrapper.setScale(Array.isArray(item.scale) ? item.scale : [1, 1, 1]);
 
           scene.addChild(instanceWrapper);
           console.log(`[compiler] Mounted GLB "${item.instanceId}" (${item.name}) at [${finalX.toFixed(3)}, ${finalY.toFixed(3)}, ${finalZ.toFixed(3)}]`);
 
         } else {
-          // ── IFC branch (unchanged) ───────────────────────────────────
+          // ── IFC branch ───────────────────────────────────────────────
           const assetType = classifyAsset(item, structuralEdits);
           const behavior = ASSET_TYPE_BEHAVIOR[assetType];
 
@@ -733,19 +731,15 @@ if (url.pathname.startsWith("/jobs/")) {
             continue;
           }
 
-          let finalX: number, finalY: number, finalZ: number;
-          if (behavior.preservePlacement) {
-            [finalX, finalY, finalZ] = item.position;
-          } else {
-            const [centerX, bottomY, centerZ] = computeAssetPivotOffset(tempSubtree);
-            finalX = item.position[0] - centerX;
-            finalY = item.position[1] - bottomY;
-            finalZ = item.position[2] - centerZ;
-          }
+          // For structural replacements the position is an absolute IFC coordinate.
+          // For furniture the position is the AABB-corrected world position already
+          // saved by the frontend — use it directly in both cases.
+          const [finalX, finalY, finalZ] = item.position;
 
           const instanceWrapper = doc.createNode(item.instanceId).addChild(tempSubtree);
           instanceWrapper.setTranslation([finalX, finalY, finalZ]);
-          instanceWrapper.setRotation(eulerToQuaternion(degTupleToRadTuple(item.rotation)));
+          // instanceWrapper.setRotation(eulerToQuaternion(degTupleToRadTuple(item.rotation)));
+          eulerToQuaternion(item.rotation)
           instanceWrapper.setScale(Array.isArray(item.scale) ? item.scale : [1, 1, 1]);
 
           scene.addChild(instanceWrapper);

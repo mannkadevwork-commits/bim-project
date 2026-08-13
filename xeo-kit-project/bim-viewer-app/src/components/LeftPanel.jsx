@@ -7,7 +7,7 @@ export const LeftPanel = ({
   isOpen, onClose, treeRef, availableAssets,
   catalogTree, catalogLoading, catalogError, //[cite: 1]
   placementMode, setPlacementMode, resetSelection,
-  homeTemplates, onApplyTemplate, fileName 
+  homeTemplates, onApplyTemplate, availableLayouts, layoutsLoading, layoutsError, onSelectLayout, fileName 
 }) => {
   const [leftTab, setLeftTab] = useState('explorer');
   const [activeCategory, setActiveCategory] = useState('All');
@@ -67,33 +67,51 @@ export const LeftPanel = ({
       />
     </div>
 
-      {/* Predefined Home Templates */}
+      {/* Predefined IFC Layouts */}
       <div className={`flex-1 overflow-y-auto p-4 ${leftTab === 'templates' ? 'block' : 'hidden'}`}>
-        <p className="text-xs text-slate-400 dark:text-slate-500 mb-4 text-center leading-relaxed">
-          Upload a blank structure, then apply a predefined library layout below to auto-populate furniture.
-        </p>
-        <div className="space-y-4">
-          {homeTemplates?.map(template => (
-            <div key={template.id} className="p-4 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 rounded-xl hover:border-indigo-300 transition-colors">
-              <div className="flex items-center gap-2 mb-2">
-                <Layout className="w-5 h-5 text-indigo-500" />
-                <h3 className="font-bold text-sm text-slate-800 dark:text-white">{template.name}</h3>
-              </div>
-              <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">{template.description}</p>
-              
-              <div className="text-[10px] text-slate-400 mb-4 font-mono">
-                Contains {template.items.length} assets
-              </div>
-
-              <button
-                onClick={() => onApplyTemplate(template.id)}
-                className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition-colors shadow-sm cursor-pointer"
-              >
-                Apply Layout to Structure
-              </button>
-            </div>
-          ))}
+        <div className="mb-4 text-center">
+          <p className="text-xs text-slate-400 dark:text-slate-500 leading-relaxed">
+            Choose a predefined IFC layout to replace the current project with a fresh workspace.
+          </p>
         </div>
+
+        {layoutsLoading ? (
+          <div className="h-40 flex flex-col items-center justify-center text-slate-400">
+            <Loader2 className="w-6 h-6 animate-spin mb-2" />
+            <span className="text-xs">Loading layouts...</span>
+          </div>
+        ) : layoutsError ? (
+          <div className="p-4 rounded-xl border border-rose-200 dark:border-rose-900/50 bg-rose-50 dark:bg-rose-900/10 text-xs text-rose-600 dark:text-rose-400">
+            {layoutsError}
+          </div>
+        ) : availableLayouts?.length ? (
+          <div className="space-y-4">
+            {availableLayouts.map(layout => (
+              <div
+                key={layout.id}
+                className="p-4 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 rounded-xl hover:border-indigo-300 dark:hover:border-indigo-600 transition-colors"
+              >
+                <div className="flex items-center gap-2 mb-2">
+                  <Layout className="w-5 h-5 text-indigo-500" />
+                  <h3 className="font-bold text-sm text-slate-800 dark:text-white">{layout.name}</h3>
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">{layout.description}</p>
+                <div className="text-[10px] text-slate-400 mb-4 font-mono truncate" title={layout.fileName}>
+                  {layout.fileName}
+                </div>
+                <button
+                  onClick={() => onSelectLayout?.(layout)}
+                  disabled={layout.available === false}
+                  className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold transition-colors shadow-sm cursor-pointer"
+                >
+                  {layout.available === false ? 'Unavailable' : 'Use This Layout'}
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="p-4 text-center text-xs text-slate-400">No predefined layouts available.</div>
+        )}
       </div>
     </div>
   );

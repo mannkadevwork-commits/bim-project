@@ -13,7 +13,7 @@ import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
 import { AssetContextMenu } from './components/AssetContextMenu';
 import { useCatalog } from './hooks/useCatalog';
 
-const BIMViewer = ({ activeProject, onDelete, onAdd }) => {
+const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const { file, jobId, fileName } = activeProject || {};
   const containerRef = useRef(null);
   const tooltipRef = useRef(null);
@@ -42,7 +42,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd }) => {
 
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
-    availableAssets, homeTemplates,
+    availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
     toastMessage, customColor, applyMaterial, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, setToastMessage, saveNow
@@ -81,14 +81,23 @@ const BIMViewer = ({ activeProject, onDelete, onAdd }) => {
       const data = await response.json();
       if (!response.ok || data.error) throw new Error(data.error || 'Failed to insert door');
       
-      if (refs.viewerRef.current?.scene.objects[wallGlobalId]) {
-        refs.viewerRef.current.scene.objects[wallGlobalId].visible = false;
-      }
+      // The modified wall IFC (data.fileUrl) is the full building IFC with the
+      // opening baked in — it has its own IFC placement, so we load it with
+      // targetPosition=null and let the IFC coordinates place it correctly.
+      const wallEntity = refs.viewerRef.current?.scene.objects[wallGlobalId];
+      if (wallEntity) wallEntity.visible = false;
       updateStructuralEdit(wallGlobalId, 'visible', null, false);
       
       const modifiedWallId = `${wallGlobalId}_cut_${Date.now()}`;
+      // targetPosition is null — the full IFC already has the wall at its correct
+      // world coordinates via its own IfcLocalPlacement.
       await engineActions.loadIFCAssetIntoScene(modifiedWallId, data.fileUrl, null, null);
-      adoptIsolatedAsset(wallGlobalId, modifiedWallId, data.fileUrl, 'Wall with Void');
+      // The modified wall file is the full building IFC — its wall element
+      // already sits at the correct world coordinates via its own IfcLocalPlacement.
+      // The compiler must apply zero translation so it doesn't double-offset.
+      // wallWorldPos is stored only so the viewer can restore visibility correctly
+      // on reload; the compiler uses position [0,0,0] for full-IFC assets.
+      adoptIsolatedAsset(wallGlobalId, modifiedWallId, data.fileUrl, 'Wall with Void', [0, 0, 0]);
       
       if (!data.doorPlacement) {
         throw new Error('Backend did not return doorPlacement check ifc_element_editor.py version.');
@@ -408,6 +417,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd }) => {
             catalogLoading={catalogLoading} 
             catalogError={catalogError} 
             homeTemplates={homeTemplates}
+            availableLayouts={availableLayouts}
+            layoutsLoading={layoutsLoading}
+            layoutsError={layoutsError}
+            onSelectLayout={onReplaceProject}
             onApplyTemplate={(templateId) => applyTemplate(templateId, engineActions.loadIFCAssetIntoScene)}
             placementMode={engineState.placementMode}
             setPlacementMode={engineActions.setPlacementMode}

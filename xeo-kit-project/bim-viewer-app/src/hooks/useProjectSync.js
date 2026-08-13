@@ -57,6 +57,9 @@ export const useProjectSync = (activeProject) => {
   const projectStateRef = useRef(projectState);
   
   const [availableAssets, setAvailableAssets] = useState([]);
+  const [availableLayouts, setAvailableLayouts] = useState([]);
+  const [layoutsLoading, setLayoutsLoading] = useState(false);
+  const [layoutsError, setLayoutsError] = useState(null);
   const [homeTemplates, setHomeTemplates] = useState(MOCK_ROOM_TEMPLATES);
   const [saveStatus, setSaveStatus] = useState('saved');
   const [lastSavedTime, setLastSavedTime] = useState(null);
@@ -113,6 +116,21 @@ export const useProjectSync = (activeProject) => {
       .then(res => res.json())
       .then(data => setAvailableAssets(data))
       .catch(err => console.error('[ProjectSync] Failed to load asset catalog:', err));
+
+    setLayoutsLoading(true);
+    setLayoutsError(null);
+    fetch(`${API_BASE_URL}/api/layouts`)
+      .then(res => {
+        if (!res.ok) throw new Error(`Failed to load layouts (${res.status})`);
+        return res.json();
+      })
+      .then(data => setAvailableLayouts(Array.isArray(data?.layouts) ? data.layouts : []))
+      .catch(err => {
+        console.error('[ProjectSync] Failed to load predefined layouts:', err);
+        setLayoutsError(err.message);
+        setAvailableLayouts([]);
+      })
+      .finally(() => setLayoutsLoading(false));
   }, [file, jobId]);
 
   // 2. AUTO-SAVE: Safe sequential queue
@@ -311,12 +329,24 @@ export const useProjectSync = (activeProject) => {
       furniture: [...(prev.furniture || []), furnitureItem],
     }));
 
+    // onPlaced is called by AssetManager after AABB correction with the real
+    // final world position. We patch the saved furniture entry so the compiler
+    // receives the corrected coordinates and can use them directly.
+    const onPlaced = (instanceId, finalPosition) => {
+      setProjectState(prev => ({
+        ...prev,
+        furniture: (prev.furniture || []).map(f =>
+          f.instanceId === instanceId ? { ...f, position: finalPosition } : f
+        ),
+      }));
+    };
+
     loadIFCAssetIntoScene(
       uniqueId,
       fullAssetUrl,
       position,
       safeRotation,
-      { fileType, scale }
+      { fileType, scale, onPlaced }
     ).catch(error => {
       console.error('[ProjectSync] Failed to load placed asset:', error);
       setProjectState(prev => ({
@@ -331,26 +361,34 @@ export const useProjectSync = (activeProject) => {
   const updateStructuralEdit = (entityId, transformType, axis, value) => {
     if (!entityId) return;
     if (transformType !== 'scale' && transformType !== 'offset' && transformType !== 'visible') return;
-    
+
     setProjectState(prev => {
-      const existingEdit = (prev.structural_edits || {})[entityId] || { scale: [1, 1, 1], offset: [0, 0, 0], visible: true };
-      
+      const structuralEdits = prev.structural_edits || {};
+      const existingEdit = structuralEdits[entityId] || {};
+
+      // Unlock only changes native visibility. Never create an empty
+      // scale/offset vector as a side effect of hiding the native element.
       if (transformType === 'visible') {
-          return {
-            ...prev,
-            structural_edits: {
-              ...(prev.structural_edits || {}),
-              [entityId]: { ...existingEdit, visible: value },
+        return {
+          ...prev,
+          structural_edits: {
+            ...structuralEdits,
+            [entityId]: {
+              ...existingEdit,
+              visible: value,
             },
-          };
+          },
+        };
       }
+
       const defaultVector = transformType === 'scale' ? [1, 1, 1] : [0, 0, 0];
       const updatedVector = [...(existingEdit[transformType] || defaultVector)];
-      if (axis !== null) updatedVector[axis] = value;
+      if (axis !== null && axis !== undefined) updatedVector[axis] = value;
+
       return {
         ...prev,
         structural_edits: {
-          ...(prev.structural_edits || {}),
+          ...structuralEdits,
           [entityId]: {
             ...existingEdit,
             [transformType]: updatedVector,
@@ -360,23 +398,44 @@ export const useProjectSync = (activeProject) => {
     });
   };
 
-  const adoptIsolatedAsset = (entityId, newInstanceId, fileUrl, assetName) => {
-    setProjectState(prev => ({
-      ...prev,
-      furniture: [
-        ...(prev.furniture || []),
-        {
-          id: entityId,
-          instanceId: newInstanceId,
-          name: assetName || 'Isolated Element',
-          src: fileUrl,
-          fileType: 'ifc',
-          position: [0, 0, 0],
-          rotation: [0, 0, 0],
-          scale: [1, 1, 1],
-        },
-      ],
-    }));
+  const adoptIsolatedAsset = (
+    entityId,
+    newInstanceId,
+    fileUrl,
+    assetName,
+    position = [0, 0, 0],
+    rotation = [0, 0, 0],
+    scale = [1, 1, 1]
+  ) => {
+    setProjectState(prev => {
+      const furniture = prev.furniture || [];
+
+      // Unlock/isolate is a live scene operation. The subsequent project-state
+      // update can be triggered more than once by autosave/state reconciliation,
+      // so never append the same isolated instance twice.
+      if (furniture.some(item => item.instanceId === newInstanceId)) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        furniture: [
+          ...furniture,
+          {
+            id: entityId,
+            instanceId: newInstanceId,
+            name: assetName || 'Isolated Element',
+            src: fileUrl,
+            fileType: 'ifc',
+            position,
+            rotation,
+            scale,
+            nativeSourceId: entityId,
+            isNativeIsolation: true,
+          },
+        ],
+      };
+    });
   };
 
   return {
@@ -385,6 +444,9 @@ export const useProjectSync = (activeProject) => {
     saveStatus,
     lastSavedTime,
     availableAssets,
+    availableLayouts,
+    layoutsLoading,
+    layoutsError,
     homeTemplates,
     toastMessage,
     customColor,

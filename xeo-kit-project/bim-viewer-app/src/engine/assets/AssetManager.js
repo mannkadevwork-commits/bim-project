@@ -38,6 +38,8 @@ export const loadSceneAsset = async ({
   scale = [1, 1, 1],
   edges = true,
   globalScale = null,
+  onPlaced = null,
+  nativeSourceId = null,
 }) => {
   const url = resolveAssetUrl(srcUrl);
   const type = inferAssetFileType(url, fileType);
@@ -148,12 +150,16 @@ export const loadSceneAsset = async ({
     } else {
       model.position = targetPosition;
     }
+    // Report the final corrected world position back so the project state
+    // stores what the compiler will later use directly (no re-correction needed).
+    onPlaced?.(instanceId, [...model.position]);
   }
 
   model._assetMeta = {
     instanceId,
     src: url,
     fileType: type,
+    ...(nativeSourceId ? { nativeSourceId, isNativeIsolation: true } : {}),
   };
 
   return model;
@@ -183,6 +189,8 @@ export const loadIFCAssetIntoScene = async (
     scale: options.scale || [1, 1, 1],
     globalScale: globalScaleFactorRef?.current,
     edges: options.edges !== false,
+    onPlaced: options.onPlaced || null,
+    nativeSourceId: options.nativeSourceId || null,
   });
 };
 
@@ -195,19 +203,100 @@ export const updateStructuralTransform = (viewerRef, entityId, transformType, ax
     newScale[axis] = value;
     entity.scale = newScale;
   } else if (transformType === 'offset') {
-    const newOffset = [...(entity.offset || [0, 0, 0])];
-    newOffset[axis] = value;
-    entity.offset = newOffset;
+    // Native IFC object offsets are not enabled in this Viewer.
+    // Native movement is intentionally handled by the Unlock -> isolated
+    // model workflow instead of Entity#offset.
+    return;
   }
 };
 
-export const updateNativeOffset = (viewerRef, id, axis, value) => {
-  const entity = viewerRef.current?.scene.objects[id];
-  if (entity) {
-    const newOffset = [...(entity.offset || [0, 0, 0])];
-    newOffset[axis] = value;
-    entity.offset = newOffset;
+export const updateNativeOffset = () => {
+  // Deprecated: native IFC objects do not enable Entity#offset in this Viewer.
+  // Keep the API for compatibility, but never attempt to write the property.
+};
+
+const rotateYVector = (v, degrees) => {
+  const rad = (degrees * Math.PI) / 180;
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  return [
+    v[0] * c - v[2] * s,
+    v[1],
+    v[0] * s + v[2] * c,
+  ];
+};
+
+const getPivotWorldPosition = (model) => {
+  if (!model?._transformPivot?.local) {
+    const aabb = model?.aabb;
+    if (!aabb) return [...(model?.position || [0, 0, 0])];
+    return [
+      (aabb[0] + aabb[3]) / 2,
+      (aabb[1] + aabb[4]) / 2,
+      (aabb[2] + aabb[5]) / 2,
+    ];
   }
+
+  const scale = model.scale || [1, 1, 1];
+  const local = [
+    model._transformPivot.local[0] * (scale[0] || 1),
+    model._transformPivot.local[1] * (scale[1] || 1),
+    model._transformPivot.local[2] * (scale[2] || 1),
+  ];
+  const rot = model.rotation?.[1] || 0;
+  const rotated = rotateYVector(local, rot);
+  const pos = model.position || [0, 0, 0];
+  return [pos[0] + rotated[0], pos[1] + rotated[1], pos[2] + rotated[2]];
+};
+
+const setModelRotationPreservingPivot = (model, axis, value) => {
+  const nextRotation = [...(model.rotation || [0, 0, 0])];
+  nextRotation[axis] = value;
+
+  // Native-isolation ghosts rotate around their element center, not the IFC
+  // file origin. Keep the current pivot fixed while changing the model angle.
+  if (model._transformPivot?.local && axis === 1) {
+    const pivotWorld = getPivotWorldPosition(model);
+    const scale = model.scale || [1, 1, 1];
+    const localScaled = [
+      model._transformPivot.local[0] * (scale[0] || 1),
+      model._transformPivot.local[1] * (scale[1] || 1),
+      model._transformPivot.local[2] * (scale[2] || 1),
+    ];
+    const rotated = rotateYVector(localScaled, value);
+    model.rotation = nextRotation;
+    model.position = [
+      pivotWorld[0] - rotated[0],
+      pivotWorld[1] - rotated[1],
+      pivotWorld[2] - rotated[2],
+    ];
+    return;
+  }
+
+  model.rotation = nextRotation;
+};
+
+const setModelScalePreservingPivot = (model, axis, value) => {
+  const nextScale = [...(model.scale || [1, 1, 1])];
+  if (model._transformPivot?.local) {
+    const pivotWorld = getPivotWorldPosition(model);
+    nextScale[axis] = value;
+    const localScaled = [
+      model._transformPivot.local[0] * (nextScale[0] || 1),
+      model._transformPivot.local[1] * (nextScale[1] || 1),
+      model._transformPivot.local[2] * (nextScale[2] || 1),
+    ];
+    const rotated = rotateYVector(localScaled, model.rotation?.[1] || 0);
+    model.scale = nextScale;
+    model.position = [
+      pivotWorld[0] - rotated[0],
+      pivotWorld[1] - rotated[1],
+      pivotWorld[2] - rotated[2],
+    ];
+    return;
+  }
+  nextScale[axis] = value;
+  model.scale = nextScale;
 };
 
 export const updateDynamicTransform = (viewerRef, modelId, type, axis, value) => {
@@ -215,13 +304,9 @@ export const updateDynamicTransform = (viewerRef, modelId, type, axis, value) =>
   if (!model) return;
 
   if (type === 'scale') {
-    const next = [...(model.scale || [1, 1, 1])];
-    next[axis] = value;
-    model.scale = next;
+    setModelScalePreservingPivot(model, axis, value);
   } else if (type === 'rotation') {
-    const next = [...(model.rotation || [0, 0, 0])];
-    next[axis] = value;
-    model.rotation = next;
+    setModelRotationPreservingPivot(model, axis, value);
   } else if (type === 'position') {
     const next = [...(model.position || [0, 0, 0])];
     next[axis] = value;
@@ -235,47 +320,117 @@ export const isolateAndMakeMoveable = async (ctx, entityId, onAdoptCallback, upd
     viewerRef,
     loadersRef,
     globalScaleFactorRef,
+    loadingModelsRef,
     setSelectedAssetId,
     setSelectedObject,
   } = ctx;
-  if (!activeProject || !activeProject.jobId) return;
+
+  if (!activeProject?.jobId) return null;
 
   const jobId = activeProject.jobId;
 
   try {
-    const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${entityId}/isolate`, {
-      method: 'POST',
-    });
-    if (!response.ok) return;
+    const viewer = viewerRef.current;
+    const nativeEntity = viewer?.scene.objects[entityId];
+
+    if (!viewer || !nativeEntity) {
+      console.warn('[NativeIsolation] Native entity not found:', entityId);
+      return null;
+    }
+
+    // Faithful to the Aug-11 workflow:
+    // the backend creates a standalone IFC containing this single element.
+    const response = await fetch(
+      `${API_BASE_URL}/api/elements/${jobId}/${entityId}/isolate`,
+      { method: 'POST' }
+    );
+
+    if (!response.ok) {
+      console.error('[NativeIsolation] Isolate request failed:', response.status);
+      return null;
+    }
 
     const data = await response.json();
-
-    const nativeEntity = viewerRef.current?.scene.objects[entityId];
-    if (nativeEntity) {
-      nativeEntity.visible = false;
-      updateStructuralEdit?.(entityId, 'visible', null, false);
+    if (!data?.fileUrl) {
+      console.error('[NativeIsolation] Backend returned no fileUrl.', data);
+      return null;
     }
 
     const newInstanceId = `${entityId}_isolated`;
-    await loadSceneAsset({
-      loadersRef,
-      globalScaleFactorRef,
-      instanceId: newInstanceId,
-      srcUrl: data.fileUrl,
-      fileType: 'ifc',
-    });
 
-    const metaObject = viewerRef.current?.metaScene.metaObjects[entityId];
+    // Do not invent a new placement transform for the isolated IFC.
+    // The old working implementation loaded the isolated file at its own
+    // IFC/world coordinates with no AABB target-position correction.
+    let isolatedModel = viewer.scene.models[newInstanceId];
 
-    onAdoptCallback?.(entityId, newInstanceId, data.fileUrl, metaObject?.name);
-
-    const isolatedModel = viewerRef.current?.scene.models[newInstanceId];
-    if (isolatedModel) {
-      viewerRef.current.scene.setObjectsSelected(viewerRef.current.scene.selectedObjectIds, false);
-      isolatedModel.selected = true;
+    if (!isolatedModel) {
+      if (loadingModelsRef?.current?.has(newInstanceId)) {
+        // Another call is already creating it; wait briefly for that live model
+        // rather than asking Xeokit to instantiate the same ID twice.
+        for (let i = 0; i < 100; i += 1) {
+          await new Promise(resolve => setTimeout(resolve, 25));
+          isolatedModel = viewer.scene.models[newInstanceId];
+          if (isolatedModel) break;
+        }
+      } else {
+        loadingModelsRef?.current?.add(newInstanceId);
+        try {
+          isolatedModel = await loadIFCAssetIntoScene(
+            loadersRef,
+            globalScaleFactorRef,
+            newInstanceId,
+            data.fileUrl,
+            null,
+            null,
+            {
+              fileType: 'ifc',
+              // Mark it as native isolation, but do not alter its placement.
+              nativeSourceId: entityId,
+            }
+          );
+        } finally {
+          loadingModelsRef?.current?.delete(newInstanceId);
+        }
+      }
     }
 
+    if (!isolatedModel) {
+      console.error('[NativeIsolation] Isolated model was not created:', newInstanceId);
+      return null;
+    }
+
+    // The original element is hidden only after the replacement exists.
+    nativeEntity.visible = false;
+    updateStructuralEdit?.(entityId, 'visible', null, false);
+
+    const metaObject = viewer.metaScene.metaObjects[entityId];
+
+    // Store the isolated model as an editable furniture/asset entry.
+    // IMPORTANT: position is the model transform, not an AABB-corrected
+    // target position. For a freshly isolated IFC this should normally be [0,0,0].
+    onAdoptCallback?.(
+      entityId,
+      newInstanceId,
+      data.fileUrl,
+      metaObject?.name,
+      [...(isolatedModel.position || [0, 0, 0])],
+      [...(isolatedModel.rotation || [0, 0, 0])],
+      [...(isolatedModel.scale || [1, 1, 1])]
+    );
+
+    // Clear both object and model selection, then select the isolated model.
+    const selectedIds = [...viewer.scene.selectedObjectIds];
+    for (const id of selectedIds) {
+      const object = viewer.scene.objects[id];
+      if (object) object.selected = false;
+    }
+    for (const model of Object.values(viewer.scene.models || {})) {
+      if (model) model.selected = false;
+    }
+
+    isolatedModel.selected = true;
     setSelectedAssetId(newInstanceId);
+
     setSelectedObject({
       id: newInstanceId,
       name: metaObject?.name || 'Isolated Element',
@@ -293,8 +448,21 @@ export const isolateAndMakeMoveable = async (ctx, entityId, onAdoptCallback, upd
 
     return newInstanceId;
   } catch (error) {
-    console.error('[BIM Engine] Isolate-and-move failure:', error);
+    console.error('[NativeIsolation] Isolate-and-move failure:', error);
+    return null;
   }
+};
+
+const currentNativeModelForEntity = (viewer, entityId) => {
+  if (!viewer?.scene?.objects || !viewer?.scene?.models) return null;
+  const entity = viewer.scene.objects[entityId];
+  if (!entity?.model) return null;
+  // Native entity must belong to the original main IFC model, never the
+  // standalone ghost. This is the same boundary used by native restoration.
+  const mainModel = Object.values(viewer.scene.models || {})
+    .find(model => model?.id === 'main_structure');
+  if (mainModel && entity.model === mainModel) return mainModel;
+  return entity.model._assetMeta ? null : entity.model;
 };
 
 export const inspectNativeElement = async (activeProject, entityId) => {

@@ -16,6 +16,7 @@ function ViewerApp() {
   const [activeProject, setActiveProject] = useState(null);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [isResettingProject, setIsResettingProject] = useState(false);
+  const [isSwitchingLayout, setIsSwitchingLayout] = useState(false);
 
   // Resume active project on refresh
   useEffect(() => {
@@ -117,6 +118,64 @@ function ViewerApp() {
   };
 
 
+  const handleLayoutReplace = async (layout) => {
+    if (!activeProject?.jobId || !layout?.id) return;
+
+    const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+    const oldJobId = activeProject.jobId;
+
+    setIsSwitchingLayout(true);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/projects/${oldJobId}/layout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ layoutId: layout.id }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success || !data.newJobId) {
+        throw new Error(data.error || `Layout switch failed (${response.status})`);
+      }
+
+      const newJobId = data.newJobId;
+      const fileUrl = data.fileUrl || `${API_BASE_URL}/jobs/${newJobId}/original.ifc`;
+      const resIfc = await fetch(fileUrl, { cache: 'no-store' });
+      if (!resIfc.ok) throw new Error('New layout was created, but its IFC could not be loaded.');
+
+      const blob = await resIfc.blob();
+      const file = new File([blob], data.fileName || layout.fileName || `${layout.id}.ifc`, {
+        type: 'application/octet-stream',
+      });
+
+      // The layout is a full project replacement: discard only the browser
+      // state for the previous active project. The backend archives the old
+      // project for server-side history.
+      localStorage.removeItem(`hci_state_${oldJobId}`);
+
+      const nextProject = {
+        jobId: newJobId,
+        file,
+        fileName: data.fileName || layout.fileName || file.name,
+      };
+
+      localStorage.setItem('hci_active_project', JSON.stringify({
+        jobId: newJobId,
+        fileName: nextProject.fileName,
+      }));
+
+      // Changing the project key forces BIMViewer to unmount the old viewer
+      // and initialize a completely fresh scene for the new IFC.
+      setActiveProject(nextProject);
+      setIsUploadOpen(false);
+    } catch (error) {
+      console.error('[App] Failed to replace project with layout:', error);
+      alert(`Failed to load ${layout.name}: ${error.message}`);
+    } finally {
+      setIsSwitchingLayout(false);
+    }
+  };
+
   return (
     <div className="relative w-screen h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-50 transition-colors duration-300 overflow-hidden flex flex-col">
       {!activeProject && (
@@ -132,6 +191,7 @@ function ViewerApp() {
           activeProject={activeProject}
           onDelete={handleDeleteRequest} 
           onAdd={() => setIsUploadOpen(true)}
+          onReplaceProject={handleLayoutReplace}
         />
       </div>
 
@@ -147,6 +207,16 @@ function ViewerApp() {
         isOpen={isContactOpen}
         onClose={() => setIsContactOpen(false)}
       />
+
+      {isSwitchingLayout && (
+        <div className="fixed inset-0 z-[260] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
+          <div className="rounded-2xl bg-slate-900 border border-slate-700 px-8 py-7 text-center shadow-2xl">
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-indigo-400 animate-spin" />
+            <p className="text-white font-semibold">Loading new layout…</p>
+            <p className="mt-1 text-sm text-slate-400">Replacing the current project with a fresh workspace.</p>
+          </div>
+        </div>
+      )}
 
       {isResettingProject && (
         <div className="fixed inset-0 z-[250] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
