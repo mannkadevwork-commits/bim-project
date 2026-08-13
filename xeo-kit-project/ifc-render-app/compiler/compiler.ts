@@ -683,7 +683,7 @@ if (url.pathname.startsWith("/jobs/")) {
           const instanceWrapper = doc.createNode(item.instanceId).addChild(clonedRoot);
           instanceWrapper.setTranslation([finalX, finalY, finalZ]);
           // instanceWrapper.setRotation(eulerToQuaternion(degTupleToRadTuple(item.rotation)));
-          eulerToQuaternion(item.rotation)
+          instanceWrapper.setRotation(eulerToQuaternion(item.rotation));
           instanceWrapper.setScale(Array.isArray(item.scale) ? item.scale : [1, 1, 1]);
 
           scene.addChild(instanceWrapper);
@@ -739,7 +739,7 @@ if (url.pathname.startsWith("/jobs/")) {
           const instanceWrapper = doc.createNode(item.instanceId).addChild(tempSubtree);
           instanceWrapper.setTranslation([finalX, finalY, finalZ]);
           // instanceWrapper.setRotation(eulerToQuaternion(degTupleToRadTuple(item.rotation)));
-          eulerToQuaternion(item.rotation)
+          instanceWrapper.setRotation(eulerToQuaternion(item.rotation));
           instanceWrapper.setScale(Array.isArray(item.scale) ? item.scale : [1, 1, 1]);
 
           scene.addChild(instanceWrapper);
