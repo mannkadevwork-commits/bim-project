@@ -24,7 +24,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [isManualSaving, setIsManualSaving] = useState(false);
-  const [lastClickPos, setLastClickPos] = useState({ x: 0, y: 0 });
 
   // Add the useCatalog hook call[cite: 1]
   const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
@@ -188,9 +187,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     }
   };
 
-  const handlePointerDown = (e) => {
+  const handlePointerDown = () => {
     refs.canvasRef.current?.focus();
-    setLastClickPos({ x: e.clientX, y: e.clientY });
   };
 
   const handlePointerUp = (e) => {
@@ -304,8 +302,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           mode={engineState.transformMode}
           onModeChange={engineActions.setTransformMode}
           assetName={activeAsset?.name || engineState.selectedObject?.name || 'Selected element'}
-          x={lastClickPos.x}
-          y={lastClickPos.y}
           isNative={!!engineState.selectedObject && !activeAsset}
           onIsolate={() => {
             if (engineState.selectedObject && !activeAsset) {
