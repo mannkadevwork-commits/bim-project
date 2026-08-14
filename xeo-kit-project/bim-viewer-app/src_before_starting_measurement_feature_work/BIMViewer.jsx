@@ -429,6 +429,22 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
       )}
 
       {engineState.isMeasuring && (
+        <div className="absolute top-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 px-5 py-2.5 bg-slate-900/90 backdrop-blur-xl border border-slate-700 text-white rounded-full shadow-2xl animate-in slide-in-from-top-4 fade-in zoom-in-95 duration-300">
+          <span className="relative flex h-3 w-3">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+            <span className="relative inline-flex rounded-full h-3 w-3 bg-cyan-500"></span>
+          </span>
+          <Ruler className="w-4 h-4 text-cyan-400" />
+          <span className="font-medium text-sm tracking-wide">
+            Click two points to measure
+          </span>
+          <button onClick={engineActions.toggleMeasurementMode} className="ml-2 bg-slate-700 hover:bg-slate-600 p-1.5 rounded-full transition-colors cursor-pointer">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {engineState.isMeasuring && (
         <MeasurementPanel
           measurementsList={engineState.measurementsList}
           measurementUnit={engineState.measurementUnit}
@@ -444,8 +460,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           clearMeasurements={engineActions.clearMeasurements}
           onClose={engineActions.toggleMeasurementMode}
           scaleModelByMeasurement={engineActions.scaleModelByMeasurement}
-          sceneScaleFactor={engineState.sceneScaleFactor}
-          measurementPhase={engineState.measurementPhase}
+          sceneScaleFactor={engineState.sceneScaleFactor} 
         />
       )}
 

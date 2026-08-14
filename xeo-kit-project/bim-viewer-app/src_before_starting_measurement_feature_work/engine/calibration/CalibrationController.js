@@ -31,7 +31,6 @@ export const applyGlobalScale = (ctx, ratioVec) => {
     if (id === mainModel.id) return;
     const assetModel = scene.models[id];
     if (!assetModel) return;
-
     const s = assetModel.scale || [1, 1, 1];
     assetModel.scale = [s[0] * rx, s[1] * ry, s[2] * rz];
     assetModel.position = scalePositionAboutPivot(assetModel.position || [0, 0, 0]);
@@ -50,13 +49,13 @@ export const applyGlobalScale = (ctx, ratioVec) => {
 
   viewer.cameraFlight.duration = 0.6;
   viewer.cameraFlight.flyTo(mainModel);
+
   return true;
 };
 
 export const reloadMainModel = async (ctx, jobId) => {
   const { setIsLoading, loadersRef, currentModelRef, viewerRef, projectStateRef } = ctx;
   setIsLoading(true);
-
   try {
     const ifcRes = await fetch(`${API_BASE_URL}/jobs/${jobId}/input.ifc?v=${Date.now()}`);
     const buffer = await ifcRes.arrayBuffer();
@@ -86,7 +85,6 @@ export const reloadMainModel = async (ctx, jobId) => {
         });
       }
     });
-
   } catch (err) {
     console.error('[BIM Engine] Failed to reload main model:', err);
     setIsLoading(false);
@@ -97,7 +95,7 @@ export const updateFurnitureScale = (ctx, ratio) => {
   const { viewerRef, globalScaleFactorRef, setSceneScaleFactor } = ctx;
   const viewer = viewerRef.current;
   if (!viewer) return;
-
+  
   Object.keys(viewer.scene.models).forEach((id) => {
     if (id === 'main_structure') return; 
     const assetModel = viewer.scene.models[id];
@@ -105,7 +103,7 @@ export const updateFurnitureScale = (ctx, ratio) => {
 
     const currentScale = assetModel.scale || [1, 1, 1];
     assetModel.scale = [currentScale[0] * ratio, currentScale[1] * ratio, currentScale[2] * ratio];
-    
+
     const currentPos = assetModel.position || [0, 0, 0];
     assetModel.position = [currentPos[0] * ratio, currentPos[1] * ratio, currentPos[2] * ratio];
   });
@@ -119,13 +117,11 @@ export const updateFurnitureScale = (ctx, ratio) => {
 };
 
 export const scaleModelByMeasurement = async (ctx, measurementId, newDesiredLengthInMeters) => {
-  const { activeProject, measurementsPluginRef, setIsLoading, setMeasurementsList } = ctx;
-  
-  if (!activeProject || !activeProject.jobId) return { success: false, error: 'No active file.' };
-  
+  const { file, measurementsPluginRef, setIsLoading, setMeasurementsList } = ctx;
+  if (!file) return { success: false, error: 'No active file.' };
   const plugin = measurementsPluginRef.current;
   if (!plugin || !plugin.measurements) return { success: false, error: 'No active measurement.' };
-  
+
   const measurement = plugin.measurements[measurementId];
   if (!measurement || !measurement.origin || !measurement.target) return { success: false };
 
@@ -134,14 +130,14 @@ export const scaleModelByMeasurement = async (ctx, measurementId, newDesiredLeng
   const dx = originPos[0] - targetPos[0];
   const dy = originPos[1] - targetPos[1];
   const dz = originPos[2] - targetPos[2];
-  
   const currentLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  
   if (!currentLength) return { success: false, error: 'Measurement is zero.' };
 
   const ratio = parseFloat(newDesiredLengthInMeters) / currentLength;
   if (!ratio || ratio <= 0 || !isFinite(ratio)) return { success: false, error: 'Enter a valid length.' };
 
-  const jobId = activeProject.jobId;
+  const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
   setIsLoading(true);
 
   try {
@@ -150,7 +146,6 @@ export const scaleModelByMeasurement = async (ctx, measurementId, newDesiredLeng
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ factor: ratio })
     });
-
     const data = await response.json();
     if (!response.ok || data.error) throw new Error(data.error);
 
@@ -168,30 +163,26 @@ export const scaleModelByMeasurement = async (ctx, measurementId, newDesiredLeng
 };
 
 export const calibrateWallHeight = async (ctx, entityId, newHeightMeters) => {
-  const { activeProject, setIsLoading, inspectNativeElement } = ctx;
-  if (!activeProject || !activeProject.jobId || !entityId) return { success: false, error: 'No element selected.' };
-
+  const { file, setIsLoading, inspectNativeElement } = ctx;
+  if (!file || !entityId) return { success: false, error: 'No element selected.' };
   const target = parseFloat(newHeightMeters);
   if (!target || target <= 0) return { success: false, error: 'Enter a height greater than 0.' };
 
   try {
-    const dims = await inspectNativeElement(activeProject, entityId);
+    const dims = await inspectNativeElement(file, entityId);
     if (!dims || dims.error || !dims.height) {
       return { success: false, error: 'Element has no parametric height.' };
     }
-
     const ratio = target / dims.height;
-    const jobId = activeProject.jobId;
+    const jobId = `job_${file.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
     
     setIsLoading(true);
-    
     console.log(`API data ${ratio} ${jobId}`);
     const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}/rescale`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ factor: ratio }) 
     });
-
     const data = await response.json();
     if (!response.ok || data.error) throw new Error(data.error);
 

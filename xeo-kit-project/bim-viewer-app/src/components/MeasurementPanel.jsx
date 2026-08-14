@@ -1,99 +1,137 @@
-import { useState } from 'react';
-import { Ruler, X, Trash2, MapPin, Magnet, ArrowLeftRight, Axis3d, Wand2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import {
+  Ruler,
+  X,
+  Trash2,
+  MapPin,
+  Magnet,
+  Wand2,
+  ChevronDown,
+  ChevronUp,
+  Crosshair,
+  Move3d,
+  CheckCircle2,
+} from 'lucide-react';
 
-// Single measurement row with inline "type a length, calibrate the whole scene" control
+const UNIT_OPTIONS = [
+  { value: 'mm', label: 'mm' },
+  { value: 'cm', label: 'cm' },
+  { value: 'm', label: 'm' },
+  { value: 'ft', label: 'ft' },
+];
+
+const toMeters = (value, unit) => {
+  if (!Number.isFinite(value)) return NaN;
+  if (unit === 'mm') return value / 1000;
+  if (unit === 'cm') return value / 100;
+  if (unit === 'ft') return value / 3.28084;
+  return value;
+};
+
 const MeasurementRow = ({
   m,
   idx,
   formatLength,
-  measurementUnit,
   deleteMeasurement,
   flyToMeasurement,
-  scaleModelByMeasurement,
+  showComponents,
+  isCalibrationSource,
+  onUseForCalibration,
 }) => {
-  const [desiredLength, setDesiredLength] = useState('');
-
-  const handleRescale = () => {
-    const value = parseFloat(desiredLength);
-    if (!value || value <= 0) return;
-    const meters = measurementUnit === 'ft' ? value / 3.28084 : value;
-    scaleModelByMeasurement(m.id, meters);
-    setDesiredLength('');
-  };
+  const [showDetails, setShowDetails] = useState(false);
 
   return (
-    <div className="flex flex-col gap-1.5 px-4 py-2.5 border-b border-slate-100 dark:border-slate-800/60 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors group">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="w-5 h-5 rounded-full bg-cyan-100 dark:bg-cyan-900/40 text-cyan-700 dark:text-cyan-400 text-[10px] font-bold flex items-center justify-center shrink-0">
-            {idx + 1}
-          </span>
-          <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
-            {formatLength(m.lengthMeters)}
-          </span>
-        </div>
+    <div className={`border-b border-slate-100 dark:border-slate-800/60 transition-colors ${isCalibrationSource ? 'bg-amber-50/50 dark:bg-amber-950/10' : 'hover:bg-slate-50/70 dark:hover:bg-slate-800/30'}`}>
+      <div className="px-4 py-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="w-5 h-5 rounded-full bg-cyan-100 dark:bg-cyan-900/40 text-cyan-700 dark:text-cyan-400 text-[10px] font-bold flex items-center justify-center shrink-0">
+              {idx + 1}
+            </span>
+            <div className="min-w-0">
+              <div className="text-sm font-bold text-slate-800 dark:text-white tabular-nums">
+                {formatLength(m.lengthMeters)}
+              </div>
+              <div className="text-[10px] text-slate-400 dark:text-slate-500 mt-0.5">
+                Point-to-point reference
+              </div>
+            </div>
+          </div>
 
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <button
-            onClick={() => flyToMeasurement(m.midpoint)}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-slate-800"
-            title="Fly to this measurement"
-          >
-            <MapPin className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => deleteMeasurement(m.id)}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-slate-800"
-            title="Delete this measurement"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      </div>
-
-      {/* Calibration row — type the real-world length here to rescale the
-          ENTIRE scene so this segment matches it. Only shown when the
-          measurement actually touched a loaded model (has a modelId). */}
-      {m.modelId && (
-        <div className="pl-7 flex flex-col gap-1">
-          <span className="text-[10px] uppercase tracking-wider font-bold text-slate-400 dark:text-slate-500">
-            Calibration
-          </span>
-          <div className="flex items-center gap-1.5">
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={desiredLength}
-              onChange={(e) => setDesiredLength(e.target.value)}
-              placeholder={`Actual (${measurementUnit})`}
-              className="w-24 text-xs px-2 py-1 rounded-md bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-500 focus:border-cyan-500 transition-colors"
-            />
+          <div className="flex items-center gap-1 shrink-0">
             <button
-              onClick={handleRescale}
-              disabled={!desiredLength}
-              className="flex items-center gap-1 text-[11px] font-bold px-2.5 py-1 rounded-md bg-[#ff914d] hover:bg-[#ff7a28] disabled:bg-slate-200 disabled:text-slate-400 dark:disabled:bg-slate-800 dark:disabled:text-slate-600 text-white transition-colors disabled:cursor-not-allowed"
-              title="Rescale the entire scene so this measurement equals the typed length"
+              onClick={() => onUseForCalibration(m.id)}
+              className={`p-1.5 rounded-lg transition-colors ${isCalibrationSource ? 'text-amber-600 bg-amber-100 dark:text-amber-400 dark:bg-amber-900/30' : 'text-slate-400 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-slate-800'}`}
+              title={isCalibrationSource ? 'Using this measurement for scene calibration' : 'Use this measurement as calibration reference'}
             >
-              <Wand2 className="w-3 h-3" />
-              Rescale Scene
+              <Wand2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => setShowDetails((v) => !v)}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-cyan-600 hover:bg-cyan-50 dark:hover:bg-slate-800"
+              title={showDetails ? 'Hide measurement details' : 'Show measurement details'}
+            >
+              {showDetails ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            </button>
+            <button
+              onClick={() => flyToMeasurement(m.midpoint)}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-slate-800"
+              title="Focus this measurement"
+            >
+              <MapPin className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => deleteMeasurement(m.id)}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-slate-800"
+              title="Delete this measurement"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
             </button>
           </div>
         </div>
-      )}
+
+        {isCalibrationSource && (
+          <div className="mt-2 ml-7 inline-flex items-center gap-1.5 text-[10px] font-semibold text-amber-700 dark:text-amber-400">
+            <CheckCircle2 className="w-3 h-3" />
+            Calibration reference selected
+          </div>
+        )}
+
+        {showDetails && (
+          <div className="mt-3 ml-7 space-y-1.5 text-[10px] text-slate-500 dark:text-slate-400 tabular-nums">
+            <div className="grid grid-cols-2 gap-1.5">
+              <div className="rounded-md bg-slate-100/80 dark:bg-slate-800/70 px-2 py-1.5">
+                <span className="block uppercase tracking-wider text-[9px] text-slate-400">Plan XZ</span>
+                <span className="font-semibold">{formatLength(m.planDistanceMeters)}</span>
+              </div>
+              <div className="rounded-md bg-slate-100/80 dark:bg-slate-800/70 px-2 py-1.5">
+                <span className="block uppercase tracking-wider text-[9px] text-slate-400">Vertical Y</span>
+                <span className="font-semibold">{formatLength(m.verticalDistanceMeters)}</span>
+              </div>
+            </div>
+            <div className="rounded-md bg-slate-100/80 dark:bg-slate-800/70 px-2 py-1.5">
+              <span className="block uppercase tracking-wider text-[9px] text-slate-400">Elevation Δ</span>
+              <span className="font-semibold">
+                {m.elevationDeltaMeters >= 0 ? '+' : '-'}{formatLength(Math.abs(m.elevationDeltaMeters))}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <div className="rounded-md bg-slate-100/80 dark:bg-slate-800/70 px-2 py-1.5">
+                <span className="block uppercase tracking-wider text-[9px] text-slate-400">Origin</span>
+                <span className="font-mono text-[9px]">{m.origin.map((v) => v.toFixed(3)).join(', ')}</span>
+              </div>
+              <div className="rounded-md bg-slate-100/80 dark:bg-slate-800/70 px-2 py-1.5">
+                <span className="block uppercase tracking-wider text-[9px] text-slate-400">Target</span>
+                <span className="font-mono text-[9px]">{m.target.map((v) => v.toFixed(3)).join(', ')}</span>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
 
-
-
-// ── Coohom-style Measurement Panel ──────────────────────────────
-// Floats in the top area of the canvas while measurement mode is on.
-// Shows every segment created so far (not just the last one), with:
-//   - per-segment length, a "fly to" button, and a delete button
-//   - a running total across all segments
-//   - a unit toggle (m / ft)
-//   - a snap-to-vertex/edge toggle (xeokit's built-in snapping)
 export const MeasurementPanel = ({
   measurementsList,
   measurementUnit,
@@ -103,84 +141,191 @@ export const MeasurementPanel = ({
   axisBreakdownVisible,
   toggleAxisBreakdown,
   formatLength,
-  totalMeasuredLength,
   deleteMeasurement,
   flyToMeasurement,
   clearMeasurements,
   scaleModelByMeasurement,
-  sceneScaleFactor, // NEW — optional; pass state.sceneScaleFactor from useBIMEngine
+  sceneScaleFactor,
+  measurementPhase,
   onClose,
 }) => {
-  return (
-    <div className="absolute top-20 right-4 z-40 w-72 bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl overflow-hidden animate-in slide-in-from-right-4 fade-in duration-300">
+  const [showCalibration, setShowCalibration] = useState(false);
+  const [calibrationMeasurementId, setCalibrationMeasurementId] = useState(null);
+  const [desiredLength, setDesiredLength] = useState('');
+  const [calibrationBusy, setCalibrationBusy] = useState(false);
+  const [calibrationError, setCalibrationError] = useState('');
+  const [calibrationSuccess, setCalibrationSuccess] = useState('');
 
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50">
-        <div className="flex items-center gap-2">
-  <Ruler className="w-4 h-4 text-cyan-500" />
-  <h3 className="text-sm font-bold text-slate-800 dark:text-white">Measurements</h3>
-  {sceneScaleFactor && Math.abs(sceneScaleFactor.x - sceneScaleFactor.y) < 0.001 && Math.abs(sceneScaleFactor.y - sceneScaleFactor.z) < 0.001 && Math.abs(sceneScaleFactor.x - 1) > 0.001 && (
-    <span
-      className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
-      title="Cumulative uniform scale from ruler calibration"
-    >
-      ×{sceneScaleFactor.x.toFixed(2)}
-    </span>
-  )}
-</div>
-        <button onClick={onClose} className="text-slate-400 hover:text-slate-600 dark:hover:text-white">
+  const incomplete = measurementPhase === 'selecting-target';
+  const calibrationMeasurement = measurementsList.find((m) => m.id === calibrationMeasurementId) || null;
+
+  useEffect(() => {
+    if (calibrationMeasurementId && !calibrationMeasurement) {
+      setCalibrationMeasurementId(null);
+      setDesiredLength('');
+    }
+  }, [calibrationMeasurementId, calibrationMeasurement]);
+
+  const handleUseForCalibration = (id) => {
+    setCalibrationError('');
+    setCalibrationSuccess('');
+
+    // The wand is a true toggle: clicking the active reference again clears it.
+    if (calibrationMeasurementId === id) {
+      setCalibrationMeasurementId(null);
+      setDesiredLength('');
+      return;
+    }
+
+    setCalibrationMeasurementId(id);
+    setDesiredLength('');
+    setShowCalibration(true);
+  };
+
+  const clearCalibrationReference = () => {
+    if (calibrationBusy) return;
+    setCalibrationMeasurementId(null);
+    setDesiredLength('');
+    setCalibrationError('');
+    setCalibrationSuccess('');
+  };
+
+  const handleRescale = async () => {
+    if (!calibrationMeasurement || calibrationBusy) return;
+
+    const value = Number.parseFloat(desiredLength);
+    if (!Number.isFinite(value) || value <= 0) {
+      setCalibrationError('Enter a valid real-world length greater than 0.');
+      setCalibrationSuccess('');
+      return;
+    }
+
+    const meters = toMeters(value, measurementUnit);
+    if (!Number.isFinite(meters) || meters <= 0) {
+      setCalibrationError('The calibration length could not be converted to meters.');
+      setCalibrationSuccess('');
+      return;
+    }
+
+    const ratio = meters / calibrationMeasurement.lengthMeters;
+    if (!Number.isFinite(ratio) || ratio <= 0) {
+      setCalibrationError('Calibration factor is invalid.');
+      setCalibrationSuccess('');
+      return;
+    }
+
+    setCalibrationBusy(true);
+    setCalibrationError('');
+    setCalibrationSuccess('');
+
+    try {
+      const result = await scaleModelByMeasurement(calibrationMeasurement.id, meters);
+
+      if (!result?.success) {
+        throw new Error(result?.error || 'Calibration request failed.');
+      }
+
+      setCalibrationSuccess(`Scene calibrated ×${ratio.toFixed(4)}.`);
+      setCalibrationMeasurementId(null);
+      setDesiredLength('');
+      // Keep the panel open so the success state is visible.
+    } catch (error) {
+      console.error('[Measurement UI] Calibration failed:', error);
+      setCalibrationError(error?.message || 'Calibration failed. No scene changes were confirmed.');
+    } finally {
+      setCalibrationBusy(false);
+    }
+  };
+
+  return (
+    <div className="absolute top-20 right-4 z-40 w-[332px] max-h-[calc(100vh-112px)] bg-white/96 dark:bg-slate-900/96 backdrop-blur-xl border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl overflow-hidden animate-in slide-in-from-right-4 fade-in duration-300">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-800/50">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="w-8 h-8 rounded-lg bg-cyan-50 dark:bg-cyan-900/30 flex items-center justify-center">
+            <Ruler className="w-4 h-4 text-cyan-500" />
+          </div>
+          <div className="min-w-0">
+            <h3 className="text-sm font-bold text-slate-800 dark:text-white">Measurements</h3>
+            <p className="text-[10px] text-slate-400 dark:text-slate-500">
+              {incomplete ? 'Select the second reference' : 'Select two references to measure'}
+            </p>
+          </div>
+        </div>
+        <button onClick={onClose} className="text-slate-400 hover:text-slate-600 dark:hover:text-white p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800" title="Close measurement tool">
           <X className="w-4 h-4" />
         </button>
       </div>
 
-      {/* Controls row: unit toggle + snap toggle */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 gap-2">
-        <button
-          onClick={() => setMeasurementUnit(measurementUnit === 'm' ? 'ft' : 'm')}
-          className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
-          title="Toggle units"
-        >
-          <ArrowLeftRight className="w-3.5 h-3.5" />
-          {measurementUnit === 'm' ? 'Meters' : 'Feet'}
-        </button>
-
-        <button
-          onClick={toggleSnapping}
-          className={`flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full transition-colors ${
-            snappingEnabled
-              ? 'bg-cyan-50 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400'
-              : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
-          }`}
-          title="Toggle snap-to-vertex/edge"
-        >
-          <Magnet className="w-3.5 h-3.5" />
-          Snap {snappingEnabled ? 'On' : 'Off'}
-        </button>
+      <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 dark:text-slate-400">
+            <Crosshair className={`w-3.5 h-3.5 ${incomplete ? 'text-cyan-500 animate-pulse' : 'text-emerald-500'}`} />
+            {incomplete ? 'Measurement in progress' : 'Ready for next measurement'}
+          </div>
+          <span className="text-[9px] uppercase tracking-wider font-bold text-slate-400">Esc cancels</span>
+        </div>
       </div>
 
-      {/* Axis breakdown toggle — off by default for the clean Coohom-style
-          single line; turn on to see the X/Y/Z component wires xeokit
-          draws natively for every measurement. */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-slate-200 dark:border-slate-800">
-        <span className="text-xs text-slate-500 dark:text-slate-400">Show X/Y/Z breakdown</span>
-        <button
-          onClick={toggleAxisBreakdown}
-          className={`flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full transition-colors ${
-            axisBreakdownVisible
-              ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400'
-              : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
-          }`}
-        >
-          <Axis3d className="w-3.5 h-3.5" />
-          {axisBreakdownVisible ? 'On' : 'Off'}
-        </button>
+      <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 space-y-2.5">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider font-bold text-slate-400">Display units</div>
+            <div className="text-[10px] text-slate-400 mt-0.5">Updates 3D labels and measurements</div>
+          </div>
+          <div className="flex items-center gap-1 p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800 shrink-0">
+            {UNIT_OPTIONS.map((unit) => (
+              <button
+                key={unit.value}
+                onClick={() => setMeasurementUnit(unit.value)}
+                className={`px-2 py-1 rounded-md text-[10px] font-bold transition-colors ${
+                  measurementUnit === unit.value
+                    ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-200'
+                }`}
+              >
+                {unit.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={toggleSnapping}
+            className={`flex-1 inline-flex items-center justify-center gap-1.5 text-[10px] font-semibold px-2.5 py-1.5 rounded-lg transition-colors ${
+              snappingEnabled
+                ? 'bg-cyan-50 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400'
+                : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+            }`}
+            title="Toggle vertex/edge reference snapping"
+          >
+            <Magnet className="w-3.5 h-3.5" />
+            Snap {snappingEnabled ? 'On' : 'Off'}
+          </button>
+
+          <button
+            onClick={toggleAxisBreakdown}
+            className={`flex-1 inline-flex items-center justify-center gap-1.5 text-[10px] font-semibold px-2.5 py-1.5 rounded-lg transition-colors ${
+              axisBreakdownVisible
+                ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400'
+                : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+            }`}
+            title="Show X/Y/Z components"
+          >
+            <Move3d className="w-3.5 h-3.5" />
+            XYZ {axisBreakdownVisible ? 'On' : 'Off'}
+          </button>
+        </div>
       </div>
 
-      {/* Measurement list */}
-      <div className="max-h-64 overflow-y-auto">
+      <div className="max-h-[calc(100vh-420px)] min-h-[140px] overflow-y-auto">
         {measurementsList.length === 0 ? (
-          <div className="px-4 py-6 text-center text-xs text-slate-400 dark:text-slate-500">
-            Click two points on the model to start measuring.
+          <div className="px-5 py-10 text-center">
+            <Ruler className="w-7 h-7 mx-auto text-slate-300 dark:text-slate-700 mb-2" />
+            <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">No measurements yet</div>
+            <div className="text-[10px] leading-4 text-slate-400 dark:text-slate-500 mt-1">
+              Select a first reference and a second reference in the model.
+            </div>
           </div>
         ) : (
           measurementsList.map((m, idx) => (
@@ -189,23 +334,21 @@ export const MeasurementPanel = ({
               m={m}
               idx={idx}
               formatLength={formatLength}
-              measurementUnit={measurementUnit}
               deleteMeasurement={deleteMeasurement}
               flyToMeasurement={flyToMeasurement}
-              scaleModelByMeasurement={scaleModelByMeasurement}
+              showComponents={axisBreakdownVisible}
+              isCalibrationSource={m.id === calibrationMeasurementId}
+              onUseForCalibration={handleUseForCalibration}
             />
           ))
         )}
       </div>
 
-      {/* Footer: total + clear all */}
       {measurementsList.length > 0 && (
-        <div className="flex items-center justify-between px-4 py-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50">
+        <div className="px-4 py-2.5 border-t border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-800/50 flex items-center justify-between gap-3">
           <div>
-            <span className="text-[10px] uppercase tracking-wider text-slate-400 font-bold block">Total</span>
-            <span className="text-sm font-bold text-slate-800 dark:text-white">
-              {formatLength(totalMeasuredLength)}
-            </span>
+            <span className="text-[10px] uppercase tracking-wider text-slate-400 font-bold block">Measurements</span>
+            <span className="text-sm font-bold text-slate-800 dark:text-white tabular-nums">{measurementsList.length}</span>
           </div>
           <button
             onClick={clearMeasurements}
@@ -213,6 +356,116 @@ export const MeasurementPanel = ({
           >
             Clear All
           </button>
+        </div>
+      )}
+
+      <div className="border-t border-slate-200 dark:border-slate-800">
+        <button
+          onClick={() => setShowCalibration((v) => !v)}
+          className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-amber-50/40 dark:hover:bg-amber-950/10 transition-colors"
+        >
+          <div className="flex items-center gap-2">
+            <Wand2 className="w-3.5 h-3.5 text-amber-500" />
+            <div>
+              <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500 dark:text-slate-300">Scene calibration</div>
+              <div className="text-[9px] text-slate-400 mt-0.5">Separate from ordinary measurement</div>
+            </div>
+          </div>
+          {showCalibration ? <ChevronUp className="w-3.5 h-3.5 text-slate-400" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-400" />}
+        </button>
+
+        {showCalibration && (
+          <div className="px-4 pb-4">
+            <div className="p-3 rounded-xl bg-amber-50/70 dark:bg-amber-950/20 border border-amber-100 dark:border-amber-900/40">
+              {!calibrationMeasurement ? (
+                <div className="text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+                  Select the wand icon on a measurement first. Calibration is only for a segment whose real-world size is known; it changes project scale.
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <div>
+                      <div className="text-[10px] font-semibold text-slate-600 dark:text-slate-300">Reference segment</div>
+                      <div className="text-[9px] text-slate-400 mt-0.5">Known physical dimension used to rescale the scene</div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <div className="text-xs font-bold text-amber-700 dark:text-amber-400 tabular-nums">{formatLength(calibrationMeasurement.lengthMeters)}</div>
+                      <button
+                        type="button"
+                        onClick={clearCalibrationReference}
+                        disabled={calibrationBusy}
+                        className="p-1 rounded-md text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-slate-800 disabled:opacity-40"
+                        title="Clear calibration reference"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                  <div className="text-[10px] leading-4 text-slate-500 dark:text-slate-400 mb-2.5">
+                    Enter the known real-world length in the selected unit.
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={desiredLength}
+                      onChange={(e) => {
+                        setDesiredLength(e.target.value);
+                        setCalibrationError('');
+                        setCalibrationSuccess('');
+                      }}
+                      placeholder={`Known length (${measurementUnit})`}
+                      disabled={calibrationBusy}
+                      className="min-w-0 flex-1 text-xs px-2.5 py-2 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-60"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleRescale}
+                      disabled={!desiredLength || calibrationBusy}
+                      className="inline-flex items-center justify-center gap-1 text-[10px] font-bold px-3 py-2 rounded-md bg-amber-500 hover:bg-amber-600 disabled:bg-slate-200 disabled:text-slate-400 text-white transition-colors disabled:cursor-not-allowed"
+                    >
+                      {calibrationBusy ? 'Applying…' : 'Calibrate'}
+                    </button>
+                  </div>
+
+                  {desiredLength && Number.isFinite(Number.parseFloat(desiredLength)) && Number.parseFloat(desiredLength) > 0 && (
+                    <div className="mt-2 rounded-lg bg-white/70 dark:bg-slate-900/60 border border-amber-100 dark:border-amber-900/30 px-2.5 py-2 text-[10px] text-slate-500 dark:text-slate-400">
+                      <div className="flex items-center justify-between">
+                        <span>Current</span>
+                        <span className="font-semibold tabular-nums">{formatLength(calibrationMeasurement.lengthMeters)}</span>
+                      </div>
+                      <div className="flex items-center justify-between mt-1">
+                        <span>Target</span>
+                        <span className="font-semibold tabular-nums">{desiredLength} {measurementUnit}</span>
+                      </div>
+                      <div className="flex items-center justify-between mt-1 pt-1 border-t border-slate-100 dark:border-slate-800">
+                        <span>Scale factor</span>
+                        <span className="font-bold text-amber-700 dark:text-amber-400 tabular-nums">{(() => { const targetM = toMeters(Number.parseFloat(desiredLength), measurementUnit); const factor = targetM / calibrationMeasurement.lengthMeters; return Number.isFinite(factor) ? `×${factor.toFixed(4)}` : '—'; })()}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {calibrationError && (
+                    <div className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-2 text-[10px] leading-4 text-rose-700 dark:border-rose-900/40 dark:bg-rose-950/20 dark:text-rose-300">
+                      {calibrationError}
+                    </div>
+                  )}
+                  {calibrationSuccess && (
+                    <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-2 text-[10px] leading-4 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/20 dark:text-emerald-300">
+                      {calibrationSuccess}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {sceneScaleFactor && Math.abs(sceneScaleFactor.x - sceneScaleFactor.y) < 0.001 && Math.abs(sceneScaleFactor.y - sceneScaleFactor.z) < 0.001 && Math.abs(sceneScaleFactor.x - 1) > 0.001 && (
+        <div className="px-4 py-2 text-[10px] text-indigo-600 dark:text-indigo-400 bg-indigo-50/70 dark:bg-indigo-900/20 border-t border-indigo-100 dark:border-indigo-900/30">
+          Scene calibrated · cumulative scale ×{sceneScaleFactor.x.toFixed(3)}
         </div>
       )}
     </div>

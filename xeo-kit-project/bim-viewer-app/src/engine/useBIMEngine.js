@@ -7,13 +7,14 @@ import { TreeViewPlugin } from '@xeokit/xeokit-sdk/src/plugins/TreeViewPlugin/Tr
 import { NavCubePlugin } from '@xeokit/xeokit-sdk/src/plugins/NavCubePlugin/NavCubePlugin';
 import { SectionPlanesPlugin } from '@xeokit/xeokit-sdk/src/plugins/SectionPlanesPlugin/SectionPlanesPlugin';
 import { DistanceMeasurementsPlugin } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsPlugin';
+import { DistanceMeasurementsMouseControl } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsMouseControl';
 import * as WebIFC from 'web-ifc';
 
 import { API_BASE_URL, AXIS_HANDLE_COLORS, STRETCH_HANDLE_DRAG_SCALE, STRETCH_HANDLE_HOVER_SCALE } from './utils/constants';
 import { brightenColor } from './utils/helpers';
 import { animateHandleTo, buildStretchHandles, destroyStretchHandles, hideRevealedGroup, revealGroupForFace } from './stretch/StretchHandles';
 import { applyScale, cursorForAxes, resetHoveredStretchHandle } from './stretch/StretchController';
-import { toggleMeasurementMode, clearMeasurements, syncMeasurementsList, deleteMeasurement, flyToMeasurement, toggleSnapping, toggleAxisBreakdown, formatLength } from './measurements/MeasurementController';
+import { toggleMeasurementMode, clearMeasurements, syncMeasurementsList, deleteMeasurement, flyToMeasurement, toggleSnapping, toggleAxisBreakdown, formatLength, cancelActiveMeasurement, applyMeasurementUnitToPlugin } from './measurements/MeasurementController';
 import { applyGlobalScale, scaleModelByMeasurement, calibrateWallHeight } from './calibration/CalibrationController';
 import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './placement/PlacementController';
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
@@ -32,7 +33,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const currentModelRef = useRef(null);
   const currentPlaneRef = useRef(null);
   const measurementsPluginRef = useRef(null);
+  const measurementControlRef = useRef(null);
   const isMeasuringRef = useRef(false);
+  const [measurementPhase, setMeasurementPhase] = useState('idle');
   const globalScaleFactorRef = useRef({ x: 1, y: 1, z: 1 });
   
   // NEW: Concurrency lock for async asset loading to prevent duplication
@@ -84,10 +87,16 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [measurementsList, setMeasurementsList] = useState([]); 
-  const [measurementUnit, setMeasurementUnit] = useState('m'); 
+  const [measurementUnit, setMeasurementUnit] = useState('m');
+  const measurementUnitRef = useRef('m');
   const [snappingEnabled, setSnappingEnabled] = useState(true);
   const [axisBreakdownVisible, setAxisBreakdownVisible] = useState(false);
-  const measurementPollRef = useRef(null);
+  const [measurementDisplayMode, setMeasurementDisplayMode] = useState('distance');
+
+  useEffect(() => {
+    measurementUnitRef.current = measurementUnit;
+    applyMeasurementUnitToPlugin(measurementsPluginRef, measurementUnit);
+  }, [measurementUnit]);
 
   const stretchCtx = {
     viewerRef, stretchHandlesRef, selectionCageRef, stretchFaceAdjacencyRef,
@@ -276,27 +285,41 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
   useEffect(() => {
     isMeasuringRef.current = isMeasuring;
-    if (measurementsPluginRef.current && measurementsPluginRef.current.control) {
-        if (isMeasuring) {
-            measurementsPluginRef.current.control.activate();
-        } else {
-            measurementsPluginRef.current.control.deactivate();
-        }
-    }
+
+    const control = measurementControlRef.current;
+    if (!control) return;
+
     if (isMeasuring) {
-      measurementPollRef.current = setInterval(() => {
-        syncMeasurementsList(measurementsPluginRef, setMeasurementsList);
-      }, 400);
-    } else if (measurementPollRef.current) {
-      clearInterval(measurementPollRef.current);
-      measurementPollRef.current = null;
+      control.activate();
+      setMeasurementPhase(control.currentMeasurement ? 'selecting-target' : 'ready');
+      console.debug('[Measurement] activated', {
+        active: control.active,
+        snapping: control.snapping,
+      });
+    } else {
+      control.deactivate();
+      setMeasurementPhase('idle');
+      console.debug('[Measurement] deactivated');
     }
-    return () => {
-      if (measurementPollRef.current) {
-        clearInterval(measurementPollRef.current);
-        measurementPollRef.current = null;
-      }
+  }, [isMeasuring]);
+
+  // Escape cancels only the unfinished measurement and keeps Measure active.
+  useEffect(() => {
+    if (!isMeasuring) return undefined;
+
+    const onKeyDown = (event) => {
+      if (event.key !== 'Escape') return;
+      const control = measurementControlRef.current;
+      if (!control?.active || !control.currentMeasurement) return;
+      event.preventDefault();
+      cancelActiveMeasurement(measurementControlRef);
+      setMeasurementPhase('ready');
+      applyMeasurementUnitToPlugin(measurementsPluginRef, measurementUnitRef.current);
+      syncMeasurementsList(measurementsPluginRef, setMeasurementsList);
     };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
   }, [isMeasuring]);
 
   useEffect(() => {
@@ -356,17 +379,69 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     loadersRef.current.xkt = new XKTLoaderPlugin(viewer);
     loadersRef.current.gltf = new GLTFLoaderPlugin(viewer);
     
+    const measurementContainer = canvasRef.current.parentElement || document.body;
+
     measurementsPluginRef.current = new DistanceMeasurementsPlugin(viewer, {
-        containerElement: canvasRef.current.parentElement,
-        distanceLineColor: '#22d3ee',      
-        distanceLineThickness: 2,
-        distanceLabelColor: '#ffffff',
-        distanceLabelFillColor: '#4f46e5', 
-        distancePointColor: '#22d3ee',
-        distancePointThickness: 6,
-        defaultHoverSurface: true
+      container: measurementContainer,
+      defaultColor: '#22d3ee',
+      defaultAxisVisible: false,
+      defaultLabelsVisible: true,
+      defaultLengthLabelEnabled: true,
+      defaultLabelsOnWires: true,
+      zIndex: 10000,
     });
-    measurementsPluginRef.current.setAxisVisible(false);
+
+    applyMeasurementUnitToPlugin(measurementsPluginRef, measurementUnitRef.current);
+
+    // Use an explicit control instance. Xeokit's plugin.control is a deprecated
+    // convenience getter; keeping our control as a ref gives the editor one
+    // authoritative measurement input controller and makes lifecycle/debugging
+    // deterministic.
+    measurementControlRef.current = new DistanceMeasurementsMouseControl(
+      measurementsPluginRef.current,
+      { snapping: true },
+    );
+
+    // Keep the plugin's event stream as the source of truth for React state.
+    measurementsPluginRef.current.on('measurementStart', (measurement) => {
+      console.debug('[Measurement] start', {
+        id: measurement?.id,
+        origin: measurement?.origin?.worldPos,
+      });
+      setMeasurementPhase('selecting-target');
+      applyMeasurementUnitToPlugin(measurementsPluginRef, measurementUnitRef.current);
+      syncMeasurementsList(measurementsPluginRef, setMeasurementsList);
+    });
+
+    measurementsPluginRef.current.on('measurementEnd', (measurement) => {
+      console.debug('[Measurement] end', {
+        id: measurement?.id,
+        origin: measurement?.origin?.worldPos,
+        target: measurement?.target?.worldPos,
+      });
+      setMeasurementPhase('ready');
+      applyMeasurementUnitToPlugin(measurementsPluginRef, measurementUnitRef.current);
+      syncMeasurementsList(measurementsPluginRef, setMeasurementsList);
+    });
+
+    measurementsPluginRef.current.on('measurementCancel', (measurement) => {
+      console.debug('[Measurement] cancel', { id: measurement?.id });
+      setMeasurementPhase('ready');
+      applyMeasurementUnitToPlugin(measurementsPluginRef, measurementUnitRef.current);
+      syncMeasurementsList(measurementsPluginRef, setMeasurementsList);
+    });
+
+    measurementsPluginRef.current.on('measurementCreated', (measurement) => {
+      console.debug('[Measurement] created', { id: measurement?.id });
+      applyMeasurementUnitToPlugin(measurementsPluginRef, measurementUnitRef.current);
+      syncMeasurementsList(measurementsPluginRef, setMeasurementsList);
+    });
+
+    measurementsPluginRef.current.on('measurementDestroyed', (measurement) => {
+      console.debug('[Measurement] destroyed', { id: measurement?.id });
+      syncMeasurementsList(measurementsPluginRef, setMeasurementsList);
+    });
+
     
     let viewerAlive = true;
 
@@ -922,7 +997,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       canvas.removeEventListener('mousemove', onCanvasHoverMove);
       document.removeEventListener('mousemove', onDocMouseMove);
       document.removeEventListener('mouseup', onDocMouseUp);
+      try { measurementControlRef.current?.deactivate(); } catch (e) {}
+      try { measurementControlRef.current?.destroy(); } catch (e) {}
+      measurementControlRef.current = null;
+      try { measurementsPluginRef.current?.destroy(); } catch (e) {}
       measurementsPluginRef.current = null;
+      setMeasurementPhase('idle');
       viewerAlive = false;
       ifcLoaderOwnerRef.current = null;
       loadersRef.current = {};
@@ -1133,9 +1213,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   };
 
   const calibrationCtx = {
+    file, jobId, activeProject,
     viewerRef, currentModelRef, globalScaleFactorRef, setSceneScaleFactor,
     measurementsPluginRef, setMeasurementsList, setIsLoading,
-    loadersRef, projectStateRef, activeProject, inspectNativeElement
+    loadersRef, projectStateRef, inspectNativeElement
   };
 
   const assetCtx = {
@@ -1162,10 +1243,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       selectedAssetId,
       placementMode,
       isMeasuring,
+      measurementPhase,
       measurementsList,
       measurementUnit,
       snappingEnabled,
       axisBreakdownVisible,
+      measurementDisplayMode,
       totalMeasuredLength: measurementsList.reduce((sum, m) => sum + m.lengthMeters, 0),
       sceneScaleFactor,
       isStretching,
@@ -1199,9 +1282,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       scaleModelByMeasurement: (id, l) => scaleModelByMeasurement(calibrationCtx, id, l),
       calibrateWallHeight: (e, h) => calibrateWallHeight(calibrationCtx, e, h),
       flyToMeasurement: (m) => flyToMeasurement(viewerRef, m),
-      toggleSnapping: () => toggleSnapping(measurementsPluginRef, snappingEnabled, setSnappingEnabled),
+      toggleSnapping: () => toggleSnapping(measurementControlRef, snappingEnabled, setSnappingEnabled),
       toggleAxisBreakdown: () => toggleAxisBreakdown(measurementsPluginRef, axisBreakdownVisible, setAxisBreakdownVisible),
       setMeasurementUnit,
+      setMeasurementDisplayMode,
       formatLength: (m) => formatLength(m, measurementUnit),
       updateNativeOffset: (id, ax, val) => updateNativeOffset(viewerRef, id, ax, val),
       updateDynamicTransform: (id, t, ax, val) => updateDynamicTransform(viewerRef, id, t, ax, val),
