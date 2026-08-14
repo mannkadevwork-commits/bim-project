@@ -149,15 +149,17 @@ const UploadModal = ({ isOpen, onClose, onProjectCreated }) => {
         )}
 
         <div className="text-center mb-8 relative z-10">
-          <h2 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-cyan-500 dark:from-indigo-400 dark:to-cyan-400 mb-3">
-            XeoVision Pro
+          <img src="/hci-logo.svg" alt="High Creation Interiors" className="hci-logo-badge hci-logo-badge--upload mb-3" />
+          <p className="text-xs font-bold tracking-[0.24em] uppercase text-[#ff914d] mb-2">HIGH CREATION INTERIORS</p>
+          <h2 className="text-3xl font-extrabold text-slate-900 dark:text-white mb-2">
+            Interior BIM Studio
           </h2>
           <p className="text-slate-500 dark:text-slate-400 text-lg">Initialize your BIM environment</p>
         </div>
 
         {isProcessing ? (
-          <div className="relative group border-2 border-indigo-300/50 dark:border-indigo-500/30 rounded-3xl p-12 flex flex-col items-center justify-center bg-indigo-50/30 dark:bg-indigo-900/10 overflow-hidden min-h-[320px]">
-            <Loader2 className="w-16 h-16 text-indigo-500 animate-spin mb-6" />
+          <div className="relative group border-2 border-[#ff914d]/30 dark:border-[#ff914d]/30 rounded-3xl p-12 flex flex-col items-center justify-center bg-[#ff914d]/5 dark:bg-[#ff914d]/5 overflow-hidden min-h-[320px]">
+            <Loader2 className="w-16 h-16 text-[#ff914d] animate-spin mb-6" />
             <h3 className="text-xl font-bold text-slate-800 dark:text-white mb-2">Preparing Environment</h3>
             <p className="text-slate-500 dark:text-slate-400 text-center max-w-sm">
               {statusMessage}
@@ -168,9 +170,9 @@ const UploadModal = ({ isOpen, onClose, onProjectCreated }) => {
             {/* Drag & Drop Zone */}
             <div 
               onClick={() => fileInputRef.current?.click()}
-              className="relative group border-2 border-dashed border-indigo-300/50 dark:border-indigo-500/30 rounded-3xl p-10 flex flex-col items-center justify-center bg-indigo-50/30 dark:bg-indigo-900/10 hover:bg-indigo-50/80 dark:hover:bg-indigo-900/30 transition-all duration-300 cursor-pointer overflow-hidden"
+              className="relative group border-2 border-dashed border-[#ff914d]/30 dark:border-[#ff914d]/30 rounded-3xl p-10 flex flex-col items-center justify-center bg-[#ff914d]/5 dark:bg-[#ff914d]/5 hover:bg-[#ff914d]/10 dark:hover:bg-[#ff914d]/10 transition-all duration-300 cursor-pointer overflow-hidden"
             >
-              <div className="absolute inset-0 bg-gradient-to-b from-transparent to-indigo-500/5 opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
+              <div className="absolute inset-0 bg-gradient-to-b from-transparent to-[#ff914d]/10 opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
 
               <div className="flex gap-4 mb-6 group-hover:scale-110 group-hover:-translate-y-2 transition-all duration-500">
                 <div className="w-14 h-14 rounded-2xl bg-white dark:bg-slate-800 shadow-xl flex items-center justify-center">
@@ -182,12 +184,12 @@ const UploadModal = ({ isOpen, onClose, onProjectCreated }) => {
                 </div>
               </div>
               
-              <button className="bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-3 rounded-full font-semibold shadow-[0_8px_30px_rgb(99,102,241,0.3)] transition-all transform mb-3 pointer-events-none relative z-10">
+              <button className="bg-[#ff914d] hover:bg-[#ff7a28] text-white px-8 py-3 rounded-full font-semibold shadow-[0_8px_30px_rgba(255,145,77,0.28)] transition-all transform mb-3 pointer-events-none relative z-10">
                 Upload Floor Plan or 3D Model
               </button>
               
               <div className="text-xs text-slate-400 dark:text-slate-500 text-center relative z-10 space-y-1">
-                <p>Images (<span className="text-cyan-600 dark:text-cyan-400">.jpg, .png</span>) | 3D (<span className="text-indigo-600 dark:text-indigo-400">.ifc, .xkt</span>)</p>
+                <p>Images (<span className="text-cyan-600 dark:text-cyan-400">.jpg, .png</span>) | 3D (<span className="text-[#ff914d]">.ifc, .xkt</span>)</p>
               </div>
               
               <input type="file" className="hidden" ref={fileInputRef} onChange={handleFileChange} accept="image/jpeg, image/png, .xkt, .ifc" />
@@ -206,10 +208,10 @@ const UploadModal = ({ isOpen, onClose, onProjectCreated }) => {
                 <button
                   key={plan.id}
                   onClick={() => handlePredefinedSelect(plan)}
-                  className="flex items-start gap-4 p-4 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/50 hover:border-indigo-400 dark:hover:border-indigo-500 hover:shadow-lg transition-all text-left group"
+                  className="flex items-start gap-4 p-4 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/50 hover:border-[#ff914d] dark:hover:border-[#ff914d] hover:shadow-lg transition-all text-left group"
                 >
-                  <div className="w-12 h-12 rounded-xl bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">
-                    <plan.icon className="w-6 h-6 text-indigo-600 dark:text-indigo-400" />
+                  <div className="w-12 h-12 rounded-xl bg-[#ff914d]/10 dark:bg-[#ff914d]/10 flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">
+                    <plan.icon className="w-6 h-6 text-[#ff914d]" />
                   </div>
                   <div>
                     <h4 className="font-bold text-slate-900 dark:text-white text-sm">{plan.name}</h4>

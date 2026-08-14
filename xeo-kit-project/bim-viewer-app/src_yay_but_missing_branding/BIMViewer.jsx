@@ -417,12 +417,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
       </div>
 
       {engineState.placementMode && !engineState.isMeasuring && (
-        <div className="absolute top-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 px-5 py-2.5 bg-[#ff914d] text-white rounded-full shadow-lg animate-in slide-in-from-top-2 fade-in duration-200">
+        <div className="absolute top-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 px-5 py-2.5 bg-indigo-600 text-white rounded-full shadow-lg animate-in slide-in-from-top-2 fade-in duration-200">
           <MousePointerClick className="w-4 h-4 animate-pulse" />
           <span className="font-semibold text-sm">
             Click canvas to place {engineState.placementMode.name}
           </span>
-          <button onClick={() => engineActions.setPlacementMode(null)} className="ml-1 hover:bg-[#ff7a28] p-1 rounded-full cursor-pointer">
+          <button onClick={() => engineActions.setPlacementMode(null)} className="ml-1 hover:bg-indigo-700 p-1 rounded-full cursor-pointer">
             <X className="w-3 h-3" />
           </button>
         </div>
@@ -573,7 +573,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
                   100% { transform: translateY(128px); }
                 }
               `}</style>
-              <img src="/hci-logo.svg" alt="High Creation Interiors" className="hci-logo-badge hci-logo-badge--processing animate-pulse" />
+              <Hexagon className="w-14 h-14 text-indigo-400 animate-pulse" />
             </div>
             <h3 className="mt-8 text-2xl font-bold text-white tracking-wide drop-shadow-md">Recalculating Geometry</h3>
             <p className="mt-2 text-sm text-slate-300 font-medium max-w-sm text-center leading-relaxed">

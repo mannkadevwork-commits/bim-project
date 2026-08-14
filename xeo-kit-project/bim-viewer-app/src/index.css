@@ -5,7 +5,7 @@
 
 @theme {
   --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
-  --color-brand: #6366f1; 
+  --color-brand: #ff914d; 
   --color-accent: #06b6d4; 
 }
 
@@ -49,3 +49,81 @@ button {
   pointer-events: all;
 }
 #myNavCubeCanvas { width: 150px; height: 150px; pointer-events: all; display: block; }
+
+
+/* HCI logo visibility: the supplied brand mark uses dark typography, so place it
+   on a soft light badge in both themes. The larger crop gives the lockup enough
+   room to remain legible in the compact viewer chrome. */
+.hci-logo-badge {
+  display: block;
+  flex: 0 0 auto;
+  object-fit: contain;
+  object-position: center;
+  background: #f8fafc;
+  border: 1px solid rgba(255, 145, 77, 0.35);
+  border-radius: 10px;
+  padding: 5px;
+  box-sizing: border-box;
+  box-shadow: 0 4px 16px rgba(2, 6, 23, 0.18);
+}
+.hci-logo-badge--compact { width: 34px; height: 34px; padding: 5px; border-radius: 9px; }
+.hci-logo-badge--nav { width: 42px; height: 42px; padding: 6px; border-radius: 11px; }
+.hci-logo-badge--modal { width: 50px; height: 50px; padding: 7px; border-radius: 13px; }
+.hci-logo-badge--upload { width: 74px; height: 74px; padding: 9px; border-radius: 17px; }
+.hci-logo-badge--processing { width: 62px; height: 62px; padding: 8px; border-radius: 15px; }
+.dark .hci-logo-badge {
+  background: #ffffff;
+  border-color: rgba(255, 145, 77, 0.55);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.38);
+}
+@media (max-width: 640px) {
+  .hci-logo-badge--nav { width: 38px; height: 38px; }
+  .hci-logo-badge--compact { width: 32px; height: 32px; }
+}
+
+/* HCI brand system: orange belongs to product chrome/actions. Keep 3D semantic colors (cyan/green/blue) intact. */
+:root {
+  --hci-orange: #ff914d;
+  --hci-orange-hover: #ff7a28;
+  --hci-orange-soft: rgba(255, 145, 77, 0.12);
+  --hci-orange-border: rgba(255, 145, 77, 0.34);
+}
+
+/* Primary UI buttons that previously used Tailwind indigo are now HCI orange. */
+button.bg-indigo-600,
+a.bg-indigo-600 {
+  background-color: var(--hci-orange) !important;
+}
+
+button.bg-cyan-600,
+a.bg-cyan-600 {
+  background-color: var(--hci-orange) !important;
+}
+button.hover\:bg-indigo-700:hover,
+button.hover\:bg-indigo-500:hover,
+a.hover\:bg-indigo-700:hover,
+a.hover\:bg-indigo-500:hover,
+button.hover\:bg-cyan-500:hover,
+a.hover\:bg-cyan-500:hover {
+  background-color: var(--hci-orange-hover) !important;
+}
+button.shadow-indigo-500\/20,
+button.shadow-indigo-500\/30,
+button[class*="shadow-indigo-"] {
+  --tw-shadow-color: rgba(255, 145, 77, 0.22) !important;
+}
+
+/* Brand text / icon accents in navigation and UI chrome. */
+button:hover.text-indigo-600,
+button.dark\:hover\:text-indigo-400:hover,
+a:hover.text-indigo-600,
+a.dark\:hover\:text-indigo-400:hover {
+  color: var(--hci-orange) !important;
+}
+
+/* Accessible focus ring for branded controls. */
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--hci-orange) 75%, white);
+  outline-offset: 2px;
+}

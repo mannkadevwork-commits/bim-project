@@ -356,7 +356,7 @@ function ViewerApp() {
       {isSwitchingLayout && (
         <div className="fixed inset-0 z-[260] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
           <div className="rounded-2xl bg-slate-900 border border-slate-700 px-8 py-7 text-center shadow-2xl">
-            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-[#ff914d] animate-spin" />
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-indigo-400 animate-spin" />
             <p className="text-white font-semibold">Loading new layout…</p>
             <p className="mt-1 text-sm text-slate-400">Replacing the current project with a fresh workspace.</p>
           </div>
@@ -366,7 +366,7 @@ function ViewerApp() {
       {isResettingProject && (
         <div className="fixed inset-0 z-[250] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
           <div className="rounded-2xl bg-slate-900 border border-slate-700 px-8 py-7 text-center shadow-2xl">
-            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-[#ff914d] animate-spin" />
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-indigo-400 animate-spin" />
             <p className="text-white font-semibold">Resetting project…</p>
             <p className="mt-1 text-sm text-slate-400">Returning to the project start screen.</p>
           </div>

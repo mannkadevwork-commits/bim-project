@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { PanelLeftClose, Loader2, Database, Layout, Hexagon } from 'lucide-react'; //[cite: 2]
+import { PanelLeftClose, Loader2, Database, Layout } from 'lucide-react';
 import { CatalogTree } from './CatalogTree'; //[cite: 1]
 
 
@@ -18,7 +18,7 @@ export const LeftPanel = ({
       {/* ── NEW: Global Logo & Filename Header ── */}
       <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 dark:border-slate-800 shrink-0 bg-slate-50 dark:bg-slate-900/50">
         <div className="flex items-center gap-3">
-          <Hexagon className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
+          <img src="/hci-logo.svg" alt="High Creation Interiors" className="hci-logo-badge hci-logo-badge--compact" />
           <div className="w-px h-4 bg-slate-300 dark:bg-slate-700"></div>
           <span className="text-xs font-bold text-slate-700 dark:text-slate-300 tracking-wide truncate max-w-[150px]">
             {fileName || 'Untitled Project'}
@@ -32,19 +32,19 @@ export const LeftPanel = ({
       <div className="flex border-b border-slate-200 dark:border-slate-800 shrink-0">
         <button
           onClick={() => setLeftTab('explorer')}
-          className={`flex-1 py-3 text-[11px] font-bold uppercase tracking-wider transition-colors cursor-pointer ${leftTab === 'explorer' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-indigo-500 bg-indigo-50/50 dark:bg-indigo-900/20' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
+          className={`flex-1 py-3 text-[11px] font-bold uppercase tracking-wider transition-colors cursor-pointer ${leftTab === 'explorer' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-[#ff914d] bg-indigo-50/50 dark:bg-indigo-900/20' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
         >
           Explorer
         </button>
         <button
           onClick={() => setLeftTab('assets')}
-          className={`flex-1 py-3 text-[11px] font-bold uppercase tracking-wider transition-colors cursor-pointer ${leftTab === 'assets' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-indigo-500 bg-indigo-50/50 dark:bg-indigo-900/20' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
+          className={`flex-1 py-3 text-[11px] font-bold uppercase tracking-wider transition-colors cursor-pointer ${leftTab === 'assets' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-[#ff914d] bg-indigo-50/50 dark:bg-indigo-900/20' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
         >
           Catalog
         </button>
         <button
           onClick={() => setLeftTab('templates')}
-          className={`flex-1 py-3 text-[11px] font-bold uppercase tracking-wider transition-colors cursor-pointer ${leftTab === 'templates' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-indigo-500 bg-indigo-50/50 dark:bg-indigo-900/20' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
+          className={`flex-1 py-3 text-[11px] font-bold uppercase tracking-wider transition-colors cursor-pointer ${leftTab === 'templates' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-[#ff914d] bg-indigo-50/50 dark:bg-indigo-900/20' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
         >
           Layouts
         </button>
@@ -102,7 +102,7 @@ export const LeftPanel = ({
                 <button
                   onClick={() => onSelectLayout?.(layout)}
                   disabled={layout.available === false}
-                  className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold transition-colors shadow-sm cursor-pointer"
+                  className="w-full py-2 bg-[#ff914d] hover:bg-[#ff7a28] disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold transition-colors shadow-sm cursor-pointer"
                 >
                   {layout.available === false ? 'Unavailable' : 'Use This Layout'}
                 </button>

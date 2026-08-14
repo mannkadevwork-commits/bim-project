@@ -78,7 +78,7 @@ const response = await fetch(`${API_BASE_URL}/api/contact`, {
           <button 
             type="submit" 
             disabled={isSubmitting}
-            className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-cyan-500 text-white px-6 py-3 rounded-xl font-medium shadow-lg shadow-indigo-500/30 transition-all transform hover:-translate-y-0.5 disabled:opacity-50 disabled:transform-none"
+            className="w-full flex items-center justify-center gap-2 bg-[#ff914d] hover:bg-[#ff7a28] text-white px-6 py-3 rounded-xl font-medium shadow-lg shadow-[0_10px_30px_rgba(255,145,77,0.22)] transition-all transform hover:-translate-y-0.5 disabled:opacity-50 disabled:transform-none"
           >
             {isSubmitting ? 'Sending...' : 'Send Message'}
             <Send className="w-4 h-4" />

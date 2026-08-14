@@ -7,16 +7,11 @@ import Footer from './components/Footer';
 import UploadModal from './components/UploadModal';
 import ContactForm from './components/ContactForm';
 import { AlertTriangle } from 'lucide-react';
-import ProjectStartModal from './components/ProjectStartModal';
 
 function ViewerApp() {
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isBooting, setIsBooting] = useState(true);
-  const [showStartChoice, setShowStartChoice] = useState(false);
-  const [previousProject, setPreviousProject] = useState(null);
-  const [isContinuingProject, setIsContinuingProject] = useState(false);
   const [isContactOpen, setIsContactOpen] = useState(false);
-  const [startupMode, setStartupMode] = useState(() => localStorage.getItem('hci_startup_mode') || null);
   
   // NEW: Canonical project state holding { jobId, file, fileName }
   const [activeProject, setActiveProject] = useState(null);
@@ -24,31 +19,18 @@ function ViewerApp() {
   const [isResettingProject, setIsResettingProject] = useState(false);
   const [isSwitchingLayout, setIsSwitchingLayout] = useState(false);
 
-  // Validate the last project on startup, but DO NOT automatically open it.
-  // The user explicitly decides whether to continue or start a new project.
+  // Restore a saved project only after the backend confirms that it still exists.
+  // A stale localStorage jobId must never race a new UploadModal selection.
   useEffect(() => {
     let cancelled = false;
 
     const bootstrapProject = async () => {
       const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
       const saved = localStorage.getItem('hci_active_project');
-      const requestedMode = localStorage.getItem('hci_startup_mode');
-
-      if (requestedMode === 'new') {
-        if (!cancelled) {
-          setStartupMode('new');
-          setPreviousProject(null);
-          setShowStartChoice(false);
-          setIsUploadOpen(true);
-          setIsBooting(false);
-        }
-        return;
-      }
 
       if (!saved) {
         if (!cancelled) {
-          setPreviousProject(null);
-          setShowStartChoice(false);
+          setActiveProject(null);
           setIsUploadOpen(true);
           setIsBooting(false);
         }
@@ -74,25 +56,27 @@ function ViewerApp() {
           throw new Error(`Saved project is invalid: ${validation.reason || 'unknown reason'}`);
         }
 
+        const ifcResponse = await fetch(
+          `${API_BASE_URL}/jobs/${jobId}/original.ifc`,
+          { cache: 'no-store' }
+        );
+        if (!ifcResponse.ok) {
+          throw new Error(`Saved project IFC could not be loaded (${ifcResponse.status}).`);
+        }
+
+        const blob = await ifcResponse.blob();
+        const file = new File([blob], fileName, { type: 'application/octet-stream' });
+
         if (cancelled) return;
 
-        localStorage.removeItem('hci_startup_mode');
-        setStartupMode(null);
-        setPreviousProject({
-          jobId,
-          fileName,
-        });
-        setShowStartChoice(true);
+        setActiveProject({ jobId, file, fileName });
         setIsUploadOpen(false);
       } catch (error) {
-        console.warn('[App] Saved project is stale/unavailable. Starting without previous-work option.', error);
+        console.warn('[App] Saved project is stale/unavailable. Returning to UploadModal.', error);
         if (cancelled) return;
 
         localStorage.removeItem('hci_active_project');
-        localStorage.removeItem('hci_startup_mode');
-        setStartupMode(null);
-        setPreviousProject(null);
-        setShowStartChoice(false);
+        setActiveProject(null);
         setIsUploadOpen(true);
       } finally {
         if (!cancelled) setIsBooting(false);
@@ -103,82 +87,13 @@ function ViewerApp() {
     return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => {
-    const handlePageShow = (event) => {
-      if (!event.persisted) return;
-      const mode = localStorage.getItem('hci_startup_mode');
-      if (mode === 'new') {
-        setActiveProject(null);
-        setPreviousProject(null);
-        setShowStartChoice(false);
-        setIsUploadOpen(true);
-        setIsBooting(false);
-      }
-    };
-
-    window.addEventListener('pageshow', handlePageShow);
-    return () => window.removeEventListener('pageshow', handlePageShow);
-  }, []);
-
-  const handleContinuePreviousProject = async () => {
-    localStorage.removeItem('hci_startup_mode');
-    setStartupMode(null);
-    if (!previousProject?.jobId || isContinuingProject) return;
-
-    const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-    setIsContinuingProject(true);
-
-    try {
-      const response = await fetch(
-        `${API_BASE_URL}/jobs/${previousProject.jobId}/original.ifc`,
-        { cache: 'no-store' }
-      );
-
-      if (!response.ok) {
-        throw new Error(`Previous project IFC could not be loaded (${response.status}).`);
-      }
-
-      const blob = await response.blob();
-      const file = new File([blob], previousProject.fileName, {
-        type: 'application/octet-stream',
-      });
-
-      setActiveProject({
-        jobId: previousProject.jobId,
-        file,
-        fileName: previousProject.fileName,
-      });
-      setShowStartChoice(false);
-      setIsUploadOpen(false);
-    } catch (error) {
-      console.error('[App] Failed to continue previous project:', error);
-      localStorage.removeItem('hci_active_project');
-      setPreviousProject(null);
-      setShowStartChoice(false);
-      setIsUploadOpen(true);
-      alert(`Previous project could not be opened: ${error.message}`);
-    } finally {
-      setIsContinuingProject(false);
-    }
-  };
-
-  const handleStartNewProject = () => {
-    localStorage.setItem('hci_startup_mode', 'new');
-    setStartupMode('new');
-    setShowStartChoice(false);
-    setIsUploadOpen(true);
-  };
-
   const handleProjectUpload = (projectData) => {
-    localStorage.removeItem('hci_startup_mode');
-    setStartupMode(null);
     setActiveProject(projectData);
     localStorage.setItem('hci_active_project', JSON.stringify({
       jobId: projectData.jobId,
       fileName: projectData.fileName
     }));
     setIsUploadOpen(false);
-    setShowStartChoice(false);
   };
 
   const handleDeleteRequest = () => {
@@ -212,8 +127,6 @@ function ViewerApp() {
 
       localStorage.removeItem(`hci_state_${jobId}`);
       localStorage.removeItem('hci_active_project');
-      localStorage.removeItem('hci_startup_mode');
-      setStartupMode(null);
 
       // Unmount the viewer before opening the modal so no old loader can keep
       // running while the next project is being created.
@@ -268,8 +181,6 @@ function ViewerApp() {
         fileName: data.fileName || layout.fileName || file.name,
       };
 
-      localStorage.removeItem('hci_startup_mode');
-      setStartupMode(null);
       localStorage.setItem('hci_active_project', JSON.stringify({
         jobId: newJobId,
         fileName: nextProject.fileName,
@@ -320,31 +231,9 @@ function ViewerApp() {
 
       {!activeProject && <Footer />}
 
-      <ProjectStartModal
-        isOpen={showStartChoice && !activeProject}
-        previousProject={previousProject}
-        onContinue={handleContinuePreviousProject}
-        onStartNew={handleStartNewProject}
-        onClose={handleStartNewProject}
-        isContinuing={isContinuingProject}
-      />
-
       <UploadModal
-        isOpen={isUploadOpen && !showStartChoice}
-        onClose={() => {
-          if (activeProject) {
-            setIsUploadOpen(false);
-            return;
-          }
-          if (previousProject) {
-            localStorage.removeItem('hci_startup_mode');
-            setStartupMode(null);
-            setIsUploadOpen(false);
-            setShowStartChoice(true);
-            return;
-          }
-          setIsUploadOpen(false);
-        }}
+        isOpen={isUploadOpen}
+        onClose={() => { if (activeProject) setIsUploadOpen(false); }}
         onProjectCreated={handleProjectUpload}
       />
 
@@ -356,7 +245,7 @@ function ViewerApp() {
       {isSwitchingLayout && (
         <div className="fixed inset-0 z-[260] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
           <div className="rounded-2xl bg-slate-900 border border-slate-700 px-8 py-7 text-center shadow-2xl">
-            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-[#ff914d] animate-spin" />
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-indigo-400 animate-spin" />
             <p className="text-white font-semibold">Loading new layout…</p>
             <p className="mt-1 text-sm text-slate-400">Replacing the current project with a fresh workspace.</p>
           </div>
@@ -366,9 +255,9 @@ function ViewerApp() {
       {isResettingProject && (
         <div className="fixed inset-0 z-[250] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
           <div className="rounded-2xl bg-slate-900 border border-slate-700 px-8 py-7 text-center shadow-2xl">
-            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-[#ff914d] animate-spin" />
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-indigo-400 animate-spin" />
             <p className="text-white font-semibold">Resetting project…</p>
-            <p className="mt-1 text-sm text-slate-400">Returning to the project start screen.</p>
+            <p className="mt-1 text-sm text-slate-400">Creating a fresh workspace from the original IFC.</p>
           </div>
         </div>
       )}

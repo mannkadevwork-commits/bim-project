@@ -16,7 +16,6 @@ function ViewerApp() {
   const [previousProject, setPreviousProject] = useState(null);
   const [isContinuingProject, setIsContinuingProject] = useState(false);
   const [isContactOpen, setIsContactOpen] = useState(false);
-  const [startupMode, setStartupMode] = useState(() => localStorage.getItem('hci_startup_mode') || null);
   
   // NEW: Canonical project state holding { jobId, file, fileName }
   const [activeProject, setActiveProject] = useState(null);
@@ -32,18 +31,6 @@ function ViewerApp() {
     const bootstrapProject = async () => {
       const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
       const saved = localStorage.getItem('hci_active_project');
-      const requestedMode = localStorage.getItem('hci_startup_mode');
-
-      if (requestedMode === 'new') {
-        if (!cancelled) {
-          setStartupMode('new');
-          setPreviousProject(null);
-          setShowStartChoice(false);
-          setIsUploadOpen(true);
-          setIsBooting(false);
-        }
-        return;
-      }
 
       if (!saved) {
         if (!cancelled) {
@@ -76,8 +63,6 @@ function ViewerApp() {
 
         if (cancelled) return;
 
-        localStorage.removeItem('hci_startup_mode');
-        setStartupMode(null);
         setPreviousProject({
           jobId,
           fileName,
@@ -89,8 +74,6 @@ function ViewerApp() {
         if (cancelled) return;
 
         localStorage.removeItem('hci_active_project');
-        localStorage.removeItem('hci_startup_mode');
-        setStartupMode(null);
         setPreviousProject(null);
         setShowStartChoice(false);
         setIsUploadOpen(true);
@@ -103,26 +86,7 @@ function ViewerApp() {
     return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => {
-    const handlePageShow = (event) => {
-      if (!event.persisted) return;
-      const mode = localStorage.getItem('hci_startup_mode');
-      if (mode === 'new') {
-        setActiveProject(null);
-        setPreviousProject(null);
-        setShowStartChoice(false);
-        setIsUploadOpen(true);
-        setIsBooting(false);
-      }
-    };
-
-    window.addEventListener('pageshow', handlePageShow);
-    return () => window.removeEventListener('pageshow', handlePageShow);
-  }, []);
-
   const handleContinuePreviousProject = async () => {
-    localStorage.removeItem('hci_startup_mode');
-    setStartupMode(null);
     if (!previousProject?.jobId || isContinuingProject) return;
 
     const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
@@ -163,15 +127,11 @@ function ViewerApp() {
   };
 
   const handleStartNewProject = () => {
-    localStorage.setItem('hci_startup_mode', 'new');
-    setStartupMode('new');
     setShowStartChoice(false);
     setIsUploadOpen(true);
   };
 
   const handleProjectUpload = (projectData) => {
-    localStorage.removeItem('hci_startup_mode');
-    setStartupMode(null);
     setActiveProject(projectData);
     localStorage.setItem('hci_active_project', JSON.stringify({
       jobId: projectData.jobId,
@@ -212,8 +172,6 @@ function ViewerApp() {
 
       localStorage.removeItem(`hci_state_${jobId}`);
       localStorage.removeItem('hci_active_project');
-      localStorage.removeItem('hci_startup_mode');
-      setStartupMode(null);
 
       // Unmount the viewer before opening the modal so no old loader can keep
       // running while the next project is being created.
@@ -268,8 +226,6 @@ function ViewerApp() {
         fileName: data.fileName || layout.fileName || file.name,
       };
 
-      localStorage.removeItem('hci_startup_mode');
-      setStartupMode(null);
       localStorage.setItem('hci_active_project', JSON.stringify({
         jobId: newJobId,
         fileName: nextProject.fileName,
@@ -331,20 +287,7 @@ function ViewerApp() {
 
       <UploadModal
         isOpen={isUploadOpen && !showStartChoice}
-        onClose={() => {
-          if (activeProject) {
-            setIsUploadOpen(false);
-            return;
-          }
-          if (previousProject) {
-            localStorage.removeItem('hci_startup_mode');
-            setStartupMode(null);
-            setIsUploadOpen(false);
-            setShowStartChoice(true);
-            return;
-          }
-          setIsUploadOpen(false);
-        }}
+        onClose={() => { if (activeProject) setIsUploadOpen(false); }}
         onProjectCreated={handleProjectUpload}
       />
 
@@ -356,7 +299,7 @@ function ViewerApp() {
       {isSwitchingLayout && (
         <div className="fixed inset-0 z-[260] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
           <div className="rounded-2xl bg-slate-900 border border-slate-700 px-8 py-7 text-center shadow-2xl">
-            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-[#ff914d] animate-spin" />
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-indigo-400 animate-spin" />
             <p className="text-white font-semibold">Loading new layout…</p>
             <p className="mt-1 text-sm text-slate-400">Replacing the current project with a fresh workspace.</p>
           </div>
@@ -366,7 +309,7 @@ function ViewerApp() {
       {isResettingProject && (
         <div className="fixed inset-0 z-[250] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
           <div className="rounded-2xl bg-slate-900 border border-slate-700 px-8 py-7 text-center shadow-2xl">
-            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-[#ff914d] animate-spin" />
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-600 border-t-indigo-400 animate-spin" />
             <p className="text-white font-semibold">Resetting project…</p>
             <p className="mt-1 text-sm text-slate-400">Returning to the project start screen.</p>
           </div>

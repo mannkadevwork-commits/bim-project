@@ -19,7 +19,7 @@ export const STRETCH_HANDLE_HOVER_SCALE = 1.22;
 export const STRETCH_HANDLE_DRAG_SCALE = 1.38;
 export const STRETCH_HANDLE_ANIM_MS = 150;
 
-export const SELECTION_CAGE_COLOR = [0.35, 0.62, 1];
+export const SELECTION_CAGE_COLOR = [0.12, 0.78, 0.95];
 
 // Extracted from inside the hook (getWallSnapData) to global constants
 export const WALL_IFC_CLASSES = new Set(['IfcWall', 'IfcWallStandardCase', 'IfcCurtainWall']);

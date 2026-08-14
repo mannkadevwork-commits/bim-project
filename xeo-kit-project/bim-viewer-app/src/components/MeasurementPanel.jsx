@@ -72,7 +72,7 @@ const MeasurementRow = ({
             <button
               onClick={handleRescale}
               disabled={!desiredLength}
-              className="flex items-center gap-1 text-[11px] font-bold px-2.5 py-1 rounded-md bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-200 disabled:text-slate-400 dark:disabled:bg-slate-800 dark:disabled:text-slate-600 text-white transition-colors disabled:cursor-not-allowed"
+              className="flex items-center gap-1 text-[11px] font-bold px-2.5 py-1 rounded-md bg-[#ff914d] hover:bg-[#ff7a28] disabled:bg-slate-200 disabled:text-slate-400 dark:disabled:bg-slate-800 dark:disabled:text-slate-600 text-white transition-colors disabled:cursor-not-allowed"
               title="Rescale the entire scene so this measurement equals the typed length"
             >
               <Wand2 className="w-3 h-3" />

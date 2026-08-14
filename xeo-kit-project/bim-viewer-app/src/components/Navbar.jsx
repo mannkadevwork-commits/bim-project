@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Menu, X, Sun, Moon, Hexagon } from 'lucide-react'; // Hexagon is our placeholder logo
+import { Menu, X, Sun, Moon } from 'lucide-react';
 
 const Navbar = ({onOpenUpload, onOpenContact}) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -23,10 +23,15 @@ const Navbar = ({onOpenUpload, onOpenContact}) => {
           
           {/* Logo Section */}
           <div className="flex items-center gap-2 cursor-pointer">
-            <Hexagon className="w-8 h-8 text-blue-600 dark:text-blue-400" />
-            <span className="text-xl font-bold text-gray-900 dark:text-white tracking-wide">
-              PlaceHolder
-            </span>
+            <img
+              src="/hci-logo.svg"
+              alt="High Creation Interiors"
+              className="hci-logo-badge hci-logo-badge--nav"
+            />
+            <div className="leading-tight">
+              <span className="block text-[11px] font-semibold uppercase tracking-[0.18em] text-[#ff914d]">High Creation</span>
+              <span className="block text-lg font-bold text-gray-900 dark:text-white tracking-wide">Interior BIM</span>
+            </div>
           </div>
 
           {/* Desktop Links (Hidden on mobile) */}
@@ -41,7 +46,7 @@ const Navbar = ({onOpenUpload, onOpenContact}) => {
           <div className="flex items-center gap-2">
             <button 
       onClick={onOpenContact}
-      className="hidden sm:block bg-indigo-600 hover:bg-cyan-500 text-white px-5 py-2 rounded-lg font-medium shadow-md shadow-indigo-500/20 transition-all"
+      className="hidden sm:block bg-[#ff914d] hover:bg-[#ff7a28] text-white px-5 py-2 rounded-lg font-medium shadow-md shadow-[0_8px_20px_rgba(255,145,77,0.22)] transition-all"
     >
       Get in Touch
     </button>

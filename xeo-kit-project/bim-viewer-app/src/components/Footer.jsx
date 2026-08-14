@@ -21,7 +21,7 @@ const Footer = () => {
           </div>
 
           <div className="hidden sm:block text-slate-500 dark:text-slate-400 font-medium">
-            &copy; {new Date().getFullYear()} XeoVision Pro. All rights reserved.
+            &copy; {new Date().getFullYear()} High Creation Interiors — Interior BIM. All rights reserved.
           </div>
 
           <div className="flex items-center gap-4">
