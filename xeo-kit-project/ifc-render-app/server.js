@@ -787,66 +787,120 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
   }
 });
 
+
+// ==========================================
+// PROJECT VALIDATION API
+// Used by the frontend on startup to verify
+// whether a saved project still exists.
+// ==========================================
+app.get('/api/projects/:jobId/validate', (req, res) => {
+    try {
+        const { jobId } = req.params;
+        const jobDir = path.join(jobsDir, jobId);
+
+        if (!fs.existsSync(jobDir)) {
+            return res.status(404).json({
+                valid: false,
+                reason: 'PROJECT_NOT_FOUND',
+            });
+        }
+
+        const manifest = readManifest(jobDir);
+
+        if (!manifest) {
+            return res.status(404).json({
+                valid: false,
+                reason: 'MANIFEST_NOT_FOUND',
+            });
+        }
+
+        if (manifest.status === 'archived') {
+            return res.status(409).json({
+                valid: false,
+                reason: 'PROJECT_ARCHIVED',
+            });
+        }
+
+        const originalIfcPath = path.join(jobDir, 'original.ifc');
+
+        if (!fs.existsSync(originalIfcPath)) {
+            return res.status(404).json({
+                valid: false,
+                reason: 'ORIGINAL_IFC_NOT_FOUND',
+            });
+        }
+
+        return res.json({
+            valid: true,
+            jobId,
+            fileName: manifest.originalFileName || path.basename(originalIfcPath),
+            manifest,
+        });
+
+    } catch (error) {
+        console.error('[Project Validate] Error:', error);
+
+        return res.status(500).json({
+            valid: false,
+            reason: 'VALIDATION_ERROR',
+        });
+    }
+});
+
+// ==========================================
+// DELETE / RESET PROJECT API
+// ==========================================
 // ==========================================
 // DELETE / RESET PROJECT API
 // ==========================================
 app.delete('/api/projects/:jobId', (req, res) => {
     try {
-        const oldJobId = req.params.jobId;
-        const oldJobDir = path.join(jobsDir, oldJobId);
+        const jobId = req.params.jobId;
+        const jobDir = path.join(jobsDir, jobId);
 
-        if (!fs.existsSync(oldJobDir)) {
-            return res.status(404).json({ error: `Project ${oldJobId} not found.` });
+        if (!fs.existsSync(jobDir)) {
+            return res.status(404).json({
+                error: `Project ${jobId} not found.`,
+            });
         }
 
-        const oldManifest = readManifest(oldJobDir) || {
-            jobId: oldJobId,
+        const manifest = readManifest(jobDir);
+
+        if (manifest?.status === 'archived') {
+            return res.status(409).json({
+                error: `Project ${jobId} is already archived.`,
+                archivedJobId: jobId,
+            });
+        }
+
+        const nextManifest = manifest || {
+            jobId,
             originalFileName: null,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
-            status: 'active'
+            status: 'active',
         };
 
-        if (oldManifest.status === 'archived') {
-            return res.status(409).json({ error: `Project ${oldJobId} is already archived.`, archivedJobId: oldJobId });
-        }
+        // Mark the current project as archived.
+        nextManifest.status = 'archived';
+        nextManifest.updatedAt = new Date().toISOString();
 
-        oldManifest.status = 'archived';
-        oldManifest.updatedAt = new Date().toISOString();
-        writeManifest(oldJobDir, oldManifest);
+        writeManifest(jobDir, nextManifest);
 
-        const newJobId = generateJobId();
-        const newJobDir = path.join(jobsDir, newJobId);
-        fs.mkdirSync(newJobDir, { recursive: true });
-
-        const oldOriginalPath = path.join(oldJobDir, 'original.ifc');
-        const sourceIfcPath = fs.existsSync(oldOriginalPath)
-            ? oldOriginalPath
-            : path.join(oldJobDir, 'input.ifc');
-
-        if (fs.existsSync(sourceIfcPath)) {
-            fs.copyFileSync(sourceIfcPath, path.join(newJobDir, 'original.ifc'));
-            fs.copyFileSync(sourceIfcPath, path.join(newJobDir, 'input.ifc'));
-        }
-
-        fs.writeFileSync(
-            path.join(newJobDir, 'project_state.json'),
-            JSON.stringify({ materials: {}, furniture: [] }, null, 2)
-        );
-
-        const now = new Date().toISOString();
-        writeManifest(newJobDir, {
-            jobId: newJobId,
-            originalFileName: oldManifest.originalFileName || null,
-            createdAt: now,
-            updatedAt: now,
-            status: 'active'
+        // IMPORTANT:
+        // Do NOT create a replacement project here.
+        // The frontend will clear the current project and open UploadModal.
+        res.json({
+            success: true,
+            archivedJobId: jobId,
         });
 
-        res.json({ success: true, archivedJobId: oldJobId, newJobId });
     } catch (error) {
-        console.error("Reset Error:", error);
-        res.status(500).json({ error: 'Failed to reset project' });
+        console.error('Delete Project Error:', error);
+
+        res.status(500).json({
+            error: 'Failed to delete project',
+        });
     }
 });
 

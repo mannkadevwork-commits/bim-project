@@ -27,7 +27,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const navCubeCanvasRef = useRef(null);
   const viewerRef = useRef(null);
   const loadersRef = useRef({});
-  const ifcLoaderOwnerRef = useRef(null);
   const sectionPlanesRef = useRef(null);
   const currentModelRef = useRef(null);
   const currentPlaneRef = useRef(null);
@@ -368,30 +367,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     });
     measurementsPluginRef.current.setAxisVisible(false);
     
-    let viewerAlive = true;
-
     const initializeIFCEngine = async () => {
       try {
         const ifcAPI = new WebIFC.IfcAPI();
         ifcAPI.SetWasmPath('/');
         await ifcAPI.Init();
-
-        // StrictMode/layout switches can destroy this viewer while WASM init
-        // is still pending. Never attach a loader to a dead/stale viewer.
-        if (!viewerAlive || viewerRef.current !== viewer) return;
-
         loadersRef.current.ifc = new WebIFCLoaderPlugin(viewer, {
           WebIFC: WebIFC,
           IfcAPI: ifcAPI,
         });
-        ifcLoaderOwnerRef.current = viewer;
       } catch (error) {
         console.error('[BIM Engine] Failed to boot IFC Engine.', error);
       }
     };
 
-    viewerRef.current = viewer;
     initializeIFCEngine();
+    viewerRef.current = viewer;
     
     // Clear BOTH object-level and model-level selection. This matters because
     // the scene now contains the native IFC model plus separately loaded
@@ -923,11 +914,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       document.removeEventListener('mousemove', onDocMouseMove);
       document.removeEventListener('mouseup', onDocMouseUp);
       measurementsPluginRef.current = null;
-      viewerAlive = false;
-      ifcLoaderOwnerRef.current = null;
-      loadersRef.current = {};
       viewerRef.current = null;
-      try { viewer.destroy(); } catch (e) {}
+      viewer.destroy();
     };
   }, []);
 
@@ -969,6 +957,15 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     clearScene();
     const fileExtension = fileName.split('.').pop().toLowerCase();
 
+    if (fileExtension === 'ifc') {
+      const formData = new FormData();
+      formData.append('file', file);
+      fetch(`${API_BASE_URL}/api/projects/${jobId}/upload-ifc`, {
+        method: 'POST',
+        body: formData
+      }).catch(err => console.error('[BIM Engine] Backend IFC sync failed:', err));
+    }
+
     setIsLoading(true);
 
     const waitForLoader = async (key) => {
@@ -981,12 +978,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     const loadMainModel = async (buffer) => {
       if (!isCurrentLoad()) return;
-      const loadViewer = viewerRef.current;
-      if (!loadViewer || !loadViewer.scene) {
-        console.error('[BIM Engine] Aborting model load: viewer scene is unavailable.');
-        setIsLoading(false);
-        return;
-      }
 
       const requiredLoader = fileExtension === 'ifc'
         ? 'ifc'
@@ -1010,24 +1001,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
       if (fileExtension === 'ifc' && loadersRef.current.ifc) {
         if (!isCurrentLoad()) return;
-        if (ifcLoaderOwnerRef.current !== loadViewer) {
-          console.error('[BIM Engine] Aborting IFC load: loader belongs to a stale viewer.');
-          setIsLoading(false);
-          return;
-        }
-        try {
-          currentModelRef.current = loadersRef.current.ifc.load({
-            id: 'main_structure',
-            ifc: ifcData,
-            edges: true,
-            globalizeCoordinates: false,
-          });
-        } catch (error) {
-          console.error('[BIM Engine] IFC load failed:', error);
-          currentModelRef.current = null;
-          if (isCurrentLoad()) setIsLoading(false);
-          return;
-        }
+        currentModelRef.current = loadersRef.current.ifc.load({
+          id: 'main_structure',
+          ifc: ifcData,
+          edges: true,
+          globalizeCoordinates: false,
+        });
       } else if (fileExtension === 'xkt' && loadersRef.current.xkt) {
         if (!isCurrentLoad()) return;
         currentModelRef.current = loadersRef.current.xkt.load({
@@ -1050,12 +1029,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         currentModelRef.current.on('destroyed', () => URL.revokeObjectURL(objectUrl));
       } else {
         console.error(`[BIM Engine] No loader for main model type: ${fileExtension}`);
-        setIsLoading(false);
-        return;
-      }
-
-      if (!currentModelRef.current) {
-        console.error('[BIM Engine] Loader did not create main_structure.');
         setIsLoading(false);
         return;
       }

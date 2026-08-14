@@ -9,7 +9,8 @@ import ContactForm from './components/ContactForm';
 import { AlertTriangle } from 'lucide-react';
 
 function ViewerApp() {
-  const [isUploadOpen, setIsUploadOpen] = useState(true);
+  const [isUploadOpen, setIsUploadOpen] = useState(false);
+  const [isBooting, setIsBooting] = useState(true);
   const [isContactOpen, setIsContactOpen] = useState(false);
   
   // NEW: Canonical project state holding { jobId, file, fileName }
@@ -18,31 +19,72 @@ function ViewerApp() {
   const [isResettingProject, setIsResettingProject] = useState(false);
   const [isSwitchingLayout, setIsSwitchingLayout] = useState(false);
 
-  // Resume active project on refresh
+  // Restore a saved project only after the backend confirms that it still exists.
+  // A stale localStorage jobId must never race a new UploadModal selection.
   useEffect(() => {
-    const resumeProject = async () => {
+    let cancelled = false;
+
+    const bootstrapProject = async () => {
+      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
       const saved = localStorage.getItem('hci_active_project');
-      if (saved) {
-        try {
-          const { jobId, fileName } = JSON.parse(saved);
-          const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-          
-          // Reconstruct the File object from the backend's original IFC copy
-          const res = await fetch(`${API_BASE_URL}/jobs/${jobId}/original.ifc`);
-          if (!res.ok) throw new Error('Could not fetch original ifc from backend');
-          
-          const blob = await res.blob();
-          const file = new File([blob], fileName, { type: 'application/octet-stream' });
-          
-          setActiveProject({ jobId, file, fileName });
-          setIsUploadOpen(false);
-        } catch (err) {
-          console.error("[App] Failed to resume project. Starting fresh.", err);
-          localStorage.removeItem('hci_active_project');
+
+      if (!saved) {
+        if (!cancelled) {
+          setActiveProject(null);
+          setIsUploadOpen(true);
+          setIsBooting(false);
         }
+        return;
+      }
+
+      try {
+        const savedProject = JSON.parse(saved);
+        const { jobId, fileName } = savedProject || {};
+        if (!jobId || !fileName) throw new Error('Saved project identity is incomplete.');
+
+        const validationResponse = await fetch(
+          `${API_BASE_URL}/api/projects/${jobId}/validate`,
+          { cache: 'no-store' }
+        );
+
+        if (!validationResponse.ok) {
+          throw new Error(`Saved project validation failed (${validationResponse.status}).`);
+        }
+
+        const validation = await validationResponse.json();
+        if (!validation.valid) {
+          throw new Error(`Saved project is invalid: ${validation.reason || 'unknown reason'}`);
+        }
+
+        const ifcResponse = await fetch(
+          `${API_BASE_URL}/jobs/${jobId}/original.ifc`,
+          { cache: 'no-store' }
+        );
+        if (!ifcResponse.ok) {
+          throw new Error(`Saved project IFC could not be loaded (${ifcResponse.status}).`);
+        }
+
+        const blob = await ifcResponse.blob();
+        const file = new File([blob], fileName, { type: 'application/octet-stream' });
+
+        if (cancelled) return;
+
+        setActiveProject({ jobId, file, fileName });
+        setIsUploadOpen(false);
+      } catch (error) {
+        console.warn('[App] Saved project is stale/unavailable. Returning to UploadModal.', error);
+        if (cancelled) return;
+
+        localStorage.removeItem('hci_active_project');
+        setActiveProject(null);
+        setIsUploadOpen(true);
+      } finally {
+        if (!cancelled) setIsBooting(false);
       }
     };
-    resumeProject();
+
+    bootstrapProject();
+    return () => { cancelled = true; };
   }, []);
 
   const handleProjectUpload = (projectData) => {
@@ -61,62 +103,42 @@ function ViewerApp() {
   const confirmDelete = async () => {
     if (!activeProject?.jobId) {
       setIsDeleteModalOpen(false);
+      localStorage.removeItem('hci_active_project');
+      setActiveProject(null);
+      setIsUploadOpen(true);
       return;
     }
 
-    const { jobId, fileName } = activeProject;
+    const { jobId } = activeProject;
     const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
     setIsDeleteModalOpen(false);
     setIsResettingProject(true);
 
     try {
-      // Backend archives the current project and returns a brand-new jobId.
       const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}`, {
         method: 'DELETE',
       });
 
-      if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({}));
-        throw new Error(errorBody.error || `Project reset failed (${response.status})`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || `Project delete failed (${response.status})`);
       }
 
-      const data = await response.json();
-      if (!data.success || !data.newJobId) {
-        throw new Error('Backend did not return a new project jobId.');
-      }
-
-      const newJobId = data.newJobId;
-      const resIfc = await fetch(`${API_BASE_URL}/jobs/${newJobId}/original.ifc`, {
-        cache: 'no-store',
-      });
-      if (!resIfc.ok) {
-        throw new Error('Fresh project was created, but its original IFC could not be loaded.');
-      }
-
-      const blob = await resIfc.blob();
-      const file = new File([blob], fileName, { type: 'application/octet-stream' });
-
-      // Remove only the old project's browser cache. The backend project itself
-      // is intentionally retained as archived history.
       localStorage.removeItem(`hci_state_${jobId}`);
+      localStorage.removeItem('hci_active_project');
 
-      const nextProject = { jobId: newJobId, file, fileName };
-      localStorage.setItem('hci_active_project', JSON.stringify({
-        jobId: newJobId,
-        fileName,
-      }));
-      setActiveProject(nextProject);
+      // Unmount the viewer before opening the modal so no old loader can keep
+      // running while the next project is being created.
+      setActiveProject(null);
+      setIsUploadOpen(true);
     } catch (error) {
-      console.error('[App] Failed to reset project:', error);
-      // Do not silently pretend reset succeeded. Keep the existing project
-      // active so a failed reset cannot make the UI lose the user's work.
-      alert(`Failed to reset project: ${error.message}`);
+      console.error('[App] Failed to delete project:', error);
+      alert(`Failed to delete project: ${error.message}`);
     } finally {
       setIsResettingProject(false);
     }
   };
-
 
   const handleLayoutReplace = async (layout) => {
     if (!activeProject?.jobId || !layout?.id) return;
@@ -186,14 +208,26 @@ function ViewerApp() {
       )}
 
       <div className="flex-1 relative h-full">
-        <BIMViewer
-          key={activeProject?.jobId || 'no-active-project'}
-          activeProject={activeProject}
-          onDelete={handleDeleteRequest} 
-          onAdd={() => setIsUploadOpen(true)}
-          onReplaceProject={handleLayoutReplace}
-        />
+        {!isBooting && activeProject ? (
+          <BIMViewer
+            key={activeProject.jobId}
+            activeProject={activeProject}
+            onDelete={handleDeleteRequest}
+            onAdd={() => setIsUploadOpen(true)}
+            onReplaceProject={handleLayoutReplace}
+          />
+        ) : null}
       </div>
+
+      {isBooting && (
+        <div className="fixed inset-0 z-[300] flex items-center justify-center bg-slate-950">
+          <div className="text-center">
+            <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-slate-700 border-t-cyan-400 animate-spin" />
+            <p className="text-white font-semibold">Preparing your workspace</p>
+            <p className="mt-1 text-sm text-slate-400">Checking your last project…</p>
+          </div>
+        </div>
+      )}
 
       {!activeProject && <Footer />}
 
@@ -238,7 +272,7 @@ function ViewerApp() {
               <div>
                 <h3 className="text-lg font-bold text-slate-900 dark:text-white">Delete Current Project?</h3>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                  This will reset the current workspace to a fresh copy of the original IFC. Your current project will be archived on the server and kept for future project history.
+                  This will archive the current project and return you to the project start screen. Choose a new layout or upload an IFC to start again.
                 </p>
               </div>
             </div>
