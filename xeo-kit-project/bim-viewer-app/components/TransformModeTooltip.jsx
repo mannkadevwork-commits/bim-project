@@ -58,11 +58,12 @@ export const TransformModeTooltip = ({
           {/* MOVE */}
           <button
             onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => { e.stopPropagation(); handleModeClick('move'); }}
+            onClick={(e) => { e.stopPropagation(); if (!isNative) handleModeClick('move'); }}
+            disabled={isNative}
             className={`relative flex items-center justify-center w-10 h-10 rounded-xl transition-all ${
-              mode === 'move' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50' : 'text-slate-400 hover:bg-slate-800 hover:text-white border border-transparent'
+              isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : mode === 'move' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50' : 'text-slate-400 hover:bg-slate-800 hover:text-white border border-transparent'
             }`}
-            title="Move (W)"
+            title={isNative ? 'Unlock Element first' : 'Move (W)'}
           >
             <Move className="w-5 h-5" />
             {mode === 'move' && <span className="absolute -bottom-1 text-[8px] font-bold text-emerald-500">W</span>}
@@ -71,11 +72,12 @@ export const TransformModeTooltip = ({
           {/* ROTATE */}
           <button
             onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => { e.stopPropagation(); handleModeClick('rotate'); }}
+            onClick={(e) => { e.stopPropagation(); if (!isNative) handleModeClick('rotate'); }}
+            disabled={isNative}
             className={`relative flex items-center justify-center w-10 h-10 rounded-xl transition-all ${
-              mode === 'rotate' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/50' : 'text-slate-400 hover:bg-slate-800 hover:text-white border border-transparent'
+              isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : mode === 'rotate' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/50' : 'text-slate-400 hover:bg-slate-800 hover:text-white border border-transparent'
             }`}
-            title="Rotate (E)"
+            title={isNative ? 'Unlock Element first' : 'Rotate (E)'}
           >
             <RotateCw className="w-5 h-5" />
             {mode === 'rotate' && <span className="absolute -bottom-1 text-[8px] font-bold text-blue-500">E</span>}
@@ -84,11 +86,12 @@ export const TransformModeTooltip = ({
           {/* SCALE / STRETCH */}
           <button
             onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => { e.stopPropagation(); handleScaleClick(); }}
+            onClick={(e) => { e.stopPropagation(); if (!isNative) handleScaleClick(); }}
+            disabled={isNative}
             className={`relative flex items-center justify-center w-10 h-10 rounded-xl transition-all ${
-              isScaleActive ? 'bg-amber-500/20 text-amber-400 border border-amber-500/50' : 'text-slate-400 hover:bg-slate-800 hover:text-white border border-transparent'
+              isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : isScaleActive ? 'bg-amber-500/20 text-amber-400 border border-amber-500/50' : 'text-slate-400 hover:bg-slate-800 hover:text-white border border-transparent'
             }`}
-            title="Scale/Stretch (R)"
+            title={isNative ? 'Unlock Element first' : 'Scale/Stretch (R)'}
           >
             <Scaling className="w-5 h-5" />
             {isScaleActive && <span className="absolute -bottom-1 text-[8px] font-bold text-amber-500">R</span>}
@@ -127,7 +130,7 @@ export const TransformModeTooltip = ({
       <div className="w-3 h-3 bg-slate-900 border-b border-r border-slate-700 transform rotate-45 -mt-1.5 shadow-sm" />
 
       {/* SUB-MENU: Scale Modes (1D, 2D, 3D) */}
-      {isScaleActive && (
+      {isScaleActive && !isNative && (
         <div className="absolute top-full mt-3 flex items-center gap-1 p-1 bg-slate-900 border border-slate-700 rounded-xl shadow-xl animate-in slide-in-from-top-2">
           <button 
             onPointerDown={(e) => e.stopPropagation()}

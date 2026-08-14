@@ -1,29 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import {
-  Move,
-  RotateCw,
-  Scaling,
-  Unlock,
-  MoreHorizontal,
-  Trash2,
-  Palette,
-  ArrowRightLeft,
-  Square,
-  Box,
-  Lock,
-} from 'lucide-react';
+import { Move, RotateCw, Scaling, Unlock, MoreHorizontal, Trash2, Palette, CircleHelp, ArrowUp, RotateCcw } from 'lucide-react';
 
 const QUICK_COLORS = ['#FFFFFF', '#000000', '#E74C3C', '#3498DB', '#F5DEB3', '#7F8C8D'];
 
-/**
- * Stable contextual transform toolbar.
- *
- * Intentional UX contract:
- * - It is NOT anchored to the last mouse click.
- * - It sits in a stable, dock-relative position so it never chases the cursor.
- * - The outer layer does not intercept canvas input; only the actual controls do.
- * - Submenus open upward to stay clear of the bottom dock and viewport edges.
- */
 export const TransformModeTooltip = ({
   mode,
   onModeChange,
@@ -32,320 +11,262 @@ export const TransformModeTooltip = ({
   onColorChange,
   isNative,
   onIsolate,
+  isDarkMode = true,
+  anchorX = 0,
+  anchorY = 0,
 }) => {
-  const [openMenu, setOpenMenu] = useState(null);
-  const [scaleMode, setScaleMode] = useState(
-    mode?.startsWith('stretch-') ? mode : 'stretch-1d'
-  );
+  const [showMore, setShowMore] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [placement, setPlacement] = useState({ left: 0, top: 0, above: true });
   const toolbarRef = useRef(null);
 
-  const isScaleActive = mode?.startsWith('stretch');
-  const isMoveActive = mode === 'move';
-  const isRotateActive = mode === 'rotate';
-
   useEffect(() => {
-    if (mode?.startsWith('stretch-')) {
-      setScaleMode(mode);
-    }
-  }, [mode]);
+    const updatePlacement = () => {
+      const rect = toolbarRef.current?.getBoundingClientRect();
+      if (!rect) return;
 
-  useEffect(() => {
-    const closeOnEscape = (event) => {
-      if (event.key === 'Escape') setOpenMenu(null);
+      // Keep a deliberate breathing room between the cursor and the floating toolbar.
+      const gap = 32;
+      const margin = 12;
+      const width = rect.width;
+      const height = rect.height;
+
+      let left = anchorX + 18;
+      let above = true;
+      let top = anchorY - height - gap;
+
+      if (left + width > window.innerWidth - margin) {
+        left = Math.max(margin, window.innerWidth - width - margin);
+      }
+      if (left < margin) left = margin;
+
+      if (top - height < margin) {
+        above = false;
+        top = anchorY + gap;
+      }
+
+      if (!above && top + height > window.innerHeight - margin) {
+        top = Math.max(margin, window.innerHeight - height - margin);
+      }
+
+      setPlacement({ left, top, above });
     };
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, []);
 
-  const stopCanvasEvent = (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-  };
+    updatePlacement();
+    window.addEventListener('resize', updatePlacement);
+    return () => window.removeEventListener('resize', updatePlacement);
+  }, [anchorX, anchorY, showMore, showHelp, isNative, assetName]);
 
-  const selectMode = (nextMode) => {
-    onModeChange(nextMode);
-    setOpenMenu(null);
-  };
-
-  const handleStretchTrigger = () => {
+  const handleModeClick = (newMode) => {
     if (isNative) return;
-
-    // Stretch is an explicit mode picker, not a cycling button.
-    setOpenMenu((current) => (current === 'stretch' ? null : 'stretch'));
+    onModeChange(newMode);
+    setShowMore(false);
   };
 
-  const handleStretchChoice = (nextMode) => {
-    setScaleMode(nextMode);
-    onModeChange(nextMode);
-    setOpenMenu(null);
-  };
-
-  const handleMore = () => {
-    setOpenMenu((current) => (current === 'more' ? null : 'more'));
+  const buttonClass = (active, tone) => {
+    const tones = {
+      move: active ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-400/40' : 'text-slate-400 hover:text-white hover:bg-white/6',
+      rotate: active ? 'bg-sky-500/15 text-sky-300 ring-1 ring-sky-400/40' : 'text-slate-400 hover:text-white hover:bg-white/6',
+      resize: active ? 'bg-amber-400/15 text-amber-300 ring-1 ring-amber-300/50' : 'text-slate-400 hover:text-white hover:bg-white/6',
+    };
+    return tones[tone];
   };
 
   return (
     <div
-      className="pointer-events-none fixed inset-x-0 bottom-[92px] z-[70] flex justify-center px-4"
-      aria-label="Selected element transform toolbar"
+      ref={toolbarRef}
+      className="fixed z-[120] pointer-events-none"
+      style={{ left: placement.left, top: placement.top }}
+      aria-label="Transform toolbar"
     >
-      <div ref={toolbarRef} className="relative pointer-events-auto">
-        {/* Upward menus — they never sit underneath the bottom dock. */}
-        {openMenu === 'stretch' && !isNative && (
-          <div
-            className="absolute bottom-[calc(100%+10px)] left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-2xl border border-slate-700/80 bg-slate-950/95 p-2 shadow-2xl shadow-black/30 backdrop-blur-xl animate-in slide-in-from-bottom-2 fade-in duration-150"
-            onPointerDown={stopCanvasEvent}
-            onClick={stopCanvasEvent}
+      <div className={`relative ${placement.above ? 'origin-bottom-left' : 'origin-top-left'}`}>
+        <div
+          className="flex items-center gap-1.5 px-2 py-2 rounded-2xl bg-[#0b1322]/96 border border-slate-700/80 shadow-[0_18px_50px_rgba(0,0,0,0.45)] backdrop-blur-2xl pointer-events-auto"
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center gap-2 px-2.5 min-w-0 max-w-[205px]">
+            <div className="min-w-0">
+              <div className="text-[11px] font-semibold text-white truncate" title={assetName}>
+                {assetName || 'Selected element'}
+              </div>
+              <div className="text-[8px] uppercase tracking-[0.17em] text-slate-500 mt-0.5">
+                {isNative ? 'Native element' : 'Editable transform'}
+              </div>
+            </div>
+            <span className={`shrink-0 text-[8px] px-1.5 py-0.5 rounded-md font-bold uppercase tracking-wider ${isNative ? 'bg-indigo-600 text-white' : 'bg-emerald-500/15 text-emerald-300 border border-emerald-400/20'}`}>
+              {isNative ? 'Native' : 'Editable'}
+            </span>
+          </div>
+
+          <div className="w-px h-7 bg-slate-700/70" />
+
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); handleModeClick('move'); }}
+            disabled={isNative}
+            className={`relative flex items-center justify-center w-10 h-10 rounded-xl ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'move', 'move')}`}
+            title={isNative ? 'Unlock Element first' : 'Move · W'}
           >
-            <StretchOption
-              active={scaleMode === 'stretch-1d'}
-              icon={<ArrowRightLeft className="h-4 w-4" />}
-              label="1 Axis"
-              hint="Single-axis stretch"
-              onClick={() => handleStretchChoice('stretch-1d')}
-            />
-            <StretchOption
-              active={scaleMode === 'stretch-2d'}
-              icon={<Square className="h-4 w-4" />}
-              label="2 Axis"
-              hint="Planar stretch"
-              onClick={() => handleStretchChoice('stretch-2d')}
-            />
-            <StretchOption
-              active={scaleMode === 'stretch-3d'}
-              icon={<Box className="h-4 w-4" />}
-              label="3 Axis"
-              hint="Uniform 3-axis stretch"
-              onClick={() => handleStretchChoice('stretch-3d')}
-            />
+            <Move className="w-5 h-5" />
+            <span className="absolute -bottom-0.5 text-[7px] font-bold text-slate-500">W</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); handleModeClick('rotate'); }}
+            disabled={isNative}
+            className={`relative flex items-center justify-center w-10 h-10 rounded-xl ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'rotate', 'rotate')}`}
+            title={isNative ? 'Unlock Element first' : 'Rotate · E'}
+          >
+            <RotateCw className="w-5 h-5" />
+            <span className="absolute -bottom-0.5 text-[7px] font-bold text-slate-500">E</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); handleModeClick('stretch'); }}
+            disabled={isNative}
+            className={`relative flex items-center justify-center w-10 h-10 rounded-xl ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'stretch', 'resize')}`}
+            title={isNative ? 'Unlock Element first' : 'Resize · R'}
+          >
+            <Scaling className="w-5 h-5" />
+            <span className="absolute -bottom-0.5 text-[7px] font-bold text-slate-500">R</span>
+          </button>
+
+          <div className="w-px h-7 bg-slate-700/70 mx-0.5" />
+
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); if (isNative && onIsolate) onIsolate(); }}
+            disabled={!isNative || !onIsolate}
+            className={`flex items-center justify-center w-10 h-10 rounded-xl ${!isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : 'text-slate-300 hover:text-white hover:bg-white/6'}`}
+            title="Unlock Element · U"
+          >
+            <Unlock className="w-4.5 h-4.5" />
+          </button>
+
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); setShowMore((v) => !v); }}
+            className={`flex items-center justify-center w-10 h-10 rounded-xl ${showMore ? 'bg-white/8 text-white' : 'text-slate-400 hover:text-white hover:bg-white/6'}`}
+            title="More options"
+            aria-expanded={showMore}
+          >
+            <MoreHorizontal className="w-5 h-5" />
+          </button>
+
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); setShowHelp((v) => !v); setShowMore(false); }}
+            className={`flex items-center justify-center w-8 h-8 rounded-xl ${showHelp ? 'bg-indigo-500/15 text-indigo-300 ring-1 ring-indigo-400/40' : 'text-slate-500 hover:text-white hover:bg-white/6'}`}
+            title="Transform help"
+            aria-label="Transform help"
+            aria-expanded={showHelp}
+          >
+            <CircleHelp className="w-4 h-4" />
+          </button>
+        </div>
+
+        {showHelp && (
+          <div
+            className={`absolute right-0 w-[286px] p-3 rounded-2xl backdrop-blur-2xl border shadow-[0_18px_50px_rgba(0,0,0,0.5)] pointer-events-auto ${placement.above ? 'bottom-full mb-2' : 'top-full mt-2'} ${isDarkMode ? 'bg-[#07111d]/98 border-slate-700 text-slate-200' : 'bg-white/98 border-slate-200 text-slate-700'}`}
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className={`text-[9px] font-bold uppercase tracking-[0.15em] mb-3 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+              Transform controls
+            </div>
+            <div className="space-y-2.5">
+              <HelpRow tone="move" icon={<Move className="w-4 h-4" />} title="Move" text="Drag the colored arrows. Small translucent planes move on two axes." isDarkMode={isDarkMode} />
+              <HelpRow tone="rotate" icon={<RotateCw className="w-4 h-4" />} title="Rotate" text="Drag the circular arrow on the left or right side of the object. The highlighted arrow shows the active rotation direction." isDarkMode={isDarkMode} />
+              <div className="rounded-xl border border-slate-700/60 bg-slate-900/40 p-2.5">
+                <HelpRow tone="resize" icon={<Scaling className="w-4 h-4" />} title="Resize" text="Choose Resize, then drag the grip that matches the dimensions you want to change." isDarkMode={isDarkMode} />
+                <div className="grid grid-cols-3 gap-1.5 mt-2.5">
+                  <div className="rounded-lg border border-red-400/20 bg-red-500/5 px-2 py-1.5 text-center">
+                    <div className="mx-auto mb-1 w-3 h-3 rounded-sm border-2 border-red-300" />
+                    <div className="text-[8px] font-semibold text-slate-200">FACE</div>
+                    <div className="text-[7px] text-slate-500">1 axis</div>
+                  </div>
+                  <div className="rounded-lg border border-violet-400/20 bg-violet-500/5 px-2 py-1.5 text-center">
+                    <div className="mx-auto mb-1 w-3 h-3 rotate-45 border-2 border-violet-300" />
+                    <div className="text-[8px] font-semibold text-slate-200">EDGE</div>
+                    <div className="text-[7px] text-slate-500">2 axes</div>
+                  </div>
+                  <div className="rounded-lg border border-fuchsia-400/20 bg-fuchsia-500/5 px-2 py-1.5 text-center">
+                    <div className="mx-auto mb-1 w-3 h-3 rounded-full border-2 border-fuchsia-300" />
+                    <div className="text-[8px] font-semibold text-slate-200">CORNER</div>
+                    <div className="text-[7px] text-slate-500">3 axes</div>
+                  </div>
+                </div>
+              </div>
+              <HelpRow tone="unlock" icon={<Unlock className="w-4 h-4" />} title="Unlock" text="Convert a native IFC element into an editable isolated object." isDarkMode={isDarkMode} />
+            </div>
           </div>
         )}
 
-        {openMenu === 'more' && (
+        {showMore && (
           <div
-            className="absolute bottom-[calc(100%+10px)] right-0 w-56 rounded-2xl border border-slate-700/80 bg-slate-950/95 p-3 shadow-2xl shadow-black/30 backdrop-blur-xl animate-in slide-in-from-bottom-2 fade-in duration-150"
-            onPointerDown={stopCanvasEvent}
-            onClick={stopCanvasEvent}
+            className={`absolute right-0 w-56 p-3 rounded-2xl bg-[#0b1322]/98 border border-slate-700 shadow-[0_18px_50px_rgba(0,0,0,0.5)] backdrop-blur-2xl pointer-events-auto ${placement.above ? 'bottom-full mb-2' : 'top-full mt-2'}`}
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
           >
             {onColorChange && (
               <div>
-                <div className="mb-2 text-[9px] font-bold uppercase tracking-[0.16em] text-slate-500">
-                  Quick Paint
-                </div>
+                <div className="text-[9px] font-bold text-slate-500 uppercase tracking-[0.15em] mb-2">Quick Paint</div>
                 <div className="flex items-center gap-2">
-                  {QUICK_COLORS.map((hex) => (
+                  {QUICK_COLORS.map(hex => (
                     <button
                       key={hex}
                       type="button"
-                      title={`Paint ${hex}`}
-                      onPointerDown={stopCanvasEvent}
-                      onClick={(event) => {
-                        stopCanvasEvent(event);
-                        onColorChange(hex);
-                        setOpenMenu(null);
-                      }}
-                      className="h-6 w-6 rounded-full border border-slate-600 shadow-sm transition-transform hover:scale-110"
+                      onClick={(e) => { e.stopPropagation(); onColorChange(hex); setShowMore(false); }}
+                      className="w-5 h-5 rounded-full border border-slate-600 hover:scale-110 transition-transform"
                       style={{ backgroundColor: hex }}
+                      title={hex}
                     />
                   ))}
-                  <label
-                    className="relative flex h-6 w-6 cursor-pointer items-center justify-center overflow-hidden rounded-full border border-slate-600 bg-slate-900"
-                    title="Custom color"
-                    onPointerDown={stopCanvasEvent}
-                  >
-                    <Palette className="pointer-events-none h-3.5 w-3.5 text-slate-400" />
+                  <label className="relative w-5 h-5 rounded-full border border-slate-600 hover:scale-110 transition-transform overflow-hidden cursor-pointer" title="Custom color">
+                    <Palette className="w-3 h-3 text-slate-400 absolute inset-0 m-auto pointer-events-none" />
                     <input
                       type="color"
-                      className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-                      onChange={(event) => {
-                        onColorChange(event.target.value);
-                        setOpenMenu(null);
-                      }}
+                      className="absolute inset-0 opacity-0 w-full h-full cursor-pointer"
+                      onChange={(e) => { onColorChange(e.target.value); setShowMore(false); }}
                     />
                   </label>
                 </div>
               </div>
             )}
-
+            {onColorChange && onDelete && <div className="w-full h-px bg-slate-800 my-3" />}
             {onDelete && (
-              <>
-                {onColorChange && <div className="my-3 h-px bg-slate-800" />}
-                <button
-                  type="button"
-                  onPointerDown={stopCanvasEvent}
-                  onClick={(event) => {
-                    stopCanvasEvent(event);
-                    onDelete();
-                    setOpenMenu(null);
-                  }}
-                  className="flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-semibold text-rose-400 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
-                >
-                  <Trash2 className="h-4 w-4" />
-                  Delete element
-                </button>
-              </>
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onDelete(); setShowMore(false); }}
+                className="w-full flex items-center gap-2 px-2 py-2 rounded-lg text-xs font-semibold text-rose-400 hover:bg-rose-500/10 hover:text-rose-300"
+              >
+                <Trash2 className="w-3.5 h-3.5" /> Delete Element
+              </button>
             )}
           </div>
         )}
 
-        {/* Main contextual toolbar */}
-        <div className="relative overflow-hidden rounded-2xl border border-slate-700/80 bg-slate-950/95 shadow-[0_14px_40px_rgba(0,0,0,0.36)] backdrop-blur-2xl">
-          <div className="flex items-center gap-1 px-2 py-2">
-            {/* Selection identity */}
-            <div className="min-w-0 max-w-[210px] px-2.5 py-1.5">
-              <div className="truncate text-[11px] font-semibold tracking-wide text-slate-100">
-                {assetName || 'Selected element'}
-              </div>
-              <div className="mt-0.5 flex items-center gap-1.5">
-                <span className="text-[8px] uppercase tracking-[0.16em] text-slate-500">
-                  {isNative ? 'Native Element' : 'Transform'}
-                </span>
-                {isNative ? (
-                  <span className="rounded-md bg-indigo-500/15 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-indigo-300">
-                    Native
-                  </span>
-                ) : (
-                  <span className="rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-emerald-300">
-                    Editable
-                  </span>
-                )}
-              </div>
-            </div>
-
-            <div className="mx-1 h-8 w-px bg-slate-800" />
-
-            <ToolbarButton
-              icon={<Move className="h-[18px] w-[18px]" />}
-              label="Move"
-              shortcut="W"
-              active={isMoveActive}
-              disabled={isNative}
-              tone="emerald"
-              onClick={() => selectMode('move')}
-              title={isNative ? 'Unlock Element first' : 'Move (W)'}
-            />
-
-            <ToolbarButton
-              icon={<RotateCw className="h-[18px] w-[18px]" />}
-              label="Rotate"
-              shortcut="E"
-              active={isRotateActive}
-              disabled={isNative}
-              tone="blue"
-              onClick={() => selectMode('rotate')}
-              title={isNative ? 'Unlock Element first' : 'Rotate (E)'}
-            />
-
-            <ToolbarButton
-              icon={<Scaling className="h-[18px] w-[18px]" />}
-              label="Stretch"
-              shortcut="R"
-              active={isScaleActive || openMenu === 'stretch'}
-              disabled={isNative}
-              tone="amber"
-              onClick={handleStretchTrigger}
-              title={isNative ? 'Unlock Element first' : 'Stretch (R)'}
-            />
-
-            <div className="mx-1 h-8 w-px bg-slate-800" />
-
-            <ToolbarButton
-              icon={<Unlock className="h-4 w-4" />}
-              label="Unlock"
-              shortcut="U"
-              active={false}
-              disabled={!isNative || !onIsolate}
-              tone="neutral"
-              onClick={onIsolate}
-              title={isNative ? 'Unlock element (U)' : 'Already unlocked'}
-            />
-
-            <button
-              type="button"
-              onPointerDown={stopCanvasEvent}
-              onClick={(event) => {
-                stopCanvasEvent(event);
-                handleMore();
-              }}
-              className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border text-slate-400 transition-all hover:border-slate-600 hover:bg-slate-800/80 hover:text-white ${openMenu === 'more' ? 'border-slate-600 bg-slate-800 text-white' : 'border-transparent'}`}
-              title="More options"
-              aria-label="More options"
-              aria-expanded={openMenu === 'more'}
-            >
-              <MoreHorizontal className="h-5 w-5" />
-            </button>
-          </div>
-
-          {/* Tiny visual connector toward the viewport content, not the cursor. */}
-          <div className="absolute -bottom-1.5 left-1/2 h-3 w-3 -translate-x-1/2 rotate-45 border-b border-r border-slate-700/80 bg-slate-950" />
-        </div>
+        <div
+          className={`absolute w-3 h-3 rotate-45 bg-[#0b1322] border-slate-700/80 ${placement.above ? 'left-5 -bottom-1.5 border-r border-b' : 'left-5 -top-1.5 border-l border-t'}`}
+          aria-hidden="true"
+        />
       </div>
     </div>
   );
 };
 
-function ToolbarButton({ icon, label, shortcut, active, disabled, tone, onClick, title }) {
-  const toneClasses = {
-    emerald: active
-      ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
-      : 'border-transparent text-slate-400 hover:border-emerald-500/20 hover:bg-slate-800 hover:text-emerald-300',
-    blue: active
-      ? 'border-blue-500/40 bg-blue-500/15 text-blue-300'
-      : 'border-transparent text-slate-400 hover:border-blue-500/20 hover:bg-slate-800 hover:text-blue-300',
-    amber: active
-      ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
-      : 'border-transparent text-slate-400 hover:border-amber-500/20 hover:bg-slate-800 hover:text-amber-300',
-    neutral: active
-      ? 'border-slate-600 bg-slate-800 text-white'
-      : 'border-transparent text-slate-400 hover:border-slate-600 hover:bg-slate-800 hover:text-white',
-  };
-
+function HelpRow({ tone, icon, title, text, isDarkMode }) {
+  const toneClass = { move: 'text-emerald-400 bg-emerald-500/10 border-emerald-400/20', rotate: 'text-sky-400 bg-sky-500/10 border-sky-400/20', resize: 'text-amber-400 bg-amber-500/10 border-amber-400/20', unlock: 'text-slate-400 bg-slate-500/10 border-slate-500/20' }[tone];
   return (
-    <button
-      type="button"
-      onPointerDown={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      }}
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        if (!disabled) onClick?.();
-      }}
-      disabled={disabled}
-      className={`group relative flex h-11 min-w-11 shrink-0 flex-col items-center justify-center rounded-xl border px-2 transition-all ${toneClasses[tone]} ${disabled ? 'cursor-not-allowed opacity-35' : 'cursor-pointer'}`}
-      title={title}
-      aria-label={title}
-    >
-      {icon}
-      <span className="pointer-events-none absolute -bottom-0.5 text-[7px] font-bold uppercase tracking-wider opacity-0 transition-opacity group-hover:opacity-70">
-        {shortcut}
-      </span>
-      <span className="pointer-events-none sr-only">{label}</span>
-    </button>
-  );
-}
-
-function StretchOption({ active, icon, label, hint, onClick }) {
-  return (
-    <button
-      type="button"
-      onPointerDown={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      }}
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        onClick();
-      }}
-      className={`flex min-w-[112px] flex-col items-start rounded-xl border px-3 py-2 transition-all ${active ? 'border-amber-500/40 bg-amber-500/10 text-amber-300' : 'border-transparent text-slate-400 hover:border-slate-700 hover:bg-slate-800/80 hover:text-slate-200'}`}
-    >
-      <span className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider">
-        {icon}
-        {label}
-      </span>
-      <span className="mt-1 text-[8px] text-slate-500">{hint}</span>
-    </button>
+    <div className="flex gap-2.5 items-start">
+      <div className={`w-8 h-8 shrink-0 rounded-lg border flex items-center justify-center ${toneClass}`}>{icon}</div>
+      <div className="min-w-0">
+        <div className={`text-[11px] font-semibold ${isDarkMode ? 'text-white' : 'text-slate-800'}`}>{title}</div>
+        <div className={`text-[10px] leading-[1.35] mt-0.5 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{text}</div>
+      </div>
+    </div>
   );
 }

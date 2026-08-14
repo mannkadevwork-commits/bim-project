@@ -222,30 +222,29 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   useEffect(() => { transformModeRef.current = transformMode; }, [transformMode]);
 
   const configureTransformHandles = (mode) => {
-    // 1. Resolve base mode vs sub-mode
-    const baseMode = mode?.startsWith('stretch') ? 'stretch' : mode;
-    const stretchSubMode = mode?.startsWith('stretch') ? mode : null;
+    // Resize is a single user-facing tool. The handle itself determines
+    // whether the operation is 1-axis (face), 2-axis (edge), or 3-axis
+    // (corner). There is deliberately no stretch-1d/2d/3d UI state.
+    const baseMode = mode === 'stretch' ? 'stretch' : mode;
 
     stretchHandlesRef.current.forEach(mesh => {
       const meta = mesh._stretchMeta;
       if (!meta) return;
 
-      // 2. Hide everything by default
       let active = false;
 
-      if (!mode) {
-         active = false;
-      } else if (meta.transformMode === 'move' && baseMode === 'move') {
-         active = true;
+      if (meta.transformMode === 'move' && baseMode === 'move') {
+        active = true;
       } else if (meta.transformMode === 'rotate' && baseMode === 'rotate') {
-         active = true;
+        active = true;
       } else if (meta.transformMode === 'stretch' && baseMode === 'stretch') {
-         // 3. ONLY show meshes belonging to the active sub-mode
-         if (stretchSubMode === 'stretch-1d' && meta.type === 'face') active = true;
-         if (stretchSubMode === 'stretch-2d' && meta.type === 'corner2d' && meta.axes?.length === 2) active = true;
-         if (stretchSubMode === 'stretch-3d' && meta.type === 'corner3d' && meta.axes?.length === 3) active = true;
+        // Industry-style Resize: expose the semantic grip types together.
+        // Face = one axis, edge/corner2d = two axes, corner3d = three axes.
+        active = meta.type === 'face' || meta.type === 'corner2d' || meta.type === 'corner3d';
       }
 
+      // Only expose the active transform family. The selected object stays clean
+      // until the user explicitly chooses Move / Rotate / Resize.
       mesh.visible = active;
       mesh.pickable = active && meta.type !== 'rotateRing';
     });
@@ -298,6 +297,30 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     viewer.cameraControl.smartPivot = true;
     viewer.cameraControl.doublePickFlyTo = false;
     viewer.scene.camera.project.fov = 65;
+
+    // Modern BIM selection treatment: preserve the asset's real materials
+    // and show a subtle cool outline/tint instead of xeokit's default
+    // opaque green selection wash. This keeps furniture readable while
+    // making the active object obvious.
+    const selectionMaterial = viewer.scene.selectedMaterial;
+    selectionMaterial.fill = true;
+    selectionMaterial.fillColor = [0.39, 0.45, 0.98];
+    selectionMaterial.fillAlpha = 0.06;
+    selectionMaterial.edges = true;
+    selectionMaterial.edgeColor = [0.39, 0.45, 0.98];
+    selectionMaterial.edgeAlpha = 0.95;
+    selectionMaterial.edgeWidth = 2;
+    selectionMaterial.glowThrough = false;
+
+    // Hover/preselection stays lighter than a committed selection.
+    const highlightMaterial = viewer.scene.highlightMaterial;
+    highlightMaterial.fill = false;
+    highlightMaterial.edges = true;
+    highlightMaterial.edgeColor = [0.43, 0.75, 1.0];
+    highlightMaterial.edgeAlpha = 0.9;
+    highlightMaterial.edgeWidth = 1.5;
+    highlightMaterial.glowThrough = false;
+
     viewer.camera.eye = [-3.93, 2.85, 27.01];
     viewer.camera.look = [4.4, 3.72, 8.89];
     viewer.camera.up = [-0.01, 0.99, 0.039];
@@ -415,9 +438,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         
         buildStretchHandlesRef.current?.(stretchCtx, entity.model.id, true);
         
-        transformModeRef.current = 'move';
-        setTransformMode('move');
-        setTimeout(() => configureTransformHandles('move'), 0);
+        transformModeRef.current = 'select';
+        setTransformMode('select');
+        setTimeout(() => configureTransformHandles('select'), 0);
         
         const assetMetaObject = viewer.metaScene.metaObjects[entity.id];
         const furnitureItem = (projectStateRef.current.furniture || [])
@@ -475,8 +498,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       if (entity.model) entity.model.selected = false;
       entity.selected = true;
       destroyStretchHandlesRef.current?.(stretchCtx);
-      transformModeRef.current = 'move';
-      setTransformMode('move');
+      transformModeRef.current = 'select';
+      setTransformMode('select');
       
       const metaObject = viewer.metaScene.metaObjects[entity.id];
       if (metaObject) {
@@ -509,14 +532,16 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     const canvas = canvasRef.current;
     
     const onCanvasMouseDown = (e) => {
-      const canvasPos = [e.offsetX, e.offsetY];
+      const rect = canvas.getBoundingClientRect();
+      const canvasPos = [e.clientX - rect.left, e.clientY - rect.top];
       const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
       const meta = pick?.entity?._stretchMeta;
       
       if (!meta?.isStretchHandle) return;
       
       const mode = transformModeRef.current;
-      if (meta.transformMode !== mode) return;
+      const baseMetaMode = mode === 'stretch' ? 'stretch' : mode;
+      if (meta.transformMode !== baseMetaMode) return;
       
       e.stopPropagation();
       e.preventDefault();
@@ -578,11 +603,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         
         isStretchingRef.current = true;
         setIsStretching(true);
-        setActiveStretchData({ label: 'Rotate', x: e.clientX, y: e.clientY });
+        canvas.style.cursor = 'grabbing';
+        setActiveStretchData({ label: 'Rotate • drag around the arrow', x: e.clientX, y: e.clientY });
         return;
       }
 
-      if (mode?.startsWith('stretch') && (type === 'face' || type === 'corner2d' || type === 'corner3d')) {
+      if (mode === 'stretch' && (type === 'face' || type === 'corner2d' || type === 'corner3d')) {
         const rotationY = ((targetObj.rotation?.[1] || 0) * Math.PI) / 180;
         const c = Math.cos(rotationY);
         const sn = Math.sin(rotationY);
@@ -778,6 +804,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       isStretchingRef.current = false;
       setIsStretching(false);
       setActiveStretchData(null);
+      canvas.style.cursor = '';
       viewer.cameraControl.active = true;
 
       buildStretchHandlesRef.current?.(stretchCtx, dragData.targetId, dragData.isAsset);
@@ -797,14 +824,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           hideTimeoutRef.current = null;
         }
         
-        if (meta.type === 'face') {
-          const { axis, dir } = meta.axes[0];
-          const faceKey = `${axis}_${dir}`;
-          if (revealedFaceKeyRef.current !== faceKey) {
-            hideRevealedGroup(revealedFaceKeyRef, revealedHandlesRef, stretchAnimFramesRef);
-            revealGroupForFace(faceKey, stretchFaceAdjacencyRef, revealedFaceKeyRef, revealedHandlesRef, stretchAnimFramesRef);
-          }
-        }
+        // All resize grips remain available. Hover only highlights the grip;
+        // it does not reveal/hide another grip family.
         
         if (hoveredStretchMeshRef.current !== pick.entity) {
           resetHoveredStretchHandle(hoveredStretchMeshRef, stretchAnimFramesRef);
@@ -812,8 +833,15 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           const hoverColor = brightenColor(meta.color);
           pick.entity.material.diffuse = hoverColor;
           pick.entity.material.emissive = hoverColor;
-          
-          animateHandleTo(pick.entity, stretchAnimFramesRef, { opacity: 1, scale: STRETCH_HANDLE_HOVER_SCALE });
+
+          // Rotation arrow geometry is positioned in world space. Scaling the
+          // mesh around the scene origin makes the arrowhead appear to jump.
+          // Rotation controls therefore use color/opacity feedback only.
+          if (meta.type === 'rotate') {
+            pick.entity.material.opacity = Math.min(1, (meta.restOpacity ?? 0.78) + 0.15);
+          } else {
+            animateHandleTo(pick.entity, stretchAnimFramesRef, { opacity: 1, scale: STRETCH_HANDLE_HOVER_SCALE });
+          }
           hoveredStretchMeshRef.current = pick.entity;
         }
         
@@ -828,12 +856,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         }
         canvas.style.cursor = '';
 
-        if (revealedFaceKeyRef.current && !hideTimeoutRef.current) {
-          hideTimeoutRef.current = setTimeout(() => {
-            hideRevealedGroup(revealedFaceKeyRef, revealedHandlesRef, stretchAnimFramesRef);
-            hideTimeoutRef.current = null;
-          }, 1200); 
-        }
       }
     };
     
@@ -1149,7 +1171,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       destroyStretchHandles: () => destroyStretchHandles(stretchCtx),
       setStretchPersistCallback: (fn) => { stretchPersistCallbackRef.current = fn; },
       setTransformMode: (mode) => {
-        if (!['move', 'rotate', 'stretch', 'stretch-1d', 'stretch-2d', 'stretch-3d'].includes(mode)) return;
+        if (!['select', 'move', 'rotate', 'stretch'].includes(mode)) return;
         transformModeRef.current = mode;
         setTransformMode(mode);
       },

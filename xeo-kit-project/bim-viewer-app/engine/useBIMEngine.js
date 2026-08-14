@@ -39,6 +39,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
   // Hard rendering boundary lock
   const isModelLoadedRef = useRef(false);
+  // Prevent stale async FileReader/loader work from creating duplicate main models.
+  // React StrictMode intentionally mounts effects twice in development; without
+  // a generation guard both readers can finish and both can create
+  // `main_structure`, leaving two copies of the IFC in the viewer.
+  const mainLoadGenerationRef = useRef(0);
 
   const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
   const [isLoading, setIsLoading] = useState(false);
@@ -130,41 +135,75 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
    if (state.furniture) {
       state.furniture.forEach(item => {
-        // ADDED: Check the loadingModelsRef lock
-        if (!viewerRef.current.scene.models[item.instanceId] && !loadingModelsRef.current.has(item.instanceId)) {
-          
-          // Set the lock to prevent duplicate spawns during rapid state updates (e.g., moving)
-          loadingModelsRef.current.add(item.instanceId);
-          
-          loadIFCAssetIntoScene(
-            loadersRef,
-            globalScaleFactorRef,
-            item.instanceId,
-            item.src,
-            item.position,
-            item.rotation,
-            {
-              fileType: item.fileType || item.file_type,
-              scale: item.scale || [1, 1, 1],
-            }
-          ).then(() => {
-            // Release lock on success
-            loadingModelsRef.current.delete(item.instanceId);
-          }).catch(error => {
-            // Release lock on error
-            loadingModelsRef.current.delete(item.instanceId);
-            console.error('[BIM Engine] Failed to restore asset:', item.instanceId, error);
-          });
-        }
+        if (!item?.instanceId || !item?.src) return;
+
+        // A furniture/ghost model can be created by a live user action (for
+        // example Unlock/Isolate) and then immediately added to projectState.
+        // The projectState effect will run again after that state update. Never
+        // create a second xeokit model for an instance that already exists or
+        // is currently being loaded.
+        if (viewerRef.current.scene.models[item.instanceId]) return;
+        if (loadingModelsRef.current.has(item.instanceId)) return;
+
+        loadingModelsRef.current.add(item.instanceId);
+
+        const isNativeIsolation = !!item.isNativeIsolation;
+
+        // Native-isolated IFCs already contain the element in its original
+        // IFC/world coordinate space. Passing item.position as targetPosition
+        // would run the generic AABB-to-floor placement correction and move the
+        // isolated wall. Load these at model origin, then restore their model
+        // transform exactly as persisted.
+        const targetPosition = isNativeIsolation ? null : (item.position || [0, 0, 0]);
+
+        loadIFCAssetIntoScene(
+          loadersRef,
+          globalScaleFactorRef,
+          item.instanceId,
+          item.src,
+          targetPosition,
+          item.rotation || [0, 0, 0],
+          {
+            fileType: item.fileType || item.file_type,
+            scale: item.scale || [1, 1, 1],
+            nativeSourceId: item.nativeSourceId || item.id || null,
+          }
+        ).then((model) => {
+          loadingModelsRef.current.delete(item.instanceId);
+          if (!model) return;
+
+          if (isNativeIsolation) {
+            model.position = [...(item.position || [0, 0, 0])];
+            model.rotation = [...(item.rotation || [0, 0, 0])];
+            model.scale = [...(item.scale || [1, 1, 1])];
+          }
+        }).catch(error => {
+          loadingModelsRef.current.delete(item.instanceId);
+          console.error('[BIM Engine] Failed to restore asset:', item.instanceId, error);
+        });
       });
     }
 
     if (state.structural_edits) {
       Object.entries(state.structural_edits).forEach(([entityId, edit]) => {
-        const entity = viewerRef.current.scene.objects[entityId];
+        // Resolve the native entity specifically from the original model. The
+        // isolated IFC can contain the same GlobalId, so scene.objects[id] is
+        // not sufficient once an element has been unlocked.
+        const entity = currentModelRef.current
+          ? Object.values(viewerRef.current.scene.objects || {})
+              .find(object => object?.id === entityId && object.model === currentModelRef.current)
+          : null;
         if (!entity) return;
-        if (edit.scale) entity.scale = edit.scale;
-        if (edit.offset) entity.offset = edit.offset;
+
+        // Native structural edits belong only to the original IFC model.
+        // Never apply them to an unlocked ghost.
+        // The current viewer does not enable Entity#offset, so the isolated
+        // editing workflow intentionally does not consume native offset data.
+        if (edit.scale) {
+          try { entity.scale = edit.scale; } catch (error) {
+            console.warn('[NativeEdit] Ignoring unsupported native scale:', entityId, error);
+          }
+        }
         if (edit.visible === false) entity.visible = false;
       });
     }
@@ -183,28 +222,36 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   useEffect(() => { transformModeRef.current = transformMode; }, [transformMode]);
 
   const configureTransformHandles = (mode) => {
-    // 1. Resolve base mode vs sub-mode
     const baseMode = mode?.startsWith('stretch') ? 'stretch' : mode;
     const stretchSubMode = mode?.startsWith('stretch') ? mode : null;
+
+    // Full reset first. This prevents previous Move/Rotate/Stretch gizmos
+    // from remaining visible or pickable when the user changes mode.
+    stretchHandlesRef.current.forEach(mesh => {
+      const meta = mesh._stretchMeta;
+      if (!meta) return;
+      mesh.visible = false;
+      mesh.pickable = false;
+    });
 
     stretchHandlesRef.current.forEach(mesh => {
       const meta = mesh._stretchMeta;
       if (!meta) return;
 
-      // 2. Hide everything by default
       let active = false;
 
-      if (!mode) {
-         active = false;
-      } else if (meta.transformMode === 'move' && baseMode === 'move') {
-         active = true;
-      } else if (meta.transformMode === 'rotate' && baseMode === 'rotate') {
-         active = true;
-      } else if (meta.transformMode === 'stretch' && baseMode === 'stretch') {
-         // 3. ONLY show meshes belonging to the active sub-mode
-         if (stretchSubMode === 'stretch-1d' && meta.type === 'face') active = true;
-         if (stretchSubMode === 'stretch-2d' && meta.type === 'corner2d' && meta.axes?.length === 2) active = true;
-         if (stretchSubMode === 'stretch-3d' && meta.type === 'corner2d' && meta.axes?.length === 3) active = true;
+      if (baseMode === 'move' && meta.transformMode === 'move') {
+        active = true;
+      } else if (baseMode === 'rotate' && meta.transformMode === 'rotate') {
+        active = true;
+      } else if (baseMode === 'stretch' && meta.transformMode === 'stretch') {
+        if (stretchSubMode === 'stretch-1d') {
+          active = meta.type === 'face';
+        } else if (stretchSubMode === 'stretch-2d') {
+          active = meta.type === 'corner2d' && meta.axes?.length === 2;
+        } else if (stretchSubMode === 'stretch-3d') {
+          active = meta.type === 'corner3d' && meta.axes?.length === 3;
+        }
       }
 
       mesh.visible = active;
@@ -215,6 +262,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       selectionCageRef.current.visible = baseMode === 'stretch';
     }
   };
+
 
   useEffect(() => {
     configureTransformHandles(transformMode);
@@ -433,7 +481,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       // the id against every model and can match unintended objects.
       clearSelection();
       setSelectedAssetId(null);
-      selectedAssetIdRef.current = null;
       if (entity.model) entity.model.selected = false;
       entity.selected = true;
       destroyStretchHandlesRef.current?.(stretchCtx);
@@ -463,8 +510,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           id: entity.id,
           name: metaObject.name || 'Unnamed Object',
           type: metaObject.type || 'Generic Component',
-          groupedProperties: groupedProps,
-          offset: entity.offset || [0, 0, 0] 
+          groupedProperties: groupedProps
         });
       }
     });
@@ -472,21 +518,37 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     const canvas = canvasRef.current;
     
     const onCanvasMouseDown = (e) => {
-      const canvasPos = [e.offsetX, e.offsetY];
+      const rect = canvas.getBoundingClientRect();
+      const canvasPos = [e.clientX - rect.left, e.clientY - rect.top];
       const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
       const meta = pick?.entity?._stretchMeta;
       
       if (!meta?.isStretchHandle) return;
-      
-      const mode = transformModeRef.current;
-      if (meta.transformMode !== mode) return;
-      
+
+      // A transform gizmo owns the mouse gesture. Disable navigation before
+      // any mode-specific validation so camera orbit/pan cannot start.
       e.stopPropagation();
       e.preventDefault();
       viewer.cameraControl.active = false;
+      
+      const mode = transformModeRef.current;
+      // Stretch UI uses sub-modes (stretch-1d/2d/3d), while every handle
+      // carries the shared base transformMode = 'stretch'.
+      const baseMode = mode?.startsWith('stretch') ? 'stretch' : mode;
+      if (meta.transformMode !== baseMode) {
+        viewer.cameraControl.active = true;
+        return;
+      }
       const { targetId, isAsset, type, axes } = meta;
       
-      const targetObj = isAsset ? viewer.scene.models[targetId] : viewer.scene.objects[targetId];
+      // Native IFC elements are intentionally NOT transform targets. They must
+      // first go through Unlock -> isolated asset before Move/Rotate/Stretch.
+      if (!isAsset) {
+        viewer.cameraControl.active = true;
+        return;
+      }
+
+      const targetObj = viewer.scene.models[targetId];
       if (!targetObj) return;
 
       if (mode === 'move' && type === 'move') {
@@ -538,7 +600,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         return;
       }
 
-      if (mode === 'stretch' && (type === 'face' || type === 'corner2d')) {
+      if (mode?.startsWith('stretch') && (type === 'face' || type === 'corner2d' || type === 'corner3d')) {
         const rotationY = ((targetObj.rotation?.[1] || 0) * Math.PI) / 180;
         const c = Math.cos(rotationY);
         const sn = Math.sin(rotationY);
@@ -635,11 +697,34 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         while (delta < -180) delta += 360;
         
         let nextRotation = dragData.startRotationY + delta;
-        if (nextRotation < 0) nextRotation += 360;
+        while (nextRotation < 0) nextRotation += 360;
         nextRotation = nextRotation % 360;
-        
-        const currentRotation = targetObj.rotation ? [...targetObj.rotation] : [0, 0, 0];
-        targetObj.rotation = [currentRotation[0], nextRotation, currentRotation[2]];
+
+        const pivot = targetObj._transformPivot?.local;
+        if (pivot && dragData.isAsset && targetObj.position) {
+          const scale = targetObj.scale || [1, 1, 1];
+          const scaledLocal = [
+            pivot[0] * (scale[0] || 1),
+            pivot[1] * (scale[1] || 1),
+            pivot[2] * (scale[2] || 1),
+          ];
+          const oldRot = targetObj.rotation?.[1] || 0;
+          const currentPivot = [
+            targetObj.position[0] + scaledLocal[0] * Math.cos(oldRot * Math.PI / 180) - scaledLocal[2] * Math.sin(oldRot * Math.PI / 180),
+            targetObj.position[1] + scaledLocal[1],
+            targetObj.position[2] + scaledLocal[0] * Math.sin(oldRot * Math.PI / 180) + scaledLocal[2] * Math.cos(oldRot * Math.PI / 180),
+          ];
+          const nr = nextRotation * Math.PI / 180;
+          targetObj.rotation = [targetObj.rotation?.[0] || 0, nextRotation, targetObj.rotation?.[2] || 0];
+          targetObj.position = [
+            currentPivot[0] - (scaledLocal[0] * Math.cos(nr) - scaledLocal[2] * Math.sin(nr)),
+            currentPivot[1] - scaledLocal[1],
+            currentPivot[2] - (scaledLocal[0] * Math.sin(nr) + scaledLocal[2] * Math.cos(nr)),
+          ];
+        } else {
+          const currentRotation = targetObj.rotation ? [...targetObj.rotation] : [0, 0, 0];
+          targetObj.rotation = [currentRotation[0], nextRotation, currentRotation[2]];
+        }
         
         setActiveStretchData({ label: `Rotate: ${nextRotation.toFixed(1)}°`, x: e.clientX, y: e.clientY });
         return;
@@ -813,6 +898,16 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   useEffect(() => {
     if (!viewerRef.current) return;
 
+    const generation = ++mainLoadGenerationRef.current;
+    let cancelled = false;
+    let activeReader = null;
+
+    const isCurrentLoad = () => (
+      !cancelled &&
+      generation === mainLoadGenerationRef.current &&
+      !!viewerRef.current
+    );
+
     const clearScene = () => {
       if (viewerRef.current && viewerRef.current.scene) {
         Object.keys(viewerRef.current.scene.models).forEach(id => {
@@ -854,6 +949,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     };
 
     const loadMainModel = async (buffer) => {
+      if (!isCurrentLoad()) return;
+
       const requiredLoader = fileExtension === 'ifc'
         ? 'ifc'
         : fileExtension === 'xkt'
@@ -863,14 +960,19 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             : null;
 
       if (requiredLoader && !(await waitForLoader(requiredLoader))) {
-        console.error(`[BIM Engine] Timed out waiting for ${requiredLoader} loader.`);
-        setIsLoading(false);
+        if (isCurrentLoad()) {
+          console.error(`[BIM Engine] Timed out waiting for ${requiredLoader} loader.`);
+          setIsLoading(false);
+        }
         return;
       }
+
+      if (!isCurrentLoad()) return;
 
       const ifcData = new Uint8Array(buffer);
 
       if (fileExtension === 'ifc' && loadersRef.current.ifc) {
+        if (!isCurrentLoad()) return;
         currentModelRef.current = loadersRef.current.ifc.load({
           id: 'main_structure',
           ifc: ifcData,
@@ -878,12 +980,14 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           globalizeCoordinates: false,
         });
       } else if (fileExtension === 'xkt' && loadersRef.current.xkt) {
+        if (!isCurrentLoad()) return;
         currentModelRef.current = loadersRef.current.xkt.load({
           id: 'main_structure',
           xkt: buffer,
           edges: true,
         });
       } else if ((fileExtension === 'glb' || fileExtension === 'gltf') && loadersRef.current.gltf) {
+        if (!isCurrentLoad()) return;
         const objectUrl = URL.createObjectURL(new Blob([buffer], {
           type: fileExtension === 'glb' ? 'model/gltf-binary' : 'model/gltf+json',
         }));
@@ -902,6 +1006,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       }
 
       currentModelRef.current.on('loaded', async () => {
+        if (!isCurrentLoad()) {
+          try { currentModelRef.current?.destroy(); } catch (e) {}
+          return;
+        }
+
         viewerRef.current.cameraFlight.flyTo(currentModelRef.current);
         
         setIsLoading(false);
@@ -916,9 +1025,30 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     };
 
     const reader = new FileReader();
-    reader.onload = (e) => loadMainModel(e.target.result);
+    activeReader = reader;
+    reader.onload = (e) => {
+      if (!isCurrentLoad()) return;
+      loadMainModel(e.target.result);
+    };
+    reader.onerror = () => {
+      if (isCurrentLoad()) {
+        setIsLoading(false);
+        console.error('[BIM Engine] Failed to read IFC/model file.');
+      }
+    };
     reader.readAsArrayBuffer(file);
-  }, [jobId, file]);
+
+    return () => {
+      cancelled = true;
+      if (activeReader && activeReader.readyState === FileReader.LOADING) {
+        try { activeReader.abort(); } catch (e) {}
+      }
+      // Invalidate any loader work that is still awaiting a plugin or model event.
+      if (generation === mainLoadGenerationRef.current) {
+        mainLoadGenerationRef.current += 1;
+      }
+    };
+  }, [jobId, file, fileName]);
 
   const toggleXRay = () => {
     const scene = viewerRef.current.scene;
@@ -954,7 +1084,13 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   };
 
   const assetCtx = {
-    activeProject, viewerRef, loadersRef, globalScaleFactorRef, setSelectedAssetId, setSelectedObject
+    activeProject,
+    viewerRef,
+    loadersRef,
+    globalScaleFactorRef,
+    loadingModelsRef,
+    setSelectedAssetId,
+    setSelectedObject,
   };
 
   buildStretchHandlesRef.current = buildStretchHandles;
@@ -1014,7 +1150,16 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       updateNativeOffset: (id, ax, val) => updateNativeOffset(viewerRef, id, ax, val),
       updateDynamicTransform: (id, t, ax, val) => updateDynamicTransform(viewerRef, id, t, ax, val),
       updateStructuralTransform: (id, t, ax, val) => updateStructuralTransform(viewerRef, id, t, ax, val),
-      isolateAndMakeMoveable: (e, onA, uSE) => isolateAndMakeMoveable(assetCtx, e, onA, uSE),
+      isolateAndMakeMoveable: async (e, onA, uSE) => {
+        const instanceId = await isolateAndMakeMoveable(assetCtx, e, onA, uSE);
+        if (instanceId && viewerRef.current?.scene.models[instanceId]) {
+          destroyStretchHandlesRef.current?.(stretchCtx);
+          buildStretchHandlesRef.current?.(stretchCtx, instanceId, true);
+          transformModeRef.current = 'move';
+          setTransformMode('move');
+        }
+        return instanceId;
+      },
       inspectNativeElement: (e) => inspectNativeElement(activeProject, e),
       getCursorWorldPosition: (c) => getCursorWorldPosition(viewerRef, c),
       setIsLoading,
@@ -1022,8 +1167,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       destroyStretchHandles: () => destroyStretchHandles(stretchCtx),
       setStretchPersistCallback: (fn) => { stretchPersistCallbackRef.current = fn; },
       setTransformMode: (mode) => {
-        if (!['move', 'rotate', 'stretch'].includes(mode)) return;
+        if (!['move', 'rotate', 'stretch', 'stretch-1d', 'stretch-2d', 'stretch-3d'].includes(mode)) return;
         transformModeRef.current = mode;
+        configureTransformHandles(mode);
         setTransformMode(mode);
       },
     },

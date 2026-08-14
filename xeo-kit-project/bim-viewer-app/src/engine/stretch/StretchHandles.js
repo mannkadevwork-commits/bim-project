@@ -246,84 +246,119 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
     }
   });
 
-  const ROTATION_COLOR = [0.13, 0.82, 0.93]; // Cyan
-  
+  // Modern rotate UX: two directional circular-arrow controls at the
+  // left and right of the selected object. The existing drag math still
+  // performs the Y-axis rotation; only the visual affordance changes here.
+  const ROTATION_COLOR = [0.13, 0.58, 0.95];
+  const ROTATION_HOVER = [0.25, 0.78, 1.0];
   const radiusX = (xMax - xMin) / 2;
   const radiusZ = (zMax - zMin) / 2;
-  const radius = Math.max(radiusX, radiusZ) + 0.35; 
-  
-  const circlePositions = [];
-  const circleIndices = [];
-  const segments = 64; 
+  const radius = Math.max(radiusX, radiusZ) + 0.42;
+  const ringY = cy;
+  const segments = 28;
 
-  for (let i = 0; i < segments; i++) {
-      const theta = (i / segments) * Math.PI * 2;
-      circlePositions.push(cx + Math.cos(theta) * radius, yMin + 0.02, cz + Math.sin(theta) * radius);
-      circleIndices.push(i, (i + 1) % segments);
-  }
+  const createRotateArc = (startDeg, endDeg, id) => {
+    const positions = [];
+    const indices = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const theta = (startDeg + (endDeg - startDeg) * t) * Math.PI / 180;
+      positions.push(
+        cx + Math.cos(theta) * radius,
+        ringY,
+        cz + Math.sin(theta) * radius,
+      );
+      if (i < segments) indices.push(i, i + 1);
+    }
 
-  const rotLine = new Mesh(viewer.scene, {
-      id: `sh_${ts}_rot_ring`,
+    const mesh = new Mesh(viewer.scene, {
+      id,
       geometry: new ReadableGeometry(viewer.scene, {
-          primitive: "lines",
-          positions: circlePositions,
-          indices: circleIndices
+        primitive: 'lines',
+        positions,
+        indices,
       }),
       material: new PhongMaterial(viewer.scene, {
-          emissive: ROTATION_COLOR,
-          lineWidth: 3
+        emissive: ROTATION_COLOR,
+        lineWidth: 4,
+        opacity: 0.78,
       }),
-      pickable: false,
-      collidable: false
-  });
-  
-  rotLine._stretchMeta = {
-    isStretchHandle: true,
-    type: 'rotateRing',
-    transformMode: 'rotate',
-    targetId: entityId,
-    isAsset,
-  };
-  stretchHandlesRef.current.push(rotLine);
-
-  const grips = [
-  { pos: [cx + radius, yMin + 0.02, cz], rot: [0, 0, 0] },
-  { pos: [cx - radius, yMin + 0.02, cz], rot: [0, 180, 0] },
-  { pos: [cx, yMin + 0.02, cz + radius], rot: [0, 90, 0] },
-  { pos: [cx, yMin + 0.02, cz - radius], rot: [0, -90, 0] }
-];
-
-  grips.forEach((grip, idx) => {
-    const rotMesh = new Mesh(viewer.scene, {
-        id: `sh_${ts}_rot_grip_${idx}`,
-        // Using a slightly longer, thinner box to imply direction along the ring
-        geometry: new ReadableGeometry(viewer.scene, buildBoxGeometry({
-            xSize: 0.18, ySize: 0.02, zSize: 0.06,
-        })),
-        material: new PhongMaterial(viewer.scene, {
-            diffuse: ROTATION_COLOR,
-            emissive: ROTATION_COLOR,
-            opacity: 0.9,
-        }),
-        position: grip.pos,
-        rotation: grip.rot, // Align the grip with the curve of the circle
-        visible: true,
-        pickable: true,
+      pickable: true,
+      collidable: false,
+      visible: true,
     });
-      rotMesh._stretchMeta = {
-          isStretchHandle: true,
-          type: 'rotate',
-          transformMode: 'rotate',
-          axes: [],
-          targetId: entityId,
-          isAsset,
-          color: ROTATION_COLOR,
-          restOpacity: 0.8
-      };
-      stretchHandlesRef.current.push(rotMesh);
-  });
 
-  const MOVE_HANDLE_COLOR = [1, 0.78, 0.2]; // Amber
+    mesh._stretchMeta = {
+      isStretchHandle: true,
+      type: 'rotate',
+      transformMode: 'rotate',
+      axes: [],
+      targetId: entityId,
+      isAsset,
+      color: ROTATION_COLOR,
+      hoverColor: ROTATION_HOVER,
+      restOpacity: 0.78,
+    };
+    stretchHandlesRef.current.push(mesh);
+    return mesh;
+  };
+
+  const createRotateArrow = (angleDeg, direction, id) => {
+    const theta = angleDeg * Math.PI / 180;
+    const x = cx + Math.cos(theta) * radius;
+    const z = cz + Math.sin(theta) * radius;
+    const tangent = [-Math.sin(theta) * direction, Math.cos(theta) * direction];
+    const normal = [Math.cos(theta), Math.sin(theta)];
+    const tip = [x + tangent[0] * 0.16, ringY + 0.012, z + tangent[1] * 0.16];
+    const base = [x - tangent[0] * 0.07, ringY + 0.012, z - tangent[1] * 0.07];
+    const wing = 0.08;
+    const p1 = [base[0] + normal[0] * wing, base[1], base[2] + normal[1] * wing];
+    const p2 = [base[0] - normal[0] * wing, base[1], base[2] - normal[1] * wing];
+
+    const mesh = new Mesh(viewer.scene, {
+      id,
+      geometry: new ReadableGeometry(viewer.scene, {
+        primitive: 'triangles',
+        positions: [
+          tip[0], tip[1], tip[2],
+          p1[0], p1[1], p1[2],
+          p2[0], p2[1], p2[2],
+        ],
+        indices: [0, 1, 2],
+      }),
+      material: new PhongMaterial(viewer.scene, {
+        diffuse: ROTATION_COLOR,
+        emissive: ROTATION_COLOR,
+        opacity: 0.98,
+      }),
+      pickable: true,
+      collidable: false,
+      visible: true,
+    });
+
+    mesh._stretchMeta = {
+      isStretchHandle: true,
+      type: 'rotate',
+      transformMode: 'rotate',
+      axes: [],
+      targetId: entityId,
+      isAsset,
+      color: ROTATION_COLOR,
+      hoverColor: ROTATION_HOVER,
+      restOpacity: 0.98,
+    };
+    stretchHandlesRef.current.push(mesh);
+  };
+
+  // Two opposite circular arrows communicate: "drag here to rotate".
+  createRotateArc(200, 335, `sh_${ts}_rot_left_arc`);
+  createRotateArrow(335, +1, `sh_${ts}_rot_left_arrow`);
+  createRotateArc(25, 160, `sh_${ts}_rot_right_arc`);
+  createRotateArrow(160, -1, `sh_${ts}_rot_right_arrow`);
+
+  // Keep the currently approved Move affordance unchanged; only the
+  // rotation visual is being redesigned in this pass.
+  const MOVE_HANDLE_COLOR = [1, 0.78, 0.2];
   const moveHandle = new Mesh(viewer.scene, {
       id: `sh_${ts}_move`,
       geometry: new ReadableGeometry(viewer.scene, buildBoxGeometry({
@@ -349,4 +384,5 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
       restOpacity: 0.85,
   };
   stretchHandlesRef.current.push(moveHandle);
+
 };

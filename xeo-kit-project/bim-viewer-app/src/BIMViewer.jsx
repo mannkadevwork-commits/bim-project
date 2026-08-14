@@ -10,6 +10,8 @@ import { MeasurementPanel } from './components/MeasurementPanel';
 import { StretchTooltipOverlay } from './components/StretchTooltipOverlay';
 import { TransformModeTooltip } from './components/TransformModeTooltip';
 import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
+import { ViewportToolbar } from './components/ViewportToolbar';
+import { TransformModesHelp } from './components/TransformModesHelp';
 import { AssetContextMenu } from './components/AssetContextMenu';
 import { useCatalog } from './hooks/useCatalog';
 
@@ -24,6 +26,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [isManualSaving, setIsManualSaving] = useState(false);
+  const [lastClickPos, setLastClickPos] = useState({ x: 0, y: 0 });
 
   // Add the useCatalog hook call[cite: 1]
   const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
@@ -187,8 +190,20 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     }
   };
 
-  const handlePointerDown = () => {
+  const handlePointerDown = (e) => {
     refs.canvasRef.current?.focus();
+
+    const canvas = refs.canvasRef.current;
+    if (!canvas || !refs.viewerRef.current) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const canvasPos = [e.clientX - rect.left, e.clientY - rect.top];
+    const picked = refs.viewerRef.current.scene.pick({ canvasPos, pickSurface: false });
+
+    // Do not move the contextual toolbar when interacting with a transform gizmo.
+    if (picked?.entity?._stretchMeta?.isStretchHandle) return;
+
+    setLastClickPos({ x: e.clientX, y: e.clientY });
   };
 
   const handlePointerUp = (e) => {
@@ -281,6 +296,42 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
         ${engineState.isStretching ? (engineState.transformMode === 'move' ? 'cursor-move' : engineState.transformMode === 'rotate' ? 'cursor-grabbing' : 'cursor-ew-resize') : engineState.placementMode || engineState.isMeasuring ? 'cursor-crosshair' : 'cursor-default'}
         ${isFullscreen ? 'z-[100]' : ''}`}
     >
+      {file && (
+        <>
+          <div
+            className={`absolute top-[64px] z-[45] transition-all duration-200 ${isLeftPanelOpen ? 'left-[336px]' : 'left-4'}`}
+          >
+            <TransformModesHelp isDarkMode={isDarkMode} />
+          </div>
+
+          <ViewportToolbar
+          isMeasuring={engineState.isMeasuring}
+          isClipping={engineState.isClipping}
+          isMaxView={isMaxView}
+          isFullscreen={isFullscreen}
+          navMode={engineState.navMode}
+          onSelect={() => {
+            engineActions.setPlacementMode(null);
+            if (engineState.isMeasuring) engineActions.toggleMeasurementMode();
+            if (engineState.isClipping) engineActions.toggleClipping();
+            engineActions.setTransformMode('select');
+          }}
+          onNavMode={(next) => engineActions.setNavMode(next)}
+          onMeasure={() => engineActions.toggleMeasurementMode()}
+          onClip={() => engineActions.toggleClipping()}
+          onMaxView={toggleMaxView}
+          onFullscreen={toggleBrowserFullscreen}
+          onFit={() => {
+            const viewer = refs.viewerRef.current;
+            if (viewer) {
+              const mainModel = viewer.scene.models?.main_structure;
+              if (mainModel) viewer.cameraFlight.flyTo(mainModel);
+            }
+          }}
+          />
+        </>
+      )}
+
       <div 
         ref={tooltipRef}
         className="fixed z-[999] pointer-events-none hidden px-3 py-2 bg-slate-900/95 backdrop-blur-xl border border-slate-700/50 rounded-xl shadow-2xl transition-opacity duration-75 text-xs font-mono"
@@ -302,7 +353,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           mode={engineState.transformMode}
           onModeChange={engineActions.setTransformMode}
           assetName={activeAsset?.name || engineState.selectedObject?.name || 'Selected element'}
+          anchorX={lastClickPos.x}
+          anchorY={lastClickPos.y}
           isNative={!!engineState.selectedObject && !activeAsset}
+          isDarkMode={isDarkMode}
           onIsolate={() => {
             if (engineState.selectedObject && !activeAsset) {
               engineActions.isolateAndMakeMoveable(
@@ -351,7 +405,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           onDrop={handleDrop}
           style={{ width: '100%', height: '100%', display: 'block', outline: 'none', touchAction: 'none' }}
         />
-        <canvas id="myNavCubeCanvas" ref={refs.navCubeCanvasRef} className="absolute bottom-16 right-6 z-10 w-[150px] h-[150px]" />
+        <div
+          className={`absolute bottom-[88px] z-20 w-[176px] h-[176px] rounded-full border backdrop-blur-xl shadow-2xl flex items-center justify-center transition-all duration-200 ${isRightPanelOpen ? 'right-[294px]' : 'right-5'} ${isDarkMode ? 'bg-[#07111d]/72 border-slate-700/70 shadow-black/35' : 'bg-white/76 border-slate-200 shadow-slate-900/10'}`}
+          aria-label="View orientation"
+        >
+          <div className={`absolute inset-[8px] rounded-full border ${isDarkMode ? 'border-slate-800/80' : 'border-slate-200/80'}`} />
+          <canvas id="myNavCubeCanvas" ref={refs.navCubeCanvasRef} className="relative z-10 w-[150px] h-[150px]" />
+        </div>
       </div>
 
       {engineState.placementMode && !engineState.isMeasuring && (
