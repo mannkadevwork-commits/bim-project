@@ -30,7 +30,7 @@ export class NavigationPipeline {
     }
 
     console.log(`[NavigationPipeline] Extracting geometry from ${outputGlbPath}`);
-    const { soup, triangleLabels } = await GeometryExtractor.extractWithLabels(outputGlbPath);
+    const soup = await GeometryExtractor.extract(outputGlbPath);
 
     if (soup.indices.length === 0) {
       console.warn(
@@ -43,12 +43,7 @@ export class NavigationPipeline {
     console.log(
       `[NavigationPipeline] Generating NavMesh from ${soup.indices.length / 3} triangles`
     );
-    const navMeshResult = await NavMeshGenerator.generate(
-      soup,
-      { injectSyntheticFloor: false },
-      path.basename(jobDirectory),
-      triangleLabels,
-    );
+    const navMeshResult = await NavMeshGenerator.generate(soup);
 
     if (!navMeshResult.success || !navMeshResult.navMesh || !navMeshResult.surface) {
       console.warn(
@@ -59,7 +54,10 @@ export class NavigationPipeline {
     }
 
     console.log("[NavigationPipeline] Building viewpoint graph from NavMesh");
-    const nodes: NavNode[] = GraphBuilder.build(navMeshResult.navMesh);
+    const nodes: NavNode[] = await GraphBuilder.build(
+      navMeshResult.navMesh,
+      navMeshResult.surface
+    );
 
     const stats = GraphValidator.validate(nodes);
     GraphValidator.logSummary(stats);

@@ -2,23 +2,6 @@ import { API_BASE_URL } from '../utils/constants';
 
 const nativeIsolationInFlight = new Set();
 
-const resolveAssetFormat = (srcUrl, options = {}) => {
-  const explicit = String(
-    options.assetFormat ||
-    options.fileType ||
-    options.file_type ||
-    ''
-  ).trim().toLowerCase();
-
-  if (explicit === 'glb' || explicit === 'gltf') return 'glb';
-  if (explicit === 'ifc') return 'ifc';
-
-  const cleanSrc = String(srcUrl || '').split('?')[0].split('#')[0].toLowerCase();
-  if (cleanSrc.endsWith('.glb') || cleanSrc.endsWith('.gltf')) return 'glb';
-
-  return 'ifc';
-};
-
 export const loadIFCAssetIntoScene = async (
   loadersRef,
   globalScaleFactorRef,
@@ -28,94 +11,6 @@ export const loadIFCAssetIntoScene = async (
   rotation,
   options = {}
 ) => {
-  const assetFormat = resolveAssetFormat(srcUrl, options);
-
-  if (assetFormat === 'glb') {
-    if (!loadersRef.current.gltf) {
-      throw new Error('GLTF loader is not initialized.');
-    }
-
-    try {
-      // GLTFLoaderPlugin loads GLB/GLTF from src directly. Do not send a GLB
-      // through WebIFCLoaderPlugin - that is what caused the xeokit
-      // "reading 'arguments'" failure for GLB catalog doors.
-      const assetModel = loadersRef.current.gltf.load({
-        id: instanceId,
-        src: srcUrl,
-        edges: true,
-      });
-
-      // Keep the same asset marker and transform/persistence contract used by
-      // IFC catalog assets. Existing callers can continue to use this function.
-      assetModel._assetMeta = {
-        instanceId,
-        fileType: 'glb',
-        assetFormat: 'glb',
-        srcUrl,
-      };
-
-      const applyLoadedTransform = () => {
-        const userScale = Array.isArray(options.scale) && options.scale.length === 3
-          ? options.scale
-          : [1, 1, 1];
-
-        const safeRotation = Array.isArray(rotation) && rotation.length === 3
-          ? rotation
-          : [0, 0, 0];
-
-        // Match the existing IFC asset contract exactly: scale + rotation first,
-        // then use the post-transform AABB to honor the persisted target position.
-        assetModel.scale = [...userScale];
-        assetModel.rotation = [...safeRotation];
-
-        if (Array.isArray(targetPosition) && targetPosition.length === 3) {
-          const aabb = assetModel.aabb;
-          if (aabb && aabb.length >= 6) {
-            const centerX = (aabb[0] + aabb[3]) / 2;
-            const centerZ = (aabb[2] + aabb[5]) / 2;
-            const bottomY = aabb[1];
-            assetModel.position = [
-              targetPosition[0] - centerX,
-              targetPosition[1] - bottomY,
-              targetPosition[2] - centerZ,
-            ];
-          } else {
-            assetModel.position = [...targetPosition];
-          }
-        }
-
-        if (typeof options.onLoaded === 'function') {
-          options.onLoaded(assetModel);
-        }
-
-        if (typeof options.onPlaced === 'function') {
-          const persistedTarget = Array.isArray(targetPosition) && targetPosition.length === 3
-            ? [...targetPosition]
-            : [...assetModel.position];
-          options.onPlaced(instanceId, persistedTarget, assetModel);
-        }
-      };
-
-      assetModel.on('loaded', applyLoadedTransform);
-      assetModel.on('error', (error) => {
-        console.error('[BIM Engine] GLB asset load failure:', {
-          instanceId,
-          srcUrl,
-          error,
-        });
-      });
-
-      return assetModel;
-    } catch (error) {
-      console.error('[BIM Engine] GLB placement failure:', {
-        instanceId,
-        srcUrl,
-        error,
-      });
-      throw error;
-    }
-  }
-
   if (!loadersRef.current.ifc) return null;
 
   try {
@@ -123,6 +18,7 @@ export const loadIFCAssetIntoScene = async (
     if (!response.ok) throw new Error(`Asset fetch failed (${response.status})`);
 
     const buffer = await response.arrayBuffer();
+    const fileType = options.fileType || 'ifc';
     const assetModel = loadersRef.current.ifc.load({
       id: instanceId,
       ifc: new Uint8Array(buffer),
@@ -134,8 +30,7 @@ export const loadIFCAssetIntoScene = async (
     // editable asset and the original/native IFC model. Do not infer this from IDs.
     assetModel._assetMeta = {
       instanceId,
-      fileType: 'ifc',
-      assetFormat: 'ifc',
+      fileType,
       srcUrl,
     };
 

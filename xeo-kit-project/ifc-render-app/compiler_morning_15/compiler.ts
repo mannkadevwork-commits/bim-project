@@ -2,11 +2,11 @@ import * as fs from "fs";
 import * as path from "path";
 import { IfcAPI } from "web-ifc";
 import { Document, NodeIO, Node as GltfNode, Primitive } from "@gltf-transform/core";
+import * as THREE from "three";
 
 import { extractGeometry } from "./geometry";
 import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
 import { fileURLToPath, pathToFileURL } from "url";
-import { NavigationPipeline } from "./NavigationPipeline";
 
 enum AssetType {
   STRUCTURAL_REPLACEMENT = "structural_replacement",
@@ -267,6 +267,321 @@ function applyAuthoredTransform(
     rotation: item.rotation,
     scale,
   });
+}
+
+const NAV_GRID_SPACING = 0.8;
+const NAV_EYE_HEIGHT = 1.6;
+const NAV_FLOOR_DIST_MAX = 2.0;
+const NAV_FLOOR_DIST_MIN = 1.0;
+const NAV_WALL_CLEARANCE = 0.4;
+const NAV_LINK_RADIUS = 1.5;
+const NAV_DOORWAY_SEARCH_RADIUS = 2.5;
+const NAV_HORIZONTAL_RAY_COUNT = 8;
+const NAV_LOS_EPSILON = 0.05;
+
+interface NavNode {
+  id: string;
+  position: [number, number, number];
+  links: Set<string>;
+}
+
+function extractTriangleSoup(doc: Document): {
+  positions: Float32Array;
+  indices: Uint32Array;
+} {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  let vertexOffset = 0;
+
+  function visit(node: GltfNode, parentMatrix: THREE.Matrix4) {
+    const localMatrix = new THREE.Matrix4().fromArray(node.getMatrix());
+    const worldMatrix = parentMatrix.clone().multiply(localMatrix);
+
+    const mesh = node.getMesh();
+    if (mesh) {
+      for (const primitive of mesh.listPrimitives()) {
+        if (primitive.getMode() !== Primitive.Mode.TRIANGLES) continue;
+
+        const positionAccessor = primitive.getAttribute("POSITION");
+        if (!positionAccessor) continue;
+
+        const posArray = positionAccessor.getArray();
+        if (!posArray) continue;
+
+        const vertexCount = positionAccessor.getCount();
+        const tempVec = new THREE.Vector3();
+
+        for (let i = 0; i < vertexCount; i++) {
+          tempVec.set(posArray[i * 3], posArray[i * 3 + 1], posArray[i * 3 + 2]);
+          tempVec.applyMatrix4(worldMatrix);
+          positions.push(tempVec.x, tempVec.y, tempVec.z);
+        }
+
+        const indexAccessor = primitive.getIndices();
+        if (indexAccessor) {
+          const idxArray = indexAccessor.getArray();
+          if (idxArray) {
+            for (let i = 0; i < idxArray.length; i++) {
+              indices.push(vertexOffset + idxArray[i]);
+            }
+          }
+        } else {
+          for (let i = 0; i < vertexCount; i++) {
+            indices.push(vertexOffset + i);
+          }
+        }
+
+        vertexOffset += vertexCount;
+      }
+    }
+
+    for (const child of node.listChildren()) {
+      visit(child, worldMatrix);
+    }
+  }
+
+  for (const scene of doc.getRoot().listScenes()) {
+    for (const child of scene.listChildren()) {
+      visit(child, new THREE.Matrix4());
+    }
+  }
+
+  return {
+    positions: Float32Array.from(positions),
+    indices: Uint32Array.from(indices),
+  };
+}
+
+function buildCollisionMesh(doc: Document): THREE.Mesh {
+  const { positions, indices } = extractTriangleSoup(doc);
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  geometry.computeBoundingBox();
+
+  return new THREE.Mesh(geometry);
+}
+
+function findConnectedComponents(nodes: NavNode[]): Map<string, number> {
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const componentOf = new Map<string, number>();
+  let nextComponentId = 0;
+
+  for (const node of nodes) {
+    if (componentOf.has(node.id)) continue;
+
+    const queue: string[] = [node.id];
+    componentOf.set(node.id, nextComponentId);
+
+    while (queue.length > 0) {
+      const currentId = queue.shift()!;
+      const current = nodeById.get(currentId)!;
+      for (const neighborId of current.links) {
+        if (!componentOf.has(neighborId)) {
+          componentOf.set(neighborId, nextComponentId);
+          queue.push(neighborId);
+        }
+      }
+    }
+
+    nextComponentId++;
+  }
+
+  return componentOf;
+}
+
+async function generateDenseNavigationGraph(
+  doc: Document,
+  jobDirectory: string
+): Promise<void> {
+  const outputPath = path.join(jobDirectory, "navigation.json");
+  const mesh = buildCollisionMesh(doc);
+  const geometry = mesh.geometry as THREE.BufferGeometry;
+  const bbox = geometry.boundingBox;
+
+  if (!bbox || !geometry.getAttribute("position") || geometry.getAttribute("position").count === 0) {
+    console.warn("[navigation] No collidable geometry found, writing empty navigation.json");
+    fs.writeFileSync(outputPath, "[]");
+    return;
+  }
+
+  const raycaster = new THREE.Raycaster();
+  const downDirection = new THREE.Vector3(0, -1, 0);
+  const survivors: NavNode[] = [];
+  let nodeCounter = 1;
+
+  for (let x = bbox.min.x; x <= bbox.max.x; x += NAV_GRID_SPACING) {
+    for (let z = bbox.min.z; z <= bbox.max.z; z += NAV_GRID_SPACING) {
+      const candidate = new THREE.Vector3(x, NAV_EYE_HEIGHT, z);
+
+      raycaster.set(candidate, downDirection);
+      raycaster.far = Infinity;
+      const floorHits = raycaster.intersectObject(mesh);
+      if (floorHits.length === 0) continue;
+
+      const floorDistance = floorHits[0].distance;
+      if (floorDistance > NAV_FLOOR_DIST_MAX || floorDistance < NAV_FLOOR_DIST_MIN) continue;
+
+      let blockedByWall = false;
+      for (let i = 0; i < NAV_HORIZONTAL_RAY_COUNT; i++) {
+        const angle = (i / NAV_HORIZONTAL_RAY_COUNT) * Math.PI * 2;
+        const dir = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
+        raycaster.set(candidate, dir);
+        raycaster.far = NAV_WALL_CLEARANCE;
+        const wallHits = raycaster.intersectObject(mesh);
+        if (wallHits.length > 0) {
+          blockedByWall = true;
+          break;
+        }
+      }
+      if (blockedByWall) continue;
+
+      survivors.push({
+        id: `vp_${nodeCounter++}`,
+        position: [candidate.x, NAV_EYE_HEIGHT, candidate.z],
+        links: new Set<string>(),
+      });
+    }
+  }
+
+  function hasLineOfSight(
+    a: [number, number, number],
+    b: [number, number, number]
+  ): boolean {
+    const origin = new THREE.Vector3(a[0], a[1], a[2]);
+    const target = new THREE.Vector3(b[0], b[1], b[2]);
+    const delta = target.clone().sub(origin);
+    const distance = delta.length();
+    if (distance <= NAV_LOS_EPSILON) return true;
+
+    delta.normalize();
+    raycaster.set(origin, delta);
+    raycaster.far = distance - NAV_LOS_EPSILON;
+    const hits = raycaster.intersectObject(mesh);
+    return hits.length === 0;
+  }
+
+  for (let i = 0; i < survivors.length; i++) {
+    for (let j = i + 1; j < survivors.length; j++) {
+      const a = survivors[i];
+      const b = survivors[j];
+      const dx = a.position[0] - b.position[0];
+      const dz = a.position[2] - b.position[2];
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist > NAV_LINK_RADIUS) continue;
+
+      if (hasLineOfSight(a.position, b.position)) {
+        a.links.add(b.id);
+        b.links.add(a.id);
+      }
+    }
+  }
+
+  function bridgeAcrossComponents(
+    searchRadius: number,
+    requireLineOfSight: boolean
+  ): boolean {
+    const componentOf = findConnectedComponents(survivors);
+    if (new Set(componentOf.values()).size <= 1) return false;
+
+    let bridgedAny = false;
+
+    for (let i = 0; i < survivors.length; i++) {
+      for (let j = i + 1; j < survivors.length; j++) {
+        const a = survivors[i];
+        const b = survivors[j];
+        if (componentOf.get(a.id) === componentOf.get(b.id)) continue;
+
+        const dx = a.position[0] - b.position[0];
+        const dz = a.position[2] - b.position[2];
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist > searchRadius) continue;
+
+        if (requireLineOfSight && !hasLineOfSight(a.position, b.position)) continue;
+
+        a.links.add(b.id);
+        b.links.add(a.id);
+        bridgedAny = true;
+      }
+    }
+
+    return bridgedAny;
+  }
+
+  let doorwayPasses = 0;
+  while (
+    bridgeAcrossComponents(NAV_DOORWAY_SEARCH_RADIUS, true) &&
+    doorwayPasses < survivors.length
+  ) {
+    doorwayPasses++;
+  }
+
+  let forcedPasses = 0;
+  while (forcedPasses < survivors.length) {
+    const componentOf = findConnectedComponents(survivors);
+    const componentIds = new Set(componentOf.values());
+    if (componentIds.size <= 1) break;
+    forcedPasses++;
+
+    const componentSizes = new Map<number, number>();
+    for (const c of componentOf.values()) {
+      componentSizes.set(c, (componentSizes.get(c) ?? 0) + 1);
+    }
+
+    let mainComponentId = -1;
+    let mainComponentSize = -1;
+    for (const [componentId, size] of componentSizes) {
+      if (size > mainComponentSize) {
+        mainComponentSize = size;
+        mainComponentId = componentId;
+      }
+    }
+
+    let bestPair: [NavNode, NavNode] | null = null;
+    let bestDist = Infinity;
+
+    for (const a of survivors) {
+      if (componentOf.get(a.id) !== mainComponentId) continue;
+      for (const b of survivors) {
+        if (componentOf.get(b.id) === mainComponentId) continue;
+        const dx = a.position[0] - b.position[0];
+        const dz = a.position[2] - b.position[2];
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestPair = [a, b];
+        }
+      }
+    }
+
+    if (!bestPair) break;
+
+    const [a, b] = bestPair;
+    a.links.add(b.id);
+    b.links.add(a.id);
+    console.warn(
+      `[navigation] Force-bridged isolated cluster: ${a.id} <-> ${b.id} (${bestDist.toFixed(2)}m)`
+    );
+  }
+
+  const output = survivors.map((node) => ({
+    id: node.id,
+    position: node.position,
+    lookAt: [node.position[0], node.position[1], node.position[2] - 1] as [
+      number,
+      number,
+      number
+    ],
+    links: Array.from(node.links),
+  }));
+
+  fs.writeFileSync(outputPath, JSON.stringify(output, null, 2));
+
+  const totalLinks = survivors.reduce((sum, n) => sum + n.links.size, 0) / 2;
+  console.log(
+    `[navigation] Generated ${output.length} viewpoints with ${totalLinks} links -> ${outputPath}`
+  );
 }
 
 export async function compileScene(
@@ -677,10 +992,10 @@ if (url.pathname.startsWith("/jobs/")) {
     console.log(`[compiler] Wrote ${OUTPUT_GLB_PATH} (${glbBuffer.byteLength} bytes)`);
 
     try {
-      await NavigationPipeline.run(OUTPUT_GLB_PATH, jobDirectory);
+      await generateDenseNavigationGraph(doc, jobDirectory);
     } catch (err) {
       console.error(
-        `[compiler] Recast navigation generation failed - ${(err as Error).message}. Continuing without navigation.json.`
+        `[compiler] Dense navigation graph generation failed - ${(err as Error).message}. Continuing without navigation.json.`
       );
     }
   } finally {

@@ -33,7 +33,7 @@ const DEFAULT_CONFIG: Required<NavMeshGeneratorConfig> = {
   walkableHeight: 1.6,
   walkableClimb: 0.4,
   walkableRadius: 0.15,
-  injectSyntheticFloor: false,
+  injectSyntheticFloor: true,
 };
 
 export interface NavMeshGenerationResult {
@@ -123,7 +123,7 @@ export class NavMeshGenerator {
       };
     }
 
-    const connectivity = logConnectivityReport(generation.navMesh);
+    logConnectivityReport(generation.navMesh);
 
     const [surfacePositions, surfaceIndices] = getNavMeshPositionsAndIndices(
       generation.navMesh
@@ -138,27 +138,6 @@ export class NavMeshGenerator {
     const surfaceTriangleCount = surface.indices.length / 3;
     console.log(`[NavMesh] Debug surface vertex count: ${surfaceVertexCount}`);
     console.log(`[NavMesh] Debug surface triangle count: ${surfaceTriangleCount}`);
-
-    const bounds = computeBoundingBox(surface.positions);
-    const validationReport: NavMeshValidationReport = {
-      success: true,
-      syntheticFloorInjected: merged.injectSyntheticFloor,
-      surfaceVertexCount,
-      surfaceTriangleCount,
-      bounds: {
-        min: [bounds.minX, bounds.minY, bounds.minZ],
-        max: [bounds.maxX, bounds.maxY, bounds.maxZ],
-      },
-      ...connectivity,
-    };
-
-    const validationDir = path.join("jobs", jobId ?? "debug");
-    await fs.mkdir(validationDir, { recursive: true });
-    await fs.writeFile(
-      path.join(validationDir, "navmesh_validation.json"),
-      JSON.stringify(validationReport, null, 2),
-      "utf8",
-    );
 
     try {
       const debugPath = await writeDebugObj(jobId ?? "debug", surface);
@@ -294,18 +273,6 @@ interface WalkablePolygon {
   vertexIds: number[];
 }
 
-interface NavMeshValidationReport {
-  success: true;
-  syntheticFloorInjected: boolean;
-  surfaceVertexCount: number;
-  surfaceTriangleCount: number;
-  bounds: { min: [number, number, number]; max: [number, number, number] };
-  walkablePolygonCount: number;
-  connectedComponentCount: number;
-  largestComponentSize: number;
-  isolatedPolygonCount: number;
-}
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function enumerateWalkablePolygons(navMesh: any): WalkablePolygon[] {
   const records: WalkablePolygon[] = [];
@@ -404,12 +371,7 @@ function computeConnectedComponents(polys: WalkablePolygon[]): number[][] {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function logConnectivityReport(navMesh: any): {
-  walkablePolygonCount: number;
-  connectedComponentCount: number;
-  largestComponentSize: number;
-  isolatedPolygonCount: number;
-} {
+function logConnectivityReport(navMesh: any): void {
   const polys = enumerateWalkablePolygons(navMesh);
   const components = computeConnectedComponents(polys);
   const largest = components.reduce((max, c) => Math.max(max, c.length), 0);
@@ -419,11 +381,4 @@ function logConnectivityReport(navMesh: any): {
   console.log(`[NavMesh] Connected components: ${components.length}`);
   console.log(`[NavMesh] Largest component size: ${largest}`);
   console.log(`[NavMesh] Isolated polygons: ${isolated}`);
-
-  return {
-    walkablePolygonCount: polys.length,
-    connectedComponentCount: components.length,
-    largestComponentSize: largest,
-    isolatedPolygonCount: isolated,
-  };
 }
