@@ -20,7 +20,7 @@ export const useCloudRender = (activeProject, projectStateRef) => {
 
     const formData = new FormData();
     formData.append('ifcFile', file);
-    formData.append('jobId', jobId); // Include canonical jobId mapped directly to backend
+    formData.append('jobId', jobId);
 
     const actualAngle = renderConfig.type === 'static' ? 'top-front-right' : renderConfig.type;
     formData.append('angle', actualAngle);
@@ -33,7 +33,12 @@ export const useCloudRender = (activeProject, projectStateRef) => {
       if (!response.ok) throw new Error('Render failed. Server returned ' + response.status);
 
       const data = await response.json();
-      setRenderResult(data);
+      setRenderResult({
+        ...data,
+        jobId,
+        modelUrl: `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`,
+        walkthroughUrl: `${window.location.origin}/walkthrough/${encodeURIComponent(jobId)}`,
+      });
       setRenderTime(((Date.now() - startTime) / 1000).toFixed(1));
     } catch (error) {
       setRenderError(error.message || 'An error occurred during rendering.');
@@ -48,6 +53,6 @@ export const useCloudRender = (activeProject, projectStateRef) => {
     setRenderConfig,
     executeRender,
     setRenderResult,
-    setRenderError
+    setRenderError,
   };
 };

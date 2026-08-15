@@ -90,9 +90,11 @@ function generate360ViewerFromGLB(jobDir) {
   .nav-btn { background: #ff7300; font-weight: bold; }
   .nav-btn:hover { background: #e06500; }
   #room-panel {
-    position: absolute; top: 16px; right: 16px; width: 220px; max-height: 70vh;
-    background: rgba(0,0,0,0.65); border-radius: 6px; color: #fff;
+    position: absolute; top: 88px; left: 16px; width: 210px; max-height: 62vh;
+    background: rgba(20,24,28,0.78); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; color: #fff;
     font-family: sans-serif; font-size: 13px; overflow: hidden; display: none;
+    box-shadow: 0 8px 28px rgba(0,0,0,.25);
   }
   #room-panel.collapsed #room-list { display: none; }
   #room-panel-header {
@@ -101,13 +103,22 @@ function generate360ViewerFromGLB(jobDir) {
   }
   #room-panel-toggle { background: transparent; border: none; color: #fff; font-size: 16px; cursor: pointer; padding: 0 4px; }
   #room-list { list-style: none; margin: 0; padding: 6px; max-height: 60vh; overflow-y: auto; }
-  .room-item { padding: 8px 10px; border-radius: 4px; cursor: pointer; margin-bottom: 2px; }
-  .room-item:hover { background: rgba(255,255,255,0.12); }
-  .room-item.active { background: #ff7300; font-weight: bold; }
+  .room-item { padding: 9px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 3px; display:flex; align-items:center; gap:8px; }
+  .room-item:before { content:''; width:7px; height:7px; border:1px solid rgba(255,255,255,.8); border-radius:50%; flex:0 0 auto; }
+  .room-item:hover { background: rgba(255,255,255,0.10); }
+  .room-item.active { background: rgba(255,115,0,.24); font-weight: bold; }
+  .room-item.active:before { background:#ff7300; border-color:#ff7300; }
+  #walk-status { padding: 9px 12px; font-size:12px; color:rgba(255,255,255,.72); border-top:1px solid rgba(255,255,255,.08); }
+  #walk-tip { padding: 8px 12px; font-size:11px; color:rgba(255,255,255,.55); }
+  #room-panel-header span { letter-spacing:.02em; }
 </style>
 </head>
 <body>
-<div id="info">Follow the Glowing Path or Press WASD to Walk | Drag to Look</div>
+<div id="info">3D View</div>
+<div id="walk-hud" style="display:none;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);pointer-events:none;color:#fff;font:600 13px/1.4 sans-serif;text-shadow:0 1px 4px #000;text-align:center;">
+  <div style="width:7px;height:7px;border:1px solid rgba(255,255,255,.9);border-radius:50%;margin:0 auto 10px;background:rgba(255,255,255,.25);"></div>
+  <div>W A S D · Shift run · Q/E height · Esc exit</div>
+</div>
 <div id="loading">Loading model&hellip;</div>
 <div id="controls">
   <button onclick="resetView()">Reset View</button>
@@ -117,15 +128,18 @@ function generate360ViewerFromGLB(jobDir) {
   <button onclick="setView('side')">Side</button>
   <button onclick="setView('perspective')">Perspective</button>
   <button onclick="toggleFullscreen()">Fullscreen</button>
+  <button onclick="toggleWalkMode()" class="nav-btn" id="walk-btn">Walk</button>
   <button onclick="startNavigation()" class="nav-btn" id="tour-btn" style="display:none;">Start Tour</button>
 </div>
 
 <div id="room-panel">
   <div id="room-panel-header">
-    <span>Rooms</span>
+    <span>Rooms / Areas</span>
     <button id="room-panel-toggle" title="Toggle room panel (R)">&minus;</button>
   </div>
   <ul id="room-list"></ul>
+  <div id="walk-status">Walk mode ready</div>
+  <div id="walk-tip">Click a room to travel there. In Walk mode, center your crosshair on a room pointer and click.</div>
 </div>
 
 <script type="importmap">
@@ -141,6 +155,19 @@ function generate360ViewerFromGLB(jobDir) {
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const RECAST_VERSION = '0.43.1';
+let recastModulePromise = null;
+async function loadRecastRuntime() {
+    if (!recastModulePromise) {
+        recastModulePromise = import('https://cdn.jsdelivr.net/npm/recast-navigation@' + RECAST_VERSION + '/+esm')
+            .then(function(core) {
+                return { core };
+            });
+    }
+    return recastModulePromise;
+}
+
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(${c(cfg.background.color)});
@@ -203,6 +230,7 @@ scene.add(grid);` : 'const grid = { position: { y: 0 } };'}
 
 let modelSize = 1;
 let roomList = [];
+let walkAreas = [];
 
 class NavigationGraph {
     constructor() { this.nodes = []; }
@@ -697,6 +725,558 @@ class NavigationManager {
 
 const navManager = new NavigationManager(scene, camera, controls);
 
+class ContinuousWalkController {
+    constructor(camera, domElement) {
+        this.camera = camera;
+        this.domElement = domElement;
+        this.model = null;
+        this.active = false;
+        this.ready = false;
+        this.navMesh = null;
+        this.query = null;
+        this.filter = null;
+        this.nodeRef = 0;
+        this.position = new THREE.Vector3();
+        this.velocity = new THREE.Vector3();
+        this.yaw = 0;
+        this.pitch = 0;
+        this.physicalMetersPerUnit = 1;
+        this.eyeHeightMeters = 1.6;
+        this.radiusMeters = 0.15;
+        this.walkSpeedMeters = 1.8;
+        this.runSpeedMeters = 4.5;
+        this.walkSpeed = 1.8;
+        this.runSpeed = 4.5;
+        this.acceleration = 7.0;
+        this.deceleration = 10.0;
+        this.heightOffset = 0;
+        this.heightSpeedMeters = 0.35;
+        this.minHeightOffsetMeters = -0.15;
+        this.maxHeightOffsetMeters = 0.35;
+        this.keys = new Set();
+        this.pointerLocked = false;
+        this._lastTime = performance.now();
+        this._savedCamera = null;
+        this._savedControls = null;
+        this._travelPath = null;
+        this._travelIndex = 0;
+        this._touring = false;
+        this._boundMouseMove = this._onMouseMove.bind(this);
+        this._boundPointerLock = this._onPointerLockChange.bind(this);
+        this._boundKeyDown = this._onKeyDown.bind(this);
+        this._boundKeyUp = this._onKeyUp.bind(this);
+        document.addEventListener('pointerlockchange', this._boundPointerLock);
+        window.addEventListener('mousemove', this._boundMouseMove);
+        window.addEventListener('keydown', this._boundKeyDown);
+        window.addEventListener('keyup', this._boundKeyUp);
+    }
+
+    _setMetrics(metadata) {
+        this.physicalMetersPerUnit = Number(metadata?.physicalMetersPerUnit) > 0 ? Number(metadata.physicalMetersPerUnit) : 1;
+        this.eyeHeightMeters = Number(metadata?.eyeHeightMeters) > 0 ? Number(metadata.eyeHeightMeters) : 1.6;
+        this.radiusMeters = Number(metadata?.agentRadiusMeters) > 0 ? Number(metadata.agentRadiusMeters) : 0.15;
+        this.walkSpeed = this.walkSpeedMeters * this.physicalMetersPerUnit;
+        this.runSpeed = this.runSpeedMeters * this.physicalMetersPerUnit;
+        this.acceleration = 7.0 * this.physicalMetersPerUnit;
+        this.deceleration = 10.0 * this.physicalMetersPerUnit;
+    }
+
+    _candidateSpawn(surfacePayload) {
+        const positions = surfacePayload.positions || [];
+        const indices = surfacePayload.indices || [];
+        if (!positions.length || !indices.length) return null;
+
+        const ray = new THREE.Raycaster();
+        const directions = [
+            new THREE.Vector3(1,0,0), new THREE.Vector3(-1,0,0),
+            new THREE.Vector3(0,0,1), new THREE.Vector3(0,0,-1),
+            new THREE.Vector3(1,0,1).normalize(), new THREE.Vector3(-1,0,1).normalize(),
+            new THREE.Vector3(1,0,-1).normalize(), new THREE.Vector3(-1,0,-1).normalize()
+        ];
+        const maxRay = 2.5 * this.physicalMetersPerUnit;
+        const candidates = [];
+        const step = Math.max(1, Math.floor((indices.length / 3) / 180));
+
+        for (let t = 0; t < indices.length / 3; t += step) {
+            const ia = indices[t * 3] * 3;
+            const ib = indices[t * 3 + 1] * 3;
+            const ic = indices[t * 3 + 2] * 3;
+            const p = new THREE.Vector3(
+                (positions[ia] + positions[ib] + positions[ic]) / 3,
+                (positions[ia + 1] + positions[ib + 1] + positions[ic + 1]) / 3,
+                (positions[ia + 2] + positions[ib + 2] + positions[ic + 2]) / 3
+            );
+            const eyeY = p.y + this.eyeHeightMeters * this.physicalMetersPerUnit * 0.55;
+            let minClearance = maxRay;
+            for (const dir of directions) {
+                ray.set(new THREE.Vector3(p.x, eyeY, p.z), dir);
+                ray.far = maxRay;
+                const hits = this.model ? ray.intersectObject(this.model, true) : [];
+                if (hits.length) minClearance = Math.min(minClearance, hits[0].distance);
+            }
+            candidates.push({ point: p, clearance: minClearance });
+        }
+
+        candidates.sort((a,b) => b.clearance - a.clearance);
+        return candidates.length ? candidates[0].point : null;
+    }
+
+    async init(navMeshBytes, surfacePayload, model) {
+        const runtime = await loadRecastRuntime();
+        await runtime.core.init();
+        this.model = model;
+        this._setMetrics(surfacePayload?.metadata || {});
+
+        const imported = runtime.core.importNavMesh(new Uint8Array(navMeshBytes));
+        if (!imported || !imported.navMesh) throw new Error('Browser could not import serialized Recast NavMesh.');
+
+        this.navMesh = imported.navMesh;
+        this.query = new runtime.core.NavMeshQuery(this.navMesh);
+        this.filter = new runtime.core.QueryFilter();
+
+        const seed = this._candidateSpawn(surfacePayload) || new THREE.Vector3(
+            Number(surfacePayload.metadata?.spawnX ?? 0),
+            Number(surfacePayload.metadata?.spawnY ?? 0),
+            Number(surfacePayload.metadata?.spawnZ ?? 0)
+        );
+        const start = this.query.findClosestPoint({ x: seed.x, y: seed.y, z: seed.z }, {
+            halfExtents: {
+                x: 4 * this.physicalMetersPerUnit,
+                y: 2 * this.physicalMetersPerUnit,
+                z: 4 * this.physicalMetersPerUnit
+            },
+            filter: this.filter
+        });
+        if (!start.success) throw new Error('Browser Recast could not find a walkable start position.');
+
+        this.position.set(start.point.x, start.point.y, start.point.z);
+        this.nodeRef = start.polyRef;
+        this.ready = true;
+        this._syncCamera();
+    }
+
+    async enter(navMeshBytes, surfacePayload, model) {
+        if (!this.ready) await this.init(navMeshBytes, surfacePayload, model);
+        if (!this.ready) return false;
+
+        this._savedCamera = {
+            position: this.camera.position.clone(),
+            quaternion: this.camera.quaternion.clone(),
+            target: controls.target.clone()
+        };
+        this._savedControls = {
+            enablePan: controls.enablePan,
+            enableZoom: controls.enableZoom,
+            autoRotate: controls.autoRotate
+        };
+
+        controls.enabled = false;
+        controls.autoRotate = false;
+        if (navManager.hotspotManager) navManager.hotspotManager.clearHotspots();
+        if (ground && ground.material) ground.visible = false;
+        if (grid) grid.visible = false;
+
+        this.active = true;
+        this.velocity.set(0, 0, 0);
+        this._travelPath = null;
+        this._travelIndex = 0;
+        this._touring = false;
+        this.heightOffset = 0;
+        this._captureOrientationFromCamera();
+        document.getElementById('walk-hud').style.display = 'block';
+        document.getElementById('walk-btn').textContent = 'Exit Walk';
+        const statusEl = document.getElementById('walk-status'); if (statusEl) statusEl.textContent = 'Walk mode active';
+        document.getElementById('info').textContent = 'Walk Mode — click to capture mouse · WASD move · Shift run · Q/E camera height · Esc exit';
+        this.domElement.requestPointerLock();
+        this._lastTime = performance.now();
+        return true;
+    }
+
+    exit() {
+        this.active = false;
+        this.keys.clear();
+        this.velocity.set(0, 0, 0);
+        this._travelPath = null;
+        this._touring = false;
+        document.getElementById('walk-hud').style.display = 'none';
+        document.getElementById('walk-btn').textContent = 'Walk';
+        const statusEl = document.getElementById('walk-status'); if (statusEl) statusEl.textContent = 'Walk mode ready';
+        if (document.pointerLockElement === this.domElement) document.exitPointerLock();
+
+        if (this._savedControls) {
+            controls.enabled = true;
+            controls.enablePan = this._savedControls.enablePan;
+            controls.enableZoom = this._savedControls.enableZoom;
+            controls.autoRotate = this._savedControls.autoRotate;
+        } else {
+            controls.enabled = true;
+        }
+        if (ground) ground.visible = false;
+        if (grid) grid.visible = false;
+
+        if (this._savedCamera) {
+            this.camera.position.copy(this._savedCamera.position);
+            this.camera.quaternion.copy(this._savedCamera.quaternion);
+            controls.target.copy(this._savedCamera.target);
+            controls.update();
+        }
+    }
+
+    _captureOrientationFromCamera() {
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+        forward.y = THREE.MathUtils.clamp(forward.y, -0.999, 0.999);
+        this.yaw = Math.atan2(-forward.x, -forward.z);
+        this.pitch = Math.asin(forward.y);
+    }
+
+    _syncCamera() {
+        const h = this.eyeHeightMeters * this.physicalMetersPerUnit;
+        const offset = this.heightOffset * this.physicalMetersPerUnit;
+        this.camera.position.set(this.position.x, this.position.y + h + offset, this.position.z);
+        const pitchQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), this.pitch);
+        const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), this.yaw);
+        this.camera.quaternion.copy(yawQuat).multiply(pitchQuat);
+        const running = this.keys.has('shift');
+        const targetFov = running ? 76 : 70;
+        this.camera.fov += (targetFov - this.camera.fov) * 0.08;
+        this.camera.updateProjectionMatrix();
+    }
+
+    _onPointerLockChange() {
+        this.pointerLocked = document.pointerLockElement === this.domElement;
+        if (this.active && !this.pointerLocked && !this._touring) this.exit();
+    }
+
+    _onMouseMove(event) {
+        if (!this.active || !this.pointerLocked || this._touring) return;
+        const sensitivity = 0.0022;
+        this.yaw -= event.movementX * sensitivity;
+        this.pitch -= event.movementY * sensitivity;
+        const limit = Math.PI * 0.49;
+        this.pitch = Math.max(-limit, Math.min(limit, this.pitch));
+    }
+
+    _onKeyDown(event) {
+        if (event.key === 'Escape' && this.active) {
+            event.preventDefault();
+            this.exit();
+            return;
+        }
+        if (!this.active) return;
+        const key = event.key.toLowerCase();
+        if (['w','a','s','d','shift','q','e'].includes(key)) {
+            event.preventDefault();
+            this.keys.add(key);
+        }
+    }
+
+    _onKeyUp(event) {
+        if (!this.active) return;
+        this.keys.delete(event.key.toLowerCase());
+    }
+
+    _moveToTarget(target) {
+        const desired = this.position.clone().add(target.clone().sub(this.position));
+        const result = this.query.moveAlongSurface(
+            this.nodeRef,
+            { x: this.position.x, y: this.position.y, z: this.position.z },
+            { x: desired.x, y: desired.y, z: desired.z },
+            { filter: this.filter, maxVisitedSize: 64 }
+        );
+        if (result.success) {
+            this.position.set(result.resultPosition.x, result.resultPosition.y, result.resultPosition.z);
+            if (result.visited && result.visited.length) this.nodeRef = result.visited[result.visited.length - 1];
+            return true;
+        }
+        return false;
+    }
+
+    async travelTo(targetWorld) {
+        if (!this.active || !this.ready || !this.query) return false;
+        const target = this.query.findClosestPoint(
+            { x: targetWorld[0], y: targetWorld[1], z: targetWorld[2] },
+            { halfExtents: {
+                x: 3 * this.physicalMetersPerUnit,
+                y: 2 * this.physicalMetersPerUnit,
+                z: 3 * this.physicalMetersPerUnit
+            }, filter: this.filter }
+        );
+        if (!target.success) return false;
+
+        const pathResult = this.query.computePath(
+            { x: this.position.x, y: this.position.y, z: this.position.z },
+            { x: target.point.x, y: target.point.y, z: target.point.z },
+            { filter: this.filter, maxStraightPathSize: 256, maxPathSize: 256 }
+        );
+        if (!pathResult.success || !pathResult.path || pathResult.path.length === 0) return false;
+
+        this._travelPath = pathResult.path.map(p => ({ x: p.x, y: p.y, z: p.z }));
+        this._travelIndex = 0;
+        this._touring = true;
+        this.keys.clear();
+        if (document.pointerLockElement === this.domElement) document.exitPointerLock();
+        return true;
+    }
+
+    async _updateTravel(dt) {
+        if (!this._travelPath || this._travelIndex >= this._travelPath.length) {
+            this._travelPath = null;
+            this._touring = false;
+            return;
+        }
+        const waypoint = this._travelPath[this._travelIndex];
+        const target = new THREE.Vector3(waypoint.x, waypoint.y, waypoint.z);
+        const delta = target.clone().sub(this.position);
+        delta.y = 0;
+        const threshold = 0.06 * this.physicalMetersPerUnit;
+        if (delta.length() <= threshold) {
+            this._travelIndex += 1;
+            if (this._travelIndex >= this._travelPath.length) {
+                this._travelPath = null;
+                this._touring = false;
+                document.getElementById('info').textContent = 'Walk Mode — click to capture mouse · WASD move · Shift run · Q/E camera height · Esc exit';
+                if (this.active && document.pointerLockElement !== this.domElement) this.domElement.requestPointerLock();
+                return;
+            }
+        }
+        const next = this._travelPath[this._travelIndex];
+        const nextTarget = new THREE.Vector3(next.x, next.y, next.z);
+        const direction = nextTarget.clone().sub(this.position);
+        direction.y = 0;
+        if (direction.lengthSq() < 1e-8) return;
+        direction.normalize();
+
+        this.yaw = Math.atan2(-direction.x, -direction.z);
+        const speed = this.walkSpeed;
+        const desired = this.position.clone().addScaledVector(direction, speed * dt);
+        const result = this.query.moveAlongSurface(
+            this.nodeRef,
+            { x: this.position.x, y: this.position.y, z: this.position.z },
+            { x: desired.x, y: desired.y, z: desired.z },
+            { filter: this.filter, maxVisitedSize: 64 }
+        );
+        if (result.success) {
+            this.position.set(result.resultPosition.x, result.resultPosition.y, result.resultPosition.z);
+            if (result.visited && result.visited.length) this.nodeRef = result.visited[result.visited.length - 1];
+        }
+    }
+
+    _updateMovement(dt) {
+        if (!this.active || !this.ready || !this.query) return;
+        if (this._touring) return;
+
+        const forward = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+        const right = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
+        const wish = new THREE.Vector3();
+        if (this.keys.has('w')) wish.add(forward);
+        if (this.keys.has('s')) wish.sub(forward);
+        if (this.keys.has('d')) wish.add(right);
+        if (this.keys.has('a')) wish.sub(right);
+
+        const heightDeltaMeters = this.heightSpeedMeters * dt;
+        if (this.keys.has('q')) this.heightOffset = Math.min(this.heightOffset + heightDeltaMeters, this.maxHeightOffsetMeters);
+        if (this.keys.has('e')) this.heightOffset = Math.max(this.heightOffset - heightDeltaMeters, this.minHeightOffsetMeters);
+
+        const moving = wish.lengthSq() > 0.000001;
+        if (moving) wish.normalize();
+        const speed = this.keys.has('shift') ? this.runSpeed : this.walkSpeed;
+        const targetVelocity = wish.multiplyScalar(speed);
+        const response = moving ? this.acceleration : this.deceleration;
+        const blend = Math.min(1, response * dt);
+        this.velocity.lerp(targetVelocity, blend);
+
+        if (!moving && this.velocity.lengthSq() < 0.00001) {
+            this.velocity.set(0,0,0);
+            this._syncCamera();
+            return;
+        }
+
+        const desired = this.position.clone().addScaledVector(this.velocity, dt);
+        const result = this.query.moveAlongSurface(
+            this.nodeRef,
+            { x: this.position.x, y: this.position.y, z: this.position.z },
+            { x: desired.x, y: desired.y, z: desired.z },
+            { filter: this.filter, maxVisitedSize: 64 }
+        );
+
+        if (result.success) {
+            this.position.set(result.resultPosition.x, result.resultPosition.y, result.resultPosition.z);
+            if (result.visited && result.visited.length) this.nodeRef = result.visited[result.visited.length - 1];
+        }
+
+        this._syncCamera();
+    }
+
+    update(now) {
+        if (!this.active) return;
+        const dt = Math.min(0.05, Math.max(0.001, (now - this._lastTime) / 1000));
+        this._lastTime = now;
+        if (this._touring) {
+            this._updateTravel(dt);
+        } else {
+            this._updateMovement(dt);
+        }
+    }
+
+    destroy() {
+        this.exit();
+        if (this.query) this.query.destroy?.();
+        if (this.navMesh && this.navMesh.destroy) this.navMesh.destroy();
+    }
+}
+
+const walkController = new ContinuousWalkController(camera, renderer.domElement);
+
+class WalkPortalManager {
+    constructor(scene, camera, controller) {
+        this.scene = scene;
+        this.camera = camera;
+        this.controller = controller;
+        this.model = null;
+        this.areas = [];
+        this.portals = [];
+        this.raycaster = new THREE.Raycaster();
+        this.hovered = null;
+        this._clickBound = this._onClick.bind(this);
+        window.addEventListener('mousedown', this._clickBound);
+    }
+
+    _texture(label, accent = false) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 320; canvas.height = 110;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0,0,320,110);
+        ctx.fillStyle = accent ? 'rgba(255,115,0,.94)' : 'rgba(18,24,29,.84)';
+        ctx.beginPath();
+        ctx.roundRect(16,12,288,72,14);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = '600 22px Arial';
+        ctx.fillText(label, 52, 58);
+        ctx.beginPath();
+        ctx.moveTo(34,70); ctx.lineTo(46,58); ctx.lineTo(58,70);
+        ctx.fill();
+        return new THREE.CanvasTexture(canvas);
+    }
+
+    _makePortal(target, label, position, kind='area') {
+        const material = new THREE.SpriteMaterial({
+            map: this._texture(label, kind === 'door'),
+            transparent: true,
+            depthTest: true,
+            depthWrite: false,
+        });
+        const sprite = new THREE.Sprite(material);
+        const baseScale = new THREE.Vector3(0.9 * this.controller.physicalMetersPerUnit, 0.31 * this.controller.physicalMetersPerUnit, 1);
+        sprite.scale.copy(baseScale);
+        sprite.position.set(position[0], position[1], position[2]);
+        sprite.userData = { target, label, kind };
+        this.scene.add(sprite);
+        this.portals.push({ sprite, target, label, kind, base: sprite.position.clone(), baseScale });
+    }
+
+    clear() {
+        this.portals.forEach(p => {
+            if (p.sprite.parent) p.sprite.parent.remove(p.sprite);
+            p.sprite.material.map?.dispose();
+            p.sprite.material.dispose();
+        });
+        this.portals = [];
+    }
+
+    setAreas(areas, model) {
+        this.clear();
+        this.areas = areas || [];
+        this.model = model || null;
+        // A light presentation layer: show destination pointers near area centres.
+        this.areas.forEach(area => {
+            const p = area.center.slice();
+            p[1] = this.controller.position.y + this.controller.eyeHeightMeters * this.controller.physicalMetersPerUnit * 0.55;
+            this._makePortal(area.center, area.label, p, 'area');
+        });
+        this._addDoorSidePortals();
+    }
+
+    _addDoorSidePortals() {
+        if (!this.model || !this.controller.query) return;
+        const doors = [];
+        this.model.traverse(obj => {
+            if (!obj.isMesh) return;
+            const name = (obj.name || '').toLowerCase();
+            if (!name.includes('door') && !name.includes('sliding')) return;
+            const box = new THREE.Box3().setFromObject(obj);
+            if (box.isEmpty()) return;
+            const size = box.getSize(new THREE.Vector3());
+            if (size.x < 0.02 && size.z < 0.02) return;
+            const center = box.getCenter(new THREE.Vector3());
+            const normal = size.x >= size.z ? new THREE.Vector3(0,0,1) : new THREE.Vector3(1,0,0);
+            doors.push({ center, normal });
+        });
+
+        const offset = Math.max(0.55, this.controller.radiusMeters * 3) * this.controller.physicalMetersPerUnit;
+        doors.slice(0, 16).forEach((door, i) => {
+            [-1, 1].forEach(side => {
+                const sample = door.center.clone().addScaledVector(door.normal, side * offset);
+                const closest = this.controller.query.findClosestPoint(
+                    {x:sample.x,y:sample.y,z:sample.z},
+                    {halfExtents:{x:1.5*this.controller.physicalMetersPerUnit,y:2*this.controller.physicalMetersPerUnit,z:1.5*this.controller.physicalMetersPerUnit},filter:this.controller.filter}
+                );
+                if (!closest.success) return;
+                const target = [closest.point.x, closest.point.y, closest.point.z];
+                const label = this._nearestAreaLabel(target) || ('Room ' + (i + 1));
+                const p = [closest.point.x, closest.point.y + this.controller.eyeHeightMeters * this.controller.physicalMetersPerUnit * 0.55, closest.point.z];
+                this._makePortal(target, label, p, 'door');
+            });
+        });
+    }
+
+    _nearestAreaLabel(target) {
+        let best = Infinity, label = null;
+        this.areas.forEach(a => {
+            const dx = a.center[0]-target[0], dz=a.center[2]-target[2];
+            const d = dx*dx+dz*dz;
+            if (d < best) { best = d; label = a.label; }
+        });
+        return label;
+    }
+
+    update() {
+        if (!this.controller.active) {
+            this.portals.forEach(p => p.sprite.visible = false);
+            return;
+        }
+        const camForward = new THREE.Vector3(0,0,-1).applyQuaternion(this.camera.quaternion).normalize();
+        let best = null, bestScore = -Infinity;
+        this.portals.forEach(p => {
+            const world = p.sprite.position;
+            const delta = world.clone().sub(this.camera.position);
+            const dist = delta.length();
+            if (dist > 12 * this.controller.physicalMetersPerUnit) { p.sprite.visible = false; return; }
+            delta.normalize();
+            const dot = camForward.dot(delta);
+            p.sprite.visible = dot > 0.02 || dist < 1.5 * this.controller.physicalMetersPerUnit;
+            if (!p.sprite.visible) return;
+            p.sprite.quaternion.copy(this.camera.quaternion);
+            const pulse = 1 + Math.sin(performance.now()*0.003 + p.base.x)*0.035;
+            p.sprite.scale.copy(p.baseScale).multiplyScalar(pulse);
+            if (dot > bestScore) { bestScore = dot; best = p; }
+        });
+        this.hovered = best && bestScore > 0.55 ? best : null;
+    }
+
+    _onClick() {
+        if (!this.controller.active || !this.controller.pointerLocked || !this.hovered) return;
+        this.controller.travelTo(this.hovered.target);
+    }
+
+    destroy() {
+        window.removeEventListener('mousedown', this._clickBound);
+        this.clear();
+    }
+}
+
+const walkPortalManager = new WalkPortalManager(scene, camera, walkController);
+
 const ROOM_SPLIT_GAP_THRESHOLD = 1.2;
 const ROOM_MIN_CLUSTER_SIZE = 3;
 
@@ -735,68 +1315,45 @@ function splitClusterByGaps(members) {
 }
 
 function clusterViewpointsIntoRooms(nodes) {
-    const byId = new Map(nodes.map(n => [n.id, n]));
-    const visited = new Set();
-    const rawClusters = [];
+    if (!Array.isArray(nodes) || nodes.length === 0) return [];
+    const valid = nodes.map((n, i) => {
+        const x = Number(n?.position?.[0]);
+        const z = Number(n?.position?.[2]);
+        if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+        return { id:n.id || ('node-'+i), position:[x,0,z] };
+    }).filter(Boolean);
+    if (!valid.length) return [];
+    const cellSize = 3.0 * Math.max(0.000001, walkController.physicalMetersPerUnit || 1);
+    const minX = Math.min(...valid.map(n=>n.position[0]));
+    const minZ = Math.min(...valid.map(n=>n.position[2]));
+    const buckets = new Map();
+    valid.forEach(n=>{
+        const key = Math.floor((n.position[0]-minX)/cellSize)+':'+Math.floor((n.position[2]-minZ)/cellSize);
+        if(!buckets.has(key)) buckets.set(key,[]);
+        buckets.get(key).push(n);
+    });
+    return Array.from(buckets.values()).map((members,idx)=>{
+        const x=members.reduce((a,m)=>a+m.position[0],0)/members.length;
+        const z=members.reduce((a,m)=>a+m.position[2],0)/members.length;
+        return { roomId:'area_'+(idx+1), label:'Room '+(idx+1), representativeId:members[0].id, center:[x,0,z], memberIds:members.map(m=>m.id) };
+    }).sort((a,b)=>a.center[2]-b.center[2] || a.center[0]-b.center[0]);
+}
 
-    nodes.forEach(node => {
-        if (visited.has(node.id)) return;
-
-        const queue = [node.id];
-        visited.add(node.id);
-        const members = [];
-
-        while (queue.length > 0) {
-            const currentId = queue.shift();
-            const current = byId.get(currentId);
-            if (!current) continue;
-            members.push(current);
-
-            (current.links || []).forEach(linkId => {
-                if (!visited.has(linkId) && byId.has(linkId)) {
-                    visited.add(linkId);
-                    queue.push(linkId);
-                }
-            });
+async function loadWalkAreas() {
+    try {
+        const res = await fetch('walk_areas.json', {cache:'no-store'});
+        if (res.ok) {
+            const payload = await res.json();
+            if (Array.isArray(payload.areas) && payload.areas.length) return payload.areas;
         }
-
-        rawClusters.push(members);
-    });
-
-    const clusters = [];
-    rawClusters.forEach(members => {
-        splitClusterByGaps(members).forEach(sub => clusters.push(sub));
-    });
-
-    return clusters.map((members, idx) => {
-        const center = members.reduce((acc, m) => {
-            acc[0] += m.position[0];
-            acc[1] += m.position[1];
-            acc[2] += m.position[2];
-            return acc;
-        }, [0, 0, 0]).map(v => v / members.length);
-
-        let representative = members[0];
-        let bestDistSq = Infinity;
-        members.forEach(m => {
-            const dx = m.position[0] - center[0];
-            const dy = m.position[1] - center[1];
-            const dz = m.position[2] - center[2];
-            const distSq = dx * dx + dy * dy + dz * dz;
-            if (distSq < bestDistSq) {
-                bestDistSq = distSq;
-                representative = m;
-            }
-        });
-
-        return {
-            roomId: 'room_' + (idx + 1),
-            label: 'Room ' + (idx + 1),
-            representativeId: representative.id,
-            center,
-            memberIds: members.map(m => m.id)
-        };
-    });
+    } catch (_) {}
+    try {
+        const res = await fetch('navigation.json', {cache:'no-store'});
+        if (!res.ok) return [];
+        return clusterViewpointsIntoRooms(await res.json());
+    } catch (_) {
+        return [];
+    }
 }
 
 function buildRoomPanel(rooms) {
@@ -818,14 +1375,27 @@ function buildRoomPanel(rooms) {
 }
 
 function highlightActiveRoom(nodeId) {
-    const room = roomList.find(r => r.memberIds.includes(nodeId));
+    let room = null;
+    if (walkController.active && walkAreas.length) {
+        let best = Infinity;
+        walkAreas.forEach(a => {
+            const dx=a.center[0]-walkController.position.x;
+            const dz=a.center[2]-walkController.position.z;
+            const d=dx*dx+dz*dz;
+            if(d<best){best=d; room=a;}
+        });
+    }
     document.querySelectorAll('.room-item').forEach(el => {
-        el.classList.toggle('active', !!room && el.dataset.roomId === room.roomId);
+        el.classList.toggle('active', !!room && el.dataset.roomId === room.id);
     });
 }
 
-function jumpToRoom(room) {
-    navManager.jumpTo(room.representativeId);
+async function jumpToRoom(room) {
+    if (!walkController.active) await toggleWalkMode();
+    if (!walkController.active) return;
+    const started = await walkController.travelTo(room.center);
+    if (!started) console.warn('[Walk] Could not compute a path to', room.label);
+    else document.getElementById('info').textContent = 'Walking to ' + room.label + '…';
 }
 
 function toggleRoomPanel() {
@@ -852,6 +1422,7 @@ const roomPanelHeader = document.getElementById('room-panel-header');
 if (roomPanelHeader) roomPanelHeader.addEventListener('click', toggleRoomPanel);
 
 function setView(name) {
+    if (walkController.active) walkController.exit();
     const d = modelSize * 2;
     const views = {
         top:         [0, d * 1.5, 0.01],
@@ -860,13 +1431,14 @@ function setView(name) {
         perspective: [d * 0.7, d * 0.8, d * 0.7]
     };
     const p = views[name] || views.perspective;
-    camera.position.set(p[0], p[1], p[2]);
-    controls.target.set(0, 0, 0);
+    camera.position.copy(modelCenter).add(new THREE.Vector3(p[0], p[1], p[2]));
+    controls.target.copy(modelCenter);
     navManager.hotspotManager.clearHotspots();
     controls.update();
 }
 
 function resetView() {
+    if (walkController.active) walkController.exit();
     controls.enablePan = true;
     controls.enableZoom = true;
     controls.minDistance = 0;
@@ -883,11 +1455,58 @@ function toggleFullscreen() {
     else document.exitFullscreen();
 }
 
-function startNavigation() {
-    if (navManager.graph.nodes.length > 0) {
-        controls.autoRotate = false;
-        navManager.startAt(navManager.graph.nodes[0].id);
+let walkSurfacePayload = null;
+let navigationNavMeshBytes = null;
+let modelCenter = new THREE.Vector3();
+
+async function toggleWalkMode() {
+    if (walkController.active) {
+        walkController.exit();
+        return;
     }
+    try {
+        if (!walkSurfacePayload) {
+            const response = await fetch('navigation_surface.json', { cache: 'no-store' });
+            if (!response.ok) throw new Error('navigation_surface.json not found.');
+            walkSurfacePayload = await response.json();
+        }
+        if (!navigationNavMeshBytes) {
+            const response = await fetch('navigation_navmesh.bin', { cache: 'no-store' });
+            if (!response.ok) throw new Error('navigation_navmesh.bin not found. Re-run the compiler.');
+            navigationNavMeshBytes = new Uint8Array(await response.arrayBuffer());
+        }
+        await walkController.enter(navigationNavMeshBytes, walkSurfacePayload, navManager.model);
+        if (!walkAreas.length) walkAreas = await loadWalkAreas();
+        buildRoomPanel(walkAreas);
+        walkPortalManager.setAreas(walkAreas, navManager.model);
+    } catch (error) {
+        console.error('[Walk] Failed to start:', error);
+        document.getElementById('info').textContent = 'Walk mode unavailable — generate navigation_navmesh.bin first.';
+    }
+}
+
+async function startNavigation() {
+    if (!walkController.active) {
+        await toggleWalkMode();
+    }
+    if (!walkController.active || !roomList.length) return;
+    const ordered = walkAreas.slice();
+    let index = 0;
+    const visitNext = async () => {
+        if (!walkController.active || index >= ordered.length) return;
+        const room = ordered[index++];
+        await walkController.travelTo(room.center);
+        const wait = () => {
+            if (!walkController.active) return;
+            if (!walkController._touring) {
+                setTimeout(visitNext, 700);
+            } else {
+                setTimeout(wait, 250);
+            }
+        };
+        wait();
+    };
+    visitNext();
 }
 
 window.resetView = resetView;
@@ -895,6 +1514,7 @@ window.toggleAutoRotate = toggleAutoRotate;
 window.setView = setView;
 window.toggleFullscreen = toggleFullscreen;
 window.startNavigation = startNavigation;
+window.toggleWalkMode = toggleWalkMode;
 
 const loadingEl = document.getElementById('loading');
 const loader = new GLTFLoader();
@@ -914,13 +1534,14 @@ loader.load(
 
         const box = new THREE.Box3().setFromObject(model);
         const center = box.getCenter(new THREE.Vector3());
+        modelCenter.copy(center);
         const size = box.getSize(new THREE.Vector3());
         modelSize = Math.max(size.x, size.y, size.z) || 1;
 
-        model.position.sub(center);
+        // Keep the GLB in its original world frame. The serialized Recast NavMesh
+        // uses the same frame; centering the model here would make runtime queries
+        // and collision coordinates diverge.
         model.updateMatrixWorld(true);
-        box.setFromObject(model); 
-        
         ground.position.y = -size.y / 2 - 0.01;
         grid.position.y = ground.position.y;
 
@@ -935,36 +1556,19 @@ loader.load(
         navManager.setModel(model);
         setView('perspective');
 
-        navManager.floorY = ground.position.y + 0.05;
+        navManager.floorY = 0;
+        ground.visible = false;
+        if (grid) grid.visible = false;
         navManager.hotspotSize = Math.max(modelSize * 0.05, 0.2);
 
-        // --- FETCH DENSE GRID PRE-LINKED BY BACKEND ---
-        fetch('navigation.json')
-            .then(res => res.json())
-            .then(nodes => {
-                if (!nodes || nodes.length === 0) return;
-
-                // Sync coordinates with the centered GLB
-                nodes.forEach(node => {
-                    node.position[0] -= center.x;
-                    node.position[1] -= center.y;
-                    node.position[2] -= center.z;
-                    if (node.lookAt) {
-                        node.lookAt[0] -= center.x;
-                        node.lookAt[1] -= center.y;
-                        node.lookAt[2] -= center.z;
-                    }
-                });
-
-                navManager.graph.nodes = nodes;
-                
-                if (navManager.graph.nodes.length > 0) {
-                    document.getElementById('tour-btn').style.display = 'inline-block';
-                    roomList = clusterViewpointsIntoRooms(navManager.graph.nodes);
-                    buildRoomPanel(roomList);
-                }
-            })
-            .catch(err => console.log('Navigation JSON not found.', err));
+        loadWalkAreas().then(areas => {
+            walkAreas = areas;
+            roomList = areas;
+            if (areas.length) {
+                document.getElementById('tour-btn').style.display = 'inline-block';
+                buildRoomPanel(areas);
+            }
+        });
 
         if (loadingEl) loadingEl.remove();
     },
@@ -983,8 +1587,10 @@ window.addEventListener('resize', () => {
 
 (function animate(time) {
     requestAnimationFrame(animate);
-    controls.update();
-    if (navManager.hotspotManager) navManager.hotspotManager.update(time);
+    if (!walkController.active) controls.update();
+    walkController.update(time);
+    walkPortalManager.update();
+    if (!walkController.active && navManager.hotspotManager) navManager.hotspotManager.update(time);
     renderer.render(scene, camera);
 })();
 </script>

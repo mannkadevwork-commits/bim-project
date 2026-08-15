@@ -19,7 +19,6 @@ import { scaleModelByMeasurement, calibrateWallHeight } from './calibration/Cali
 import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './placement/PlacementController';
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
 import { calculateGrabPoint } from './stretch/TranslationController';
-import { CameraManager } from './CameraManager';
 
 export const useBIMEngine = (activeProject, projectStateRef, projectState, onAssetPlaced, setIsRightPanelOpen, setRightTab, transformFurnitureForCalibration, repairLegacyCalibrationState) => {
   const { file, jobId, fileName } = activeProject || {};
@@ -56,7 +55,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const [isXRay, setIsXRay] = useState(false);
   const [isClipping, setIsClipping] = useState(false);
   const [navMode, setNavMode] = useState('orbit');
-  const cameraManagerRef = useRef(null);
   const [selectedObject, setSelectedObject] = useState(null);
   const [selectedAssetId, setSelectedAssetId] = useState(null);
   const selectedAssetIdRef = useRef(null);
@@ -719,7 +717,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     viewer.cameraControl.smartPivot = true;
     viewer.cameraControl.doublePickFlyTo = false;
     viewer.scene.camera.project.fov = 65;
-    cameraManagerRef.current = new CameraManager(viewer);
 
     // Modern BIM selection treatment: preserve the asset's real materials
     // and show a subtle cool outline/tint instead of xeokit's default
@@ -1410,17 +1407,13 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       viewerAlive = false;
       ifcLoaderOwnerRef.current = null;
       loadersRef.current = {};
-      cameraManagerRef.current = null;
       viewerRef.current = null;
       try { viewer.destroy(); } catch (e) {}
     };
   }, []);
 
   useEffect(() => {
-    if (viewerRef.current) {
-      viewerRef.current.cameraControl.navMode = navMode;
-      viewerRef.current.cameraControl.active = true;
-    }
+    if (viewerRef.current) viewerRef.current.cameraControl.navMode = navMode;
   }, [navMode]);
 
   useEffect(() => {
@@ -1681,20 +1674,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       setSelectedObject,
       setSelectedAssetId: setSelectedAssetIdSafe,
       setPlacementMode,
-      camera: {
-        fitScene: () => cameraManagerRef.current?.fitScene(),
-        focusSelected: () => {
-          const selectedAsset = selectedAssetIdRef.current;
-          if (selectedAsset) return cameraManagerRef.current?.focus(selectedAsset, true);
-          const selected = selectedObject?.id;
-          if (selected) return cameraManagerRef.current?.focus(selected, false);
-          return cameraManagerRef.current?.fitScene();
-        },
-        preset: (name) => cameraManagerRef.current?.preset(name),
-        setProjection: (projection) => cameraManagerRef.current?.setProjection(projection),
-        getProjection: () => cameraManagerRef.current?.getProjection() || 'perspective',
-        snapshot: () => cameraManagerRef.current?.snapshot(),
-      },
       loadIFCAssetIntoScene: async (i, s, t, r, options) => {
         loadingModelsRef.current.add(i);
         try {

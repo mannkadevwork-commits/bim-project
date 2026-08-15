@@ -16,7 +16,8 @@
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-router-dom": "^7.18.2",
-    "three": "^0.185.1",
+    "recast-navigation": "^0.43.1",
+    "three": "0.185.1",
     "web-ifc": "^0.0.77"
   },
   "devDependencies": {

@@ -6,7 +6,7 @@ import { Document, NodeIO, Node as GltfNode, Primitive } from "@gltf-transform/c
 import { extractGeometry } from "./geometry";
 import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
 import { fileURLToPath, pathToFileURL } from "url";
-import { NavigationPipeline } from "./NavigationPipeline";
+import { WalkNavigationPipeline } from "./navigation/WalkNavigationPipeline";
 
 enum AssetType {
   STRUCTURAL_REPLACEMENT = "structural_replacement",
@@ -677,10 +677,10 @@ if (url.pathname.startsWith("/jobs/")) {
     console.log(`[compiler] Wrote ${OUTPUT_GLB_PATH} (${glbBuffer.byteLength} bytes)`);
 
     try {
-      await NavigationPipeline.run(OUTPUT_GLB_PATH, jobDirectory);
+      await WalkNavigationPipeline.run(OUTPUT_GLB_PATH, jobDirectory);
     } catch (err) {
       console.error(
-        `[compiler] Recast navigation generation failed - ${(err as Error).message}. Continuing without navigation.json.`
+        `[compiler] Recast navigation generation failed - ${(err as Error).message}. Continuing with output.glb.`
       );
     }
   } finally {

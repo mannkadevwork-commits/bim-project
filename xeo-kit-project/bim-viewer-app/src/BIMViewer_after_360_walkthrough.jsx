@@ -27,7 +27,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [isManualSaving, setIsManualSaving] = useState(false);
   const [lastClickPos, setLastClickPos] = useState({ x: 0, y: 0 });
-  const [cameraProjection, setCameraProjection] = useState('perspective');
 
   // Add the useCatalog hook call[cite: 1]
   const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
@@ -342,14 +341,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           onClip={() => engineActions.toggleClipping()}
           onMaxView={toggleMaxView}
           onFullscreen={toggleBrowserFullscreen}
-          projection={cameraProjection}
-          onFocus={() => engineActions.camera.focusSelected()}
-          onCameraPreset={(preset) => engineActions.camera.preset(preset)}
-          onProjection={(projection) => {
-            engineActions.camera.setProjection(projection);
-            setCameraProjection(projection);
+          onFit={() => {
+            const viewer = refs.viewerRef.current;
+            if (viewer) {
+              const mainModel = viewer.scene.models?.main_structure;
+              if (mainModel) viewer.cameraFlight.flyTo(mainModel);
+            }
           }}
-          onFit={() => engineActions.camera.fitScene()}
           />
         </>
       )}

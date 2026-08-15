@@ -8,7 +8,7 @@ import UploadModal from './components/UploadModal';
 import ContactForm from './components/ContactForm';
 import { AlertTriangle } from 'lucide-react';
 import ProjectStartModal from './components/ProjectStartModal';
-
+import WalkthroughPage from './pages/WalkthroughPage';
 function ViewerApp() {
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isBooting, setIsBooting] = useState(true);
@@ -415,6 +415,7 @@ function App() {
       <Routes>
         <Route path="/" element={<ViewerApp />} />
         <Route path="/admin" element={<AdminPanel />} />
+         <Route path="/walkthrough/:jobId" element={<WalkthroughPage />} />
       </Routes>
     </BrowserRouter>
   );
