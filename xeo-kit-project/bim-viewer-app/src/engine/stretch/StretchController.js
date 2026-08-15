@@ -36,7 +36,13 @@ export const resetHoveredStretchHandle = (hoveredStretchMeshRef, stretchAnimFram
       prev.material.diffuse = base;
       prev.material.emissive = base;
       const restOpacity = prev._stretchMeta?.restOpacity ?? STRETCH_HANDLE_FACE_OPACITY;
-      animateHandleTo(prev, stretchAnimFramesRef, { opacity: restOpacity, scale: 1 });
+      if (prev._stretchMeta?.type === 'rotate') {
+        // Rotation handles are authored in world space; scaling them would move
+        // their geometry relative to the scene origin. Restore appearance only.
+        prev.material.opacity = restOpacity;
+      } else {
+        animateHandleTo(prev, stretchAnimFramesRef, { opacity: restOpacity, scale: 1 });
+      }
     } catch (_) {}
     hoveredStretchMeshRef.current = null;
   }

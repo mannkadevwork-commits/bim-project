@@ -60,6 +60,7 @@ import sys
 import argparse
 import json
 import logging
+from pathlib import Path
 
 # Configure logger to output to stderr. 
 # CRITICAL: This ensures logs don't corrupt the JSON output on stdout that Node.js expects.
@@ -75,6 +76,7 @@ import math
 try:
     import ifcopenshell
     import ifcopenshell.util.element
+    from ifcopenshell.util.placement import get_local_placement, get_axis2placement
     import ifcopenshell.api
     import ifcopenshell.api.root
     import ifcopenshell.api.geometry
@@ -426,137 +428,297 @@ def _estimate_wall_thickness(wall):
     return DEFAULT_WALL_THICKNESS_FALLBACK
 
 
+def _normalize_vec3(values, name):
+    vec = np.asarray(values, dtype=float).reshape(3)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-9:
+        raise ValueError(f"{name} is degenerate")
+    return vec / norm
+
+
+def _profile_bounds(profile):
+    """Return min/max bounds of an extruded profile in its own 2D plane."""
+    if profile.is_a("IfcRectangleProfileDef"):
+        x = float(profile.XDim)
+        y = float(profile.YDim)
+        return (-x / 2.0, x / 2.0, -y / 2.0, y / 2.0)
+
+    if profile.is_a("IfcArbitraryClosedProfileDef"):
+        curve = profile.OuterCurve
+        if curve.is_a("IfcPolyline"):
+            points = [tuple(p.Coordinates) for p in curve.Points]
+        elif curve.is_a("IfcIndexedPolyCurve"):
+            points = [tuple(p) for p in curve.Points.CoordList]
+        else:
+            raise ValueError(
+                f"Wall profile {profile.is_a()} is not supported for hosted door placement."
+            )
+
+        xs = [float(p[0]) for p in points]
+        ys = [float(p[1]) for p in points]
+        if not xs or not ys:
+            raise ValueError("Wall profile contains no usable points.")
+        return (min(xs), max(xs), min(ys), max(ys))
+
+    raise ValueError(
+        f"Wall profile {profile.is_a()} is not supported for hosted door placement."
+    )
+
+
+def _get_host_wall_frame(wall):
+    """
+    Derive the wall frame from the ACTUAL IFC wall placement and swept solid.
+
+    The returned frame is in IFC world space and consists of:
+      - body_matrix: solid local -> IFC world
+      - run_axis: long profile axis, in world space
+      - thickness_axis: short profile axis, in world space
+      - up_axis: extrusion axis, in world space
+      - profile bounds in the solid's local XY plane
+      - wall height / thickness / run length
+    """
+    solid, _ = get_extruded_solid(wall)
+    if solid is None:
+        raise ValueError(
+            f"Wall {wall.GlobalId} has no IfcExtrudedAreaSolid Body representation."
+        )
+
+    if wall.ObjectPlacement is None:
+        raise ValueError(f"Wall {wall.GlobalId} has no IfcLocalPlacement.")
+
+    def _placement_matrix(placement):
+        if placement is None:
+            return np.eye(4)
+        if placement.is_a("IfcLocalPlacement"):
+            return np.asarray(get_local_placement(placement), dtype=float)
+        if placement.is_a("IfcAxis2Placement3D"):
+            return np.asarray(get_axis2placement(placement), dtype=float)
+        raise ValueError(
+            f"Unsupported placement type for hosted wall geometry: {placement.is_a()}"
+        )
+
+    # IMPORTANT: wall.ObjectPlacement is typically IfcLocalPlacement, while
+    # IfcExtrudedAreaSolid.Position is an IfcAxis2Placement3D. Passing the
+    # latter into get_local_placement() causes: "IfcAxis2Placement3D has no
+    # attribute PlacementRelTo". Resolve each placement type explicitly.
+    wall_matrix = _placement_matrix(wall.ObjectPlacement)
+    solid_matrix = _placement_matrix(getattr(solid, "Position", None))
+
+    # Solid/profile space -> IFC world space.
+    body_matrix = wall_matrix @ solid_matrix
+
+    profile = solid.SweptArea
+    min_x, max_x, min_y, max_y = _profile_bounds(profile)
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    if span_x <= 1e-9 or span_y <= 1e-9:
+        raise ValueError(f"Wall {wall.GlobalId} has invalid profile bounds.")
+
+    # Walls run along their longer profile axis. This is intentionally based on
+    # the actual profile dimensions, not on the picked surface normal or a yaw
+    # reconstructed in the frontend.
+    if span_x >= span_y:
+        run_axis_index = 0
+        thickness_axis_index = 1
+        run_min, run_max = min_x, max_x
+        thickness_min, thickness_max = min_y, max_y
+        wall_run = span_x
+        wall_thickness = span_y
+    else:
+        run_axis_index = 1
+        thickness_axis_index = 0
+        run_min, run_max = min_y, max_y
+        thickness_min, thickness_max = min_x, max_x
+        wall_run = span_y
+        wall_thickness = span_x
+
+    run_axis = _normalize_vec3(body_matrix[:3, run_axis_index], "wall run axis")
+    thickness_axis = _normalize_vec3(body_matrix[:3, thickness_axis_index], "wall thickness axis")
+    up_axis = _normalize_vec3(body_matrix[:3, 2], "wall up axis")
+
+    return {
+        "bodyMatrix": body_matrix,
+        "runAxis": run_axis,
+        "runAxisIndex": run_axis_index,
+        "thicknessAxis": thickness_axis,
+        "upAxis": up_axis,
+        "runMin": float(run_min),
+        "runMax": float(run_max),
+        "thicknessMin": float(thickness_min),
+        "thicknessMax": float(thickness_max),
+        "wallRun": float(wall_run),
+        "wallThickness": float(wall_thickness),
+        "wallHeight": float(solid.Depth),
+    }
+
+
+def _world_point_to_wall_local(body_matrix, ifc_point):
+    inverse = np.linalg.inv(body_matrix)
+    local = inverse @ np.array([ifc_point[0], ifc_point[1], ifc_point[2], 1.0], dtype=float)
+    return local[:3]
+
+
+def _ifc_horizontal_to_frontend_yaw(axis):
+    """Convert an IFC Z-up horizontal tangent to a Three/xeokit Y-up yaw.
+
+    Frontend basis is X-right, Y-up, Z-forward. IFC horizontal tangent is
+    (X, Y, 0). IFC +Y maps to frontend -Z, therefore a positive frontend Y
+    rotation maps door-local +X onto IFC +Y.
+    """
+    return math.degrees(math.atan2(float(axis[1]), float(axis[0])))
+
+
+def _write_isolated_wall_preview(source, wall, opening, output_path):
+    """Write only the edited host wall + its opening relationship.
+
+    The main output remains a full IFC for downstream compilation/history.
+    The preview is intentionally wall-only so the frontend never loads another
+    complete copy of the building and pollutes Xeokit picking.
+    """
+    target = ifcopenshell.file(schema=source.schema)
+
+    projects = source.by_type("IfcProject")
+    for project in projects:
+        target.add(project)
+
+    target_wall = target.add(wall)
+    target_opening = target.add(opening)
+
+    relation = None
+    for rel in source.by_type("IfcRelVoidsElement"):
+        if rel.RelatingBuildingElement == wall and rel.RelatedOpeningElement == opening:
+            relation = rel
+            break
+
+    if relation is not None:
+        owner_history = target.add(relation.OwnerHistory) if relation.OwnerHistory else None
+        kwargs = {
+            "GlobalId": relation.GlobalId,
+        }
+        if owner_history is not None:
+            kwargs["OwnerHistory"] = owner_history
+        target.create_entity(
+            "IfcRelVoidsElement",
+            **kwargs,
+            RelatingBuildingElement=target_wall,
+            RelatedOpeningElement=target_opening,
+        )
+
+    target.write(output_path)
+    return output_path
+
+
 def cmd_insert_door(args):
     """
-    Cuts a rectangular door void into a host wall.
+    Insert a semantic IFC opening hosted by the selected wall.
 
-    DESIGN CHOICE — flagged explicitly, since it's a real fork from what
-    "boolean difference" could mean: this creates an IfcOpeningElement
-    related to the wall via IfcRelVoidsElement (ifcopenshell.api.feature.
-    add_feature) — the exact mechanism Revit/ArchiCAD/BlenderBIM use for
-    every door and window in every IFC file you've ever loaded — rather
-    than literally rewriting the wall's own IfcExtrudedAreaSolid into an
-    IfcBooleanResult/IfcBooleanClippingResult.
+    Placement is wall-host driven:
+      1. frontend supplies only the actual picked world point + host wall id;
+      2. this function reads the wall's real IFC placement/profile;
+      3. the click is projected into the wall's local run/thickness frame;
+      4. the door is clamped so its full width stays inside the wall;
+      5. the opening is centered on the wall's measured thickness centerline;
+      6. the door base is aligned with the host wall's actual extrusion base;
+      7. the returned visual transform uses the same host frame.
 
-    Verified locally before writing this: ifcopenshell.geom resolves
-    IfcRelVoidsElement openings into a real boolean-cut mesh AUTOMATICALLY
-    by default (tested against a synthetic wall — vertex count went from
-    8 to 18 once the opening relationship existed, confirming the cut is
-    actually applied, not just semantically declared). So:
-      1. Anywhere downstream that already calls ifcopenshell.geom on this
-         wall — per your architecture, that's scene_merger.py's
-         structural-geometry pass — sees the hole for free.
-      2. No solid-modeling kernel beyond ifcopenshell itself is needed —
-         no pythonocc-core / trimesh boolean dependency.
-      3. The wall's own GlobalId and base solid are untouched, so your
-         GlobalId-keyed material dictionary lookup in scene_merger.py
-         keeps working with zero changes.
-    If scene_merger.py's own ifcopenshell.geom.settings() call has
-    disabled opening subtraction (worth a grep for
-    DISABLE_OPENING_SUBTRACTIONS or settings.set), this will silently
-    produce a wall with no visible hole — that's the first thing to
-    check if Phase 4 renders a solid wall.
-
-    VERTICAL POSITION — per your explicit instruction, this uses the
-    passed Z EXACTLY as the void's base; it does NOT snap to floor
-    level. Phase 1 currently passes the raw wall-click point
-    (wallPick.worldPos), not a floor-level point — if a user clicks at
-    wall-height 1.2m, the void's floor sits at 1.2m and the door will
-    look like it's floating. Confirm Phase 1 / the calling UI will
-    pre-adjust the Y component to floor level before this ships; this
-    function will not silently "fix" that by assuming floor level,
-    since you asked for the exact passed position.
-
-    UNITS — like every other command in this file (cmd_inspect,
-    cmd_resize, cmd_rescale all read/write raw IFC values with no unit
-    conversion), this assumes the project's IFC units are already
-    meters. If input.ifc is authored in millimeters, args.position /
-    args.width / args.height all need scaling first — same assumption,
-    same blind spot, as the rest of the script already has.
+    The existing IfcOpeningElement + IfcRelVoidsElement mechanism is preserved.
     """
     source = ifcopenshell.open(args.input)
     wall = find_element(source, args.global_id)
 
-    if not wall.is_a("IfcWall") and not wall.is_a("IfcWallStandardCase"):
-        raise ValueError(f"Element {args.global_id} is an {wall.is_a()}, not an IfcWall/IfcWallStandardCase.")
+    logger.info(
+        f"[DoorHost] Inserting hosted door into wall {args.global_id} "
+        f"(asset {args.asset_id})"
+    )
 
-    logger.info(f"Inserting door void into wall {args.global_id} (asset {args.asset_id})")
-
-    # ── Parse + convert the frontend's world-space position/rotation ──
     fx, fy, fz = _parse_vec3(args.position, "position")
-    _, yaw_deg, _ = _parse_vec3(args.rotation, "rotation")  # only the Y-axis (yaw) component is used
+    frontend_point = (fx, fy, fz)
+    ifc_point = _frontend_to_ifc_point(fx, fy, fz)
 
-    loc_x, loc_y, loc_z = _frontend_to_ifc_point(fx, fy, fz)
-    yaw_rad = math.radians(yaw_deg)
+    # Rotation is deliberately ignored for hosted placement. The wall's IFC
+    # frame is the authoritative orientation; the frontend value remains in
+    # the request only for backwards compatibility with the existing route.
+    _, requested_yaw = _parse_vec3(args.rotation, "rotation")[:2]
+    logger.info(f"[DoorHost] Ignoring frontend yaw {requested_yaw:.3f}°; using IFC wall frame.")
 
-    # Wall-relative axes in IFC (Z-up) world space, derived purely from
-    # yaw — the same atan2(normal.x, normal.z) convention Phase 1 used
-    # for orientation, carried through the Y-up -> Z-up mapping above.
-    tangent = (math.cos(yaw_rad), math.sin(yaw_rad), 0.0)          # along the wall run (door width axis)
-    thickness_axis = (-math.sin(yaw_rad), math.cos(yaw_rad), 0.0)  # through the wall (door thickness axis)
-    up = (0.0, 0.0, 1.0)
+    frame = _get_host_wall_frame(wall)
+    body_matrix = frame["bodyMatrix"]
+    logger.info(
+        "[DoorHost] Wall frame resolved: run=%s thickness=%s height=%s runAxis=%s",
+        frame["wallRun"], frame["wallThickness"], frame["wallHeight"],
+        [round(float(v), 6) for v in frame["runAxis"]],
+    )
+    local_hit = _world_point_to_wall_local(body_matrix, ifc_point)
 
-    # ── Dimensions ──
-    width = args.width if args.width is not None else DEFAULT_DOOR_WIDTH
-    height = args.height if args.height is not None else DEFAULT_DOOR_HEIGHT
-    # TODO(Phase 4): look these up from asset_registry.json by
-    # args.asset_id instead of hardcoded defaults, once that registry is
-    # wired up for door assets the way it already is for furniture.
+    width = float(args.width if args.width is not None else DEFAULT_DOOR_WIDTH)
+    height = float(args.height if args.height is not None else DEFAULT_DOOR_HEIGHT)
+    if width <= 0 or height <= 0:
+        raise ValueError("Door width and height must be positive.")
 
-    # BUGFIX: --thickness used to be treated as an override for the
-    # WALL's thickness. In practice the frontend sends each door
-    # catalog item's own LEAF thickness here (e.g. 0.04-0.1m for a
-    # slab door) — a completely different number from a real wall's
-    # thickness (typically 0.1-0.25m). Trusting it as "wall thickness"
-    # made the inward-centering push far too shallow and the void far
-    # too narrow to fully punch through a real wall, which is what was
-    # producing partial/off-center cuts. The wall's thickness is
-    # something only Python can reliably know (it's reading the actual
-    # wall geometry) — always measure it, never take it from the
-    # frontend.
+    if frame["wallRun"] + 1e-9 < width:
+        raise ValueError(
+            f"Door width {width:.3f}m is larger than host wall run {frame['wallRun']:.3f}m."
+        )
+    if frame["wallHeight"] + 1e-9 < height:
+        raise ValueError(
+            f"Door height {height:.3f}m is larger than host wall height {frame['wallHeight']:.3f}m."
+        )
+
+    # Project the click onto the wall's run axis, then clamp the CENTER so the
+    # entire opening remains inside the wall profile.
+    run_center_min = frame["runMin"] + width / 2.0
+    run_center_max = frame["runMax"] - width / 2.0
+    clicked_along = float(local_hit[frame["runAxisIndex"]]) if "runAxisIndex" in frame else float(
+        local_hit[0] if frame["wallRun"] == frame["runMax"] - frame["runMin"] else local_hit[1]
+    )
+    center_along = min(max(clicked_along, run_center_min), run_center_max)
+
+    # The opening is always centered through the real wall thickness. The
+    # vertical click coordinate is intentionally ignored: standard door
+    # placement starts at the host wall's extrusion base.
+    center_through = (frame["thicknessMin"] + frame["thicknessMax"]) / 2.0
+    base_height = 0.0
+    center_local = np.array([local_hit[0], local_hit[1], base_height], dtype=float)
+    if frame["runAxisIndex"] == 0:
+        center_local[0] = center_along
+        center_local[1] = center_through
+    else:
+        center_local[0] = center_through
+        center_local[1] = center_along
+
+    world_center_h = body_matrix @ np.array(
+        [center_local[0], center_local[1], center_local[2], 1.0], dtype=float
+    )
+    center_x, center_y, center_z = [float(v) for v in world_center_h[:3]]
+
+    run_axis = frame["runAxis"]
+    thickness_axis = frame["thicknessAxis"]
+    up_axis = frame["upAxis"]
+    # add_wall_representation creates a local box from X=0..width, Y centered
+    # by offset, and extrudes along +Z. Shift the local X origin back by half
+    # the requested width so the resulting opening is centered on our host point.
+    origin = np.array([center_x, center_y, center_z], dtype=float) - (width / 2.0) * run_axis
+
+    wall_thickness = frame["wallThickness"]
     if args.thickness is not None:
-        logger.info(f"--thickness={args.thickness} received (this is the door leaf's own thickness) — not used for the wall cut; wall thickness is always measured from the wall's own geometry.")
-    wall_thickness = _estimate_wall_thickness(wall)
+        logger.info(
+            f"--thickness={args.thickness} received (door leaf thickness only); "
+            f"using measured wall thickness {wall_thickness:.4f}m."
+        )
     void_thickness = wall_thickness + (2 * VOID_THICKNESS_MARGIN)
 
-    # The click point Phase 1 gives us lands on the wall's near SURFACE,
-    # not its mid-plane. Push the origin inward by half the wall's real
-    # thickness along the thickness axis so the void is centered on the
-    # wall's centerline — otherwise only half of void_thickness reaches
-    # inward from the surface, which for a small margin won't reach the
-    # far face and leaves an uncut sliver of wall.
-    #
-    # IMPORTANT: this is the ONLY place that should push the position
-    # inward. If the frontend also nudges the click point toward the
-    # wall's center before sending it here (e.g. using a guessed/
-    # hardcoded half-thickness), the two pushes stack and the actual
-    # void ends up off-center from wherever the visual door asset gets
-    # placed. The frontend should send the raw wall-surface click point,
-    # unmodified on X/Z, and let this be the single source of truth for
-    # centering.
-    inward = wall_thickness / 2.0
-    center_x = loc_x + inward * thickness_axis[0]
-    center_y = loc_y + inward * thickness_axis[1]
-    center_z = loc_z  # exact passed Z, per your instruction — see docstring caveat above
-
-    # ── Geometry: reuse ifcopenshell's own add_wall_representation()
-    # helper (the same one that would author a real wall) rather than
-    # hand-building IfcExtrudedAreaSolid/IfcShapeRepresentation entities.
-    # It builds a box from local (0,0) to (length,thickness) in its XY
-    # plane, extruded up by `height` — i.e. width runs from the
-    # placement origin along local X, not centered on it. `offset`
-    # handles Y-centering for us (shifts the box by half the added
-    # thickness margin so it's symmetric on the wall's real thickness);
-    # X-centering for width is done by shifting the placement origin
-    # back by half the width below, same trick. ──
     _, wall_body_rep = get_extruded_solid(wall)
     if wall_body_rep is None:
-        raise ValueError(f"Wall {args.global_id} has no Body representation to attach the opening's geometry context to.")
+        raise ValueError(
+            f"Wall {args.global_id} has no Body representation to attach the opening geometry to."
+        )
 
     context = wall_body_rep.ContextOfItems
 
     opening = ifcopenshell.api.root.create_entity(
-        source, ifc_class="IfcOpeningElement", name=f"Door Opening ({args.asset_id})"
+        source,
+        ifc_class="IfcOpeningElement",
+        name=f"Door Opening ({args.asset_id})",
     )
 
     opening_rep = ifcopenshell.api.geometry.add_wall_representation(
@@ -565,51 +727,41 @@ def cmd_insert_door(args):
         length=width,
         height=height,
         thickness=void_thickness,
-        offset=-void_thickness / 2.0,  # centers the thickness span on the wall's real centerline
+        offset=-void_thickness / 2.0,
     )
-    ifcopenshell.api.geometry.assign_representation(source, product=opening, representation=opening_rep)
-
-    # Shift the placement origin back by half the width so the box (which
-    # add_wall_representation draws from local X=0 to X=width) ends up
-    # centered on center_x/center_y rather than starting there.
-    origin_x = center_x - (width / 2.0) * tangent[0]
-    origin_y = center_y - (width / 2.0) * tangent[1]
+    ifcopenshell.api.geometry.assign_representation(
+        source, product=opening, representation=opening_rep
+    )
 
     world_matrix = np.array([
-        [tangent[0], thickness_axis[0], up[0], origin_x],
-        [tangent[1], thickness_axis[1], up[1], origin_y],
-        [tangent[2], thickness_axis[2], up[2], center_z],
-        [0.0,        0.0,               0.0,   1.0],
+        [run_axis[0], thickness_axis[0], up_axis[0], origin[0]],
+        [run_axis[1], thickness_axis[1], up_axis[1], origin[1]],
+        [run_axis[2], thickness_axis[2], up_axis[2], origin[2]],
+        [0.0,         0.0,              0.0,         1.0],
     ])
-    ifcopenshell.api.geometry.edit_object_placement(source, product=opening, matrix=world_matrix)
+    ifcopenshell.api.geometry.edit_object_placement(
+        source, product=opening, matrix=world_matrix
+    )
 
-    # ── Relate the opening to the wall. This IS the boolean difference
-    # from the geometry pipeline's perspective — see docstring. ──
-    rel_voids = ifcopenshell.api.feature.add_feature(source, feature=opening, element=wall)
+    # Preserve the semantic IFC hosting model.
+    ifcopenshell.api.feature.add_feature(
+        source, feature=opening, element=wall
+    )
 
-    # ── Write the full source IFC (with the new opening baked in).
-    # Writing the complete file — rather than a minimal isolated copy —
-    # guarantees that:
-    #   1. The wall's original IfcLocalPlacement is preserved, so the
-    #      frontend can load this file with no position override and the
-    #      wall appears exactly where it was in the original building.
-    #   2. All IfcGeometricRepresentationContext entities referenced by
-    #      the new opening's geometry are present (they live in the
-    #      project context which is already in source).
-    #   3. web-ifc / WebIFCLoaderPlugin resolves the IfcRelVoidsElement
-    #      opening subtraction automatically because both the wall and
-    #      the opening are in the same file with the same context. ──
     source.write(args.output)
+    logger.info(f"[DoorHost] Door void written to: {args.output}")
 
-    logger.info(f"Door void written to: {args.output}")
+    preview_path = str(Path(args.output).with_name(Path(args.output).stem + "_preview.ifc"))
+    _write_isolated_wall_preview(source, wall, opening, preview_path)
+    logger.info(f"[DoorHost] Wall-only preview written to: {preview_path}")
 
-    # Hand back the EXACT center this void was cut at, converted back to
-    # frontend Y-up space. This is the single source of truth for where
-    # the visual door asset should be placed — the frontend should use
-    # this instead of re-deriving its own centering, or the visual door
-    # and the actual hole can drift apart (see the inward-push note
-    # above for exactly this failure mode).
-    placement_fx, placement_fy, placement_fz = _ifc_to_frontend_point(center_x, center_y, center_z)
+    placement_fx, placement_fy, placement_fz = _ifc_to_frontend_point(
+        center_x, center_y, center_z
+    )
+    yaw_deg = _ifc_horizontal_to_frontend_yaw(run_axis)
+
+    host_offset = center_along - frame["runMin"]
+    host_offset = max(0.0, min(host_offset, frame["wallRun"]))
 
     print(json.dumps({
         "success": True,
@@ -617,7 +769,23 @@ def cmd_insert_door(args):
         "openingGlobalId": opening.GlobalId,
         "assetId": args.asset_id,
         "outputPath": args.output,
-        "voidDimensions": {"width": width, "height": height, "thickness": void_thickness},
+        "voidDimensions": {
+            "width": width,
+            "height": height,
+            "thickness": void_thickness,
+        },
+        "previewFileName": Path(preview_path).name,
+        "hostPlacement": {
+            "wallGlobalId": args.global_id,
+            "offsetAlongWall": host_offset,
+            "wallRun": frame["wallRun"],
+            "wallThickness": wall_thickness,
+            "wallHeight": frame["wallHeight"],
+            "baseElevation": center_z,
+            "runAxis": [float(v) for v in run_axis],
+            "thicknessAxis": [float(v) for v in thickness_axis],
+            "upAxis": [float(v) for v in up_axis],
+        },
         "doorPlacement": {
             "position": [placement_fx, placement_fy, placement_fz],
             "rotation": [0, yaw_deg, 0],

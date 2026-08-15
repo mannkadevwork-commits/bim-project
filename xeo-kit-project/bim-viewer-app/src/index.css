@@ -127,3 +127,144 @@ a:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--hci-orange) 75%, white);
   outline-offset: 2px;
 }
+
+
+/* Measurement workspace: compact, scroll-safe, and visually tied to HCI chrome. */
+.measurement-panel {
+  --measurement-scroll-thumb: rgba(100, 116, 139, 0.42);
+}
+
+.measurement-panel-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--measurement-scroll-thumb) transparent;
+}
+
+.measurement-panel-scroll::-webkit-scrollbar {
+  width: 7px;
+}
+
+.measurement-panel-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.measurement-panel-scroll::-webkit-scrollbar-thumb {
+  background: var(--measurement-scroll-thumb);
+  border-radius: 999px;
+}
+
+.measurement-panel-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(71, 85, 105, 0.58);
+}
+
+@media (max-width: 900px) {
+  .measurement-panel {
+    width: min(390px, 100vw) !important;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    height: 100% !important;
+    max-height: 100% !important;
+    border-radius: 0 !important;
+  }
+}
+
+
+/* ===== HCI UI POLISH OVERLAY: PRESENTATION ONLY ===== */
+:root {
+  --hci-orange: #ff914d;
+  --hci-orange-hover: #ff7a28;
+  --hci-orange-soft: rgba(255, 145, 77, 0.12);
+  --hci-orange-border: rgba(255, 145, 77, 0.34);
+  --hci-move: #34d399;
+  --hci-rotate: #60a5fa;
+  --hci-resize: #ffb55e;
+  --hci-help: #67e8f9;
+}
+
+/* Make the existing /hci-logo.svg responsive and readable in both themes.
+   The actual asset is kept external so no engine/component imports are required. */
+.hci-logo-badge {
+  display: block !important;
+  flex: 0 0 auto;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
+  object-position: center;
+  background: #ffffff;
+  border: 1px solid rgba(255, 145, 77, 0.42);
+  border-radius: 12px;
+  padding: 6px;
+  box-sizing: border-box;
+  box-shadow: 0 6px 20px rgba(2, 6, 23, 0.18);
+  color-scheme: light;
+}
+.hci-logo-badge--compact { width: 36px !important; height: 36px !important; padding: 5px !important; border-radius: 9px !important; }
+.hci-logo-badge--nav { width: 44px !important; height: 44px !important; padding: 6px !important; border-radius: 11px !important; }
+.hci-logo-badge--modal { width: 58px !important; height: 58px !important; padding: 7px !important; border-radius: 14px !important; }
+.hci-logo-badge--upload { width: 74px !important; height: 74px !important; padding: 9px !important; border-radius: 17px !important; }
+.hci-logo-badge--processing { width: 68px !important; height: 68px !important; padding: 8px !important; border-radius: 16px !important; }
+.dark .hci-logo-badge {
+  background: #ffffff !important;
+  border-color: rgba(255, 145, 77, 0.56) !important;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.42) !important;
+}
+@media (max-width: 640px) {
+  .hci-logo-badge--compact { width: 32px !important; height: 32px !important; }
+  .hci-logo-badge--nav { width: 38px !important; height: 38px !important; }
+  .hci-logo-badge--modal { width: 50px !important; height: 50px !important; }
+  .hci-logo-badge--upload { width: 64px !important; height: 64px !important; }
+}
+
+/* Primary HCI chrome */
+button.bg-indigo-600, button.bg-cyan-600, a.bg-indigo-600, a.bg-cyan-600 {
+  background-color: var(--hci-orange) !important;
+}
+button.bg-indigo-600:hover, button.bg-cyan-600:hover, a.bg-indigo-600:hover, a.bg-cyan-600:hover {
+  background-color: var(--hci-orange-hover) !important;
+}
+
+/* Don't turn branded disabled actions white/gray. */
+.hci-calibrate-button:disabled {
+  background: rgba(255,145,77,0.18) !important;
+  color: rgba(255,177,126,0.82) !important;
+  border: 1px solid rgba(255,145,77,0.28) !important;
+  box-shadow: none !important;
+  opacity: 1 !important;
+}
+
+/* Contextual transform toolbar semantic colors and hover feedback. */
+.hci-transform-action {
+  transition:
+    transform 160ms ease,
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease;
+}
+.hci-transform-action:not(:disabled):hover {
+  transform: translateY(-1px);
+}
+.hci-transform-action--move:not(:disabled):hover { box-shadow: 0 7px 18px rgba(16,185,129,0.18); }
+.hci-transform-action--rotate:not(:disabled):hover { box-shadow: 0 7px 18px rgba(96,165,250,0.18); }
+.hci-transform-action--resize:not(:disabled):hover { box-shadow: 0 7px 18px rgba(255,145,77,0.20); }
+.hci-transform-action--lock:not(:disabled):hover { box-shadow: 0 7px 18px rgba(245,158,11,0.16); }
+.hci-transform-action--help:hover { box-shadow: 0 7px 18px rgba(34,211,238,0.16); }
+
+/* Measurement shell */
+.measurement-panel {
+  width: min(420px, calc(100vw - 12px)) !important;
+  max-height: 100% !important;
+}
+.measurement-panel-scroll {
+  overscroll-behavior: contain;
+}
+
+/* Responsive measurement/calibration layout */
+@media (max-width: 760px) {
+  .measurement-panel {
+    width: 100vw !important;
+    max-width: 100vw !important;
+    border-radius: 0 !important;
+  }
+}

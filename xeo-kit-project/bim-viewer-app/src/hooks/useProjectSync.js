@@ -75,7 +75,7 @@ export const useProjectSync = (activeProject) => {
   // 1. LOAD: Fetch initial project state & asset catalog on startup
   useEffect(() => {
     if (file && jobId) {
-      setProjectState({ materials: {}, furniture: [], structural_edits: {} });
+      setProjectState({ materials: {}, furniture: [], structural_edits: {}, scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } } });
 
       fetch(`${API_BASE_URL}/api/projects/${jobId}/load`)
         .then(res => {
@@ -84,12 +84,12 @@ export const useProjectSync = (activeProject) => {
         })
         .then(data => {
           if (data) {
-            setProjectState(prev => ({
-              ...prev,
-              materials: data.materials || prev.materials,
-              furniture: data.furniture || prev.furniture,
-              structural_edits: data.structural_edits || prev.structural_edits
-            }));
+            setProjectState({
+              materials: data.materials || {},
+              furniture: data.furniture || [],
+              structural_edits: data.structural_edits || {},
+              scene_calibration: data.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
+            });
           }
         })
         .catch(() => {
@@ -97,19 +97,19 @@ export const useProjectSync = (activeProject) => {
           if (localState) {
             try {
               const parsed = JSON.parse(localState);
-              setProjectState(prev => ({
-                ...prev,
-                materials: parsed.materials || prev.materials,
-                furniture: parsed.furniture || prev.furniture,
-                structural_edits: parsed.structural_edits || prev.structural_edits
-              }));
+              setProjectState({
+                materials: parsed.materials || {},
+                furniture: parsed.furniture || [],
+                structural_edits: parsed.structural_edits || {},
+                scene_calibration: parsed.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
+              });
             } catch (e) {
               console.warn('[ProjectSync] Failed to parse local state, starting fresh.');
             }
           }
         });
     } else {
-      setProjectState({ materials: {}, furniture: [], structural_edits: {} });
+      setProjectState({ materials: {}, furniture: [], structural_edits: {}, scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } } });
     }
 
     fetch(`${API_BASE_URL}/api/assets`)
@@ -220,6 +220,11 @@ export const useProjectSync = (activeProject) => {
     }));
   };
 
+  const normalizeMatrix = (matrix) => {
+    if (!matrix || typeof matrix.length !== 'number' || matrix.length !== 16) return null;
+    return Array.from(matrix, Number);
+  };
+
   // ACTION: Update asset transform
   const updateAsset = (viewerRef, selectedAssetId, axis, value, isRotation = false, isScale = false) => {
     if (!selectedAssetId || !viewerRef.current) return;
@@ -227,7 +232,7 @@ export const useProjectSync = (activeProject) => {
     if (!assetModel) return;
     const numValue = parseFloat(value);
     if (!Number.isFinite(numValue)) return;
-    
+
     let updatedPos;
     let updatedRot;
     let updatedScale;
@@ -246,15 +251,21 @@ export const useProjectSync = (activeProject) => {
       assetModel.position = updatedPos;
     }
 
+    const persistedPosition = isRotation || isScale
+      ? null
+      : assetModelToTargetPosition(assetModel);
+    const persistedMatrix = normalizeMatrix(assetModel.matrix);
+
     setProjectState(prev => ({
       ...prev,
       furniture: (prev.furniture || []).map(f =>
         f.instanceId === selectedAssetId
           ? {
               ...f,
-              position: updatedPos || f.position || [0, 0, 0],
+              position: persistedPosition || f.position || [0, 0, 0],
               rotation: updatedRot || f.rotation || [0, 0, 0],
               scale: updatedScale || f.scale || [1, 1, 1],
+              ...(persistedMatrix ? { matrix: persistedMatrix } : {}),
             }
           : f
       ),
@@ -262,15 +273,21 @@ export const useProjectSync = (activeProject) => {
   };
 
   const deleteAsset = (viewerRef, selectedAssetId) => {
-    if (!selectedAssetId || !viewerRef.current) return;
-    const assetModel = viewerRef.current.scene.models[selectedAssetId];
+    if (!selectedAssetId) return;
+
+    const assetModel = viewerRef.current?.scene.models[selectedAssetId];
     if (assetModel) {
       assetModel.destroy();
-      setProjectState(prev => ({
-        ...prev,
-        furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
-      }));
     }
+
+    // Persistence is authoritative. Even if the live xeokit model is already
+    // gone (for example after a reload/race), the saved furniture entry must
+    // always be removed so a later calibration/reload cannot resurrect it.
+    setProjectState(prev => ({
+      ...prev,
+      furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
+    }));
+
     setToastMessage('Asset removed.');
     setTimeout(() => setToastMessage(null), 3000);
   };
@@ -281,8 +298,15 @@ export const useProjectSync = (activeProject) => {
     const newFurnitureItems = template.items.map(item => {
       const uniqueId = `${item.id}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
       const fullAssetUrl = item.url.startsWith('http') ? item.url : `${API_BASE_URL}${item.url}`;
-      
-      loadIFCAssetIntoScene(uniqueId, fullAssetUrl, item.position, item.rotation, { fileType: inferFileType(item.url, item.file_type), scale: item.scale || [1, 1, 1] });
+      const baseScale = item.scale || [1, 1, 1];
+      const sceneScale = globalSceneScale(projectStateRef.current);
+      // Newly placed library assets do not contain the calibrated scene scale in
+      // their source geometry. Bake the CURRENT scene calibration into the initial
+      // runtime/persisted scale exactly once for this new asset. Existing assets are
+      // already persisted in the current scene frame and are not rescaled on restore.
+      const effectiveScale = baseScale.map((v, i) => v * sceneScale[i]);
+
+      loadIFCAssetIntoScene(uniqueId, fullAssetUrl, item.position, item.rotation, { fileType: inferFileType(item.url, item.file_type), scale: effectiveScale });
       
       return {
         id: item.id,
@@ -292,7 +316,7 @@ export const useProjectSync = (activeProject) => {
         fileType: inferFileType(item.url, item.file_type),
         position: item.position || [0, 0, 0],
         rotation: item.rotation || [0, 0, 0],
-        scale: item.scale || [1, 1, 1],
+        scale: effectiveScale,
       };
     });
 
@@ -304,14 +328,37 @@ export const useProjectSync = (activeProject) => {
     setTimeout(() => setToastMessage(null), 3000);
   };
 
+  const globalSceneScale = (state) => {
+    const s = state?.scene_calibration?.scaleFactor;
+    if (!s || !Number.isFinite(s.x) || !Number.isFinite(s.y) || !Number.isFinite(s.z)) return [1, 1, 1];
+    return [s.x, s.y, s.z];
+  };
+
+  const assetModelToTargetPosition = (assetModel) => {
+    const aabb = assetModel?.aabb;
+    const pos = Array.isArray(assetModel?.position) ? assetModel.position : [0, 0, 0];
+    if (!aabb || aabb.length < 6) return [...pos];
+    return [
+      pos[0] + (aabb[0] + aabb[3]) / 2,
+      pos[1] + aabb[1],
+      pos[2] + (aabb[2] + aabb[5]) / 2,
+    ];
+  };
+
+
   const spawnAsset = (asset, coordinates, loadIFCAssetIntoScene, rotation = [0, 0, 0]) => {
     const uniqueId = `${asset.id}_${Date.now()}`;
     const urlPath = asset.url || asset.src || `/assets/${asset.id}.ifc`;
     const fullAssetUrl = urlPath.startsWith('http') ? urlPath : `${API_BASE_URL}${urlPath}`;
     const fileType = inferFileType(urlPath, asset.file_type || asset.fileType);
-    const scale = Array.isArray(asset.scale) ? asset.scale : [1, 1, 1];
-    const position = Array.isArray(coordinates) ? coordinates : [0, 0, 0];
-    const safeRotation = Array.isArray(rotation) ? rotation : [0, 0, 0];
+    const baseScale = Array.isArray(asset.scale) && asset.scale.length === 3 ? asset.scale : [1, 1, 1];
+    const sceneScale = globalSceneScale(projectStateRef.current);
+    // Newly placed library assets need the current scene calibration baked into
+    // their initial effective scale. Existing persisted assets already carry the
+    // effective scale for their current scene frame.
+    const effectiveScale = baseScale.map((value, i) => value * sceneScale[i]);
+    const position = Array.isArray(coordinates) && coordinates.length === 3 ? [...coordinates] : [0, 0, 0];
+    const safeRotation = Array.isArray(rotation) && rotation.length === 3 ? [...rotation] : [0, 0, 0];
 
     const furnitureItem = {
       id: asset.id,
@@ -321,7 +368,7 @@ export const useProjectSync = (activeProject) => {
       fileType,
       position,
       rotation: safeRotation,
-      scale,
+      scale: effectiveScale,
     };
 
     setProjectState(prev => ({
@@ -329,14 +376,18 @@ export const useProjectSync = (activeProject) => {
       furniture: [...(prev.furniture || []), furnitureItem],
     }));
 
-    // onPlaced is called by AssetManager after AABB correction with the real
-    // final world position. We patch the saved furniture entry so the compiler
-    // receives the corrected coordinates and can use them directly.
-    const onPlaced = (instanceId, finalPosition) => {
+    const onPlaced = (instanceId, finalPosition, model) => {
+      const matrix = normalizeMatrix(model?.matrix);
       setProjectState(prev => ({
         ...prev,
-        furniture: (prev.furniture || []).map(f =>
-          f.instanceId === instanceId ? { ...f, position: finalPosition } : f
+        furniture: (prev.furniture || []).map(item =>
+          item.instanceId === instanceId
+            ? {
+                ...item,
+                position: Array.isArray(finalPosition) ? [...finalPosition] : item.position,
+                ...(matrix ? { matrix } : {}),
+              }
+            : item
         ),
       }));
     };
@@ -346,14 +397,15 @@ export const useProjectSync = (activeProject) => {
       fullAssetUrl,
       position,
       safeRotation,
-      { fileType, scale, onPlaced }
+      { fileType, scale: effectiveScale, onPlaced }
     ).catch(error => {
       console.error('[ProjectSync] Failed to load placed asset:', error);
       setProjectState(prev => ({
         ...prev,
-        furniture: (prev.furniture || []).filter(f => f.instanceId !== uniqueId),
+        furniture: (prev.furniture || []).filter(item => item.instanceId !== uniqueId),
       }));
     });
+
     setToastMessage(`${furnitureItem.name} placed!`);
     setTimeout(() => setToastMessage(null), 3000);
   };
@@ -366,8 +418,6 @@ export const useProjectSync = (activeProject) => {
       const structuralEdits = prev.structural_edits || {};
       const existingEdit = structuralEdits[entityId] || {};
 
-      // Unlock only changes native visibility. Never create an empty
-      // scale/offset vector as a side effect of hiding the native element.
       if (transformType === 'visible') {
         return {
           ...prev,
@@ -405,17 +455,12 @@ export const useProjectSync = (activeProject) => {
     assetName,
     position = [0, 0, 0],
     rotation = [0, 0, 0],
-    scale = [1, 1, 1]
+    scale = [1, 1, 1],
+    metadata = {}
   ) => {
     setProjectState(prev => {
       const furniture = prev.furniture || [];
-
-      // Unlock/isolate is a live scene operation. The subsequent project-state
-      // update can be triggered more than once by autosave/state reconciliation,
-      // so never append the same isolated instance twice.
-      if (furniture.some(item => item.instanceId === newInstanceId)) {
-        return prev;
-      }
+      if (furniture.some(item => item.instanceId === newInstanceId)) return prev;
 
       return {
         ...prev,
@@ -427,16 +472,189 @@ export const useProjectSync = (activeProject) => {
             name: assetName || 'Isolated Element',
             src: fileUrl,
             fileType: 'ifc',
-            position,
-            rotation,
-            scale,
-            nativeSourceId: entityId,
-            isNativeIsolation: true,
+            position: Array.isArray(position) ? [...position] : [0, 0, 0],
+            rotation: Array.isArray(rotation) ? [...rotation] : [0, 0, 0],
+            scale: Array.isArray(scale) ? [...scale] : [1, 1, 1],
+            ...(Array.isArray(metadata?.matrix) && metadata.matrix.length === 16 ? { matrix: [...metadata.matrix] } : {}),
+            nativeSourceId: metadata?.nativeSourceId || entityId,
+            isNativeIsolation: metadata?.isNativeIsolation !== false,
           },
         ],
       };
     });
   };
+
+  const persistProjectStateForCalibration = async (state) => {
+    if (!jobId) throw new Error('No active project jobId for calibration persistence.');
+
+    while (isSavingRef.current || pendingSaveRef.current) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+
+    localStorage.setItem(`hci_state_${jobId}`, JSON.stringify(state));
+    const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state),
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`Failed to persist calibrated project state (${response.status})${text ? `: ${text}` : ''}`);
+    }
+
+    return true;
+  };
+
+  const transformMatrixBySceneScale = (matrix, ratio, oldSceneCenter, newSceneCenter) => {
+    const m = normalizeMatrix(matrix);
+    if (!m) return null;
+    const tx = newSceneCenter[0] - ratio * oldSceneCenter[0];
+    const ty = newSceneCenter[1] - ratio * oldSceneCenter[1];
+    const tz = newSceneCenter[2] - ratio * oldSceneCenter[2];
+    return [
+      m[0] * ratio, m[1] * ratio, m[2] * ratio, m[3],
+      m[4] * ratio, m[5] * ratio, m[6] * ratio, m[7],
+      m[8] * ratio, m[9] * ratio, m[10] * ratio, m[11],
+      m[12] * ratio + tx, m[13] * ratio + ty, m[14] * ratio + tz, m[15],
+    ];
+  };
+
+  const transformFurnitureForCalibration = async (ratio, oldSceneCenter, newSceneCenter, matrixSnapshots = {}) => {
+    if (!Number.isFinite(ratio) || ratio <= 0 ||
+        !Array.isArray(oldSceneCenter) || !Array.isArray(newSceneCenter) ||
+        oldSceneCenter.length !== 3 || newSceneCenter.length !== 3 ||
+        !oldSceneCenter.every(Number.isFinite) || !newSceneCenter.every(Number.isFinite)) {
+      throw new Error('Invalid calibration scene transform.');
+    }
+
+    const currentState = projectStateRef.current || {
+      materials: {},
+      furniture: [],
+      structural_edits: {},
+      scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } },
+    };
+
+    const previousSceneScale = currentState.scene_calibration?.scaleFactor || { x: 1, y: 1, z: 1 };
+    const safePrevious = {
+      x: Number.isFinite(previousSceneScale.x) && previousSceneScale.x > 0 ? previousSceneScale.x : 1,
+      y: Number.isFinite(previousSceneScale.y) && previousSceneScale.y > 0 ? previousSceneScale.y : 1,
+      z: Number.isFinite(previousSceneScale.z) && previousSceneScale.z > 0 ? previousSceneScale.z : 1,
+    };
+
+    // IMPORTANT STATE INVARIANT:
+    // Normal placed assets store a semantic placement target in the CURRENT IFC
+    // scene frame. Native-isolated IFCs use position as the explicit model
+    // translation term because their source geometry remains in IFC/world space.
+    // Both are transformed by the same observed scene affine transform.
+    //
+    // furniture.scale is the effective authored/render scale in the CURRENT
+    // scene frame. The backend rescales the main IFC; external assets therefore
+    // receive the same ratio exactly once. No arbitrary offset and no extra
+    // calibrationSourceScale multiplication are introduced.
+    const nextFurniture = (currentState.furniture || []).map(item => {
+      const position = Array.isArray(item.position) && item.position.length === 3
+        ? item.position
+        : [0, 0, 0];
+      const scale = Array.isArray(item.scale) && item.scale.length === 3
+        ? item.scale
+        : [1, 1, 1];
+
+      const sourceMatrix = normalizeMatrix(item.matrix) || normalizeMatrix(matrixSnapshots?.[item.instanceId]);
+      const nextMatrix = sourceMatrix
+        ? transformMatrixBySceneScale(sourceMatrix, ratio, oldSceneCenter, newSceneCenter)
+        : null;
+
+      return {
+        ...item,
+        position: [
+          newSceneCenter[0] + (position[0] - oldSceneCenter[0]) * ratio,
+          newSceneCenter[1] + (position[1] - oldSceneCenter[1]) * ratio,
+          newSceneCenter[2] + (position[2] - oldSceneCenter[2]) * ratio,
+        ],
+        scale: [
+          scale[0] * ratio,
+          scale[1] * ratio,
+          scale[2] * ratio,
+        ],
+        ...(nextMatrix ? { matrix: nextMatrix } : {}),
+      };
+    });
+
+    const nextState = {
+      ...currentState,
+      furniture: nextFurniture,
+      scene_calibration: {
+        ...(currentState.scene_calibration || {}),
+        scaleFactor: {
+          x: safePrevious.x * ratio,
+          y: safePrevious.y * ratio,
+          z: safePrevious.z * ratio,
+        },
+        migratedToFrameScale: true,
+      },
+    };
+
+    projectStateRef.current = nextState;
+    setProjectState(nextState);
+    await persistProjectStateForCalibration(nextState);
+    return nextState;
+  };
+
+  // One-time migration for Phase 11 projects that stored user-scale and
+  // calibration-source metadata separately. The current architecture stores
+  // furniture directly in the current scene frame, so we fold the legacy scene
+  // factor into the persisted furniture exactly once and mark the migration.
+  const repairLegacyCalibrationState = async (oldSceneCenter, newSceneCenter) => {
+    const currentState = projectStateRef.current;
+    if (!currentState) return currentState;
+
+    const sceneScale = globalSceneScale(currentState);
+    const hasLegacyMetadata = (currentState.furniture || []).some(item =>
+      Array.isArray(item?.calibrationSourceScale)
+    );
+    const alreadyMigrated = currentState.scene_calibration?.migratedToFrameScale === true;
+
+    if (!hasLegacyMetadata || alreadyMigrated || sceneScale.every(v => Math.abs(v - 1) < 1e-9)) {
+      return currentState;
+    }
+
+    if (!Array.isArray(oldSceneCenter) || !Array.isArray(newSceneCenter) ||
+        oldSceneCenter.length !== 3 || newSceneCenter.length !== 3 ||
+        !oldSceneCenter.every(Number.isFinite) || !newSceneCenter.every(Number.isFinite)) {
+      throw new Error('Invalid legacy calibration frame.');
+    }
+
+    const nextFurniture = (currentState.furniture || []).map(item => {
+      const position = Array.isArray(item.position) && item.position.length === 3 ? item.position : [0, 0, 0];
+      const scale = Array.isArray(item.scale) && item.scale.length === 3 ? item.scale : [1, 1, 1];
+      return {
+        ...item,
+        position: [
+          newSceneCenter[0] + (position[0] - oldSceneCenter[0]) * sceneScale[0],
+          newSceneCenter[1] + (position[1] - oldSceneCenter[1]) * sceneScale[1],
+          newSceneCenter[2] + (position[2] - oldSceneCenter[2]) * sceneScale[2],
+        ],
+        scale: [scale[0] * sceneScale[0], scale[1] * sceneScale[1], scale[2] * sceneScale[2]],
+        calibrationSourceScale: undefined,
+      };
+    });
+
+    const nextState = {
+      ...currentState,
+      furniture: nextFurniture,
+      scene_calibration: {
+        ...(currentState.scene_calibration || {}),
+        migratedToFrameScale: true,
+      },
+    };
+
+    projectStateRef.current = nextState;
+    setProjectState(nextState);
+    await persistProjectStateForCalibration(nextState);
+    return nextState;
+  };
+
 
   return {
     projectState,
@@ -457,6 +675,8 @@ export const useProjectSync = (activeProject) => {
     applyTemplate,
     adoptIsolatedAsset,
     updateStructuralEdit,
+    transformFurnitureForCalibration,
+    repairLegacyCalibrationState,
     setToastMessage,
     setCustomColor,
     saveNow,

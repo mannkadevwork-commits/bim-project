@@ -15,7 +15,7 @@ export const resolveCollisionFreePosition = (pos, projectStateRef, minDistance =
   const maxAttempts = 24;
   while (!isClear(x, z) && attempt < maxAttempts) {
     attempt++;
-    const angle = attempt * 0.8;   
+    const angle = attempt * 0.8;
     const radius = 0.3 * attempt;
     x = pos[0] + Math.cos(angle) * radius;
     z = pos[2] + Math.sin(angle) * radius;
@@ -33,57 +33,51 @@ export const getWallSnapData = (viewerRef, canvasPos) => {
     pickSurface: true,
   });
 
-  if (!wallPick?.worldPos || !wallPick?.worldNormal || !wallPick?.entity) {
-    return null;
-  }
+  if (!wallPick?.worldPos || !wallPick?.worldNormal || !wallPick?.entity) return null;
 
   const normal = wallPick.worldNormal;
-
   const horizontalMag = Math.sqrt(normal[0] * normal[0] + normal[2] * normal[2]);
   const isVertical = Math.abs(normal[1]) < 0.25 && horizontalMag > 0.9;
   if (!isVertical) return null;
 
   const metaObject = viewer.metaScene.metaObjects[wallPick.entity.id];
-  if (!metaObject || !WALL_IFC_CLASSES.has(metaObject.type)) {
-    return null;
-  }
+  if (!metaObject || !WALL_IFC_CLASSES.has(metaObject.type)) return null;
 
-  const rotationYRad = Math.atan2(normal[0], normal[2]);
-  const rotationYDeg = rotationYRad * (180 / Math.PI);
-
+  // Wall hosting is backend-authoritative. Xeokit only supplies the host wall
+  // identity, click point and surface validation. The IFC wall placement/profile
+  // determines the final center and rotation.
   return {
-    position: [wallPick.worldPos[0], wallPick.worldPos[1], wallPick.worldPos[2]],
-    rotation: [0, rotationYDeg, 0],
+    position: [...wallPick.worldPos],
+    rotation: [0, 0, 0],
     wallGlobalId: wallPick.entity.id,
-    wallNormal: [normal[0], normal[1], normal[2]],
+    wallNormal: [...normal],
+    wallEntityId: wallPick.entity.id,
+    wallEntityModelId: wallPick.entity.model?.id ?? null,
   };
 };
 
 export const getDropPosition = (viewerRef, projectStateRef, canvasPos, assetType = null) => {
   const viewer = viewerRef.current;
-  if (!viewer) return assetType === 'door' ? { position: [0, 0, 0], rotation: [0, 0, 0], wallGlobalId: null, snapped: false } : [0, 0, 0];
+  if (!viewer) {
+    return assetType === 'door'
+      ? { position: [0, 0, 0], rotation: [0, 0, 0], wallGlobalId: null, snapped: false }
+      : [0, 0, 0];
+  }
 
   if (assetType === 'door') {
     const wallSnap = getWallSnapData(viewerRef, canvasPos);
-    if (wallSnap) {
-      return { ...wallSnap, snapped: true };
-    }
+    if (wallSnap) return { ...wallSnap, snapped: true };
+
     const cursorPick = viewer.scene.pick({ canvasPos, pickSurface: true });
     return {
-      position: cursorPick?.worldPos
-        ? [cursorPick.worldPos[0], cursorPick.worldPos[1], cursorPick.worldPos[2]]
-        : [viewer.camera.look[0], 0, viewer.camera.look[2]],
+      position: cursorPick?.worldPos ? [...cursorPick.worldPos] : [viewer.camera.look[0], 0, viewer.camera.look[2]],
       rotation: [0, 0, 0],
       wallGlobalId: null,
       snapped: false,
     };
   }
 
-  const cursorPick = viewer.scene.pick({
-    canvasPos: canvasPos,
-    pickSurface: true,
-  });
-
+  const cursorPick = viewer.scene.pick({ canvasPos, pickSurface: true });
   let x = cursorPick?.worldPos?.[0] ?? viewer.camera.look[0];
   let z = cursorPick?.worldPos?.[2] ?? viewer.camera.look[2];
   let y = 0;
@@ -99,18 +93,13 @@ export const getDropPosition = (viewerRef, projectStateRef, canvasPos, assetType
     y = floorPick.worldPos[1];
     z = floorPick.worldPos[2];
   }
-  
+
   return resolveCollisionFreePosition([x, y, z], projectStateRef);
 };
 
 export const getCursorWorldPosition = (viewerRef, canvasPos) => {
   const viewer = viewerRef.current;
   if (!viewer) return null;
-
-  const cursorPick = viewer.scene.pick({
-    canvasPos: canvasPos,
-    pickSurface: true,
-  });
-
+  const cursorPick = viewer.scene.pick({ canvasPos, pickSurface: true });
   return cursorPick?.worldPos || null;
 };

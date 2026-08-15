@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Move, RotateCw, Scaling, Unlock, MoreHorizontal, Trash2, Palette, CircleHelp, Square, Diamond, Box } from 'lucide-react';
+import { Move, RotateCw, Scaling, Lock, Unlock, MoreHorizontal, Trash2, Palette, CircleHelp, Square, Diamond, Box } from 'lucide-react';
 
 const QUICK_COLORS = ['#FFFFFF', '#000000', '#E74C3C', '#3498DB', '#F5DEB3', '#7F8C8D'];
 
@@ -207,7 +207,7 @@ export const TransformModeTooltip = ({
             type="button"
             onClick={(e) => { e.stopPropagation(); handleModeClick('move'); }}
             disabled={isNative}
-            className={`relative flex items-center justify-center w-10 h-10 rounded-xl ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'move', 'move')}`}
+            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--move w-10 h-10 rounded-xl border border-transparent ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'move', 'move')}`}
             title={isNative ? 'Unlock Element first' : 'Move · W'}
           >
             <Move className="w-5 h-5" />
@@ -218,7 +218,7 @@ export const TransformModeTooltip = ({
             type="button"
             onClick={(e) => { e.stopPropagation(); handleModeClick('rotate'); }}
             disabled={isNative}
-            className={`relative flex items-center justify-center w-10 h-10 rounded-xl ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'rotate', 'rotate')}`}
+            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--rotate w-10 h-10 rounded-xl border border-transparent ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'rotate', 'rotate')}`}
             title={isNative ? 'Unlock Element first' : 'Rotate · E'}
           >
             <RotateCw className="w-5 h-5" />
@@ -229,7 +229,7 @@ export const TransformModeTooltip = ({
             type="button"
             onClick={(e) => { e.stopPropagation(); handleModeClick('stretch'); }}
             disabled={isNative}
-            className={`relative flex items-center justify-center w-10 h-10 rounded-xl ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'stretch', 'resize')}`}
+            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--resize w-10 h-10 rounded-xl border border-transparent ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'stretch', 'resize')}`}
             title={isNative ? 'Unlock Element first' : 'Resize · R'}
           >
             <Scaling className="w-5 h-5" />
@@ -242,16 +242,16 @@ export const TransformModeTooltip = ({
             type="button"
             onClick={(e) => { e.stopPropagation(); if (isNative && onIsolate) onIsolate(); }}
             disabled={!isNative || !onIsolate}
-            className={`flex items-center justify-center w-10 h-10 rounded-xl ${!isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : 'text-slate-300 hover:text-white hover:bg-white/6'}`}
-            title="Unlock Element · U"
+            className={`flex items-center justify-center hci-transform-action hci-transform-action--lock w-10 h-10 rounded-xl border border-transparent ${!isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : 'text-amber-300 bg-amber-500/8 hover:border-amber-400/25 hover:bg-amber-500/14 hover:text-amber-200'}`}
+            title={isNative ? 'Unlock element for editing · U' : 'Editing already enabled'}
           >
-            <Unlock className="w-4.5 h-4.5" />
+            {isNative ? <Lock className="w-[17px] h-[17px]" /> : <Unlock className="w-[17px] h-[17px]" />}
           </button>
 
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); setShowMore((v) => !v); }}
-            className={`flex items-center justify-center w-10 h-10 rounded-xl ${showMore ? 'bg-white/8 text-white' : 'text-slate-400 hover:text-white hover:bg-white/6'}`}
+            className={`flex items-center justify-center hci-transform-action w-10 h-10 rounded-xl border border-transparent ${showMore ? 'bg-white/8 text-white ring-1 ring-slate-600/70' : 'text-slate-400 hover:text-white hover:bg-white/6 hover:border-slate-700'}`}
             title="More options"
             aria-expanded={showMore}
           >
@@ -261,13 +261,13 @@ export const TransformModeTooltip = ({
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); setShowHelp((v) => !v); setShowMore(false); }}
-            className={`flex items-center justify-center w-8 h-8 rounded-xl ${showHelp ? 'bg-[#ff914d]/15 text-[#ffb07a] ring-1 ring-[#ff914d]/45' : 'text-slate-500 hover:text-white hover:bg-white/6'}`}
+            className={`flex items-center justify-center hci-transform-action hci-transform-action--help w-9 h-9 rounded-xl border border-transparent ${showHelp ? 'bg-cyan-400/12 text-cyan-300 ring-1 ring-cyan-300/35' : 'text-cyan-300/75 hover:text-cyan-200 hover:bg-cyan-400/10 hover:border-cyan-300/20'}`}
             title="Transform help"
             aria-label="Transform help"
             aria-expanded={showHelp}
             aria-controls="transform-help-panel"
           >
-            <CircleHelp className="w-4 h-4" />
+            <CircleHelp className="w-[17px] h-[17px]" strokeWidth={2.35} />
           </button>
         </div>
 

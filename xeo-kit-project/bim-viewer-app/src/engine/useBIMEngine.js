@@ -14,13 +14,13 @@ import { API_BASE_URL, AXIS_HANDLE_COLORS, STRETCH_HANDLE_DRAG_SCALE, STRETCH_HA
 import { brightenColor } from './utils/helpers';
 import { animateHandleTo, buildStretchHandles, destroyStretchHandles, hideRevealedGroup, revealGroupForFace } from './stretch/StretchHandles';
 import { applyScale, cursorForAxes, resetHoveredStretchHandle } from './stretch/StretchController';
-import { toggleMeasurementMode, clearMeasurements, syncMeasurementsList, deleteMeasurement, flyToMeasurement, toggleSnapping, toggleAxisBreakdown, formatLength, cancelActiveMeasurement, applyMeasurementUnitToPlugin } from './measurements/MeasurementController';
-import { applyGlobalScale, scaleModelByMeasurement, calibrateWallHeight } from './calibration/CalibrationController';
+import { toggleMeasurementMode, clearMeasurements, syncMeasurementsList, deleteMeasurement, flyToMeasurement, toggleSnapping, toggleAxisBreakdown, formatLength, cancelActiveMeasurement, applyMeasurementUnitToPlugin, MEASUREMENT_MODES, ORTHOGONAL_CONSTRAINTS, pickMeasurementReference, createProgrammaticDistanceMeasurement } from './measurements/MeasurementController';
+import { scaleModelByMeasurement, calibrateWallHeight } from './calibration/CalibrationController';
 import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './placement/PlacementController';
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
 import { calculateGrabPoint } from './stretch/TranslationController';
 
-export const useBIMEngine = (activeProject, projectStateRef, projectState, onAssetPlaced, setIsRightPanelOpen, setRightTab) => {
+export const useBIMEngine = (activeProject, projectStateRef, projectState, onAssetPlaced, setIsRightPanelOpen, setRightTab, transformFurnitureForCalibration, repairLegacyCalibrationState) => {
   const { file, jobId, fileName } = activeProject || {};
 
   const canvasRef = useRef(null);
@@ -40,6 +40,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   
   // NEW: Concurrency lock for async asset loading to prevent duplication
   const loadingModelsRef = useRef(new Set());
+  const legacyCalibrationRepairInFlightRef = useRef(false);
 
   // Hard rendering boundary lock
   const isModelLoadedRef = useRef(false);
@@ -87,11 +88,24 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [measurementsList, setMeasurementsList] = useState([]); 
+  const [measurementMode, setMeasurementMode] = useState('point');
+  const measurementModeRef = useRef('point');
+  const [orthogonalConstraint, setOrthogonalConstraint] = useState('horizontal');
+  const orthogonalConstraintRef = useRef('horizontal');
+  const pointMeasurementOriginRef = useRef(null);
+  const pointMeasurementPreviewRef = useRef(null);
+  const pointMeasurementPreviewIdRef = useRef(`hci_measurement_preview_${Math.random().toString(36).slice(2)}`);
+  const [measurementHover, setMeasurementHover] = useState(null);
   const [measurementUnit, setMeasurementUnit] = useState('m');
   const measurementUnitRef = useRef('m');
   const [snappingEnabled, setSnappingEnabled] = useState(true);
+  const snappingEnabledRef = useRef(true);
   const [axisBreakdownVisible, setAxisBreakdownVisible] = useState(false);
   const [measurementDisplayMode, setMeasurementDisplayMode] = useState('distance');
+
+  useEffect(() => {
+    snappingEnabledRef.current = snappingEnabled;
+  }, [snappingEnabled]);
 
   useEffect(() => {
     measurementUnitRef.current = measurementUnit;
@@ -104,10 +118,93 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     hoveredStretchMeshRef, activeResizeFaceKeyRef, canvasRef
   };
 
+  const measureOriginalProjectCenter = async () => {
+    if (!activeProject?.jobId || !loadersRef.current.ifc) return null;
+    const tempId = `__hci_original_reference_${Date.now()}`;
+    try {
+      const res = await fetch(`${API_BASE_URL}/jobs/${encodeURIComponent(activeProject.jobId)}/original.ifc?v=${Date.now()}`);
+      if (!res.ok) return null;
+      const buffer = await res.arrayBuffer();
+      const model = loadersRef.current.ifc.load({
+        id: tempId,
+        ifc: new Uint8Array(buffer),
+        edges: false,
+        globalizeCoordinates: false,
+      });
+      return await new Promise((resolve) => {
+        model.on('loaded', () => {
+          const aabb = model.aabb;
+          const center = aabb && aabb.length >= 6
+            ? [(aabb[0] + aabb[3]) / 2, (aabb[1] + aabb[4]) / 2, (aabb[2] + aabb[5]) / 2]
+            : null;
+          try { model.destroy(); } catch (_) {}
+          resolve(center);
+        });
+        model.on('error', () => {
+          try { model.destroy(); } catch (_) {}
+          resolve(null);
+        });
+      });
+    } catch (error) {
+      console.warn('[Calibration] Unable to inspect original IFC for legacy-state repair.', error);
+      return null;
+    }
+  };
+
+
+  const snapshotFurnitureMatrices = () => {
+    const snapshot = {};
+    const state = projectStateRef.current || {};
+    (state.furniture || []).forEach(item => {
+      const model = item?.instanceId ? viewerRef.current?.scene?.models?.[item.instanceId] : null;
+      if (model?.matrix && model.matrix.length === 16) snapshot[item.instanceId] = Array.from(model.matrix);
+    });
+    return snapshot;
+  };
+
   const restoreProjectStateToScene = (stateOverride) => {
-    if (!viewerRef.current || !currentModelRef.current) return;
+    if (!viewerRef.current || !currentModelRef.current) return Promise.resolve([]);
     const state = stateOverride || projectStateRef.current;
-    if (!state) return;
+    if (!state) return Promise.resolve([]);
+
+    // Hydrate the cumulative scene calibration from persisted project state.
+    // This is display/scene metadata only; furniture.scale is already stored in
+    // the current scene frame and must NOT be multiplied by this value on restore.
+    const persistedScale = state.scene_calibration?.scaleFactor;
+    if (persistedScale &&
+        Number.isFinite(persistedScale.x) && Number.isFinite(persistedScale.y) && Number.isFinite(persistedScale.z) &&
+        persistedScale.x > 0 && persistedScale.y > 0 && persistedScale.z > 0) {
+      globalScaleFactorRef.current = {
+        x: persistedScale.x,
+        y: persistedScale.y,
+        z: persistedScale.z,
+      };
+      setSceneScaleFactor({ ...globalScaleFactorRef.current });
+    }
+
+    const legacyState = !state.scene_calibration?.migratedToFrameScale
+      && (state.furniture || []).some(item => Array.isArray(item.calibrationSourceScale))
+      && (() => {
+        const s = state.scene_calibration?.scaleFactor;
+        return s && [s.x, s.y, s.z].every(Number.isFinite) && [s.x, s.y, s.z].some(v => Math.abs(v - 1) > 1e-9);
+      })();
+
+    if (legacyState && !legacyCalibrationRepairInFlightRef.current) {
+      legacyCalibrationRepairInFlightRef.current = true;
+      const currentCenter = currentModelRef.current?.aabb;
+      const newCenter = currentCenter && currentCenter.length >= 6
+        ? [(currentCenter[0] + currentCenter[3]) / 2, (currentCenter[1] + currentCenter[4]) / 2, (currentCenter[2] + currentCenter[5]) / 2]
+        : null;
+      measureOriginalProjectCenter().then(oldCenter => {
+        if (oldCenter && newCenter && repairLegacyCalibrationState) {
+          return repairLegacyCalibrationState(oldCenter, newCenter);
+        }
+        return null;
+      }).finally(() => {
+        legacyCalibrationRepairInFlightRef.current = false;
+      });
+      return Promise.resolve([]);
+    }
 
     if (state.materials) {
       Object.entries(state.materials).forEach(([targetId, matData]) => {
@@ -151,7 +248,105 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       });
     }
 
-   if (state.furniture) {
+    // Reconstruct the exact model matrix after an asset/isolation finishes loading.
+  // Resize writes model.matrix directly (the authoritative Xeokit transform).
+  // SceneModel.matrix overrides position/rotation/scale setters, so restoring only
+  // item.scale would not reliably restore the persisted resize.
+  const applyPersistedModelMatrix = (model, item) => {
+    if (!model || !item) return;
+
+    if (Array.isArray(item.matrix) && item.matrix.length === 16 && item.matrix.every(Number.isFinite)) {
+      model.matrix = Array.from(item.matrix);
+      return;
+    }
+
+    const position = item.isNativeIsolation
+      ? (Array.isArray(item.position) ? [...item.position] : [0, 0, 0])
+      : (Array.isArray(model.position) && model.position.length === 3
+        ? [...model.position]
+        : (Array.isArray(item.position) ? [...item.position] : [0, 0, 0]));
+    const rotation = Array.isArray(item.rotation) && item.rotation.length === 3
+      ? item.rotation
+      : [0, 0, 0];
+    const scale = Array.isArray(item.scale) && item.scale.length === 3
+      ? item.scale
+      : [1, 1, 1];
+
+    const ry = (rotation[1] || 0) * Math.PI / 180;
+    const c = Math.cos(ry);
+    const s = Math.sin(ry);
+
+    model.matrix = [
+      scale[0] * c, 0, -scale[0] * s, 0,
+      0, scale[1], 0, 0,
+      scale[2] * s, 0, scale[2] * c, 0,
+      position[0], position[1], position[2], 1,
+    ];
+  };
+
+  const applyPersistedMaterialToModel = (model, item, state) => {
+    if (!model || !state?.materials) return;
+    const material = state.materials[item.instanceId] || state.materials[item.nativeSourceId];
+    if (!Array.isArray(material?.rgb)) return;
+    Object.values(viewerRef.current?.scene?.objects || {}).forEach(object => {
+      if (object?.model?.id === model.id) {
+        try { object.colorize = material.rgb; } catch (_) {}
+      }
+    });
+  };
+
+
+  // Restore native IFC edits FIRST, before loading any isolated IFC assets.
+    //
+    // An isolated IFC contains the same GlobalId as its native source. If the
+    // isolated model is loaded first, xeokit may replace/override the object
+    // accessible from scene.objects[entityId], making it impossible to reliably
+    // hide the original native geometry. That was the exact reload regression:
+    // the editable/stretched isolation existed, but the original wall remained
+    // visible underneath it.
+    //
+    // The original main IFC is guaranteed to be available here because this
+    // function is only called from the main model's `loaded` callback.
+    if (state.structural_edits) {
+      Object.entries(state.structural_edits).forEach(([entityId, edit]) => {
+        const entity = currentModelRef.current
+          ? Object.values(viewerRef.current.scene.objects || {})
+              .find(object => object?.id === entityId && object.model === currentModelRef.current)
+          : null;
+
+        if (!entity) {
+          console.warn('[NativeEdit][RESTORE] Original native entity not found in main model:', {
+            entityId,
+            mainModelId: currentModelRef.current?.id || null,
+          });
+          return;
+        }
+
+        if (edit.scale) {
+          try { entity.scale = edit.scale; } catch (error) {
+            console.warn('[NativeEdit][RESTORE] Ignoring unsupported native scale:', entityId, error);
+          }
+        }
+
+        if (edit.visible === false) {
+          try {
+            entity.visible = false;
+            console.info('[NativeEdit][RESTORE] Hid original native entity before isolation load:', {
+              entityId,
+              mainModelId: currentModelRef.current?.id || null,
+            });
+          } catch (error) {
+            console.warn('[NativeEdit][RESTORE] Failed to hide original native entity:', entityId, error);
+          }
+        }
+      });
+    }
+
+    // Now restore separately loaded editable assets. Any native isolation has
+    // already had its source geometry hidden above, so a duplicate GlobalId in
+    // the isolated IFC cannot visually resurrect the original native element.
+    const restorePromises = [];
+    if (state.furniture) {
       state.furniture.forEach(item => {
         if (!item?.instanceId || !item?.src) return;
 
@@ -172,9 +367,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         // would run the generic AABB-to-floor placement correction and move the
         // isolated wall. Load these at model origin, then restore their model
         // transform exactly as persisted.
-        const targetPosition = isNativeIsolation ? null : (item.position || [0, 0, 0]);
+        const hasPersistedMatrix = Array.isArray(item.matrix) && item.matrix.length === 16;
+        const targetPosition = (isNativeIsolation || hasPersistedMatrix) ? null : (item.position || [0, 0, 0]);
 
-        loadIFCAssetIntoScene(
+        const restorePromise = loadIFCAssetIntoScene(
           loadersRef,
           globalScaleFactorRef,
           item.instanceId,
@@ -185,46 +381,29 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             fileType: item.fileType || item.file_type,
             scale: item.scale || [1, 1, 1],
             nativeSourceId: item.nativeSourceId || item.id || null,
+            isNativeIsolation,
+            onLoaded: (model) => {
+              // Matrix is the authoritative authored transform once present.
+              // Legacy records fall back to the proven target-position + TRS path.
+              applyPersistedModelMatrix(model, item);
+              applyPersistedMaterialToModel(model, item, state);
+            },
           }
         ).then((model) => {
           loadingModelsRef.current.delete(item.instanceId);
-          if (!model) return;
-
-          if (isNativeIsolation) {
-            model.position = [...(item.position || [0, 0, 0])];
-            model.rotation = [...(item.rotation || [0, 0, 0])];
-            model.scale = [...(item.scale || [1, 1, 1])];
-          }
+          if (!model) throw new Error('Asset restore returned no model.');
+          return model;
         }).catch(error => {
           loadingModelsRef.current.delete(item.instanceId);
           console.error('[BIM Engine] Failed to restore asset:', item.instanceId, error);
+          throw error;
         });
+
+        restorePromises.push(restorePromise);
       });
     }
 
-    if (state.structural_edits) {
-      Object.entries(state.structural_edits).forEach(([entityId, edit]) => {
-        // Resolve the native entity specifically from the original model. The
-        // isolated IFC can contain the same GlobalId, so scene.objects[id] is
-        // not sufficient once an element has been unlocked.
-        const entity = currentModelRef.current
-          ? Object.values(viewerRef.current.scene.objects || {})
-              .find(object => object?.id === entityId && object.model === currentModelRef.current)
-          : null;
-        if (!entity) return;
-
-        // Native structural edits belong only to the original IFC model.
-        // Never apply them to an unlocked ghost.
-        // The current viewer does not enable Entity#offset, so the isolated
-        // editing workflow intentionally does not consume native offset data.
-        if (edit.scale) {
-          try { entity.scale = edit.scale; } catch (error) {
-            console.warn('[NativeEdit] Ignoring unsupported native scale:', entityId, error);
-          }
-        }
-        if (edit.visible === false) entity.visible = false;
-      });
-    }
+    return Promise.all(restorePromises);
   };
 
   // Strictly controlled effect: Never process the state until the scene finishes loading completely.
@@ -232,7 +411,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   // geometry finishes being instantiated into `viewerRef.current.scene.objects`.
   useEffect(() => {
     if (isModelLoadedRef.current) {
-      restoreProjectStateToScene(projectState);
+      restoreProjectStateToScene(projectState).catch(error => {
+        console.error('[BIM Engine] Failed to restore persisted project state:', error);
+      });
     }
   }, [projectState]);
 
@@ -283,24 +464,217 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     configureTransformHandles(transformMode);
   }, [transformMode]);
 
+  const destroyPointMeasurementPreview = () => {
+    const plugin = measurementsPluginRef.current;
+    const preview = pointMeasurementPreviewRef.current;
+    if (plugin && preview?.id) {
+      try { plugin.destroyMeasurement(preview.id); } catch (e) {}
+    }
+    pointMeasurementPreviewRef.current = null;
+    pointMeasurementOriginRef.current = null;
+    setMeasurementHover(null);
+  };
+
+  const setMeasurementInteractionMode = (nextMode) => {
+    const safeMode = MEASUREMENT_MODES[nextMode] ? nextMode : 'point';
+    measurementModeRef.current = safeMode;
+    setMeasurementMode(safeMode);
+    destroyPointMeasurementPreview();
+
+    if (!isMeasuringRef.current) return;
+
+    const viewer = viewerRef.current;
+    const control = measurementControlRef.current;
+
+    try { control?.reset?.(); } catch (e) {}
+
+    if (safeMode === 'point' || safeMode === 'orthogonal') {
+      try { control?.deactivate(); } catch (e) {}
+      if (viewer?.cameraControl) viewer.cameraControl.active = false;
+      setMeasurementPhase('ready');
+      return;
+    }
+
+    if (viewer?.cameraControl) viewer.cameraControl.active = true;
+    control?.activate();
+    setMeasurementPhase(control?.currentMeasurement ? 'selecting-target' : 'ready');
+  };
+
+  const setOrthogonalMeasurementConstraint = (nextConstraint) => {
+    const safeConstraint = ORTHOGONAL_CONSTRAINTS[nextConstraint] ? nextConstraint : 'horizontal';
+    orthogonalConstraintRef.current = safeConstraint;
+    setOrthogonalConstraint(safeConstraint);
+    destroyPointMeasurementPreview();
+    if (isMeasuringRef.current && measurementModeRef.current === 'orthogonal') {
+      setMeasurementPhase('ready');
+    }
+  };
+
   useEffect(() => {
     isMeasuringRef.current = isMeasuring;
 
     const control = measurementControlRef.current;
-    if (!control) return;
+    const viewer = viewerRef.current;
 
-    if (isMeasuring) {
-      control.activate();
-      setMeasurementPhase(control.currentMeasurement ? 'selecting-target' : 'ready');
-      console.debug('[Measurement] activated', {
-        active: control.active,
-        snapping: control.snapping,
-      });
-    } else {
-      control.deactivate();
+    if (!isMeasuring) {
+      destroyPointMeasurementPreview();
+      try { control?.deactivate(); } catch (e) {}
+      if (viewer?.cameraControl) viewer.cameraControl.active = true;
       setMeasurementPhase('idle');
-      console.debug('[Measurement] deactivated');
+      return;
     }
+
+    if (measurementModeRef.current === 'point' || measurementModeRef.current === 'orthogonal') {
+      try { control?.deactivate(); } catch (e) {}
+      if (viewer?.cameraControl) viewer.cameraControl.active = false;
+      setMeasurementPhase('ready');
+    } else {
+      if (viewer?.cameraControl) viewer.cameraControl.active = true;
+      control?.activate();
+      setMeasurementPhase(control?.currentMeasurement ? 'selecting-target' : 'ready');
+    }
+  }, [isMeasuring]);
+
+  const constrainOrthogonalPoint = (origin, target, constraint) => {
+    if (constraint === 'vertical') {
+      return [origin[0], target[1], origin[2]];
+    }
+    return [target[0], origin[1], target[2]];
+  };
+
+  useEffect(() => {
+    if (!isMeasuring || !canvasRef.current) return undefined;
+
+    const canvas = canvasRef.current;
+
+    const handlePointMove = (event) => {
+      const activeMode = measurementModeRef.current;
+      if (activeMode !== 'point' && activeMode !== 'orthogonal') return;
+
+      const point = pickMeasurementReference(
+        viewerRef.current,
+        [event.offsetX, event.offsetY],
+        snappingEnabledRef.current,
+      );
+
+      if (!point) {
+        setMeasurementHover(null);
+        const preview = pointMeasurementPreviewRef.current;
+        if (preview) preview.targetVisible = false;
+        return;
+      }
+
+      setMeasurementHover({
+        x: point.canvasPos[0],
+        y: point.canvasPos[1],
+        snapType: point.snapType,
+        snapped: point.snapped,
+      });
+
+      const preview = pointMeasurementPreviewRef.current;
+      if (preview) {
+        const origin = pointMeasurementOriginRef.current;
+        let displayTarget = point;
+        if (activeMode === 'orthogonal' && origin) {
+          displayTarget = { ...point, worldPos: constrainOrthogonalPoint(origin.worldPos, point.worldPos, orthogonalConstraintRef.current) };
+        }
+        preview.target.entity = displayTarget.entity;
+        preview.target.worldPos = displayTarget.worldPos;
+        preview.targetVisible = true;
+      }
+    };
+
+    const handlePointDown = (event) => {
+      const activeMode = measurementModeRef.current;
+      if ((activeMode !== 'point' && activeMode !== 'orthogonal') || event.button !== 0) return;
+
+      event.preventDefault();
+      event.stopImmediatePropagation();
+
+      const point = pickMeasurementReference(
+        viewerRef.current,
+        [event.offsetX, event.offsetY],
+        snappingEnabledRef.current,
+      );
+      if (!point?.entity) return;
+
+      const origin = pointMeasurementOriginRef.current;
+
+      if (!origin) {
+        pointMeasurementOriginRef.current = point;
+        const preview = createProgrammaticDistanceMeasurement(
+          measurementsPluginRef,
+          point,
+          point,
+          {
+            id: pointMeasurementPreviewIdRef.current,
+            axisVisible: false,
+            visible: true,
+            wireVisible: true,
+            kind: activeMode === 'orthogonal' ? 'orthogonal' : 'point',
+            constraint: activeMode === 'orthogonal' ? orthogonalConstraintRef.current : null,
+          },
+        );
+
+        if (preview) {
+          preview.target.entity = point.entity;
+          preview.target.worldPos = point.worldPos;
+          preview.targetVisible = true;
+          preview.labelStringFormat = (len) => formatLength(len, measurementUnitRef.current);
+          pointMeasurementPreviewRef.current = preview;
+        }
+
+        setMeasurementPhase('selecting-target');
+        return;
+      }
+
+      const finalTarget = activeMode === 'orthogonal'
+        ? { ...point, worldPos: constrainOrthogonalPoint(origin.worldPos, point.worldPos, orthogonalConstraintRef.current) }
+        : point;
+
+      const dx = finalTarget.worldPos[0] - origin.worldPos[0];
+      const dy = finalTarget.worldPos[1] - origin.worldPos[1];
+      const dz = finalTarget.worldPos[2] - origin.worldPos[2];
+      if (Math.hypot(dx, dy, dz) < 1e-6) return;
+
+      const previewId = pointMeasurementPreviewRef.current?.id;
+      if (previewId) {
+        try { measurementsPluginRef.current?.destroyMeasurement(previewId); } catch (e) {}
+      }
+
+      const finalMeasurement = createProgrammaticDistanceMeasurement(
+        measurementsPluginRef,
+        origin,
+        finalTarget,
+        {
+          axisVisible: false,
+          visible: true,
+          wireVisible: true,
+          kind: activeMode === 'orthogonal' ? 'orthogonal' : 'point',
+          constraint: activeMode === 'orthogonal' ? orthogonalConstraintRef.current : null,
+        },
+      );
+
+      if (finalMeasurement) {
+        finalMeasurement.labelStringFormat = (len) => formatLength(len, measurementUnitRef.current);
+      }
+
+      pointMeasurementPreviewRef.current = null;
+      pointMeasurementOriginRef.current = null;
+      setMeasurementPhase('ready');
+      setMeasurementHover(null);
+      applyMeasurementUnitToPlugin(measurementsPluginRef, measurementUnitRef.current);
+      syncMeasurementsList(measurementsPluginRef, setMeasurementsList);
+    };
+
+    canvas.addEventListener('mousemove', handlePointMove);
+    canvas.addEventListener('mousedown', handlePointDown, { capture: true });
+
+    return () => {
+      canvas.removeEventListener('mousemove', handlePointMove);
+      canvas.removeEventListener('mousedown', handlePointDown, { capture: true });
+      setMeasurementHover(null);
+    };
   }, [isMeasuring]);
 
   // Escape cancels only the unfinished measurement and keeps Measure active.
@@ -309,6 +683,13 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     const onKeyDown = (event) => {
       if (event.key !== 'Escape') return;
+      if ((measurementModeRef.current === 'point' || measurementModeRef.current === 'orthogonal') && pointMeasurementOriginRef.current) {
+        event.preventDefault();
+        destroyPointMeasurementPreview();
+        setMeasurementPhase('ready');
+        return;
+      }
+
       const control = measurementControlRef.current;
       if (!control?.active || !control.currentMeasurement) return;
       event.preventDefault();
@@ -629,6 +1010,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     const canvas = canvasRef.current;
     
     const onCanvasMouseDown = (e) => {
+      if (isMeasuringRef.current && (measurementModeRef.current === 'point' || measurementModeRef.current === 'orthogonal')) {
+        return;
+      }
+
       const rect = canvas.getBoundingClientRect();
       const canvasPos = [e.clientX - rect.left, e.clientY - rect.top];
       const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
@@ -895,9 +1280,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         } else if (dragData.type === 'rotate') {
           stretchPersistCallbackRef.current(dragData.targetId, 'rotation', 1, targetObj.rotation?.[1] || 0);
         } else {
-          const scale = targetObj.scale || [1, 1, 1];
+          // Resize writes the live transform through model.matrix. Xeokit does
+          // not necessarily reflect that matrix back into model.scale, so
+          // reading targetObj.scale here can persist [1, 1, 1] even though the
+          // rendered model was visibly resized. Persist the same scale encoded
+          // in the matrix that the resize operation just applied.
+          const matrix = targetObj.matrix;
+          const matrixScale = matrix && matrix.length >= 11
+            ? [
+                Math.sqrt(matrix[0] * matrix[0] + matrix[1] * matrix[1] + matrix[2] * matrix[2]) || 1,
+                Math.sqrt(matrix[4] * matrix[4] + matrix[5] * matrix[5] + matrix[6] * matrix[6]) || 1,
+                Math.sqrt(matrix[8] * matrix[8] + matrix[9] * matrix[9] + matrix[10] * matrix[10]) || 1,
+              ]
+            : (targetObj.scale || [1, 1, 1]);
+
           dragData.axesList.forEach(({ axis }) => {
-            stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, scale[axis]);
+            stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, matrixScale[axis]);
           });
         }
       }
@@ -917,6 +1315,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     const onCanvasHoverMove = (e) => {
       if (isStretchingRef.current) return;
+      if (isMeasuringRef.current && (measurementModeRef.current === 'point' || measurementModeRef.current === 'orthogonal')) return;
       if (!stretchHandlesRef.current.length) return;
       
       const pick = viewer.scene.pick({ canvasPos: [e.offsetX, e.offsetY], pickSurface: false });
@@ -997,8 +1396,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       canvas.removeEventListener('mousemove', onCanvasHoverMove);
       document.removeEventListener('mousemove', onDocMouseMove);
       document.removeEventListener('mouseup', onDocMouseUp);
+      destroyPointMeasurementPreview();
       try { measurementControlRef.current?.deactivate(); } catch (e) {}
       try { measurementControlRef.current?.destroy(); } catch (e) {}
+      try { viewer.cameraControl.active = true; } catch (e) {}
       measurementControlRef.current = null;
       try { measurementsPluginRef.current?.destroy(); } catch (e) {}
       measurementsPluginRef.current = null;
@@ -1216,12 +1617,19 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     file, jobId, activeProject,
     viewerRef, currentModelRef, globalScaleFactorRef, setSceneScaleFactor,
     measurementsPluginRef, setMeasurementsList, setIsLoading,
-    loadersRef, projectStateRef, inspectNativeElement
+    loadersRef, projectStateRef, inspectNativeElement, transformFurnitureForCalibration,
+    restoreProjectStateToScene, snapshotFurnitureMatrices,
+    setSelectedAssetIdSafe,
+    setSelectedObject,
+    destroyStretchHandles: () => destroyStretchHandles(stretchCtx),
   };
 
   const assetCtx = {
     activeProject,
+    file,
+    jobId,
     viewerRef,
+    currentModelRef,
     loadersRef,
     globalScaleFactorRef,
     loadingModelsRef,
@@ -1244,6 +1652,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       placementMode,
       isMeasuring,
       measurementPhase,
+      measurementMode,
+      orthogonalConstraint,
+      measurementHover,
       measurementsList,
       measurementUnit,
       snappingEnabled,
@@ -1277,6 +1688,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       getDropPosition: (c, a) => getDropPosition(viewerRef, projectStateRef, c, a),
       getWallSnapData: (c) => getWallSnapData(viewerRef, c),
       toggleMeasurementMode: () => toggleMeasurementMode(isMeasuring, setIsMeasuring, setPlacementMode, setSelectedObject, setSelectedAssetId, viewerRef),
+      setMeasurementMode: setMeasurementInteractionMode,
+      orthogonalConstraint,
+      setOrthogonalConstraint: setOrthogonalMeasurementConstraint,
       clearMeasurements: () => clearMeasurements(measurementsPluginRef, setMeasurementsList),
       deleteMeasurement: (id) => deleteMeasurement(id, measurementsPluginRef, setMeasurementsList),
       scaleModelByMeasurement: (id, l) => scaleModelByMeasurement(calibrationCtx, id, l),

@@ -650,15 +650,11 @@ app.post('/api/elements/:jobId/:globalId/insert-door', (req, res) => {
 
       const protocol = req.headers['x-forwarded-proto'] || req.protocol;
       const host = req.headers.host;
-      const responsePayload = {
+      res.json({
         ...parsed,
         success: true,
         fileUrl: `${protocol}://${host}/jobs/${jobId}/element_edits/${outputFileName}`,
-      };
-      if (parsed.previewFileName) {
-        responsePayload.previewFileUrl = `${protocol}://${host}/jobs/${jobId}/element_edits/${parsed.previewFileName}`;
-      }
-      res.json(responsePayload);
+      });
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

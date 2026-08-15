@@ -11,6 +11,9 @@ import {
   Crosshair,
   Move3d,
   CheckCircle2,
+  MousePointer2,
+  MoveHorizontal,
+  MoveVertical,
 } from 'lucide-react';
 
 const UNIT_OPTIONS = [
@@ -53,7 +56,7 @@ const MeasurementRow = ({
                 {formatLength(m.lengthMeters)}
               </div>
               <div className="text-[10px] text-slate-400 dark:text-slate-500 mt-0.5">
-                Point-to-point reference
+                {m.measurementKind === 'orthogonal' ? `${m.orthogonalConstraint === 'vertical' ? 'Vertical' : 'Horizontal'} distance` : m.measurementKind === 'point' ? 'Free point-to-point' : 'Reference-to-reference'}
               </div>
             </div>
           </div>
@@ -61,7 +64,7 @@ const MeasurementRow = ({
           <div className="flex items-center gap-1 shrink-0">
             <button
               onClick={() => onUseForCalibration(m.id)}
-              className={`p-1.5 rounded-lg transition-colors ${isCalibrationSource ? 'text-amber-600 bg-amber-100 dark:text-amber-400 dark:bg-amber-900/30' : 'text-slate-400 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-slate-800'}`}
+              className={`p-1.5 rounded-lg transition-colors ${isCalibrationSource ? 'text-[var(--hci-orange)] bg-[var(--hci-orange-soft)] dark:text-[var(--hci-orange)] dark:bg-orange-950/20' : 'text-slate-400 hover:text-[var(--hci-orange)] hover:bg-[var(--hci-orange-soft)] dark:hover:bg-slate-800'}`}
               title={isCalibrationSource ? 'Using this measurement for scene calibration' : 'Use this measurement as calibration reference'}
             >
               <Wand2 className="w-3.5 h-3.5" />
@@ -147,6 +150,10 @@ export const MeasurementPanel = ({
   scaleModelByMeasurement,
   sceneScaleFactor,
   measurementPhase,
+  measurementMode,
+  setMeasurementMode,
+  orthogonalConstraint,
+  setOrthogonalConstraint,
   onClose,
 }) => {
   const [showCalibration, setShowCalibration] = useState(false);
@@ -163,6 +170,15 @@ export const MeasurementPanel = ({
     if (calibrationMeasurementId && !calibrationMeasurement) {
       setCalibrationMeasurementId(null);
       setDesiredLength('');
+      setShowCalibration(false);
+      return;
+    }
+
+    // Selecting a calibration reference should immediately expose the action area.
+    // This prevents the reference from being selected while the actual calibration
+    // controls remain hidden below the fold.
+    if (calibrationMeasurementId && calibrationMeasurement) {
+      setShowCalibration(true);
     }
   }, [calibrationMeasurementId, calibrationMeasurement]);
 
@@ -238,16 +254,16 @@ export const MeasurementPanel = ({
   };
 
   return (
-    <div className="absolute top-20 right-4 z-40 w-[332px] max-h-[calc(100vh-112px)] bg-white/96 dark:bg-slate-900/96 backdrop-blur-xl border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl overflow-hidden animate-in slide-in-from-right-4 fade-in duration-300">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-800/50">
+    <div className="measurement-panel absolute top-0 right-0 bottom-0 z-[60] w-[390px] h-full max-h-full bg-white/98 dark:bg-slate-950/98 backdrop-blur-2xl border-l border-slate-200/90 dark:border-slate-800 shadow-[-18px_0_50px_rgba(2,6,23,0.18)] overflow-hidden flex flex-col animate-in slide-in-from-right-4 fade-in duration-300">
+      <div className="flex items-center justify-between px-4 py-3.5 border-b border-slate-200/80 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-900/80 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-cyan-50 dark:bg-cyan-900/30 flex items-center justify-center">
-            <Ruler className="w-4 h-4 text-cyan-500" />
+          <div className="w-8 h-8 rounded-lg bg-[#ff914d]/10 dark:bg-[#ff914d]/[0.12] flex items-center justify-center">
+            <Ruler className="w-4 h-4 text-[#ff914d]" />
           </div>
           <div className="min-w-0">
             <h3 className="text-sm font-bold text-slate-800 dark:text-white">Measurements</h3>
             <p className="text-[10px] text-slate-400 dark:text-slate-500">
-              {incomplete ? 'Select the second reference' : 'Select two references to measure'}
+              {measurementMode === 'point' ? (incomplete ? 'Select the target point' : 'Pick two points on the model') : measurementMode === 'orthogonal' ? (incomplete ? 'Select the target for the constrained distance' : 'Pick two points for an orthogonal distance') : (incomplete ? 'Select the second reference' : 'Select two references')}
             </p>
           </div>
         </div>
@@ -256,7 +272,7 @@ export const MeasurementPanel = ({
         </button>
       </div>
 
-      <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800">
+      <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 shrink-0">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 dark:text-slate-400">
             <Crosshair className={`w-3.5 h-3.5 ${incomplete ? 'text-cyan-500 animate-pulse' : 'text-emerald-500'}`} />
@@ -266,7 +282,64 @@ export const MeasurementPanel = ({
         </div>
       </div>
 
-      <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 space-y-2.5">
+      <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 space-y-3 shrink-0">
+        <div>
+          <div className="text-[10px] uppercase tracking-wider font-bold text-slate-400 mb-1.5">Measure mode</div>
+          <div className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-slate-100 dark:bg-slate-800">
+            <button
+              onClick={() => setMeasurementMode('point')}
+              className={`flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-lg text-[10px] font-bold transition-colors ${measurementMode === 'point' ? 'bg-white dark:bg-slate-700 text-[#ff914d] dark:text-[#ffb27e] shadow-sm' : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-200'}`}
+            >
+              <MousePointer2 className="w-3.5 h-3.5" />
+              Point
+            </button>
+            <button
+              onClick={() => setMeasurementMode('reference')}
+              className={`flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-lg text-[10px] font-bold transition-colors ${measurementMode === 'reference' ? 'bg-white dark:bg-slate-700 text-[#ff914d] dark:text-[#ffb27e] shadow-sm' : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-200'}`}
+            >
+              <Crosshair className="w-3.5 h-3.5" />
+              Reference
+            </button>
+            <button
+              onClick={() => setMeasurementMode('orthogonal')}
+              className={`flex items-center justify-center gap-1.5 px-2 py-2 rounded-lg text-[10px] font-bold transition-colors ${measurementMode === 'orthogonal' ? 'bg-white dark:bg-slate-700 text-[#ff914d] dark:text-[#ffb27e] shadow-sm' : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-200'}`}
+              title="Measure a plan or vertical distance"
+            >
+              <Move3d className="w-3.5 h-3.5" />
+              Ortho
+            </button>
+          </div>
+          <div className="mt-1.5 text-[9px] leading-4 text-slate-400">
+            {measurementMode === 'point' ? 'Snap directly to vertices, edges, or any visible surface point.' : measurementMode === 'orthogonal' ? 'Constrain the result to plan (XZ) or vertical (Y) distance.' : 'Use Xeokit reference picking for model-to-model measurements.'}
+          </div>
+
+          {measurementMode === 'orthogonal' && (
+            <div className="mt-2 p-1 rounded-xl bg-slate-100 dark:bg-slate-800">
+              <div className="grid grid-cols-2 gap-1">
+                <button
+                  type="button"
+                  onClick={() => setOrthogonalConstraint('horizontal')}
+                  className={`flex items-center justify-center gap-1.5 px-2 py-2 rounded-lg text-[10px] font-bold transition-colors ${orthogonalConstraint === 'horizontal' ? 'bg-white dark:bg-slate-700 text-[#ff914d] dark:text-[#ffb27e] shadow-sm' : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-200'}`}
+                >
+                  <MoveHorizontal className="w-3.5 h-3.5" />
+                  Horizontal
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOrthogonalConstraint('vertical')}
+                  className={`flex items-center justify-center gap-1.5 px-2 py-2 rounded-lg text-[10px] font-bold transition-colors ${orthogonalConstraint === 'vertical' ? 'bg-white dark:bg-slate-700 text-[#ff914d] dark:text-[#ffb27e] shadow-sm' : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-200'}`}
+                >
+                  <MoveVertical className="w-3.5 h-3.5" />
+                  Vertical
+                </button>
+              </div>
+              <div className="px-1 pt-1.5 text-[9px] leading-4 text-slate-400">
+                {orthogonalConstraint === 'horizontal' ? 'Measures plan distance on XZ while keeping the first point elevation.' : 'Measures elevation difference on Y while keeping the first point position in plan.'}
+              </div>
+            </div>
+          )}
+        </div>
+
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-[10px] uppercase tracking-wider font-bold text-slate-400">Display units</div>
@@ -318,13 +391,14 @@ export const MeasurementPanel = ({
         </div>
       </div>
 
-      <div className="max-h-[calc(100vh-420px)] min-h-[140px] overflow-y-auto">
+      <div className="measurement-panel-scroll flex-1 min-h-0 overflow-y-auto overscroll-contain">
+        <div className="measurement-list">
         {measurementsList.length === 0 ? (
           <div className="px-5 py-10 text-center">
             <Ruler className="w-7 h-7 mx-auto text-slate-300 dark:text-slate-700 mb-2" />
             <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">No measurements yet</div>
             <div className="text-[10px] leading-4 text-slate-400 dark:text-slate-500 mt-1">
-              Select a first reference and a second reference in the model.
+              {measurementMode === 'point' ? 'Click any visible model point, then click the target point.' : measurementMode === 'orthogonal' ? `Choose ${orthogonalConstraint === 'horizontal' ? 'Horizontal' : 'Vertical'}, then click the two references.` : 'Select a first reference and a second reference in the model.'}
             </div>
           </div>
         ) : (
@@ -344,8 +418,10 @@ export const MeasurementPanel = ({
         )}
       </div>
 
+        </div>
+
       {measurementsList.length > 0 && (
-        <div className="px-4 py-2.5 border-t border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-800/50 flex items-center justify-between gap-3">
+        <div className="px-4 py-2.5 border-t border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-900/90 flex items-center justify-between gap-3">
           <div>
             <span className="text-[10px] uppercase tracking-wider text-slate-400 font-bold block">Measurements</span>
             <span className="text-sm font-bold text-slate-800 dark:text-white tabular-nums">{measurementsList.length}</span>
@@ -359,10 +435,10 @@ export const MeasurementPanel = ({
         </div>
       )}
 
-      <div className="border-t border-slate-200 dark:border-slate-800">
+      <div className="measurement-calibration border-t border-slate-200 dark:border-slate-800">
         <button
           onClick={() => setShowCalibration((v) => !v)}
-          className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-amber-50/40 dark:hover:bg-amber-950/10 transition-colors"
+          className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-[#ff914d]/[0.05] dark:hover:bg-[#ff914d]/[0.06] transition-colors"
         >
           <div className="flex items-center gap-2">
             <Wand2 className="w-3.5 h-3.5 text-amber-500" />
@@ -375,8 +451,8 @@ export const MeasurementPanel = ({
         </button>
 
         {showCalibration && (
-          <div className="px-4 pb-4">
-            <div className="p-3 rounded-xl bg-amber-50/70 dark:bg-amber-950/20 border border-amber-100 dark:border-amber-900/40">
+          <div className="measurement-calibration-body px-4 pb-4">
+            <div className="p-3 rounded-xl bg-[linear-gradient(135deg,rgba(255,145,77,0.08),rgba(245,158,11,0.08))] dark:bg-[linear-gradient(135deg,rgba(255,145,77,0.10),rgba(245,158,11,0.08))] border border-[rgba(255,145,77,0.22)] dark:border-[rgba(255,145,77,0.18)]">
               {!calibrationMeasurement ? (
                 <div className="text-[10px] leading-4 text-slate-500 dark:text-slate-400">
                   Select the wand icon on a measurement first. Calibration is only for a segment whose real-world size is known; it changes project scale.
@@ -417,13 +493,13 @@ export const MeasurementPanel = ({
                       }}
                       placeholder={`Known length (${measurementUnit})`}
                       disabled={calibrationBusy}
-                      className="min-w-0 flex-1 text-xs px-2.5 py-2 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-60"
+                      className="min-w-0 flex-1 text-xs px-2.5 py-2 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-[#ff914d] disabled:opacity-60"
                     />
                     <button
                       type="button"
                       onClick={handleRescale}
                       disabled={!desiredLength || calibrationBusy}
-                      className="inline-flex items-center justify-center gap-1 text-[10px] font-bold px-3 py-2 rounded-md bg-amber-500 hover:bg-amber-600 disabled:bg-slate-200 disabled:text-slate-400 text-white transition-colors disabled:cursor-not-allowed"
+                      className="hci-calibrate-button inline-flex items-center justify-center gap-1 text-[10px] font-bold px-3 py-2 rounded-md bg-[var(--hci-orange)] hover:bg-[var(--hci-orange-hover)] text-white shadow-[0_8px_18px_rgba(255,145,77,0.18)] transition-all disabled:cursor-not-allowed"
                     >
                       {calibrationBusy ? 'Applying…' : 'Calibrate'}
                     </button>
@@ -468,6 +544,6 @@ export const MeasurementPanel = ({
           Scene calibrated · cumulative scale ×{sceneScaleFactor.x.toFixed(3)}
         </div>
       )}
-    </div>
+        </div>
   );
 };

@@ -47,23 +47,44 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
     toastMessage, customColor, applyMaterial, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
-    updateStructuralEdit, setToastMessage, saveNow
+    updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage, saveNow
   } = useProjectSync(activeProject);
 
   const insertDoor = async (asset, wallSnapData) => {
     if (!file || !jobId) return;
     
     const { position, rotation, wallGlobalId } = wallSnapData;
-    const doorSurfacePosition = [position[0], 0, position[2]];
+    // Send the actual picked world point. The backend now owns the host-wall
+    // frame and derives the wall-center/base position from the IFC itself.
+    const doorSurfacePosition = [...position];
+    const catalogAssetId = asset.catalogId ?? (
+      typeof asset.id === 'string' && asset.id.startsWith('cat_')
+        ? asset.id.slice(4)
+        : asset.id
+    );
     
-    const doorDims = {
+    const doorDimsById = {
       'door_single': { width: 0.9, height: 2.1, thickness: 0.05 },
       'door_double': { width: 1.2, height: 2.1, thickness: 0.05 },
       'door_sliding': { width: 2.0, height: 2.1, thickness: 0.05 },
       'door_revolving': { width: 2.0, height: 2.1, thickness: 0.1 },
       'door_fire': { width: 1.0, height: 2.1, thickness: 0.06 },
       'door_3bhk': { width: 0.9, height: 2.1, thickness: 0.04 },
-    }[asset.id] || { width: 0.9, height: 2.1, thickness: 0.05 };
+    };
+
+    const doorName = String(asset.name || '').toLowerCase();
+    const doorDims = doorDimsById[catalogAssetId] ||
+      (doorName.includes('sliding')
+        ? doorDimsById.door_sliding
+        : doorName.includes('double')
+          ? doorDimsById.door_double
+          : doorName.includes('fire')
+            ? doorDimsById.door_fire
+            : doorName.includes('revolving')
+              ? doorDimsById.door_revolving
+              : doorName.includes('3bhk')
+                ? doorDimsById.door_3bhk
+                : doorDimsById.door_single);
     
     engineActions.setIsLoading(true);
     setToastMessage(`Cutting void in wall...`);
@@ -74,8 +95,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          assetId: asset.id, 
-          position: doorSurfacePosition, 
+          assetId: catalogAssetId,
+          position: doorSurfacePosition,
           rotation,
           ...doorDims 
         })
@@ -91,15 +112,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
       updateStructuralEdit(wallGlobalId, 'visible', null, false);
       
       const modifiedWallId = `${wallGlobalId}_cut_${Date.now()}`;
-      // targetPosition is null — the full IFC already has the wall at its correct
-      // world coordinates via its own IfcLocalPlacement.
-      await engineActions.loadIFCAssetIntoScene(modifiedWallId, data.fileUrl, null, null);
-      // The modified wall file is the full building IFC — its wall element
-      // already sits at the correct world coordinates via its own IfcLocalPlacement.
-      // The compiler must apply zero translation so it doesn't double-offset.
-      // wallWorldPos is stored only so the viewer can restore visibility correctly
-      // on reload; the compiler uses position [0,0,0] for full-IFC assets.
-      adoptIsolatedAsset(wallGlobalId, modifiedWallId, data.fileUrl, 'Wall with Void', [0, 0, 0]);
+      // IMPORTANT: do not load the full building IFC as a replacement wall model.
+      // Each door insertion must add only the edited host wall; loading another full
+      // building copy makes every subsequent pick ambiguous and causes wrong-wall hits.
+      const previewWallUrl = data.previewFileUrl || data.fileUrl;
+      await engineActions.loadIFCAssetIntoScene(modifiedWallId, previewWallUrl, null, null);
+      adoptIsolatedAsset(wallGlobalId, modifiedWallId, previewWallUrl, 'Wall with Void', [0, 0, 0]);
       
       if (!data.doorPlacement) {
         throw new Error('Backend did not return doorPlacement check ifc_element_editor.py version.');
@@ -129,7 +147,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
       }
     },
     setIsRightPanelOpen,
-    setRightTab
+    setRightTab,
+    transformFurnitureForCalibration,
+    repairLegacyCalibrationState
   );
 
   const {
@@ -359,13 +379,21 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           anchorY={lastClickPos.y}
           isNative={!!engineState.selectedObject && !activeAsset}
           isDarkMode={isDarkMode}
-          onIsolate={() => {
-            if (engineState.selectedObject && !activeAsset) {
-              engineActions.isolateAndMakeMoveable(
-                engineState.selectedObject.id, 
-                adoptIsolatedAsset, 
+          onIsolate={async () => {
+            if (!engineState.selectedObject || activeAsset) return;
+
+            try {
+              await engineActions.isolateAndMakeMoveable(
+                engineState.selectedObject.id,
+                adoptIsolatedAsset,
                 updateStructuralEdit
               );
+              setToastMessage('Element unlocked for editing.');
+              setTimeout(() => setToastMessage(null), 2200);
+            } catch (error) {
+              console.error('[BIMViewer] Native unlock failed:', error);
+              setToastMessage(error?.message || 'Could not unlock this IFC element.');
+              setTimeout(() => setToastMessage(null), 3500);
             }
           }}
           onColorChange={(hex) => {
@@ -428,6 +456,18 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
         </div>
       )}
 
+      {engineState.isMeasuring && engineState.measurementHover && (
+        <div
+          className="absolute z-50 pointer-events-none px-2 py-1 rounded-md bg-slate-950/90 text-white text-[10px] font-bold shadow-lg border border-white/10"
+          style={{ left: `${engineState.measurementHover.x + 14}px`, top: `${engineState.measurementHover.y + 14}px` }}
+        >
+          <span className={engineState.measurementHover.snapped ? 'text-cyan-300' : 'text-slate-200'}>
+            {engineState.measurementHover.snapType}
+          </span>
+          {engineState.measurementHover.snapped && <span className="ml-1 text-slate-400">SNAP</span>}
+        </div>
+      )}
+
       {engineState.isMeasuring && (
         <MeasurementPanel
           measurementsList={engineState.measurementsList}
@@ -446,6 +486,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           scaleModelByMeasurement={engineActions.scaleModelByMeasurement}
           sceneScaleFactor={engineState.sceneScaleFactor}
           measurementPhase={engineState.measurementPhase}
+          measurementMode={engineState.measurementMode}
+          setMeasurementMode={engineActions.setMeasurementMode}
+          orthogonalConstraint={engineState.orthogonalConstraint}
+          setOrthogonalConstraint={engineActions.setOrthogonalConstraint}
         />
       )}
 
@@ -558,7 +602,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
                   100% { transform: translateY(128px); }
                 }
               `}</style>
-              <img src="/hci-logo.svg" alt="High Creation Interiors" className="hci-logo-badge hci-logo-badge--processing animate-pulse" />
+              <div className="rounded-xl bg-white/95 px-2 py-1.5 shadow-lg"><img src="/hci-logo.svg" alt="High Creation Interiors" className="hci-logo-badge hci-logo-badge--processing animate-pulse" /></div>
             </div>
             <h3 className="mt-8 text-2xl font-bold text-white tracking-wide drop-shadow-md">Recalculating Geometry</h3>
             <p className="mt-2 text-sm text-slate-300 font-medium max-w-sm text-center leading-relaxed">

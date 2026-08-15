@@ -51,19 +51,36 @@ function ItemThumb({ url, name, fileType }) {
 }
 
 function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection }) {
-  const isActive = placementMode?.id === `cat_${item.id}`;
+  const placementId = `cat_${item.id}`;
+  const isActive = placementMode?.id === placementId;
+  const modelUrl = assetUrl(item.model_url || item.url);
+
+  const catalogId = String(item.id ?? '').trim();
+  const itemType = String(item.type || '').trim().toLowerCase();
+  const itemCategory = String(item.category || '').trim().toLowerCase();
+  const itemName = String(item.name || '').trim().toLowerCase();
+  const inferredDoor =
+    itemType === 'door' ||
+    /^door[_-]/i.test(catalogId) ||
+    (itemCategory === 'structural' && itemName.includes('door')) ||
+    itemName.includes('sliding door') ||
+    itemName.includes('flush door') ||
+    itemName.includes('swing door') ||
+    itemName.includes('fire-rated door') ||
+    itemName.includes('revolving door');
+
+  const buildPlacementAsset = () => ({
+    ...item,
+    id: placementId,
+    catalogId: item.id,
+    url: modelUrl,
+    type: inferredDoor ? 'door' : (itemType || 'furniture'),
+    file_type: item.file_type || item.fileType || 'ifc',
+    source: 'catalog',
+  });
 
   const handleDragStart = (e) => {
-    const payload = JSON.stringify({
-      id: `cat_${item.id}`,
-      name: item.name,
-      url: item.model_url,
-      type: 'furniture',
-      file_type: item.file_type,
-      color_rgb: item.color_rgb,
-      source: 'catalog',
-    });
-    e.dataTransfer.setData('application/json', payload);
+    e.dataTransfer.setData('application/json', JSON.stringify(buildPlacementAsset()));
     e.dataTransfer.effectAllowed = 'copy';
   };
 
@@ -71,7 +88,7 @@ function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection
     <div
       draggable
       onDragStart={handleDragStart}
-      onClick={() => { setPlacementMode({ id: `cat_${item.id}`, ...item }); resetSelection(); }}
+      onClick={() => { setPlacementMode(buildPlacementAsset()); resetSelection(); }}
       className={`flex flex-col rounded-xl border transition-all cursor-grab active:cursor-grabbing overflow-hidden
         ${isActive
           ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-900/30 shadow-sm'

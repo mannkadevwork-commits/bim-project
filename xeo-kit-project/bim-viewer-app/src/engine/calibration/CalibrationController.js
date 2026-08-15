@@ -53,7 +53,7 @@ export const applyGlobalScale = (ctx, ratioVec) => {
   return true;
 };
 
-export const reloadMainModel = async (ctx, jobId) => {
+export const reloadMainModel = async (ctx, jobId, options = {}) => {
   const { setIsLoading, loadersRef, currentModelRef, viewerRef, projectStateRef } = ctx;
   if (!jobId) throw new Error('Missing canonical project jobId.');
 
@@ -92,8 +92,10 @@ export const reloadMainModel = async (ctx, jobId) => {
         try {
           const viewer = viewerRef.current;
           if (viewer) {
-            viewer.cameraFlight.duration = 0.6;
-            viewer.cameraFlight.flyTo(model);
+            if (!options.preserveCamera) {
+              viewer.cameraFlight.duration = 0.6;
+              viewer.cameraFlight.flyTo(model);
+            }
 
             if (projectStateRef.current?.materials) {
               Object.entries(projectStateRef.current.materials).forEach(([entityId, matData]) => {
@@ -123,29 +125,149 @@ export const reloadMainModel = async (ctx, jobId) => {
   }
 };
 
-export const updateFurnitureScale = (ctx, ratio) => {
+const getAabbCenter = (model) => {
+  const aabb = model?.aabb;
+  if (!aabb || aabb.length < 6) return null;
+  return [
+    (aabb[0] + aabb[3]) / 2,
+    (aabb[1] + aabb[4]) / 2,
+    (aabb[2] + aabb[5]) / 2,
+  ];
+};
+
+/**
+ * Keep placed assets aligned with the calibrated IFC using the actual
+ * pre/post calibration scene-frame centers.
+ *
+ * We do NOT assume that the backend rescales around the world origin.
+ * Instead, the main IFC's observed center before and after reload defines
+ * the same uniform scene transform that was applied to the structural model:
+ *
+ *   newPosition = newCenter + (oldPosition - oldCenter) * ratio
+ *
+ * This preserves alignment whether the backend scale is centered at the
+ * origin or around another scene pivot. No arbitrary offsets are introduced.
+ */
+/**
+ * Applies exactly the same scene-space affine transform that the backend
+ * applied to the main IFC:
+ *
+ *   p' = newCenter + (p - oldCenter) * ratio
+ *
+ * In matrix form:
+ *
+ *   A = T(newCenter) * S(ratio) * T(-oldCenter)
+ *
+ * External/isolated IFC assets are not rewritten by the backend, so their
+ * current model matrices must receive A once. This is deliberately different
+ * from mutating model.scale/model.position independently: the resize work
+ * established model.matrix as the authoritative rendered transform.
+ */
+export const updateFurnitureScale = (ctx, ratio, oldSceneCenter, newSceneCenter, furnitureState = []) => {
   const { viewerRef, globalScaleFactorRef, setSceneScaleFactor } = ctx;
   const viewer = viewerRef.current;
   if (!viewer) return;
 
-  Object.keys(viewer.scene.models).forEach((id) => {
-    if (id === 'main_structure') return;
+  const values = [ratio, ...(oldSceneCenter || []), ...(newSceneCenter || [])];
+  if (values.length !== 7 || !values.every(Number.isFinite) || ratio <= 0) {
+    console.warn('[Calibration] Skipping live asset scene transform: invalid scene transform data.', {
+      ratio,
+      oldSceneCenter,
+      newSceneCenter,
+    });
+    return;
+  }
+
+  const persistedIds = new Set(
+    (furnitureState || [])
+      .map(item => item?.instanceId)
+      .filter(Boolean)
+  );
+
+  // A = T(newCenter) * S(ratio) * T(-oldCenter)
+  // For a uniform scene scale this can be applied directly to a column-major
+  // affine matrix without a general 4x4 multiply.
+  const tx = newSceneCenter[0] - ratio * oldSceneCenter[0];
+  const ty = newSceneCenter[1] - ratio * oldSceneCenter[1];
+  const tz = newSceneCenter[2] - ratio * oldSceneCenter[2];
+
+  Object.keys(viewer.scene.models || {}).forEach((id) => {
+    if (id === 'main_structure' || !persistedIds.has(id)) return;
+
     const assetModel = viewer.scene.models[id];
     if (!assetModel) return;
 
-    const currentScale = assetModel.scale || [1, 1, 1];
-    assetModel.scale = [currentScale[0] * ratio, currentScale[1] * ratio, currentScale[2] * ratio];
-
-    const currentPos = assetModel.position || [0, 0, 0];
-    assetModel.position = [currentPos[0] * ratio, currentPos[1] * ratio, currentPos[2] * ratio];
+    try {
+      const m = assetModel.matrix;
+      if (m && typeof m.length === 'number' && m.length === 16) {
+        assetModel.matrix = [
+          m[0] * ratio, m[1] * ratio, m[2] * ratio, m[3],
+          m[4] * ratio, m[5] * ratio, m[6] * ratio, m[7],
+          m[8] * ratio, m[9] * ratio, m[10] * ratio, m[11],
+          m[12] * ratio + tx, m[13] * ratio + ty, m[14] * ratio + tz, m[15],
+        ];
+      } else {
+        // Defensive fallback for a model without a readable matrix.
+        const p = Array.isArray(assetModel.position) ? assetModel.position : [0, 0, 0];
+        const s = Array.isArray(assetModel.scale) ? assetModel.scale : [1, 1, 1];
+        assetModel.position = [
+          newSceneCenter[0] + (p[0] - oldSceneCenter[0]) * ratio,
+          newSceneCenter[1] + (p[1] - oldSceneCenter[1]) * ratio,
+          newSceneCenter[2] + (p[2] - oldSceneCenter[2]) * ratio,
+        ];
+        assetModel.scale = [s[0] * ratio, s[1] * ratio, s[2] * ratio];
+      }
+    } catch (error) {
+      console.warn('[Calibration] Failed to apply scene transform to asset:', {
+        instanceId: id,
+        error,
+      });
+    }
   });
 
-  globalScaleFactorRef.current = {
-    x: globalScaleFactorRef.current.x * ratio,
-    y: globalScaleFactorRef.current.y * ratio,
-    z: globalScaleFactorRef.current.z * ratio,
-  };
+  const persistedSceneScale = ctx.projectStateRef?.current?.scene_calibration?.scaleFactor;
+  if (
+    persistedSceneScale &&
+    Number.isFinite(persistedSceneScale.x) &&
+    Number.isFinite(persistedSceneScale.y) &&
+    Number.isFinite(persistedSceneScale.z) &&
+    persistedSceneScale.x > 0 &&
+    persistedSceneScale.y > 0 &&
+    persistedSceneScale.z > 0
+  ) {
+    globalScaleFactorRef.current = {
+      x: persistedSceneScale.x,
+      y: persistedSceneScale.y,
+      z: persistedSceneScale.z,
+    };
+  } else {
+    globalScaleFactorRef.current = {
+      x: globalScaleFactorRef.current.x * ratio,
+      y: globalScaleFactorRef.current.y * ratio,
+      z: globalScaleFactorRef.current.z * ratio,
+    };
+  }
+
   setSceneScaleFactor({ ...globalScaleFactorRef.current });
+};
+
+const getCameraState = (viewer) => {
+  const camera = viewer?.camera;
+  if (!camera) return null;
+  return { eye: [...camera.eye], look: [...camera.look], up: [...camera.up] };
+};
+
+const transformPointByObservedSceneScale = (point, oldCenter, newCenter, ratio) => [
+  newCenter[0] + (point[0] - oldCenter[0]) * ratio,
+  newCenter[1] + (point[1] - oldCenter[1]) * ratio,
+  newCenter[2] + (point[2] - oldCenter[2]) * ratio,
+];
+
+const restoreCameraAfterCalibration = (viewer, cameraState, oldCenter, newCenter, ratio) => {
+  if (!viewer || !cameraState) return;
+  viewer.camera.eye = transformPointByObservedSceneScale(cameraState.eye, oldCenter, newCenter, ratio);
+  viewer.camera.look = transformPointByObservedSceneScale(cameraState.look, oldCenter, newCenter, ratio);
+  viewer.camera.up = [...cameraState.up];
 };
 
 export const scaleModelByMeasurement = async (ctx, measurementId, newDesiredLengthInMeters) => {
@@ -187,6 +309,17 @@ export const scaleModelByMeasurement = async (ctx, measurementId, newDesiredLeng
     return { success: false, error: 'Calibration factor is invalid.' };
   }
 
+  const currentMainModel = ctx.currentModelRef?.current;
+  const oldSceneCenter = getAabbCenter(currentMainModel);
+  const cameraState = getCameraState(ctx.viewerRef?.current);
+  const furnitureMatrixSnapshot = ctx.snapshotFurnitureMatrices ? ctx.snapshotFurnitureMatrices() : {};
+  ctx.setSelectedAssetIdSafe?.(null);
+  ctx.setSelectedObject?.(null);
+  ctx.destroyStretchHandles?.();
+  if (!oldSceneCenter) {
+    return { success: false, error: 'Unable to determine the current IFC scene frame for calibration.' };
+  }
+
   setIsLoading(true);
 
   try {
@@ -223,11 +356,48 @@ export const scaleModelByMeasurement = async (ctx, measurementId, newDesiredLeng
       throw new Error(data.error || `Rescale request failed (${response.status}).`);
     }
 
-    await reloadMainModel(ctx, jobId);
-    updateFurnitureScale(ctx, ratio);
+    const reloadedModel = await reloadMainModel(ctx, jobId, { preserveCamera: true });
+    const newSceneCenter = getAabbCenter(reloadedModel);
+    if (!newSceneCenter) {
+      throw new Error('Calibration completed, but the reloaded IFC scene frame could not be measured.');
+    }
+
+    let calibratedProjectState = ctx.transformFurnitureForCalibration
+      ? await ctx.transformFurnitureForCalibration(ratio, oldSceneCenter, newSceneCenter, furnitureMatrixSnapshot)
+      : { ...(ctx.projectStateRef?.current || {}), furniture: [] };
+
+    ctx.projectStateRef.current = calibratedProjectState;
+
+    updateFurnitureScale(
+      ctx,
+      ratio,
+      oldSceneCenter,
+      newSceneCenter,
+      calibratedProjectState.furniture || []
+    );
+
+    if (ctx.restoreProjectStateToScene) {
+      await ctx.restoreProjectStateToScene(calibratedProjectState);
+    }
+
+    restoreCameraAfterCalibration(
+      ctx.viewerRef?.current,
+      cameraState,
+      oldSceneCenter,
+      newSceneCenter,
+      ratio
+    );
+
+    console.info('[Calibration] Applied consistent scene-frame transform to placed assets, native edits, and camera', {
+      oldSceneCenter,
+      newSceneCenter,
+      ratio,
+      persistedFurnitureCount: calibratedProjectState.furniture?.length || 0,
+    });
 
     plugin.clear();
     setMeasurementsList([]);
+    setIsLoading(false);
 
     return {
       success: true,
@@ -255,10 +425,12 @@ export const calibrateWallHeight = async (ctx, entityId, newHeightMeters) => {
   if (!jobId) return { success: false, error: 'No active project jobId.' };
 
   const target = parseFloat(newHeightMeters);
-  if (!target || target <= 0) return { success: false, error: 'Enter a height greater than 0.' };
+  if (!Number.isFinite(target) || target <= 0) {
+    return { success: false, error: 'Enter a height greater than 0.' };
+  }
 
   try {
-    const dims = await inspectNativeElement(file, entityId);
+    const dims = await inspectNativeElement({ file, jobId }, entityId);
     if (!dims || dims.error || !dims.height) {
       return { success: false, error: 'Element has no parametric height.' };
     }
@@ -266,6 +438,13 @@ export const calibrateWallHeight = async (ctx, entityId, newHeightMeters) => {
     const ratio = target / dims.height;
     if (!Number.isFinite(ratio) || ratio <= 0) {
       return { success: false, error: 'Calculated calibration factor is invalid.' };
+    }
+
+    const oldSceneCenter = getAabbCenter(ctx.currentModelRef?.current);
+    const cameraState = getCameraState(ctx.viewerRef?.current);
+    const furnitureMatrixSnapshot = ctx.snapshotFurnitureMatrices ? ctx.snapshotFurnitureMatrices() : {};
+    if (!oldSceneCenter) {
+      return { success: false, error: 'Unable to determine the current IFC scene frame for calibration.' };
     }
 
     setIsLoading(true);
@@ -284,14 +463,44 @@ export const calibrateWallHeight = async (ctx, entityId, newHeightMeters) => {
     });
 
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || data.error) throw new Error(data.error || `Rescale request failed (${response.status}).`);
+    if (!response.ok || data.error) {
+      throw new Error(data.error || `Rescale request failed (${response.status}).`);
+    }
 
-    await reloadMainModel(ctx, jobId);
-    updateFurnitureScale(ctx, ratio);
+    const reloadedModel = await reloadMainModel(ctx, jobId, { preserveCamera: true });
+    const newSceneCenter = getAabbCenter(reloadedModel);
+    if (!newSceneCenter) {
+      throw new Error('Calibration completed, but the reloaded IFC scene frame could not be measured.');
+    }
 
-    return { success: true, ratio, jobId };
+    const calibratedProjectState = ctx.transformFurnitureForCalibration
+      ? await ctx.transformFurnitureForCalibration(ratio, oldSceneCenter, newSceneCenter, furnitureMatrixSnapshot)
+      : ctx.projectStateRef?.current;
+
+    updateFurnitureScale(
+      ctx,
+      ratio,
+      oldSceneCenter,
+      newSceneCenter,
+      calibratedProjectState?.furniture || []
+    );
+
+    if (ctx.restoreProjectStateToScene && calibratedProjectState) {
+      await ctx.restoreProjectStateToScene(calibratedProjectState);
+    }
+
+    restoreCameraAfterCalibration(
+      ctx.viewerRef?.current,
+      cameraState,
+      oldSceneCenter,
+      newSceneCenter,
+      ratio
+    );
+    setIsLoading(false);
+
+    return { success: true, ratio, jobId, response: data };
   } catch (err) {
-    console.error('[BIM Engine] Height calibration failed:', { jobId, err });
+    console.error('[BIM Engine] Height calibration failed:', { jobId, entityId, err });
     setIsLoading(false);
     return { success: false, error: err?.message || 'Height calibration failed.' };
   }
