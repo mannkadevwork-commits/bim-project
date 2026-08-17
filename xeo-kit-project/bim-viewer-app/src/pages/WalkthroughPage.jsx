@@ -38,6 +38,7 @@ export default function WalkthroughPage() {
   const lockToastTimer = useRef(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [autoRotate, setAutoRotate] = useState(false);
+  const [fov, setFov] = useState(70);
 
   const walkthrough = useWalkthroughEngine({ containerRef: viewportRef, jobId });
   const areas = walkthrough.areas || [];
@@ -62,8 +63,14 @@ export default function WalkthroughPage() {
     if (walkthrough.message) return walkthrough.message;
     return viewMode === 'walk'
       ? (walkthrough.lookLocked ? 'View locked · double-click to unlock · W/A/S/D walk' : 'Free look · W/A/S/D walk · double-click to lock')
-      : 'Perspective preview · orbit / wheel zoom · click Start Walkthrough when ready';
+      : 'Overview · orbit / wheel zoom · W/A/S/D pan · Q/E zoom · click Start Walkthrough';
   }, [walkthrough.status, walkthrough.message, viewMode]);
+
+  const applyFov = (value) => {
+    const next = Number(value);
+    setFov(next);
+    walkthrough.setFov(next);
+  };
 
   const applySensitivity = (value) => {
     const next = Number(value);
@@ -194,6 +201,11 @@ export default function WalkthroughPage() {
           </div>
           <div className="space-y-4">
             <label className="block">
+              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Field of view (FOV)</span><span className="font-mono text-slate-500">{fov}°</span></div>
+              <input className="w-full accent-[#ff914d]" type="range" min="30" max="110" step="1" value={fov} onChange={(e) => applyFov(e.target.value)} />
+              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Narrow</span><span>Normal (70°)</span><span>Wide</span></div>
+            </label>
+            <label className="block">
               <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Mouse sensitivity</span><span className="font-mono text-slate-500">{sensitivity.toFixed(4)}</span></div>
               <input className="w-full accent-[#ff914d]" type="range" min="0.0015" max="0.009" step="0.0001" value={sensitivity} onChange={(e) => applySensitivity(e.target.value)} />
               <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Precise</span><span>Fast</span></div>
@@ -203,7 +215,7 @@ export default function WalkthroughPage() {
               <input className="w-full accent-[#ff914d]" type="range" min="-0.15" max="0.35" step="0.01" value={heightOffset} onChange={(e) => applyHeight(e.target.value)} />
               <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Lower</span><span>Neutral</span><span>Higher</span></div>
             </label>
-            <button type="button" onClick={() => applyHeight(0)} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-300 hover:bg-white/[0.06]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height</button>
+            <button type="button" onClick={() => { applyHeight(0); applyFov(70); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-300 hover:bg-white/[0.06]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
           </div>
         </div>
       )}
@@ -236,9 +248,10 @@ export default function WalkthroughPage() {
         <div className="absolute bottom-24 right-5 z-40 w-[300px] rounded-2xl border border-white/10 bg-slate-950/92 p-4 text-sm text-slate-300 shadow-2xl backdrop-blur-2xl">
           <div className="mb-3 flex items-center justify-between"><span className="font-semibold text-white">Walkthrough help</span><IconButton title="Close help" onClick={() => setHelpOpen(false)}><X className="h-4 w-4" /></IconButton></div>
           <div className="space-y-2 text-xs leading-5 text-slate-400">
-            <div><b className="text-slate-200">Walk:</b> mouse looks freely · W/A/S/D moves · Shift runs.</div>
+            <div><b className="text-slate-200">Walk:</b> mouse looks freely · W/A/S/D moves · Shift runs · Q/E adjust height.</div>
+            <div><b className="text-slate-200">Overview:</b> W/A/S/D pan · Q/E zoom · mouse orbit · wheel zoom · +/- keys zoom.</div>
             <div><b className="text-slate-200">Rooms:</b> left rail switches instantly between semantic room destinations.</div>
-            <div><b className="text-slate-200">Overview:</b> Top/Front/Side/Perspective + wheel zoom.</div>
+            <div><b className="text-slate-200">Views:</b> Top/Front/Side/Perspective/Isometric presets + Fit model.</div>
             <div><b className="text-slate-200">Look lock:</b> double-click the 3D scene to lock your current view. Double-click again to unlock.</div>
           </div>
         </div>
@@ -259,9 +272,9 @@ export default function WalkthroughPage() {
         <IconButton title="More controls" active={moreOpen} onClick={() => { setMoreOpen((v) => !v); setViewsOpen(false); setSettingsOpen(false); }}><ChevronUp className="h-4 w-4" /></IconButton>
         <IconButton title={helpOpen ? 'Close help' : 'Help'} active={helpOpen} onClick={() => setHelpOpen((v) => !v)}><CircleHelp className="h-4 w-4" /></IconButton>
         <div className="mx-1 h-7 w-px bg-white/10" />
-        <button type="button" onClick={handleTour} disabled={!areas.length} className={`flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition ${touring ? 'bg-white text-slate-950' : 'bg-[#ff914d] text-slate-950 hover:bg-[#ff7a28]'}`}>
+        {/* <button type="button" onClick={handleTour} disabled={!areas.length} className={`flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition ${touring ? 'bg-white text-slate-950' : 'bg-[#ff914d] text-slate-950 hover:bg-[#ff7a28]'}`}>
           {touring ? <><StopCircle className="h-4 w-4" /> Stop</> : <><Play className="h-4 w-4" /> Tour</>}
-        </button>
+        </button> */}
       </div>
 
       {lockToast && (

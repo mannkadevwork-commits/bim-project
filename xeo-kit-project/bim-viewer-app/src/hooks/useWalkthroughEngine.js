@@ -67,6 +67,8 @@ class WalkRuntime {
 
     this.viewTarget = new THREE.Vector3();
     this.viewDistance = 1;
+    this.fov = 70;
+    this.overviewPanSpeed = 1;
     this.keys = new Set();
     this.lastPointer = { x: 0, y: 0 };
     this.pointer = new THREE.Vector2();
@@ -93,6 +95,11 @@ class WalkRuntime {
       if (['w', 'a', 's', 'd', 'shift', 'q', 'e'].includes(key)) {
         e.preventDefault();
         this.keys.add(key);
+      }
+      // Overview zoom with +/- keys
+      if (this.viewMode === 'overview') {
+        if (e.key === '+' || e.key === '=') { e.preventDefault(); this.zoom(1); }
+        if (e.key === '-' || e.key === '_') { e.preventDefault(); this.zoom(-1); }
       }
       if (e.key === 'Escape') {
         this.onState?.({ type: 'escape' });
@@ -200,11 +207,12 @@ class WalkRuntime {
     const center = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z, 1);
     this.viewTarget.copy(center);
-    // Start slightly farther back so the complete room/scene reads clearly before walking.
-    this.viewDistance = maxDim * 2.10;
+    // Fit the camera so the full scene is visible on load.
+    this.viewDistance = Math.max(size.x, size.y, size.z, 1) * 1.65;
+    this.overviewPanSpeed = Math.max(size.x, size.y, size.z, 1) * 0.6;
     this.orbitControls.target.copy(center);
-    this.orbitControls.minDistance = Math.max(maxDim * 0.08, 0.5);
-    this.orbitControls.maxDistance = Math.max(maxDim * 8, 20);
+    this.orbitControls.minDistance = Math.max(maxDim * 0.04, 0.3);
+    this.orbitControls.maxDistance = Math.max(maxDim * 12, 30);
     this.camera.near = Math.max(0.02, maxDim / 5000);
     this.camera.far = Math.max(200, maxDim * 20);
     this.camera.updateProjectionMatrix();
@@ -288,13 +296,13 @@ class WalkRuntime {
     this.portalTargets.clear();
 
     this.walkAreas.forEach((area) => {
-      const texture = this._makePortalTexture(area.label || 'Entry Point');
+      const texture = this._makePortalTexture(area.label || 'Room');
       const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false });
       const sprite = new THREE.Sprite(mat);
       sprite.scale.set(1.25 * this.metersPerUnit, 0.42 * this.metersPerUnit, 1);
       sprite.position.set(area.center[0], area.center[1] + this.eyeHeight * this.metersPerUnit * 0.7, area.center[2]);
       sprite.userData.walkTarget = area.center;
-      sprite.userData.walkLabel = area.label || 'Entry Point';
+      sprite.userData.walkLabel = area.label || 'Room';
       this.scene.add(sprite);
       this.portalObjects.push(sprite);
       this.portalTargets.set(area.label, area.center);
@@ -364,7 +372,7 @@ class WalkRuntime {
     return true;
   }
 
-  async switchRoom(target, label = 'Entry Point') {
+  async switchRoom(target, label = 'Room') {
     if (!this.query) return false;
     const closest = this._closestWalkPoint(target);
     if (!closest) {
@@ -454,11 +462,17 @@ class WalkRuntime {
   zoom(delta) {
     if (this.viewMode !== 'overview') return;
     const fromTarget = this.camera.position.clone().sub(this.orbitControls.target);
-    const factor = delta > 0 ? 0.78 : 1.28;
+    const factor = delta > 0 ? 0.72 : 1.38;
     const next = Math.max(this.orbitControls.minDistance, Math.min(this.orbitControls.maxDistance, fromTarget.length() * factor));
     fromTarget.normalize().multiplyScalar(next);
     this.camera.position.copy(this.orbitControls.target).add(fromTarget);
     this.orbitControls.update();
+  }
+
+  setFov(value) {
+    this.fov = THREE.MathUtils.clamp(Number(value) || 70, 30, 110);
+    this.camera.fov = this.fov;
+    this.camera.updateProjectionMatrix();
   }
 
   fitView() {
@@ -644,6 +658,27 @@ class WalkRuntime {
     }
   }
 
+  _updateOverviewKeys(dt) {
+    if (!this.keys.size) return;
+    const speed = this.overviewPanSpeed * (this.keys.has('shift') ? 3 : 1);
+    // WASD pan the orbit target in the camera's horizontal plane
+    const cam = this.camera;
+    const right = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 0).setY(0).normalize();
+    const fwd = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 2).negate().setY(0).normalize();
+    const pan = new THREE.Vector3();
+    if (this.keys.has('w')) pan.addScaledVector(fwd, speed * dt);
+    if (this.keys.has('s')) pan.addScaledVector(fwd, -speed * dt);
+    if (this.keys.has('a')) pan.addScaledVector(right, -speed * dt);
+    if (this.keys.has('d')) pan.addScaledVector(right, speed * dt);
+    if (this.keys.has('q')) this.zoom(-1);
+    if (this.keys.has('e')) this.zoom(1);
+    if (pan.lengthSq() > 0) {
+      this.orbitControls.target.add(pan);
+      this.camera.position.add(pan);
+      this.viewTarget.add(pan);
+    }
+  }
+
   _syncCamera() {
     const smoothing = 1 - Math.exp(-this.lookSmoothing * (this._lastDt || 0.016));
     this.currentYaw = THREE.MathUtils.lerp(this.currentYaw, this.targetYaw, smoothing);
@@ -691,6 +726,7 @@ class WalkRuntime {
       this._updateMovement(dt);
       this._syncCamera();
     } else {
+      this._updateOverviewKeys(dt);
       this.orbitControls.autoRotate = this.autoRotate;
       this.orbitControls.update();
     }
@@ -761,10 +797,11 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
   const setHeightOffset = useCallback((value) => runtimeRef.current?.setHeightOffset(value), []);
   const setSensitivity = useCallback((value) => runtimeRef.current?.setSensitivity(value), []);
   const setLookLocked = useCallback((value) => runtimeRef.current?.setLookLocked(value), []);
+  const setFov = useCallback((value) => runtimeRef.current?.setFov(value), []);
   const setViewMode = useCallback((value) => runtimeRef.current?.setViewMode(value), []);
   const setAutoRotate = useCallback((value) => runtimeRef.current?.setAutoRotate(value), []);
   const setViewPreset = useCallback((value) => runtimeRef.current?.setViewPreset(value), []);
   const zoom = useCallback((value) => runtimeRef.current?.zoom(value), []);
   const fitView = useCallback(() => runtimeRef.current?.fitView(), []);
-  return { ...state, travelTo, switchRoom, stopTravel, setHeightOffset, setSensitivity, setLookLocked, setViewMode, setAutoRotate, setViewPreset, zoom, fitView };
+  return { ...state, travelTo, switchRoom, stopTravel, setHeightOffset, setSensitivity, setLookLocked, setViewMode, setAutoRotate, setViewPreset, zoom, fitView, setFov };
 }

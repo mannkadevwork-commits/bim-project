@@ -298,57 +298,50 @@ export async function compileScene(
     }
 
     function resolveIfcPath(src: string): string {
-    const url = new URL(src);
-
-    if (url.pathname.startsWith("/assets/")) {
-        return path.join(
-            assetsDirectory,
-            path.basename(url.pathname)
-        );
+    // Normalise: accept both full URLs (http://host/...) and bare paths (/assets/...)
+    let pathname: string;
+    try {
+      pathname = new URL(src).pathname;
+    } catch {
+      // src is already a bare path like /assets/wall_standard.ifc
+      pathname = src.startsWith("/") ? src : `/${src}`;
     }
 
-if (url.pathname.startsWith("/jobs/")) {
+    // Strip query-string / fragment that may survive URL parsing
+    pathname = pathname.split("?")[0].split("#")[0];
 
-    const match = url.pathname.match(
-        /^\/jobs\/([^\/]+)\/(.+)$/
-    );
-
-    if (!match) {
-        throw new Error(`Invalid src: ${src}`);
+    // /assets/<file>  →  assetsDirectory/<file>
+    if (pathname.startsWith("/assets/")) {
+      return path.join(assetsDirectory, path.basename(pathname));
     }
 
-    const originalJobId = match[1];
-    const relativePath = match[2];
-
-    const currentPath = path.join(
-        jobDirectory,
-        relativePath
-    );
-
-    if (fs.existsSync(currentPath)) {
-        return currentPath;
+    // /uploads/<rest>  →  <serverRoot>/uploads/<rest>  (catalog-uploaded IFCs)
+    if (pathname.startsWith("/uploads/")) {
+      return path.join(ROOT_DIR, "..", pathname);
     }
 
-    const originalJobPath = path.join(
-        path.dirname(jobDirectory),
-        originalJobId,
-        relativePath
-    );
+    // /jobs/<jobId>/<relativePath>  →  job directory lookup
+    if (pathname.startsWith("/jobs/")) {
+      const match = pathname.match(/^\/jobs\/([^\/]+)\/(.+)$/);
+      if (!match) throw new Error(`Invalid /jobs/ src: ${src}`);
 
-    if (fs.existsSync(originalJobPath)) {
-        console.warn(
-            `[compiler] Using edited IFC from original job: ${originalJobPath}`
-        );
+      const originalJobId = match[1];
+      const relativePath  = match[2];
+
+      const currentPath = path.join(jobDirectory, relativePath);
+      if (fs.existsSync(currentPath)) return currentPath;
+
+      const originalJobPath = path.join(path.dirname(jobDirectory), originalJobId, relativePath);
+      if (fs.existsSync(originalJobPath)) {
+        console.warn(`[compiler] Using edited IFC from original job: ${originalJobPath}`);
         return originalJobPath;
-    }
+      }
 
-    throw new Error(
-        `Edited IFC not found.\nCurrent: ${currentPath}\nOriginal: ${originalJobPath}`
-    );
-}
+      throw new Error(`Edited IFC not found.\nCurrent: ${currentPath}\nOriginal: ${originalJobPath}`);
+    }
 
     throw new Error(`Unsupported src: ${src}`);
-}
+  }
   
   if (!fs.existsSync(INPUT_IFC_PATH)) {
     throw new Error(`Fatal: structural IFC not found at ${INPUT_IFC_PATH}`);
