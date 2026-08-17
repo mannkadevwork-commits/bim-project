@@ -7,7 +7,6 @@ import { extractGeometry } from "./geometry";
 import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
 import { fileURLToPath, pathToFileURL } from "url";
 import { WalkNavigationPipeline } from "./navigation/WalkNavigationPipeline";
-import { RoomDetector } from "./navigation/RoomDetector";
 
 enum AssetType {
   STRUCTURAL_REPLACEMENT = "structural_replacement",
@@ -379,15 +378,6 @@ if (url.pathname.startsWith("/jobs/")) {
 
   const structuralEdits = projectState.structural_edits ?? {};
   const materials = projectState.materials ?? {};
-
-  // Phase 6A: semantic room detection is read-only and must never block scene compilation.
-  // It operates from the current input.ifc + project_state structural replacements and
-  // writes rooms_debug.json for validation before editor integration.
-  try {
-    await RoomDetector.run({ jobDirectory });
-  } catch (err) {
-    console.warn(`[compiler:rooms] Room detection failed; continuing GLB compilation - ${(err as Error).message}`);
-  }
 
   // Persisted furniture position/scale are already in the CURRENT calibrated
   // scene frame. Do not apply scene_calibration a second time to asset TRS.

@@ -38,17 +38,11 @@ button {
   color: var(--color-brand);
 }
 
-/* NavCube Positioning */
+/* NavCube is positioned by the React viewport chrome. */
 #myNavCubeCanvas {
-  position: absolute;
-  bottom: 50px;
-  right: 50px;
-  width: 150px;
-  height: 150px;
-  z-index: 20;
   pointer-events: all;
+  display: block;
 }
-#myNavCubeCanvas { width: 150px; height: 150px; pointer-events: all; display: block; }
 
 
 /* HCI logo visibility: the supplied brand mark uses dark typography, so place it

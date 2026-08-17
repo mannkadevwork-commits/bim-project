@@ -21,12 +21,25 @@ import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, up
 import { calculateGrabPoint } from './stretch/TranslationController';
 import { CameraManager } from './CameraManager';
 
-export const useBIMEngine = (activeProject, projectStateRef, projectState, onAssetPlaced, setIsRightPanelOpen, setRightTab, transformFurnitureForCalibration, repairLegacyCalibrationState) => {
+const getNavCubeTheme = (isDarkMode) => ({
+  color: isDarkMode ? '#1a2435' : '#eef2f7',
+  frontColor: isDarkMode ? '#202d40' : '#ffffff',
+  backColor: isDarkMode ? '#1a2435' : '#eef2f7',
+  leftColor: isDarkMode ? '#152033' : '#e2e8f0',
+  rightColor: isDarkMode ? '#152033' : '#e2e8f0',
+  topColor: isDarkMode ? '#26364b' : '#f8fafc',
+  bottomColor: isDarkMode ? '#152033' : '#e2e8f0',
+  hoverColor: 'rgba(255,145,77,0.45)',
+});
+
+
+export const useBIMEngine = (activeProject, projectStateRef, projectState, onAssetPlaced, setIsRightPanelOpen, setRightTab, transformFurnitureForCalibration, repairLegacyCalibrationState, isDarkMode = true) => {
   const { file, jobId, fileName } = activeProject || {};
 
   const canvasRef = useRef(null);
   const treeContainerRef = useRef(null);
   const navCubeCanvasRef = useRef(null);
+  const navCubeRef = useRef(null);
   const viewerRef = useRef(null);
   const loadersRef = useRef({});
   const ifcLoaderOwnerRef = useRef(null);
@@ -753,10 +766,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       hierarchy: 'containment',
     });
     
-    new NavCubePlugin(viewer, {
+    navCubeRef.current = new NavCubePlugin(viewer, {
       canvasElement: navCubeCanvasRef.current,
-      color: '#f8fafc',
-      hoverColor: '#ff914d',
+      ...getNavCubeTheme(isDarkMode),
     });
     
     sectionPlanesRef.current = new SectionPlanesPlugin(viewer);
@@ -1406,6 +1418,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       measurementControlRef.current = null;
       try { measurementsPluginRef.current?.destroy(); } catch (e) {}
       measurementsPluginRef.current = null;
+      try { navCubeRef.current?.destroy(); } catch (e) {}
+      navCubeRef.current = null;
       setMeasurementPhase('idle');
       viewerAlive = false;
       ifcLoaderOwnerRef.current = null;
@@ -1415,6 +1429,29 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       try { viewer.destroy(); } catch (e) {}
     };
   }, []);
+
+  const navCubeThemeInitializedRef = useRef(false);
+
+  useEffect(() => {
+    if (!viewerRef.current || !navCubeCanvasRef.current) return undefined;
+
+    // The viewer bootstrap creates the first cube. Recreate only when the theme
+    // actually changes so we do not duplicate the plugin during initial mount.
+    if (!navCubeThemeInitializedRef.current) {
+      navCubeThemeInitializedRef.current = true;
+      return undefined;
+    }
+
+    try { navCubeRef.current?.destroy(); } catch (e) {}
+    navCubeRef.current = new NavCubePlugin(viewerRef.current, {
+      canvasElement: navCubeCanvasRef.current,
+      ...getNavCubeTheme(isDarkMode),
+    });
+
+    return () => {
+      // Do not destroy here on every render; the next theme change replaces it.
+    };
+  }, [isDarkMode]);
 
   useEffect(() => {
     if (viewerRef.current) {
@@ -1692,8 +1729,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         },
         preset: (name) => cameraManagerRef.current?.preset(name),
         setProjection: (projection) => cameraManagerRef.current?.setProjection(projection),
+        zoom: (direction) => cameraManagerRef.current?.zoom(direction),
         getProjection: () => cameraManagerRef.current?.getProjection() || 'perspective',
         snapshot: () => cameraManagerRef.current?.snapshot(),
+        restore: (snapshot) => cameraManagerRef.current?.restore(snapshot),
+        reset: () => cameraManagerRef.current?.reset(),
       },
       loadIFCAssetIntoScene: async (i, s, t, r, options) => {
         loadingModelsRef.current.add(i);

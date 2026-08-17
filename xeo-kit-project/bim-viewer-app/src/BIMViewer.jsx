@@ -28,6 +28,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const [isManualSaving, setIsManualSaving] = useState(false);
   const [lastClickPos, setLastClickPos] = useState({ x: 0, y: 0 });
   const [cameraProjection, setCameraProjection] = useState('perspective');
+  const [savedCameraViews, setSavedCameraViews] = useState([]);
 
   // Add the useCatalog hook call[cite: 1]
   const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
@@ -150,13 +151,56 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     setIsRightPanelOpen,
     setRightTab,
     transformFurnitureForCalibration,
-    repairLegacyCalibrationState
+    repairLegacyCalibrationState,
+    isDarkMode
   );
 
   const {
     state: renderState, config: renderConfig, setRenderConfig, executeRender,
     setRenderResult, setRenderError,
   } = useCloudRender(activeProject, projectStateRef);
+
+  useEffect(() => {
+    if (!jobId) {
+      setSavedCameraViews([]);
+      return;
+    }
+    try {
+      const raw = window.localStorage.getItem(`hci-camera-views:${jobId}`);
+      setSavedCameraViews(raw ? JSON.parse(raw) : []);
+    } catch (error) {
+      console.warn('[BIMViewer] Unable to restore saved camera views.', error);
+      setSavedCameraViews([]);
+    }
+  }, [jobId]);
+
+  const persistSavedCameraViews = (views) => {
+    setSavedCameraViews(views);
+    if (!jobId) return;
+    try {
+      window.localStorage.setItem(`hci-camera-views:${jobId}`, JSON.stringify(views));
+    } catch (error) {
+      console.warn('[BIMViewer] Unable to persist saved camera views.', error);
+    }
+  };
+
+  const saveCameraView = (name) => {
+    const snapshot = engineActions.camera.snapshot();
+    if (!snapshot) return;
+    const view = { id: `view_${Date.now()}`, name, snapshot };
+    persistSavedCameraViews([...savedCameraViews, view].slice(-12));
+  };
+
+  const restoreCameraView = (id) => {
+    const view = savedCameraViews.find((item) => item.id === id);
+    if (!view) return;
+    engineActions.camera.restore(view.snapshot);
+    setCameraProjection(view.snapshot.projection || 'perspective');
+  };
+
+  const deleteCameraView = (id) => {
+    persistSavedCameraViews(savedCameraViews.filter((item) => item.id !== id));
+  };
 
   useEffect(() => {
     const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
@@ -328,8 +372,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           <ViewportToolbar
           isMeasuring={engineState.isMeasuring}
           isClipping={engineState.isClipping}
-          isMaxView={isMaxView}
-          isFullscreen={isFullscreen}
           navMode={engineState.navMode}
           onSelect={() => {
             engineActions.setPlacementMode(null);
@@ -338,18 +380,25 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             engineActions.setTransformMode('select');
           }}
           onNavMode={(next) => engineActions.setNavMode(next)}
+          transformMode={engineState.transformMode}
           onMeasure={() => engineActions.toggleMeasurementMode()}
           onClip={() => engineActions.toggleClipping()}
-          onMaxView={toggleMaxView}
-          onFullscreen={toggleBrowserFullscreen}
           projection={cameraProjection}
           onFocus={() => engineActions.camera.focusSelected()}
-          onCameraPreset={(preset) => engineActions.camera.preset(preset)}
+          onCameraPreset={(preset) => {
+            engineActions.camera.preset(preset);
+            setCameraProjection(preset === 'top' ? 'ortho' : 'perspective');
+          }}
           onProjection={(projection) => {
             engineActions.camera.setProjection(projection);
             setCameraProjection(projection);
           }}
           onFit={() => engineActions.camera.fitScene()}
+          savedViews={savedCameraViews}
+          onSaveView={saveCameraView}
+          onRestoreView={restoreCameraView}
+          onDeleteView={deleteCameraView}
+          onResetCamera={() => engineActions.camera.reset()}
           />
         </>
       )}
@@ -438,11 +487,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           style={{ width: '100%', height: '100%', display: 'block', outline: 'none', touchAction: 'none' }}
         />
         <div
-          className={`absolute bottom-[88px] z-20 w-[176px] h-[176px] rounded-full border backdrop-blur-xl shadow-2xl flex items-center justify-center transition-all duration-200 ${isRightPanelOpen ? 'right-[294px]' : 'right-5'} ${isDarkMode ? 'bg-[#07111d]/72 border-slate-700/70 shadow-black/35' : 'bg-white/76 border-slate-200 shadow-slate-900/10'}`}
+          className={`absolute bottom-[92px] z-20 w-[146px] h-[146px] rounded-2xl border backdrop-blur-2xl flex items-center justify-center transition-all duration-200 ${isRightPanelOpen ? 'right-[286px]' : 'right-5'} ${isDarkMode ? 'bg-[#0b1322]/88 border-slate-700/85 shadow-[0_14px_34px_rgba(0,0,0,0.34)]' : 'bg-white/88 border-slate-200 shadow-[0_14px_34px_rgba(15,23,42,0.12)]'}`}
           aria-label="View orientation"
         >
-          <div className={`absolute inset-[8px] rounded-full border ${isDarkMode ? 'border-slate-800/80' : 'border-slate-200/80'}`} />
-          <canvas id="myNavCubeCanvas" ref={refs.navCubeCanvasRef} className="relative z-10 w-[150px] h-[150px]" />
+          <div className={`absolute inset-2 rounded-xl pointer-events-none ${isDarkMode ? 'border border-white/[0.04]' : 'border border-slate-200/70'}`} />
+          <canvas id="myNavCubeCanvas" ref={refs.navCubeCanvasRef} className="relative z-10 w-[126px] h-[126px]" />
         </div>
       </div>
 
