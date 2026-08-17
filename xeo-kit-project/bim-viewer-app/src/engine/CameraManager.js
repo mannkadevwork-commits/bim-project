@@ -97,13 +97,10 @@ export class CameraManager {
       this.camera.ortho.scale = Math.max(projectedHeight, 0.001);
     }
 
-    // Explicitly set the projection after the camera flight request. This avoids
-    // relying solely on the flight animation to update projection state.
     try {
       this.camera.projection = projection;
     } catch (error) {
       // Keep the flight path as the compatibility fallback for xeokit builds
-      // where projection is not directly assignable.
     }
 
     if (this.flight) {
@@ -116,13 +113,11 @@ export class CameraManager {
         fit: false,
       });
     }
-
     return true;
   }
 
   zoom(direction = 1, duration = 0.2) {
     if (!this.camera) return false;
-
     const factor = direction > 0 ? 0.82 : 1.22;
 
     if (this.camera.projection === 'ortho') {
@@ -135,10 +130,12 @@ export class CameraManager {
     const eye = [...this.camera.eye];
     const look = [...this.camera.look];
     const up = [...this.camera.up];
+
     const vx = eye[0] - look[0];
     const vy = eye[1] - look[1];
     const vz = eye[2] - look[2];
     const distance = Math.hypot(vx, vy, vz);
+
     if (!Number.isFinite(distance) || distance < 0.001) return false;
 
     const nextEye = [
@@ -188,6 +185,54 @@ export class CameraManager {
 
   getProjection() {
     return this.camera?.projection || 'perspective';
+  }
+
+  /**
+   * Smooth pointer-targeted zoom for the xeokit canvas.
+   * Picks the 3-D point under the cursor and dollies the camera toward/away
+   * from it so the scene zooms into the cursor rather than the look-at centre.
+   *
+   * @param {number} wheelDelta  - raw wheel deltaY (positive = zoom out)
+   * @param {[number,number]} canvasPos - [x, y] in canvas pixels
+   */
+  zoomToPointer(wheelDelta, canvasPos) {
+    if (!this.viewer || !this.camera) return;
+
+    const scene = this.viewer.scene;
+    const camera = this.camera;
+
+    // Pick the world-space point under the cursor (surface or entity centre).
+    const pick = scene.pick({ canvasPos, pickSurface: true });
+    const target = pick?.worldPos
+      ? pick.worldPos
+      : [...camera.look];
+
+    const eye = camera.eye;
+    const dx = eye[0] - target[0];
+    const dy = eye[1] - target[1];
+    const dz = eye[2] - target[2];
+    const dist = Math.hypot(dx, dy, dz) || 1;
+
+    // Zoom speed scales with distance so it feels consistent at any depth.
+    const zoomSpeed = dist * 0.0008;
+    const factor = wheelDelta > 0
+      ? 1 + Math.min(wheelDelta, 200) * zoomSpeed   // zoom out
+      : 1 - Math.min(-wheelDelta, 200) * zoomSpeed; // zoom in
+
+    const minDist = 0.05;
+    const newDist = Math.max(dist * factor, minDist);
+    const scale = newDist / dist;
+
+    camera.eye = [
+      target[0] + dx * scale,
+      target[1] + dy * scale,
+      target[2] + dz * scale,
+    ];
+
+    // For ortho projection also scale the ortho frustum width.
+    if (camera.projection === 'ortho' && camera.ortho) {
+      camera.ortho.scale = (camera.ortho.scale || 1) * factor;
+    }
   }
 
   snapshot() {

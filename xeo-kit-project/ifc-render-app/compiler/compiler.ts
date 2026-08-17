@@ -55,6 +55,9 @@ interface FurnitureItem {
     number, number, number, number,
     number, number, number, number
   ];
+  /** Set when a GLB door was placed via insert-door. Position is the exact
+   * Python-computed void center; no AABB pivot correction must be applied. */
+  doorHostWallId?: string;
 }
 
 interface StructuralEditEntry {
@@ -570,9 +573,11 @@ export async function compileScene(
           const itemMaterial = resolveItemMaterial(item, materials);
           applyMaterialToSubtree(clonedRoot, itemMaterial, doc);
 
-          // GLB assets are authored as standalone objects. Their persisted
-          // position/scale is already in the current scene frame.
-          applyAuthoredTransform(instanceWrapper, item, null, false);
+          // GLB doors placed via insert-door have doorHostWallId set. Their
+          // position is the exact Python-computed void center — use it directly
+          // without any AABB pivot correction (same contract as native-isolated IFCs).
+          const isHostedDoor = !!item.doorHostWallId;
+          applyAuthoredTransform(instanceWrapper, item, null, isHostedDoor);
 
           scene.addChild(instanceWrapper);
           debugLog(`[compiler] Mounted GLB "${item.instanceId}" (${item.name})`, {

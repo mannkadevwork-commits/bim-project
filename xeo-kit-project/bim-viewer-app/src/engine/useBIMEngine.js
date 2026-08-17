@@ -731,6 +731,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     viewer.cameraControl.followPointer = true;
     viewer.cameraControl.smartPivot = true;
     viewer.cameraControl.doublePickFlyTo = false;
+    viewer.cameraControl.mouseWheelDollyRate = 0; // zoom handled by our non-passive wheel listener
     viewer.scene.camera.project.fov = 65;
     cameraManagerRef.current = new CameraManager(viewer);
 
@@ -1379,8 +1380,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       }
     };
     
+    // Intercept wheel events with { passive: false } so we can call
+    // preventDefault() and stop the browser from scrolling the page.
+    // We then drive a smooth pointer-targeted zoom through CameraManager.
+    const onCanvasWheel = (e) => {
+      e.preventDefault();
+      if (!cameraManagerRef.current) return;
+      const rect = canvas.getBoundingClientRect();
+      cameraManagerRef.current.zoomToPointer(
+        e.deltaY,
+        [e.clientX - rect.left, e.clientY - rect.top],
+      );
+    };
+
     canvas.addEventListener('mousedown', onCanvasMouseDown, { capture: true });
     canvas.addEventListener('mousemove', onCanvasHoverMove);
+    canvas.addEventListener('wheel', onCanvasWheel, { passive: false });
     document.addEventListener('mousemove', onDocMouseMove);
     document.addEventListener('mouseup', onDocMouseUp);
     
@@ -1409,6 +1424,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     return () => {
       canvas.removeEventListener('mousedown', onCanvasMouseDown, { capture: true });
       canvas.removeEventListener('mousemove', onCanvasHoverMove);
+      canvas.removeEventListener('wheel', onCanvasWheel, { passive: false });
       document.removeEventListener('mousemove', onDocMouseMove);
       document.removeEventListener('mouseup', onDocMouseUp);
       destroyPointMeasurementPreview();

@@ -372,6 +372,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           <ViewportToolbar
           isMeasuring={engineState.isMeasuring}
           isClipping={engineState.isClipping}
+          isMaxView={isMaxView}
+          isFullscreen={isFullscreen}
           navMode={engineState.navMode}
           onSelect={() => {
             engineActions.setPlacementMode(null);
@@ -383,6 +385,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           transformMode={engineState.transformMode}
           onMeasure={() => engineActions.toggleMeasurementMode()}
           onClip={() => engineActions.toggleClipping()}
+          onMaxView={toggleMaxView}
+          onFullscreen={toggleBrowserFullscreen}
           projection={cameraProjection}
           onFocus={() => engineActions.camera.focusSelected()}
           onCameraPreset={(preset) => {
@@ -487,11 +491,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           style={{ width: '100%', height: '100%', display: 'block', outline: 'none', touchAction: 'none' }}
         />
         <div
-          className={`absolute bottom-[92px] z-20 w-[146px] h-[146px] rounded-2xl border backdrop-blur-2xl flex items-center justify-center transition-all duration-200 ${isRightPanelOpen ? 'right-[286px]' : 'right-5'} ${isDarkMode ? 'bg-[#0b1322]/88 border-slate-700/85 shadow-[0_14px_34px_rgba(0,0,0,0.34)]' : 'bg-white/88 border-slate-200 shadow-[0_14px_34px_rgba(15,23,42,0.12)]'}`}
+          className={`absolute bottom-[88px] z-20 w-[176px] h-[176px] rounded-full border backdrop-blur-xl shadow-2xl flex items-center justify-center transition-all duration-200 ${isRightPanelOpen ? 'right-[294px]' : 'right-5'} ${isDarkMode ? 'bg-[#07111d]/72 border-slate-700/70 shadow-black/35' : 'bg-white/76 border-slate-200 shadow-slate-900/10'}`}
           aria-label="View orientation"
         >
-          <div className={`absolute inset-2 rounded-xl pointer-events-none ${isDarkMode ? 'border border-white/[0.04]' : 'border border-slate-200/70'}`} />
-          <canvas id="myNavCubeCanvas" ref={refs.navCubeCanvasRef} className="relative z-10 w-[126px] h-[126px]" />
+          <div className={`absolute inset-[8px] rounded-full border ${isDarkMode ? 'border-slate-800/80' : 'border-slate-200/80'}`} />
+          <canvas id="myNavCubeCanvas" ref={refs.navCubeCanvasRef} className="relative z-10 w-[150px] h-[150px]" />
         </div>
       </div>
 

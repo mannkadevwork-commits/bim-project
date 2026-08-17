@@ -360,6 +360,11 @@ export const useProjectSync = (activeProject) => {
     const position = Array.isArray(coordinates) && coordinates.length === 3 ? [...coordinates] : [0, 0, 0];
     const safeRotation = Array.isArray(rotation) && rotation.length === 3 ? [...rotation] : [0, 0, 0];
 
+    // GLB doors placed via insert-door carry hostWallId. Persisting doorHostWallId
+    // tells the compiler to use the exact Python-computed void-center position
+    // instead of applying a furniture-style AABB pivot correction.
+    const doorHostWallId = asset.hostWallId || null;
+
     const furnitureItem = {
       id: asset.id,
       instanceId: uniqueId,
@@ -369,6 +374,7 @@ export const useProjectSync = (activeProject) => {
       position,
       rotation: safeRotation,
       scale: effectiveScale,
+      ...(doorHostWallId ? { doorHostWallId } : {}),
     };
 
     setProjectState(prev => ({
