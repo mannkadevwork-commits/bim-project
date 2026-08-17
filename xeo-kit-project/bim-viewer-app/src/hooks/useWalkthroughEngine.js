@@ -288,13 +288,13 @@ class WalkRuntime {
     this.portalTargets.clear();
 
     this.walkAreas.forEach((area) => {
-      const texture = this._makePortalTexture(area.label || 'Room');
+      const texture = this._makePortalTexture(area.label || 'Entry Point');
       const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false });
       const sprite = new THREE.Sprite(mat);
       sprite.scale.set(1.25 * this.metersPerUnit, 0.42 * this.metersPerUnit, 1);
       sprite.position.set(area.center[0], area.center[1] + this.eyeHeight * this.metersPerUnit * 0.7, area.center[2]);
       sprite.userData.walkTarget = area.center;
-      sprite.userData.walkLabel = area.label || 'Room';
+      sprite.userData.walkLabel = area.label || 'Entry Point';
       this.scene.add(sprite);
       this.portalObjects.push(sprite);
       this.portalTargets.set(area.label, area.center);
@@ -364,7 +364,7 @@ class WalkRuntime {
     return true;
   }
 
-  async switchRoom(target, label = 'Room') {
+  async switchRoom(target, label = 'Entry Point') {
     if (!this.query) return false;
     const closest = this._closestWalkPoint(target);
     if (!closest) {
