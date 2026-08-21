@@ -6,6 +6,11 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { init as initRecast, importNavMesh, NavMeshQuery, QueryFilter } from 'recast-navigation';
 
 const DEFAULT_SPEEDS = { walk: 1.8, run: 4.5 };
+const DEFAULT_EYE_HEIGHT_METERS = 1.6;
+const DEFAULT_HEIGHT_OFFSET_METERS = 0.35;
+const MIN_HEIGHT_OFFSET_METERS = -0.45;
+const MAX_HEIGHT_OFFSET_METERS = 1.0;
+const DEFAULT_FOV_DEGREES = 110;
 
 class WalkRuntime {
   constructor({ canvas, onState }) {
@@ -13,7 +18,7 @@ class WalkRuntime {
     this.onState = onState;
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0xf4f6f8);
-    this.camera = new THREE.PerspectiveCamera(70, 1, 0.05, 5000);
+    this.camera = new THREE.PerspectiveCamera(DEFAULT_FOV_DEGREES, 1, 0.05, 5000);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -50,12 +55,12 @@ class WalkRuntime {
     this.velocity = new THREE.Vector3();
     this.yaw = 0;
     this.pitch = -0.05;
-    this.eyeHeight = 1.6;
+    this.eyeHeight = DEFAULT_EYE_HEIGHT_METERS;
     this.radius = 0.15;
     this.walkSpeed = DEFAULT_SPEEDS.walk;
     this.runSpeed = DEFAULT_SPEEDS.run;
     this.metersPerUnit = 1;
-    this.heightOffset = 0;
+    this.heightOffset = DEFAULT_HEIGHT_OFFSET_METERS;
     // Start in a presentation-friendly perspective overview. Walk activates only after an explicit user action.
     this.viewMode = 'overview';
     this.lookLocked = false;
@@ -67,7 +72,7 @@ class WalkRuntime {
 
     this.viewTarget = new THREE.Vector3();
     this.viewDistance = 1;
-    this.fov = 70;
+    this.fov = DEFAULT_FOV_DEGREES;
     this.overviewPanSpeed = 1;
     this.keys = new Set();
     this.lastPointer = { x: 0, y: 0 };
@@ -181,7 +186,11 @@ class WalkRuntime {
     this.filter = new QueryFilter();
     this.walkAreas = Array.isArray(areasPayload?.areas) ? areasPayload.areas.filter((a) => Array.isArray(a?.center) && a.center.length >= 3) : [];
     this.metersPerUnit = Number(surfacePayload?.metadata?.physicalMetersPerUnit) > 0 ? Number(surfacePayload.metadata.physicalMetersPerUnit) : 1;
-    this.eyeHeight = Number(surfacePayload?.metadata?.eyeHeightMeters) > 0 ? Number(surfacePayload.metadata.eyeHeightMeters) : 1.6;
+    this.eyeHeight = Number(surfacePayload?.metadata?.eyeHeightMeters) > 0 ? Number(surfacePayload.metadata.eyeHeightMeters) : DEFAULT_EYE_HEIGHT_METERS;
+    this.heightOffset = DEFAULT_HEIGHT_OFFSET_METERS;
+    this.fov = DEFAULT_FOV_DEGREES;
+    this.camera.fov = this.fov;
+    this.camera.updateProjectionMatrix();
     this.radius = Number(surfacePayload?.metadata?.agentRadiusMeters) > 0 ? Number(surfacePayload.metadata.agentRadiusMeters) : 0.15;
     this.walkSpeed = DEFAULT_SPEEDS.walk * this.metersPerUnit;
     this.runSpeed = DEFAULT_SPEEDS.run * this.metersPerUnit;
@@ -296,13 +305,13 @@ class WalkRuntime {
     this.portalTargets.clear();
 
     this.walkAreas.forEach((area) => {
-      const texture = this._makePortalTexture(area.label || 'Room');
+      const texture = this._makePortalTexture(area.label || 'Node');
       const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false });
       const sprite = new THREE.Sprite(mat);
       sprite.scale.set(1.25 * this.metersPerUnit, 0.42 * this.metersPerUnit, 1);
       sprite.position.set(area.center[0], area.center[1] + this.eyeHeight * this.metersPerUnit * 0.7, area.center[2]);
       sprite.userData.walkTarget = area.center;
-      sprite.userData.walkLabel = area.label || 'Room';
+      sprite.userData.walkLabel = area.label || 'Node';
       this.scene.add(sprite);
       this.portalObjects.push(sprite);
       this.portalTargets.set(area.label, area.center);
@@ -372,7 +381,7 @@ class WalkRuntime {
     return true;
   }
 
-  async switchRoom(target, label = 'Room') {
+  async switchRoom(target, label = 'Node') {
     if (!this.query) return false;
     const closest = this._closestWalkPoint(target);
     if (!closest) {
@@ -400,6 +409,23 @@ class WalkRuntime {
     };
     this.onState?.({ type: 'travel', label, active: true, mode });
     return true;
+  }
+
+  _notifyCameraSettings() {
+    this.onState?.({
+      type: 'camera-settings',
+      cameraHeightMeters: this.eyeHeight + this.heightOffset,
+      heightOffsetMeters: this.heightOffset,
+      fov: this.fov,
+    });
+  }
+
+  _resetWalkCameraDefaults() {
+    this.heightOffset = DEFAULT_HEIGHT_OFFSET_METERS;
+    this.fov = DEFAULT_FOV_DEGREES;
+    this.camera.fov = this.fov;
+    this.camera.updateProjectionMatrix();
+    this._notifyCameraSettings();
   }
 
   setSensitivity(value) {
@@ -430,6 +456,7 @@ class WalkRuntime {
       this.orbitControls.update();
     } else {
       this.orbitControls.enabled = false;
+      this._resetWalkCameraDefaults();
       this._syncCamera();
     }
     this.onState?.({ type: 'view-mode', mode: this.viewMode });
@@ -438,6 +465,7 @@ class WalkRuntime {
   setAutoRotate(value) {
     this.autoRotate = Boolean(value);
     this.orbitControls.autoRotate = this.viewMode === 'overview' && this.autoRotate;
+    this._notifyCameraSettings();
   }
 
   setViewPreset(name) {
@@ -470,9 +498,10 @@ class WalkRuntime {
   }
 
   setFov(value) {
-    this.fov = THREE.MathUtils.clamp(Number(value) || 70, 30, 110);
+    this.fov = THREE.MathUtils.clamp(Number(value) || DEFAULT_FOV_DEGREES, 30, 110);
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
+    this._notifyCameraSettings();
   }
 
   fitView() {
@@ -486,7 +515,8 @@ class WalkRuntime {
   }
 
   setHeightOffset(value) {
-    this.heightOffset = THREE.MathUtils.clamp(value, -0.15, 0.35);
+    this.heightOffset = THREE.MathUtils.clamp(Number(value) || 0, MIN_HEIGHT_OFFSET_METERS, MAX_HEIGHT_OFFSET_METERS);
+    this._notifyCameraSettings();
   }
 
   stopTravel() {
@@ -763,7 +793,7 @@ class WalkRuntime {
 
 export function useWalkthroughEngine({ containerRef, jobId }) {
   const runtimeRef = useRef(null);
-  const [state, setState] = useState({ status: 'idle', areas: [], activeArea: null, message: '', lookLocked: false });
+  const [state, setState] = useState({ status: 'idle', areas: [], activeArea: null, message: '', lookLocked: false, cameraHeightMeters: DEFAULT_EYE_HEIGHT_METERS + DEFAULT_HEIGHT_OFFSET_METERS, heightOffsetMeters: DEFAULT_HEIGHT_OFFSET_METERS, cameraFov: DEFAULT_FOV_DEGREES });
 
   useEffect(() => {
     if (!containerRef.current || !jobId) return undefined;
@@ -775,6 +805,7 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
         if (event.type === 'travel') setState((prev) => ({ ...prev, activeArea: event.label || null, message: event.active ? `Walking to ${event.label}…` : '' }));
         if (event.type === 'error') setState((prev) => ({ ...prev, message: event.message || 'Navigation failed.' }));
         if (event.type === 'look-lock') setState((prev) => ({ ...prev, lookLocked: event.locked }));
+        if (event.type === 'camera-settings') setState((prev) => ({ ...prev, cameraHeightMeters: event.cameraHeightMeters, heightOffsetMeters: event.heightOffsetMeters, cameraFov: event.fov }));
         if (event.type === 'unstuck') setState((prev) => ({ ...prev, message: 'Recovered walk position.' }));
         if (event.type === 'escape') setState((prev) => ({ ...prev, message: '' }));
       },

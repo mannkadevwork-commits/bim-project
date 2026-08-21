@@ -341,11 +341,11 @@ function buildAreas(surfacePositions: number[], surfaceIndices: number[], cellSi
 
   const areas = Array.from(buckets.values())
     .filter((b) => b.count >= 3)
-    .map((b, i) => ({ id: `area-${i + 1}`, label: `Room ${i + 1}`, center: [b.x / b.count, floorY, b.z / b.count] as [number, number, number] }));
+    .map((b, i) => ({ id: `area-${i + 1}`, label: `Node ${i + 1}`, center: [b.x / b.count, floorY, b.z / b.count] as [number, number, number] }));
 
   // Sort spatially for deterministic presentation/tour order.
   areas.sort((a, b) => (a.center[2] - b.center[2]) || (a.center[0] - b.center[0]));
-  areas.forEach((a, i) => { a.id = `area-${i + 1}`; a.label = `Room ${i + 1}`; });
+  areas.forEach((a, i) => { a.id = `area-${i + 1}`; a.label = `Node ${i + 1}`; });
 
   return areas;
 }
