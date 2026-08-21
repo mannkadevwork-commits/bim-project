@@ -253,96 +253,180 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
     }
   });
 
-  // Modern rotate UX: two directional circular-arrow controls at the
-  // left and right of the selected object. The existing drag math still
-  // performs the Y-axis rotation; only the visual affordance changes here.
-  const ROTATION_COLOR = [0.13, 0.58, 0.95];
-  const ROTATION_HOVER = [0.25, 0.78, 1.0];
+  // Rotation UX: one continuous, thick half-arc with a single directional
+  // arrowhead. The gizmo is authored in local X/Z space and rotated around
+  // the object, so the arc + arrow visibly follow the furniture rotation.
+  const ROTATION_COLOR = [0.48, 0.30, 0.95];
+  const ROTATION_HOVER = [1.0, 0.42, 0.12];
   const radiusX = (xMax - xMin) / 2;
   const radiusZ = (zMax - zMin) / 2;
-  const radius = Math.max(radiusX, radiusZ) + 0.42;
-  const ringY = cy;
-  const segments = 28;
+  const radius = Math.max(radiusX, radiusZ) + Math.max(0.38, maxDim * 0.16);
+  const ringYOffset = Math.max(0.03, maxDim * 0.012);
+  // Use real triangle geometry for the arc instead of WebGL line width.
+  // Line width is implementation-dependent and was rendering too thin in the
+  // browser. A ribbon gives us a consistent, screen-readable interaction band.
+  const arcThickness = Math.max(0.12, Math.min(0.24, maxDim * 0.058));
+  const arcSegments = 36;
+  const arcStartDeg = -135;
+  const arcEndDeg = 45; // 180° half-arc; arrow sits at the end.
 
-  const createRotateArc = (startDeg, endDeg, id) => {
+  const createRotationArc = () => {
     const positions = [];
     const indices = [];
-    for (let i = 0; i <= segments; i++) {
-      const t = i / segments;
-      const theta = (startDeg + (endDeg - startDeg) * t) * Math.PI / 180;
+    const halfThickness = arcThickness / 2;
+
+    for (let i = 0; i <= arcSegments; i++) {
+      const t = i / arcSegments;
+      const theta = (arcStartDeg + (arcEndDeg - arcStartDeg) * t) * Math.PI / 180;
+      const cos = Math.cos(theta);
+      const sin = Math.sin(theta);
+      const outerRadius = radius + halfThickness;
+      const innerRadius = Math.max(0.01, radius - halfThickness);
+
+      // outer vertex
       positions.push(
-        cx + Math.cos(theta) * radius,
-        ringY,
-        cz + Math.sin(theta) * radius,
+        cos * outerRadius,
+        ringYOffset,
+        sin * outerRadius,
       );
-      if (i < segments) indices.push(i, i + 1);
+      // inner vertex
+      positions.push(
+        cos * innerRadius,
+        ringYOffset,
+        sin * innerRadius,
+      );
+
+      if (i < arcSegments) {
+        const a = i * 2;
+        const b = a + 1;
+        const c = a + 2;
+        const d = a + 3;
+        indices.push(a, b, c, b, d, c);
+      }
     }
 
-    const mesh = new Mesh(viewer.scene, {
-      id,
+    return new Mesh(viewer.scene, {
+      id: `sh_${ts}_rot_arc`,
       geometry: new ReadableGeometry(viewer.scene, {
-        primitive: 'lines',
+        primitive: 'triangles',
         positions,
         indices,
       }),
       material: new PhongMaterial(viewer.scene, {
+        diffuse: ROTATION_COLOR,
         emissive: ROTATION_COLOR,
-        lineWidth: 4,
-        opacity: 0.78,
+        opacity: 0.94,
       }),
+      position: center,
+      rotation: [0, rotationY, 0],
       pickable: true,
       collidable: false,
       visible: true,
     });
-
-    mesh._stretchMeta = {
-      isStretchHandle: true,
-      type: 'rotate',
-      transformMode: 'rotate',
-      axes: [],
-      targetId: entityId,
-      isAsset,
-      color: ROTATION_COLOR,
-      hoverColor: ROTATION_HOVER,
-      restOpacity: 0.78,
-    };
-    stretchHandlesRef.current.push(mesh);
-    return mesh;
   };
 
-  const createRotateArrow = (angleDeg, direction, id) => {
-    const theta = angleDeg * Math.PI / 180;
-    const x = cx + Math.cos(theta) * radius;
-    const z = cz + Math.sin(theta) * radius;
-    const tangent = [-Math.sin(theta) * direction, Math.cos(theta) * direction];
-    const normal = [Math.cos(theta), Math.sin(theta)];
-    const tip = [x + tangent[0] * 0.16, ringY + 0.012, z + tangent[1] * 0.16];
-    const base = [x - tangent[0] * 0.07, ringY + 0.012, z - tangent[1] * 0.07];
-    const wing = 0.08;
-    const p1 = [base[0] + normal[0] * wing, base[1], base[2] + normal[1] * wing];
-    const p2 = [base[0] - normal[0] * wing, base[1], base[2] - normal[1] * wing];
+  // Build a separate, intentionally generous interaction halo around the arc.
+  // The user does not need to land the cursor on the exact visual stroke: while
+  // Rotate mode is active, this halo is the forgiving hit target. It is nearly
+  // invisible but remains pickable, so we can keep the visual design clean.
+  const createRotationPickArc = () => {
+    const positions = [];
+    const indices = [];
+    const pickThickness = Math.max(0.30, arcThickness * 2.8);
+    const halfThickness = pickThickness / 2;
+    const pickRadius = radius;
 
-    const mesh = new Mesh(viewer.scene, {
-      id,
+    for (let i = 0; i <= arcSegments; i++) {
+      const t = i / arcSegments;
+      const theta = (arcStartDeg + (arcEndDeg - arcStartDeg) * t) * Math.PI / 180;
+      const cos = Math.cos(theta);
+      const sin = Math.sin(theta);
+      const outerRadius = pickRadius + halfThickness;
+      const innerRadius = Math.max(0.01, pickRadius - halfThickness);
+
+      positions.push(cos * outerRadius, ringYOffset + 0.004, sin * outerRadius);
+      positions.push(cos * innerRadius, ringYOffset + 0.004, sin * innerRadius);
+
+      if (i < arcSegments) {
+        const a = i * 2;
+        const b = a + 1;
+        const c = a + 2;
+        const d = a + 3;
+        indices.push(a, b, c, b, d, c);
+      }
+    }
+
+    return new Mesh(viewer.scene, {
+      id: `sh_${ts}_rot_pick_arc`,
       geometry: new ReadableGeometry(viewer.scene, {
         primitive: 'triangles',
-        positions: [
-          tip[0], tip[1], tip[2],
-          p1[0], p1[1], p1[2],
-          p2[0], p2[1], p2[2],
-        ],
+        positions,
+        indices,
+      }),
+      material: new PhongMaterial(viewer.scene, {
+        diffuse: ROTATION_COLOR,
+        emissive: ROTATION_COLOR,
+        opacity: 0.012,
+      }),
+      position: center,
+      rotation: [0, rotationY, 0],
+      pickable: true,
+      collidable: false,
+      visible: true,
+    });
+  };
+
+  const createRotationArrow = () => {
+    const theta = arcEndDeg * Math.PI / 180;
+    const centerX = Math.cos(theta) * radius;
+    const centerZ = Math.sin(theta) * radius;
+    const tangent = [-Math.sin(theta), Math.cos(theta)];
+    const normal = [Math.cos(theta), Math.sin(theta)];
+
+    // The triangle points along the tangent of the arc, making the intended
+    // rotation direction obvious rather than looking like a random marker.
+      const tipDistance = 0.42
+      const baseDistance = 0.12
+    
+    const wing = Math.max(0.10, Math.min(0.32, maxDim * 0.45));
+    const tipX = centerX + tangent[0] * tipDistance;
+    const tipZ = centerZ + tangent[1] * tipDistance;
+    const baseCenterX = centerX - tangent[0] * baseDistance;
+    const baseCenterZ = centerZ - tangent[1] * baseDistance;
+
+    const positions = [
+      tipX, ringYOffset + 0.018, tipZ,
+      baseCenterX + normal[0] * wing, ringYOffset + 0.018, baseCenterZ + normal[1] * wing,
+      baseCenterX - normal[0] * wing, ringYOffset + 0.018, baseCenterZ - normal[1] * wing,
+    ];
+
+    return new Mesh(viewer.scene, {
+      id: `sh_${ts}_rot_arrow`,
+      geometry: new ReadableGeometry(viewer.scene, {
+        primitive: 'triangles',
+        positions,
         indices: [0, 1, 2],
       }),
       material: new PhongMaterial(viewer.scene, {
         diffuse: ROTATION_COLOR,
         emissive: ROTATION_COLOR,
-        opacity: 0.98,
+        opacity: 1.0,
       }),
+      position: center,
+      rotation: [0, rotationY, 0],
       pickable: true,
       collidable: false,
       visible: true,
     });
+  };
 
+  const rotationArcMesh = createRotationArc();
+  const rotationArrowMesh = createRotationArrow();
+  const rotationPickArcMesh = createRotationPickArc();
+  const rotationVisualGroup = [rotationArcMesh, rotationArrowMesh];
+  const rotationGroup = [...rotationVisualGroup, rotationPickArcMesh];
+
+  rotationGroup.forEach(mesh => {
     mesh._stretchMeta = {
       isStretchHandle: true,
       type: 'rotate',
@@ -352,16 +436,13 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
       isAsset,
       color: ROTATION_COLOR,
       hoverColor: ROTATION_HOVER,
-      restOpacity: 0.98,
+      restOpacity: mesh === rotationArcMesh ? 0.94 : (mesh === rotationArrowMesh ? 1.0 : 0.012),
+      rotationGroup: rotationVisualGroup,
+      rotationPickProxy: mesh === rotationPickArcMesh,
+      rotationCenter: center,
     };
     stretchHandlesRef.current.push(mesh);
-  };
-
-  // Two opposite circular arrows communicate: "drag here to rotate".
-  createRotateArc(200, 335, `sh_${ts}_rot_left_arc`);
-  createRotateArrow(335, +1, `sh_${ts}_rot_left_arrow`);
-  createRotateArc(25, 160, `sh_${ts}_rot_right_arc`);
-  createRotateArrow(160, -1, `sh_${ts}_rot_right_arrow`);
+  });
 
   // Keep the currently approved Move affordance unchanged; only the
   // rotation visual is being redesigned in this pass.

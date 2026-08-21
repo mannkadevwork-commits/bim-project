@@ -203,21 +203,51 @@ function computeScaledFurniturePivotTranslation(
   ];
 }
 
+function applyPersistedGlbTransform(
+  wrapper: GltfNode,
+  item: FurnitureItem,
+  preserveNativeFrame: boolean
+): boolean {
+  // For catalog GLBs, project_state.matrix is the runtime/root transform
+  // that corresponds to the user's semantic placement. In the verified
+  // project states, item.position is the visual placement target while the
+  // matrix translation is that target minus the GLB's local visual pivot.
+  // Reusing item.position as the root translation causes a small but visible
+  // placement drift in output.glb.
+  //
+  // Hosted GLB doors keep the existing direct-position contract because their
+  // position is computed by the backend from the wall/void placement logic.
+  if (preserveNativeFrame || !isFiniteMatrix16(item.matrix)) {
+    return false;
+  }
+
+  try {
+    wrapper.setMatrix(item.matrix!);
+  } catch (err) {
+    console.warn(
+      `[compiler:glb-transform] ${item.instanceId}: failed to apply persisted matrix; falling back to TRS - ${(err as Error).message}`
+    );
+    return false;
+  }
+
+  debugLog(`[compiler:glb-transform] ${item.instanceId}`, {
+    mode: "persisted-matrix",
+    placementTarget: item.position,
+    persistedMatrix: item.matrix,
+  });
+
+  return true;
+}
+
 function applyAuthoredTransform(
   wrapper: GltfNode,
   item: FurnitureItem,
   pivot: [number, number, number] | null,
   preserveNativeFrame: boolean
 ): void {
-  // IMPORTANT: item.matrix is intentionally NOT authoritative here. The
-  // frontend treats position as the persisted placement target and rebuilds
-  // the runtime matrix after the asset has loaded (see applyPersistedModelMatrix).
-  // The uploaded calibrated state demonstrates why: the persisted matrix can
-  // be a stale runtime snapshot (for example, missing the persisted Y rotation
-  // or containing the raw AABB-corrected translation). Reusing it caused the
-  // GLB output to lose sofa rotation and place doors/walls at different points
-  // than the editor. Persisted TRS + the asset's frame convention are the
-  // source of truth for the compositor.
+  // IFC/native-isolated assets continue to use the existing TRS contract.
+  // GLB catalog assets are handled separately below so that their persisted
+  // runtime matrix can be reproduced exactly when one is available.
   const rotation = eulerToQuaternion(item.rotation);
   const scale: [number, number, number] = Array.isArray(item.scale)
     ? item.scale
@@ -500,9 +530,26 @@ export async function compileScene(
 
           function cloneNode(srcNode: GltfNode, parentDst: GltfNode): void {
             const dstNode = doc.createNode(srcNode.getName());
-            dstNode.setTranslation(srcNode.getTranslation());
-            dstNode.setRotation(srcNode.getRotation());
-            dstNode.setScale(srcNode.getScale());
+
+            // Preserve the source node's authored matrix when present. Some
+            // catalog GLBs rely on matrix-based parent transforms; rebuilding
+            // those nodes from TRS can introduce small placement differences.
+            let copiedSourceMatrix = false;
+            try {
+              const sourceMatrix = srcNode.getMatrix();
+              if (sourceMatrix && sourceMatrix.length === 16) {
+                dstNode.setMatrix(sourceMatrix);
+                copiedSourceMatrix = true;
+              }
+            } catch (_) {
+              copiedSourceMatrix = false;
+            }
+
+            if (!copiedSourceMatrix) {
+              dstNode.setTranslation(srcNode.getTranslation());
+              dstNode.setRotation(srcNode.getRotation());
+              dstNode.setScale(srcNode.getScale());
+            }
 
             const srcMesh = srcNode.getMesh();
             if (srcMesh) {
@@ -577,7 +624,15 @@ export async function compileScene(
           // position is the exact Python-computed void center — use it directly
           // without any AABB pivot correction (same contract as native-isolated IFCs).
           const isHostedDoor = !!item.doorHostWallId;
-          applyAuthoredTransform(instanceWrapper, item, null, isHostedDoor);
+          const appliedPersistedMatrix = applyPersistedGlbTransform(
+            instanceWrapper,
+            item,
+            isHostedDoor
+          );
+
+          if (!appliedPersistedMatrix) {
+            applyAuthoredTransform(instanceWrapper, item, null, isHostedDoor);
+          }
 
           scene.addChild(instanceWrapper);
           debugLog(`[compiler] Mounted GLB "${item.instanceId}" (${item.name})`, {
@@ -586,6 +641,7 @@ export async function compileScene(
             rotation: item.rotation,
             scale: item.scale,
             matrix: isFiniteMatrix16(item.matrix) ? item.matrix : null,
+            matrixApplied: appliedPersistedMatrix,
           });
 
         } else {

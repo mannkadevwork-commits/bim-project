@@ -1097,6 +1097,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           center,
           startGrab: [...startGrab],
           startRotationY: targetObj.rotation?.[1] || 0,
+          rotationGizmoMeshes: stretchHandlesRef.current.filter(mesh => (
+            mesh?._stretchMeta?.type === 'rotate' &&
+            mesh?._stretchMeta?.targetId === targetId &&
+            mesh?._stretchMeta?.isAsset === isAsset
+          )),
         };
         
         isStretchingRef.current = true;
@@ -1236,6 +1241,15 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           const currentRotation = targetObj.rotation ? [...targetObj.rotation] : [0, 0, 0];
           targetObj.rotation = [currentRotation[0], nextRotation, currentRotation[2]];
         }
+
+        if (dragData.rotationGizmoMeshes?.length) {
+          dragData.rotationGizmoMeshes.forEach(mesh => {
+            try {
+              mesh.position = [...dragData.center];
+              mesh.rotation = [0, nextRotation, 0];
+            } catch (_) {}
+          });
+        }
         
         setActiveStretchData({ label: `Rotate: ${nextRotation.toFixed(1)}°`, x: e.clientX, y: e.clientY });
         return;
@@ -1349,23 +1363,25 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         if (hoveredStretchMeshRef.current !== pick.entity) {
           resetHoveredStretchHandle(hoveredStretchMeshRef, stretchAnimFramesRef);
           
-          const hoverColor = brightenColor(meta.color);
-          pick.entity.material.diffuse = hoverColor;
-          pick.entity.material.emissive = hoverColor;
-
-          // Rotation arrow geometry is positioned in world space. Scaling the
-          // mesh around the scene origin makes the arrowhead appear to jump.
-          // Rotation controls therefore use color/opacity feedback only.
+          const hoverColor = brightenColor(meta.type === 'rotate' ? (meta.hoverColor || meta.color) : meta.color);
           if (meta.type === 'rotate') {
-            pick.entity.material.opacity = Math.min(1, (meta.restOpacity ?? 0.78) + 0.15);
+            const group = meta.rotationGroup || [pick.entity];
+            group.forEach(mesh => {
+              const color = brightenColor(meta.hoverColor || meta.color);
+              mesh.material.diffuse = color;
+              mesh.material.emissive = color;
+              mesh.material.opacity = 1.0;
+            });
           } else {
+            pick.entity.material.diffuse = hoverColor;
+            pick.entity.material.emissive = hoverColor;
             animateHandleTo(pick.entity, stretchAnimFramesRef, { opacity: 1, scale: STRETCH_HANDLE_HOVER_SCALE });
           }
           hoveredStretchMeshRef.current = pick.entity;
         }
         
         if (meta.type === 'rotate') {
-          canvas.style.cursor = 'ew-resize';
+          canvas.style.cursor = 'grab';
         } else {
           canvas.style.cursor = cursorForAxes(meta.axes);
         }

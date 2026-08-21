@@ -12,7 +12,7 @@ import {
 const rows = [
   { key: 'W', label: 'Move', Icon: Move, tone: 'emerald' },
   { key: 'E', label: 'Rotate', Icon: Rotate3D, tone: 'blue' },
-  { key: 'R', label: 'Scale', Icon: Maximize2, tone: 'amber' },
+  // { key: 'R', label: 'Scale', Icon: Maximize2, tone: 'amber' },
 ];
 
 const tones = {
@@ -90,7 +90,7 @@ export const TransformModesHelp = ({ isDarkMode = true }) => {
         <div className="space-y-1.5">
           <Shortcut keyName="W" label="Move" isDarkMode={isDarkMode} />
           <Shortcut keyName="E" label="Rotate" isDarkMode={isDarkMode} />
-          <Shortcut keyName="R" label="Scale" isDarkMode={isDarkMode} />
+          {/* <Shortcut keyName="R" label="Scale" isDarkMode={isDarkMode} /> */}
           <Shortcut Icon={Trash2} label="Delete" isDarkMode={isDarkMode} />
           <Shortcut Icon={LockKeyhole} label="Unlock" isDarkMode={isDarkMode} />
         </div>

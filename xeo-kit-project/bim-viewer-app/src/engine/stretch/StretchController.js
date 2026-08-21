@@ -32,15 +32,20 @@ export const resetHoveredStretchHandle = (hoveredStretchMeshRef, stretchAnimFram
   const prev = hoveredStretchMeshRef.current;
   if (prev) {
     try {
-      const base = prev._stretchMeta?.color || AXIS_HANDLE_COLORS.X;
-      prev.material.diffuse = base;
-      prev.material.emissive = base;
-      const restOpacity = prev._stretchMeta?.restOpacity ?? STRETCH_HANDLE_FACE_OPACITY;
-      if (prev._stretchMeta?.type === 'rotate') {
-        // Rotation handles are authored in world space; scaling them would move
-        // their geometry relative to the scene origin. Restore appearance only.
-        prev.material.opacity = restOpacity;
+      const meta = prev._stretchMeta || {};
+      const group = meta.rotationGroup || [prev];
+      if (meta.type === 'rotate') {
+        group.forEach(mesh => {
+          const base = mesh._stretchMeta?.color || AXIS_HANDLE_COLORS.X;
+          mesh.material.diffuse = base;
+          mesh.material.emissive = base;
+          mesh.material.opacity = mesh._stretchMeta?.restOpacity ?? STRETCH_HANDLE_FACE_OPACITY;
+        });
       } else {
+        const base = meta.color || AXIS_HANDLE_COLORS.X;
+        prev.material.diffuse = base;
+        prev.material.emissive = base;
+        const restOpacity = meta.restOpacity ?? STRETCH_HANDLE_FACE_OPACITY;
         animateHandleTo(prev, stretchAnimFramesRef, { opacity: restOpacity, scale: 1 });
       }
     } catch (_) {}

@@ -20,11 +20,6 @@ function IconButton({ title, onClick, children, active = false, disabled = false
   );
 }
 
-const DEFAULT_HEIGHT_OFFSET = 0.35;
-const MIN_HEIGHT_OFFSET = -0.45;
-const MAX_HEIGHT_OFFSET = 1.0;
-const DEFAULT_FOV = 110;
-
 const LOCK_TOAST_CSS = `@keyframes walkLockFade { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }`;
 
 export default function WalkthroughPage() {
@@ -33,7 +28,7 @@ export default function WalkthroughPage() {
   const viewportRef = useRef(null);
   const [railOpen, setRailOpen] = useState(true);
   const [touring, setTouring] = useState(false);
-  const [heightOffset, setHeightOffset] = useState(DEFAULT_HEIGHT_OFFSET);
+  const [heightOffset, setHeightOffset] = useState(0);
   const [sensitivity, setSensitivity] = useState(0.0048);
   const [viewMode, setViewMode] = useState('overview');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -43,17 +38,10 @@ export default function WalkthroughPage() {
   const lockToastTimer = useRef(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [autoRotate, setAutoRotate] = useState(false);
-  const [fov, setFov] = useState(DEFAULT_FOV);
+  const [fov, setFov] = useState(70);
 
   const walkthrough = useWalkthroughEngine({ containerRef: viewportRef, jobId });
   const areas = walkthrough.areas || [];
-
-  useEffect(() => {
-    if (Number.isFinite(walkthrough.heightOffsetMeters)) {
-      setHeightOffset(Number(walkthrough.heightOffsetMeters.toFixed(2)));
-    }
-    if (Number.isFinite(walkthrough.cameraFov)) setFov(walkthrough.cameraFov);
-  }, [walkthrough.heightOffsetMeters, walkthrough.cameraFov]);
 
   useEffect(() => {
     if (walkthrough.lookLocked === undefined) return;
@@ -215,7 +203,7 @@ export default function WalkthroughPage() {
             <label className="block">
               <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Field of view (FOV)</span><span className="font-mono text-slate-500">{fov}°</span></div>
               <input className="w-full accent-[#ff914d]" type="range" min="30" max="110" step="1" value={fov} onChange={(e) => applyFov(e.target.value)} />
-              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Narrow</span><span>Natural 60–80°</span><span>Wide</span></div>
+              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Narrow</span><span>Normal (70°)</span><span>Wide</span></div>
             </label>
             <label className="block">
               <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Mouse sensitivity</span><span className="font-mono text-slate-500">{sensitivity.toFixed(4)}</span></div>
@@ -223,16 +211,11 @@ export default function WalkthroughPage() {
               <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Precise</span><span>Fast</span></div>
             </label>
             <label className="block">
-              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Camera height</span><span className="font-mono text-slate-500">{Number.isFinite(walkthrough.cameraHeightMeters) ? walkthrough.cameraHeightMeters.toFixed(2) : '1.95'}m</span></div>
-              <input className="w-full accent-[#ff914d]" type="range" min={MIN_HEIGHT_OFFSET} max={MAX_HEIGHT_OFFSET} step="0.01" value={heightOffset} onChange={(e) => applyHeight(e.target.value)} />
-              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>1.15m</span><span>1.60m</span><span>2.60m+</span></div>
+              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Camera height</span><span className="font-mono text-slate-500">{heightOffset.toFixed(2)}m</span></div>
+              <input className="w-full accent-[#ff914d]" type="range" min="-0.15" max="0.35" step="0.01" value={heightOffset} onChange={(e) => applyHeight(e.target.value)} />
+              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Lower</span><span>Neutral</span><span>Higher</span></div>
             </label>
-            <div className="rounded-xl border border-[#ff914d]/15 bg-[#ff914d]/[0.05] px-3 py-2.5 text-[10px] leading-4 text-slate-400">
-              <div className="mb-0.5 font-semibold text-[#ffb27a]">Camera reference</div>
-              <div>Recommended interior range: <span className="text-slate-200">1.1–1.3m</span> height · <span className="text-slate-200">60–80°</span> FOV.</div>
-              <div className="mt-0.5 text-slate-500">HCI walk default remains <span className="text-slate-300">{Number.isFinite(walkthrough.cameraHeightMeters) ? walkthrough.cameraHeightMeters.toFixed(2) : '1.95'}m · {fov}°</span> for the manager-approved view.</div>
-            </div>
-            <button type="button" onClick={() => { applyHeight(DEFAULT_HEIGHT_OFFSET); applyFov(DEFAULT_FOV); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-300 hover:bg-white/[0.06]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
+            <button type="button" onClick={() => { applyHeight(0); applyFov(70); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-300 hover:bg-white/[0.06]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
           </div>
         </div>
       )}
@@ -275,7 +258,24 @@ export default function WalkthroughPage() {
       )}
 
       <div className="absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-2xl border border-white/10 bg-slate-950/82 p-2 shadow-2xl backdrop-blur-2xl">
-        <IconButton title="Exit walkthrough" onClick={() => navigate('/')}><ArrowLeft className="h-4 w-4" /></IconButton>
+        <IconButton
+          title={viewMode === 'walk' ? 'Exit first-person view' : 'Back to renderer'}
+          onClick={() => {
+            if (viewMode === 'walk') {
+              walkthrough.stopTravel();
+              walkthrough.setLookLocked(false);
+              walkthrough.setViewPreset('perspective');
+              setViewMode('overview');
+              setSettingsOpen(false);
+              setViewsOpen(false);
+              setMoreOpen(false);
+              return;
+            }
+            navigate(-1);
+          }}
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </IconButton>
         <div className="mx-1 h-7 w-px bg-white/10" />
         {viewMode === 'overview' ? (
           <button type="button" onClick={() => switchViewMode('walk')} className="flex h-9 items-center gap-2 rounded-xl bg-[#ff914d] px-3 text-xs font-bold text-slate-950 transition hover:bg-[#ff7a28]">
