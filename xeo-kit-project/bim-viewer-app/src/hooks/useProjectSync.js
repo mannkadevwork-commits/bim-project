@@ -195,22 +195,13 @@ export const useProjectSync = (activeProject) => {
     }
   };
 
-  // ACTION: Apply material color
   const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray) => {
-    if (!selectedObject || !viewerRef.current) return;
-    
-    // DEVELOPMENT LOG: Verify exactly what is being sent to persistence
-    console.log('[Material][SAVE]', {
-      targetId: selectedObject.id,
-      targetObjectType: selectedObject.type,
-      modelId: viewerRef.current.scene.objects[selectedObject.id]?.model?.id,
-      entityId: selectedObject.id,
-      rgb: rgbArray
-    });
+    if (!selectedObject || !viewerRef.current) return 0;
 
-    applyColorToSceneTarget(viewerRef.current, selectedObject.id, rgbArray);
+    const viewer = viewerRef.current;
+    applyColorToSceneTarget(viewer, selectedObject.id, rgbArray);
     setCustomColor(hexColor);
-    
+
     setProjectState(prev => ({
       ...prev,
       materials: {
@@ -218,6 +209,39 @@ export const useProjectSync = (activeProject) => {
         [selectedObject.id]: { color: hexColor, rgb: rgbArray },
       },
     }));
+    return 1;
+  };
+
+  // ACTION: Apply one material color to every native wall in the current IFC scene.
+  // Scope is deliberately semantic (IFC class from metaObjects), not name matching.
+  const applyMaterialToAllWalls = (viewerRef, hexColor, rgbArray) => {
+    const viewer = viewerRef.current;
+    if (!viewer || !Array.isArray(rgbArray) || rgbArray.length !== 3) return 0;
+
+    const wallIds = [];
+    const metaObjects = viewer.metaScene?.metaObjects || {};
+    Object.values(metaObjects).forEach(meta => {
+      const type = String(meta?.type || '').toLowerCase();
+      if (!type.includes('ifcwall')) return;
+      const id = meta?.id;
+      if (!id || !viewer.scene.objects[id]) return;
+      wallIds.push(id);
+    });
+
+    if (!wallIds.length) return 0;
+
+    wallIds.forEach(id => applyColorToSceneTarget(viewer, id, rgbArray));
+
+    setCustomColor(hexColor);
+    setProjectState(prev => {
+      const nextMaterials = { ...(prev.materials || {}) };
+      wallIds.forEach(id => {
+        nextMaterials[id] = { color: hexColor, rgb: rgbArray };
+      });
+      return { ...prev, materials: nextMaterials };
+    });
+
+    return wallIds.length;
   };
 
   const normalizeMatrix = (matrix) => {
@@ -675,6 +699,7 @@ export const useProjectSync = (activeProject) => {
     toastMessage,
     customColor,
     applyMaterial,
+    applyMaterialToAllWalls,
     updateAsset,
     deleteAsset,
     spawnAsset,

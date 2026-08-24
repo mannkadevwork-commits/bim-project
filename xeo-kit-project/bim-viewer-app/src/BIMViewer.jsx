@@ -47,7 +47,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
-    toastMessage, customColor, applyMaterial, updateAsset,
+    toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage, saveNow
   } = useProjectSync(activeProject);
@@ -228,6 +228,22 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
     applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b]);
     if (setCustomColor) setCustomColor(hex);
+  };
+
+  const handleApplyColorToAllWalls = (hexColor = customColor) => {
+    if (!hexColor || !/^#[0-9a-fA-F]{6}$/.test(hexColor)) return;
+    const r = parseInt(hexColor.substring(1, 3), 16) / 255;
+    const g = parseInt(hexColor.substring(3, 5), 16) / 255;
+    const b = parseInt(hexColor.substring(5, 7), 16) / 255;
+    const count = applyMaterialToAllWalls(refs.viewerRef, hexColor, [r, g, b]);
+    if (count > 0) {
+      setToastMessage(`Applied color to ${count} wall${count === 1 ? '' : 's'}.`);
+      setTimeout(() => setToastMessage(null), 2200);
+    } else {
+      setToastMessage('No native walls found in this scene.');
+      setTimeout(() => setToastMessage(null), 2200);
+    }
+    return count;
   };
 
   const activeAsset = engineState.selectedAssetId && refs.viewerRef.current
@@ -459,6 +475,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b]);
             if (setCustomColor) setCustomColor(hex);
           }}
+          currentColor={customColor}
+          canApplyToAllWalls={!!engineState.selectedObject && String(engineState.selectedObject.type || '').toLowerCase().includes('ifcwall')}
+          onApplyToAllWalls={handleApplyColorToAllWalls}
           onDelete={() => {
             if (engineState.selectedAssetId) {
               deleteAsset(refs.viewerRef, engineState.selectedAssetId);
@@ -588,6 +607,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             selectedAssetId={engineState.selectedAssetId}
             customColor={customColor}
             handleCustomColorChange={handleCustomColorChange}
+            onApplyToAllWalls={handleApplyColorToAllWalls}
             updateSelectedAsset={(axis, val, rot) =>
               updateAsset(refs.viewerRef, engineState.selectedAssetId, axis, val, rot)
             }

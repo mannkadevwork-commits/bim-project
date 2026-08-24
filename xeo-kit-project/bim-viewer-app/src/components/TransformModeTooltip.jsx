@@ -9,6 +9,9 @@ export const TransformModeTooltip = ({
   assetName,
   onDelete,
   onColorChange,
+  currentColor = '#FFFFFF',
+  canApplyToAllWalls = false,
+  onApplyToAllWalls,
   isNative,
   onIsolate,
   isDarkMode = true,
@@ -369,27 +372,53 @@ export const TransformModeTooltip = ({
           >
             {onColorChange && (
               <div>
-                <div className="text-[9px] font-bold text-slate-500 uppercase tracking-[0.15em] mb-2">Quick Paint</div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center justify-between mb-2">
+                  <div>
+                    <div className="text-[9px] font-bold text-slate-300 uppercase tracking-[0.15em]">Material</div>
+                    <div className="text-[8px] text-slate-600 mt-0.5">Change the selected surface</div>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-5 h-5 rounded-md border border-slate-600 shadow-inner" style={{ backgroundColor: currentColor }} />
+                    <span className="font-mono text-[8px] text-slate-500">{currentColor.toUpperCase()}</span>
+                  </div>
+                </div>
+                <div className="grid grid-cols-6 gap-1.5">
                   {QUICK_COLORS.map(hex => (
                     <button
                       key={hex}
                       type="button"
-                      onClick={(e) => { e.stopPropagation(); onColorChange(hex); setShowMore(false); }}
-                      className="w-5 h-5 rounded-full border border-slate-600 hover:scale-110 transition-transform"
+                      onClick={(e) => { e.stopPropagation(); onColorChange(hex); }}
+                      className={`aspect-square rounded-md border hover:scale-105 transition-transform ${currentColor?.toUpperCase() === hex ? 'border-[#ff914d] ring-1 ring-[#ff914d]/40' : 'border-slate-600/80'}`}
                       style={{ backgroundColor: hex }}
                       title={hex}
                     />
                   ))}
-                  <label className="relative w-5 h-5 rounded-full border border-slate-600 hover:scale-110 transition-transform overflow-hidden cursor-pointer" title="Custom color">
-                    <Palette className="w-3 h-3 text-slate-400 absolute inset-0 m-auto pointer-events-none" />
+                </div>
+                <div className="flex gap-2 mt-2">
+                  <label className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg border border-slate-700 bg-slate-900/70 text-[9px] font-semibold text-slate-300 hover:border-slate-500 hover:text-white cursor-pointer">
+                    <Palette className="w-3 h-3" /> Custom color
                     <input
                       type="color"
-                      className="absolute inset-0 opacity-0 w-full h-full cursor-pointer"
-                      onChange={(e) => { onColorChange(e.target.value); setShowMore(false); }}
+                      aria-label="Choose custom color"
+                      value={currentColor || '#FFFFFF'}
+                      className="sr-only"
+                      onChange={(e) => onColorChange(e.target.value)}
                     />
                   </label>
                 </div>
+                {canApplyToAllWalls && onApplyToAllWalls && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onApplyToAllWalls(currentColor); }}
+                    className="w-full mt-2.5 flex items-center justify-between px-2.5 py-2 rounded-lg border border-indigo-400/20 bg-indigo-500/8 text-indigo-200 hover:bg-indigo-500/15 hover:border-indigo-300/35 transition-colors"
+                  >
+                    <span className="text-left">
+                      <span className="block text-[9px] font-bold">Apply to all walls</span>
+                      <span className="block text-[7px] text-indigo-300/65 mt-0.5">Match every wall to this color</span>
+                    </span>
+                    <span className="text-[8px] font-bold uppercase tracking-wider">Apply</span>
+                  </button>
+                )}
               </div>
             )}
             {onColorChange && onDelete && <div className="w-full h-px bg-slate-800 my-3" />}
