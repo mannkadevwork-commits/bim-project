@@ -21,7 +21,9 @@ const { generate360ViewerFromGLB } = require('./aps-pipeline');
 const jobsDir = path.join(__dirname, 'jobs');
 const assetsDir = path.join(__dirname, 'assets'); 
 if (!fs.existsSync(jobsDir)) fs.mkdirSync(jobsDir);
-if (!fs.existsSync(assetsDir)) fs.mkdirSync(assetsDir);
+if (!fs.existsSync(assetsDir)) fs.mkdirSync(assetsDir, { recursive: true });
+const materialAssetsDir = path.join(assetsDir, 'materials');
+if (!fs.existsSync(materialAssetsDir)) fs.mkdirSync(materialAssetsDir, { recursive: true });
 
 // Project/job identity + manifest helpers.
 function generateJobId() {
@@ -493,8 +495,20 @@ app.post('/api/webhooks/ifc-ready/:jobId', webhookUpload.single('ifc_file'), (re
 const elementEditorScript = path.join(__dirname, 'ifc_element_editor.py');
 const { spawnSync } = require('child_process');
 
+function resolvePythonCommand() {
+  if (process.platform === 'win32') {
+    const probe = spawnSync('py', ['-3', '--version'], { encoding: 'utf-8' });
+    if (!probe.error && probe.status === 0) return { command: 'py', prefixArgs: ['-3'] };
+  }
+  return { command: 'python', prefixArgs: [] };
+}
+
 function runElementEditor(args) {
-  const result = spawnSync('python', [elementEditorScript, ...args], { encoding: 'utf-8' });
+  if (!fs.existsSync(elementEditorScript)) {
+    throw new Error(`ifc_element_editor.py not found at ${elementEditorScript}`);
+  }
+  const python = resolvePythonCommand();
+  const result = spawnSync(python.command, [...python.prefixArgs, elementEditorScript, ...args], { encoding: 'utf-8' });
   if (result.error) throw new Error(`Failed to launch ifc_element_editor.py: ${result.error.message}`);
   
   const stdout = (result.stdout || '').trim();
@@ -521,7 +535,21 @@ app.get('/api/elements/:jobId/:globalId/inspect', (req, res) => {
     const data = runElementEditor(['inspect', '--input', inputIfcPath, '--global-id', globalId]);
     res.json(data);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    // Inspect is advisory: selection should remain fully usable even when a
+    // wall uses mesh/profile geometry that cannot be edited parametrically.
+    // Return a 200 capability response instead of turning every selection into
+    // a red Network error in the browser.
+    const message = error?.message || 'Element inspection unavailable.';
+    console.warn('[ElementInspect] Non-fatal:', message);
+    res.json({
+      supported: false,
+      error: true,
+      height: null,
+      width: null,
+      length: null,
+      message,
+    });
+    return;
   }
 });
 

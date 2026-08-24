@@ -20,6 +20,7 @@ import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './plac
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
 import { calculateGrabPoint } from './stretch/TranslationController';
 import { CameraManager } from './CameraManager';
+import { applyMaterialDefinitionToSceneTarget, configureNativeIFCMaterialController, disposeNativeIFCMaterialController } from '../utils/materialScene';
 
 const getNavCubeTheme = (isDarkMode) => ({
   color: isDarkMode ? '#1a2435' : '#eef2f7',
@@ -43,6 +44,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const viewerRef = useRef(null);
   const loadersRef = useRef({});
   const ifcLoaderOwnerRef = useRef(null);
+  const ifcAPIRef = useRef(null);
   const sectionPlanesRef = useRef(null);
   const currentModelRef = useRef(null);
   const currentPlaneRef = useRef(null);
@@ -223,43 +225,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     if (state.materials) {
       Object.entries(state.materials).forEach(([targetId, matData]) => {
-        const entity = viewerRef.current.scene.objects[targetId];
-        
-        // DEVELOPMENT LOG: Verify exactly what we are applying to and if it exists
-        console.log('[Material][RESTORE]', {
-          targetId,
-          directMatch: !!entity,
-          modelMatch: false 
-        });
-
-        if (entity) {
-          entity.colorize = matData.rgb;
-        } else {
-          let matched = false;
-          Object.values(viewerRef.current.scene.objects || {}).forEach(object => {
-            if (object.model?.id === targetId) {
-              object.colorize = matData.rgb;
-              matched = true;
-            }
-          });
-          
-          if (matched) {
-            console.log('[Material][RESTORE]', {
-              targetId,
-              directMatch: false,
-              modelMatch: true
-            });
-          } else {
-            const availableMatchingIds = Object.keys(viewerRef.current.scene.objects)
-              .filter(id => id.includes(targetId.split('#').pop()))
-              .slice(0, 5);
-              
-            console.log('[Material][MISS]', {
-              targetId,
-              availableMatchingIds
-            });
-          }
-        }
+        void applyMaterialDefinitionToSceneTarget(viewerRef.current, targetId, matData);
       });
     }
 
@@ -302,12 +268,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const applyPersistedMaterialToModel = (model, item, state) => {
     if (!model || !state?.materials) return;
     const material = state.materials[item.instanceId] || state.materials[item.nativeSourceId];
-    if (!Array.isArray(material?.rgb)) return;
-    Object.values(viewerRef.current?.scene?.objects || {}).forEach(object => {
-      if (object?.model?.id === model.id) {
-        try { object.colorize = material.rgb; } catch (_) {}
-      }
-    });
+    if (!material) return;
+    void applyMaterialDefinitionToSceneTarget(viewerRef.current, model.id, material);
   };
 
 
@@ -852,6 +814,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         // is still pending. Never attach a loader to a dead/stale viewer.
         if (!viewerAlive || viewerRef.current !== viewer) return;
 
+        ifcAPIRef.current = ifcAPI;
         loadersRef.current.ifc = new WebIFCLoaderPlugin(viewer, {
           WebIFC: WebIFC,
           IfcAPI: ifcAPI,
@@ -1455,6 +1418,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       setMeasurementPhase('idle');
       viewerAlive = false;
       ifcLoaderOwnerRef.current = null;
+      try { disposeNativeIFCMaterialController(viewer); } catch (_) {}
+      ifcAPIRef.current = null;
       loadersRef.current = {};
       cameraManagerRef.current = null;
       viewerRef.current = null;
@@ -1579,6 +1544,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             edges: true,
             globalizeCoordinates: false,
           });
+          configureNativeIFCMaterialController(loadViewer, ifcAPIRef.current, ifcData, 'main_structure');
         } catch (error) {
           console.error('[BIM Engine] IFC load failed:', error);
           currentModelRef.current = null;

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { applyMaterialDefinitionToSceneTarget as applySceneMaterial, applyMaterialDefinitionToObjects as applySceneMaterials, normalizeMaterialDefinition } from '../utils/materialScene';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -9,24 +10,7 @@ const inferFileType = (url, explicitType) => {
   return ['ifc', 'glb', 'gltf', 'xkt'].includes(ext) ? ext : 'ifc';
 };
 
-const applyColorToSceneTarget = (viewer, targetId, rgb) => {
-  if (!viewer || !targetId || !Array.isArray(rgb)) return false;
-  const entity = viewer.scene.objects[targetId];
-  if (entity) {
-    entity.colorize = rgb;
-    return true;
-  }
-  const model = viewer.scene.models[targetId];
-  if (!model) return false;
-  let changed = false;
-  Object.values(viewer.scene.objects || {}).forEach(object => {
-    if (object.model?.id === targetId) {
-      object.colorize = rgb;
-      changed = true;
-    }
-  });
-  return changed;
-};
+
 
 const MOCK_ROOM_TEMPLATES = [
   {
@@ -197,17 +181,19 @@ export const useProjectSync = (activeProject) => {
 
   const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray) => {
     if (!selectedObject || !viewerRef.current) return 0;
+    const definition = { kind: 'color', color: hexColor, rgb: rgbArray };
+    applyMaterialDefinition(viewerRef, selectedObject, definition);
+    return 1;
+  };
 
-    const viewer = viewerRef.current;
-    applyColorToSceneTarget(viewer, selectedObject.id, rgbArray);
-    setCustomColor(hexColor);
-
+  const applyMaterialDefinition = (viewerRef, selectedObject, definition) => {
+    if (!selectedObject || !viewerRef.current || !definition) return 0;
+    const normalized = normalizeMaterialDefinition(definition);
+    void applySceneMaterial(viewerRef.current, selectedObject.id, normalized);
+    if (normalized.color) setCustomColor(normalized.color);
     setProjectState(prev => ({
       ...prev,
-      materials: {
-        ...(prev.materials || {}),
-        [selectedObject.id]: { color: hexColor, rgb: rgbArray },
-      },
+      materials: { ...(prev.materials || {}), [selectedObject.id]: normalized },
     }));
     return 1;
   };
@@ -215,8 +201,13 @@ export const useProjectSync = (activeProject) => {
   // ACTION: Apply one material color to every native wall in the current IFC scene.
   // Scope is deliberately semantic (IFC class from metaObjects), not name matching.
   const applyMaterialToAllWalls = (viewerRef, hexColor, rgbArray) => {
+    return applyMaterialDefinitionToAllWalls(viewerRef, { kind: 'color', color: hexColor, rgb: rgbArray });
+  };
+
+  const applyMaterialDefinitionToAllWalls = (viewerRef, definition) => {
     const viewer = viewerRef.current;
-    if (!viewer || !Array.isArray(rgbArray) || rgbArray.length !== 3) return 0;
+    if (!viewer || !definition) return 0;
+    const normalized = normalizeMaterialDefinition(definition);
 
     const wallIds = [];
     const metaObjects = viewer.metaScene?.metaObjects || {};
@@ -230,13 +221,13 @@ export const useProjectSync = (activeProject) => {
 
     if (!wallIds.length) return 0;
 
-    wallIds.forEach(id => applyColorToSceneTarget(viewer, id, rgbArray));
+    void applySceneMaterials(viewer, wallIds, normalized);
 
-    setCustomColor(hexColor);
+    setCustomColor(normalized.color);
     setProjectState(prev => {
       const nextMaterials = { ...(prev.materials || {}) };
       wallIds.forEach(id => {
-        nextMaterials[id] = { color: hexColor, rgb: rgbArray };
+        nextMaterials[id] = normalized;
       });
       return { ...prev, materials: nextMaterials };
     });
@@ -700,6 +691,8 @@ export const useProjectSync = (activeProject) => {
     customColor,
     applyMaterial,
     applyMaterialToAllWalls,
+    applyMaterialDefinition,
+    applyMaterialDefinitionToAllWalls,
     updateAsset,
     deleteAsset,
     spawnAsset,

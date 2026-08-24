@@ -10,8 +10,12 @@ export const TransformModeTooltip = ({
   onDelete,
   onColorChange,
   currentColor = '#FFFFFF',
+  materialLibrary = [],
+  selectedMaterial = null,
+  onMaterialSelect,
   canApplyToAllWalls = false,
   onApplyToAllWalls,
+  onApplyMaterialToAllWalls,
   isNative,
   onIsolate,
   isDarkMode = true,
@@ -21,6 +25,7 @@ export const TransformModeTooltip = ({
   anchorY = 0,
 }) => {
   const [showMore, setShowMore] = useState(false);
+  const [materialMode, setMaterialMode] = useState('color');
   const [showHelp, setShowHelp] = useState(false);
   const [placement, setPlacement] = useState({ left: 0, top: 0, above: true });
   const [helpPlacement, setHelpPlacement] = useState({ left: 0, top: 0, side: 'below' });
@@ -370,54 +375,32 @@ export const TransformModeTooltip = ({
             onPointerDown={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            {onColorChange && (
+            {(onColorChange || onMaterialSelect) && (
               <div>
                 <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <div className="text-[9px] font-bold text-slate-300 uppercase tracking-[0.15em]">Material</div>
-                    <div className="text-[8px] text-slate-600 mt-0.5">Change the selected surface</div>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="w-5 h-5 rounded-md border border-slate-600 shadow-inner" style={{ backgroundColor: currentColor }} />
-                    <span className="font-mono text-[8px] text-slate-500">{currentColor.toUpperCase()}</span>
-                  </div>
+                  <div><div className="text-[9px] font-bold text-slate-300 uppercase tracking-[0.15em]">Surface finish</div><div className="text-[8px] text-slate-600 mt-0.5">Color, fabric and texture are separate tools</div></div>
+                  <span className="w-6 h-6 rounded-lg border border-slate-600 shadow-inner bg-cover bg-center" style={{ backgroundColor: selectedMaterial?.color || currentColor, backgroundImage: selectedMaterial?.texture?.src ? `url(${selectedMaterial.texture.src})` : 'none' }} />
                 </div>
-                <div className="grid grid-cols-6 gap-1.5">
-                  {QUICK_COLORS.map(hex => (
-                    <button
-                      key={hex}
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); onColorChange(hex); }}
-                      className={`aspect-square rounded-md border hover:scale-105 transition-transform ${currentColor?.toUpperCase() === hex ? 'border-[#ff914d] ring-1 ring-[#ff914d]/40' : 'border-slate-600/80'}`}
-                      style={{ backgroundColor: hex }}
-                      title={hex}
-                    />
-                  ))}
+                <div className="flex p-1 rounded-lg bg-slate-900/80 border border-slate-700 mb-2">
+                  {['color','fabric','texture'].map(tab => <button key={tab} type="button" onClick={(e)=>{e.stopPropagation();setMaterialMode(tab)}} className={`flex-1 py-1.5 rounded-md text-[8px] font-bold capitalize ${materialMode===tab ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>{tab}</button>)}
                 </div>
+                {materialMode === 'color' ? (
+                  <div className="grid grid-cols-5 gap-1.5">
+                    {materialLibrary.filter(m => m.kind === 'color').map(material => <button key={material.id} type="button" title={material.name} onClick={(e)=>{e.stopPropagation();onMaterialSelect?.(material)}} style={{backgroundColor:material.color}} className={`aspect-square rounded-md border ${selectedMaterial?.kind==='color' && selectedMaterial?.color?.toUpperCase()===material.color.toUpperCase() ? 'border-[#ff914d] ring-1 ring-[#ff914d]/40' : 'border-slate-700'}`} />)}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {materialLibrary.filter(m => m.kind === materialMode).map(material => <button key={material.id} type="button" onClick={(e)=>{e.stopPropagation();onMaterialSelect?.(material)}} className={`flex items-center gap-2 p-1.5 rounded-lg border text-left ${selectedMaterial?.kind===material.kind && selectedMaterial?.texture?.id===material.id ? 'border-[#ff914d] bg-orange-500/10' : 'border-slate-700 bg-slate-900/50'}`}>
+                      <span className="w-7 h-7 rounded-md border border-white/10 bg-cover bg-center" style={{backgroundColor:material.color,backgroundImage:material.textureSrc?`url(${material.textureSrc})`:'none'}} />
+                      <span className="text-[8px] text-slate-200 truncate">{material.name}</span>
+                    </button>)}
+                  </div>
+                )}
                 <div className="flex gap-2 mt-2">
-                  <label className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg border border-slate-700 bg-slate-900/70 text-[9px] font-semibold text-slate-300 hover:border-slate-500 hover:text-white cursor-pointer">
-                    <Palette className="w-3 h-3" /> Custom color
-                    <input
-                      type="color"
-                      aria-label="Choose custom color"
-                      value={currentColor || '#FFFFFF'}
-                      className="sr-only"
-                      onChange={(e) => onColorChange(e.target.value)}
-                    />
-                  </label>
+                  <label className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg border border-slate-700 bg-slate-900/70 text-[9px] font-semibold text-slate-300 hover:border-slate-500 cursor-pointer"><Palette className="w-3 h-3"/> Custom color<input type="color" aria-label="Choose custom color" value={currentColor || '#FFFFFF'} className="sr-only" onChange={(e)=>onColorChange?.(e.target.value)} /></label>
                 </div>
-                {canApplyToAllWalls && onApplyToAllWalls && (
-                  <button
-                    type="button"
-                    onClick={(e) => { e.stopPropagation(); onApplyToAllWalls(currentColor); }}
-                    className="w-full mt-2.5 flex items-center justify-between px-2.5 py-2 rounded-lg border border-indigo-400/20 bg-indigo-500/8 text-indigo-200 hover:bg-indigo-500/15 hover:border-indigo-300/35 transition-colors"
-                  >
-                    <span className="text-left">
-                      <span className="block text-[9px] font-bold">Apply to all walls</span>
-                      <span className="block text-[7px] text-indigo-300/65 mt-0.5">Match every wall to this color</span>
-                    </span>
-                    <span className="text-[8px] font-bold uppercase tracking-wider">Apply</span>
-                  </button>
+                {canApplyToAllWalls && onApplyMaterialToAllWalls && selectedMaterial && (
+                  <button type="button" onClick={(e)=>{e.stopPropagation();onApplyMaterialToAllWalls(selectedMaterial)}} className="w-full mt-2.5 flex items-center justify-between px-2.5 py-2 rounded-lg border border-indigo-400/20 bg-indigo-500/8 text-indigo-200 hover:bg-indigo-500/15 hover:border-indigo-300/35 transition-colors"><span className="text-left"><span className="block text-[9px] font-bold">Apply finish to all walls</span><span className="block text-[7px] text-indigo-300/65 mt-0.5">Use the selected finish across every wall</span></span><span className="text-[8px] font-bold uppercase tracking-wider">Apply</span></button>
                 )}
               </div>
             )}

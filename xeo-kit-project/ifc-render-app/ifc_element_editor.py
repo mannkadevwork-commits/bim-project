@@ -118,43 +118,69 @@ def get_extruded_solid(element):
     return None, None
 
 
+def _pset_number(psets, names):
+    lowered = {str(name).lower(): value for group in psets.values() if isinstance(group, dict) for name, value in group.items()}
+    for name in names:
+        value = lowered.get(name.lower())
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                parsed = float(value)
+                if math.isfinite(parsed):
+                    return parsed
+            except ValueError:
+                pass
+    return 0.0
+
+
 def cmd_inspect(args):
     source = ifcopenshell.open(args.input)
     element = find_element(source, args.global_id)
 
-    rep = next((r for r in element.Representation.Representations if r.RepresentationIdentifier in ["Body", "SweptSolid"]), None)
-    if not rep:
-        raise ValueError("No Body/SweptSolid representation found.")
+    # Prefer exact parametric dimensions where the representation supports them.
+    reps = getattr(element, "Representation", None)
+    reps = getattr(reps, "Representations", []) if reps else []
+    for rep in reps:
+        if rep.RepresentationIdentifier not in ("Body", "SweptSolid", "Box"):
+            continue
+        for item in rep.Items:
+            if item.is_a("IfcExtrudedAreaSolid"):
+                height = float(item.Depth or 0)
+                width = 0.0
+                length = 0.0
+                profile = item.SweptArea
+                if profile.is_a("IfcRectangleProfileDef"):
+                    width = float(profile.XDim or 0)
+                    length = float(profile.YDim or 0)
+                elif profile.is_a("IfcArbitraryClosedProfileDef") and profile.OuterCurve.is_a("IfcPolyline"):
+                    pts = [p.Coordinates for p in profile.OuterCurve.Points]
+                    xs = [float(p[0]) for p in pts]
+                    ys = [float(p[1]) for p in pts]
+                    width = max(xs) - min(xs) if xs else 0.0
+                    length = max(ys) - min(ys) if ys else 0.0
+                print(json.dumps({"height": height, "width": width, "length": length, "supported": True}))
+                return
 
-    solid = rep.Items[0]
-    if not solid.is_a("IfcExtrudedAreaSolid"):
-        raise ValueError("This element has no IfcExtrudedAreaSolid representation.")
+    # Many IFC walls are not represented as IfcExtrudedAreaSolid. For those,
+    # fall back to common wall property sets so selecting the element never
+    # becomes an HTTP error. This is inspection-only; resize remains disabled
+    # unless a parametric extrusion is available.
+    try:
+        psets = ifcopenshell.util.element.get_psets(element)
+    except Exception:
+        psets = {}
 
-    height = solid.Depth
-    width = 0.0
-    length = 0.0
-
-    profile = solid.SweptArea
-    
-    # Handle standard rectangles
-    if profile.is_a("IfcRectangleProfileDef"):
-        width = profile.XDim
-        length = profile.YDim
-        
-    # Handle custom polygons (ArchiCAD/Revit standard walls)
-    elif profile.is_a("IfcArbitraryClosedProfileDef"):
-        curve = profile.OuterCurve
-        if curve.is_a("IfcPolyline"):
-            pts = [p.Coordinates for p in curve.Points]
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            width = max(xs) - min(xs)
-            length = max(ys) - min(ys)
+    height = _pset_number(psets, ["OverallHeight", "Height", "NetHeight"])
+    width = _pset_number(psets, ["Width", "Thickness", "OverallWidth"])
+    length = _pset_number(psets, ["Length", "OverallLength"])
 
     print(json.dumps({
-        "height": height,
-        "width": width,
-        "length": length
+        "height": height or None,
+        "width": width or None,
+        "length": length or None,
+        "supported": False,
+        "source": "property-set-fallback"
     }))
 
 

@@ -13,6 +13,7 @@ import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
 import { ViewportToolbar } from './components/ViewportToolbar';
 import { TransformModesHelp } from './components/TransformModesHelp';
 import { AssetContextMenu } from './components/AssetContextMenu';
+import { MATERIAL_LIBRARY, COLOR_LIBRARY, FABRIC_LIBRARY, TEXTURE_LIBRARY } from './utils/materialCatalog';
 import { useCatalog } from './hooks/useCatalog';
 
 const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
@@ -47,7 +48,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
-    toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, updateAsset,
+    toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, applyMaterialDefinition, applyMaterialDefinitionToAllWalls, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage, saveNow
   } = useProjectSync(activeProject);
@@ -246,6 +247,22 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     return count;
   };
 
+  const selectedMaterial = projectState.materials?.[engineState.selectedObject?.id || engineState.selectedAssetId] || null;
+  const applyLibraryMaterial = (material) => {
+    const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
+    if (!targetObject?.id || !material) return;
+    applyMaterialDefinition(refs.viewerRef, targetObject, material);
+    setToastMessage(`${material.name} applied.`);
+    setTimeout(() => setToastMessage(null), 1800);
+  };
+  const applyLibraryMaterialToAllWalls = (material = null) => {
+    if (!material) return;
+    const count = applyMaterialDefinitionToAllWalls(refs.viewerRef, material);
+    setToastMessage(count ? `${material.name} applied to ${count} walls.` : 'No native walls found in this scene.');
+    setTimeout(() => setToastMessage(null), 2200);
+  };
+
+
   const activeAsset = engineState.selectedAssetId && refs.viewerRef.current
     ? refs.viewerRef.current.scene.models[engineState.selectedAssetId]
     : null;
@@ -430,7 +447,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
       />
       
       {/* TOOLTIP OVERLAY FOR STRETCHING */}
-      {engineState.activeStretchData && (
+      {!showRenderStudio && engineState.activeStretchData && (
         <StretchTooltipOverlay 
           visible={true}
           x={engineState.activeStretchData.x}
@@ -439,7 +456,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
         />
       )}
       {/* TOOLTIP OVERLAY FOR EDITING */}
-      {(engineState.selectedAssetId || engineState.selectedObject) && !engineState.isStretching && (
+      {!showRenderStudio && (engineState.selectedAssetId || engineState.selectedObject) && !engineState.isStretching && (
         <TransformModeTooltip
           mode={engineState.transformMode}
           onModeChange={engineActions.setTransformMode}
@@ -467,6 +484,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
               setTimeout(() => setToastMessage(null), 3500);
             }
           }}
+          materialLibrary={MATERIAL_LIBRARY}
+          selectedMaterial={selectedMaterial}
+          onMaterialSelect={applyLibraryMaterial}
+          canApplyToAllWalls={!!engineState.selectedObject && String(engineState.selectedObject.type || '').toLowerCase().includes('ifcwall')}
+          onApplyMaterialToAllWalls={applyLibraryMaterialToAllWalls}
           onColorChange={(hex) => {
             const r = parseInt(hex.substring(1, 3), 16) / 255;
             const g = parseInt(hex.substring(3, 5), 16) / 255;
@@ -476,8 +498,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             if (setCustomColor) setCustomColor(hex);
           }}
           currentColor={customColor}
-          canApplyToAllWalls={!!engineState.selectedObject && String(engineState.selectedObject.type || '').toLowerCase().includes('ifcwall')}
-          onApplyToAllWalls={handleApplyColorToAllWalls}
           onDelete={() => {
             if (engineState.selectedAssetId) {
               deleteAsset(refs.viewerRef, engineState.selectedAssetId);
@@ -608,6 +628,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             customColor={customColor}
             handleCustomColorChange={handleCustomColorChange}
             onApplyToAllWalls={handleApplyColorToAllWalls}
+            materialLibrary={MATERIAL_LIBRARY}
+            selectedMaterial={selectedMaterial}
+            onApplyMaterial={applyLibraryMaterial}
+            onApplyMaterialToAllWalls={applyLibraryMaterialToAllWalls}
             updateSelectedAsset={(axis, val, rot) =>
               updateAsset(refs.viewerRef, engineState.selectedAssetId, axis, val, rot)
             }

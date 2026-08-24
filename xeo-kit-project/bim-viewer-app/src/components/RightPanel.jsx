@@ -23,9 +23,11 @@ export const RightPanel = ({
   customColor, handleCustomColorChange,
   updateSelectedAsset, deleteSelectedAsset, projectState,
   engineState, engineActions, adoptIsolatedAsset, updateStructuralEdit,
-  onDeleteProject, isDarkMode, toggleTheme, handleManualSave, isManualSaving, saveStatus, onApplyToAllWalls
+  onDeleteProject, isDarkMode, toggleTheme, handleManualSave, isManualSaving, saveStatus, onApplyToAllWalls,
+  materialLibrary = [], selectedMaterial = null, onApplyMaterial, onApplyMaterialToAllWalls
 }) => {
   const [propertySubTab, setPropertySubTab] = useState('details');
+  const [materialMode, setMaterialMode] = useState('color');
 
   // Unified State for Transform
   const [liveTransform, setLiveTransform] = useState({ 
@@ -229,64 +231,51 @@ export const RightPanel = ({
                                     Stretching — release mouse to apply
                                   </div>
                                 )}
-                                {/* Material Paint */}
+                                {/* Material Library */}
                                 <div>
-                                    <div className="flex items-center justify-between mb-3">
-                                      <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><Palette className="w-3.5 h-3.5"/> Material</h4>
-                                      <span className="text-[9px] text-slate-400 dark:text-slate-500">Paint / appearance</span>
-                                    </div>
-                                    <div className="bg-slate-50 dark:bg-slate-800/50 p-4 rounded-xl border border-slate-200 dark:border-slate-700/50 space-y-4">
+                                  <div className="flex items-center justify-between mb-3">
+                                    <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><Palette className="w-3.5 h-3.5"/> Surface Finish</h4>
+                                    <span className="text-[9px] text-slate-400 dark:text-slate-500">Separate color, fabric and texture</span>
+                                  </div>
+                                  <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 mb-3">
+                                    {['color','fabric','texture'].map(tab => (
+                                      <button key={tab} type="button" onClick={() => setMaterialMode(tab)} className={`flex-1 py-1.5 rounded-lg text-[9px] font-bold capitalize transition-colors ${materialMode === tab ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>{tab}</button>
+                                    ))}
+                                  </div>
+                                  {materialMode === 'color' && (
+                                    <div className="bg-slate-50 dark:bg-slate-800/50 p-3 rounded-xl border border-slate-200 dark:border-slate-700/50 space-y-3">
                                       <div className="flex items-center gap-3">
                                         <label className="relative w-11 h-11 rounded-xl border border-slate-200 dark:border-slate-600 overflow-hidden shrink-0 cursor-pointer shadow-sm">
                                           <span className="absolute inset-0" style={{ backgroundColor: customColor || '#FFFFFF' }} />
                                           <input aria-label="Choose material color" type="color" value={customColor || '#FFFFFF'} onChange={handleCustomColorChange} className="absolute inset-0 opacity-0 cursor-pointer" />
                                         </label>
-                                        <div className="min-w-0 flex-1">
-                                          <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Current color</div>
-                                          <div className="mt-1 flex items-center gap-2">
-                                            <span className="font-mono text-xs text-slate-700 dark:text-slate-200">{(customColor || '#FFFFFF').toUpperCase()}</span>
-                                            <span className="w-1.5 h-1.5 rounded-full bg-slate-300 dark:bg-slate-600" />
-                                            <span className="text-[9px] text-slate-400">Applies instantly</span>
-                                          </div>
-                                        </div>
+                                        <div><div className="text-[9px] text-slate-400 uppercase tracking-wider">Current color</div><div className="font-mono text-xs text-slate-700 dark:text-slate-200 mt-1">{(customColor || '#FFFFFF').toUpperCase()}</div></div>
                                       </div>
-
-                                      {Object.entries(PREDEFINED_COLORS).map(([category, colors]) => (
-                                        <div key={category}>
-                                          <span className="text-[9px] text-slate-500 font-bold uppercase tracking-[0.14em] mb-2 block">{category}</span>
-                                          <div className="grid grid-cols-5 gap-2">
-                                            {colors.map(hex => (
-                                              <button
-                                                key={hex}
-                                                type="button"
-                                                aria-label={`Apply ${hex}`}
-                                                onClick={() => handleCustomColorChange({ target: { value: hex } })}
-                                                style={{ backgroundColor: hex }}
-                                                className={`group relative aspect-square rounded-lg border transition-all hover:scale-105 hover:shadow-md ${customColor?.toUpperCase() === hex.toUpperCase() ? 'border-[#ff914d] ring-2 ring-[#ff914d]/20 scale-105' : 'border-slate-200/70 dark:border-slate-600/70'}`}
-                                              >
-                                                {customColor?.toUpperCase() === hex.toUpperCase() && <span className="absolute inset-0 flex items-center justify-center text-[10px] font-bold text-white drop-shadow">✓</span>}
-                                              </button>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      ))}
-
-                                      {onApplyToAllWalls && selectedObject && String(selectedObject.type || '').toLowerCase().includes('ifcwall') && (
-                                        <div className="pt-3 border-t border-slate-200 dark:border-slate-700/50">
-                                          <button
-                                            type="button"
-                                            onClick={() => onApplyToAllWalls(customColor)}
-                                            className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border border-indigo-200 dark:border-indigo-500/25 bg-indigo-50 dark:bg-indigo-500/8 text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-500/14 transition-colors"
-                                          >
-                                            <span className="text-left">
-                                              <span className="block text-[10px] font-bold">Apply to all walls</span>
-                                              <span className="block text-[9px] text-indigo-500/80 dark:text-indigo-300/70 mt-0.5">Use the current color on every wall</span>
-                                            </span>
-                                            <span className="text-[9px] font-bold uppercase tracking-wider">All walls →</span>
-                                          </button>
-                                        </div>
-                                      )}
+                                      <div className="grid grid-cols-5 gap-2">
+                                        {materialLibrary.filter(m => m.kind === 'color').map(material => (
+                                          <button key={material.id} type="button" title={material.name} onClick={() => onApplyMaterial?.(material)} style={{backgroundColor: material.color}} className={`aspect-square rounded-lg border transition-all hover:scale-105 ${selectedMaterial?.kind === 'color' && selectedMaterial?.color?.toUpperCase() === material.color.toUpperCase() ? 'border-[#ff914d] ring-2 ring-[#ff914d]/20' : 'border-slate-200 dark:border-slate-600'}`} />
+                                        ))}
+                                      </div>
                                     </div>
+                                  )}
+                                  {materialMode !== 'color' && (
+                                    <div className="grid grid-cols-2 gap-2">
+                                      {materialLibrary.filter(m => m.kind === materialMode).map(material => (
+                                        <button key={material.id} type="button" onClick={() => onApplyMaterial?.(material)} className={`group flex items-center gap-2 p-2 rounded-xl border text-left transition-all ${selectedMaterial?.kind === material.kind && selectedMaterial?.texture?.id === material.id ? 'border-[#ff914d] bg-orange-50 dark:bg-orange-500/10 ring-1 ring-[#ff914d]/30' : 'border-slate-200/80 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600'}`}>
+                                          <span className="w-10 h-10 rounded-lg border border-black/10 dark:border-white/10 shrink-0 overflow-hidden shadow-sm bg-cover bg-center" style={{ backgroundColor: material.color, backgroundImage: material.textureSrc ? `url(${material.textureSrc})` : 'none' }} />
+                                          <span className="min-w-0"><span className="block text-[9px] font-semibold text-slate-700 dark:text-slate-200 truncate">{material.name}</span><span className="block text-[8px] text-slate-400 mt-0.5">{material.category}</span></span>
+                                        </button>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {onApplyMaterialToAllWalls && selectedObject && String(selectedObject.type || '').toLowerCase().includes('ifcwall') && (selectedMaterial || materialMode === 'color') && (selectedMaterial || customColor) && (
+                                    <div className="pt-3 mt-3 border-t border-slate-200 dark:border-slate-700/50">
+                                      <button type="button" onClick={() => onApplyMaterialToAllWalls(selectedMaterial || materialLibrary.find(m => m.kind === 'color' && m.color.toUpperCase() === (customColor || '').toUpperCase()) || { kind:'color', color:customColor, rgb:[parseInt(customColor.slice(1,3),16)/255,parseInt(customColor.slice(3,5),16)/255,parseInt(customColor.slice(5,7),16)/255] })} className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border border-indigo-200 dark:border-indigo-500/25 bg-indigo-50 dark:bg-indigo-500/8 text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-500/14 transition-colors">
+                                        <span className="text-left"><span className="block text-[10px] font-bold">Apply finish to all walls</span><span className="block text-[9px] text-indigo-500/80 dark:text-indigo-300/70 mt-0.5">Match the selected color, fabric or texture</span></span>
+                                        <span className="text-[9px] font-bold uppercase tracking-wider">Apply →</span>
+                                      </button>
+                                    </div>
+                                  )}
                                 </div>
 
                                 {/* Position */}

@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { IfcAPI } from "web-ifc";
-import { Document, NodeIO, Node as GltfNode, Primitive, Texture } from "@gltf-transform/core";
+import { Document, NodeIO, Node as GltfNode, Primitive } from "@gltf-transform/core";
 
 import { extractGeometry } from "./geometry";
 import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
@@ -67,12 +67,8 @@ interface StructuralEditEntry {
 }
 
 interface MaterialEntry {
-  kind?: 'color' | 'fabric' | 'texture';
   color: string;
   rgb: [number, number, number];
-  texture?: { id?: string; name?: string; src?: string; repeat?: [number, number] };
-  roughness?: number;
-  metallic?: number;
 }
 
 interface ProjectState {
@@ -159,62 +155,32 @@ function resolveItemMaterial(
   return materials[item.instanceId] ?? materials[item.id];
 }
 
-function resolveMaterialTexturePath(src: string | undefined, assetsDirectory: string): string | null {
-  if (!src) return null;
-  const clean = String(src).split('?')[0].split('#')[0];
-  const compilerMaterials = path.join(ROOT_DIR, 'materials');
-  if (clean.startsWith('/materials/')) {
-    const candidate = path.resolve(compilerMaterials, clean.slice('/materials/'.length));
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  if (clean.startsWith('/assets/')) {
-    const candidate = path.resolve(assetsDirectory, clean.slice('/assets/'.length));
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return fs.existsSync(clean) ? clean : null;
-}
-
-function mimeForTexture(filePath: string): string {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
-  if (ext === '.webp') return 'image/webp';
-  return 'image/png';
-}
-
 function applyMaterialToSubtree(
   root: GltfNode,
   materialOverride: MaterialEntry | undefined,
-  doc: Document,
-  assetsDirectory: string
+  doc: Document
 ): void {
   if (!materialOverride) return;
+
   const [r, g, b] = materialOverride.rgb;
-  let sharedTexture: Texture | null = null;
-  if ((materialOverride.kind === 'fabric' || materialOverride.kind === 'texture') && materialOverride.texture?.src) {
-    const texturePath = resolveMaterialTexturePath(materialOverride.texture.src, assetsDirectory);
-    if (texturePath) {
-      sharedTexture = doc.createTexture(`Tex_${materialOverride.texture.id || 'material'}`)
-        .setMimeType(mimeForTexture(texturePath))
-        .setImage(fs.readFileSync(texturePath));
-    }
-  }
   const visit = (node: GltfNode): void => {
     const mesh = node.getMesh();
     if (mesh) {
       for (const primitive of mesh.listPrimitives()) {
         const source = primitive.getMaterial();
-        let material = doc
+        const alpha = source ? source.getBaseColorFactor()[3] : 1;
+        const material = doc
           .createMaterial(`${source?.getName() ?? node.getName()}_override`)
-          .setBaseColorFactor([r, g, b, source ? source.getBaseColorFactor()[3] : 1])
-          .setRoughnessFactor(materialOverride.roughness ?? source?.getRoughnessFactor() ?? 0.8)
-          .setMetallicFactor(materialOverride.metallic ?? source?.getMetallicFactor() ?? 0.1)
+          .setBaseColorFactor([r, g, b, alpha])
+          .setRoughnessFactor(source?.getRoughnessFactor() ?? 0.8)
+          .setMetallicFactor(source?.getMetallicFactor() ?? 0.1)
           .setDoubleSided(source?.getDoubleSided() ?? true);
-        if (sharedTexture) material = material.setBaseColorTexture(sharedTexture);
         primitive.setMaterial(material);
       }
     }
     for (const child of node.listChildren()) visit(child);
   };
+
   visit(root);
 }
 
@@ -490,7 +456,6 @@ export async function compileScene(
         {
           structuralEdits,
           materialOverrides: materials,
-          assetsDirectory,
         }
       );
     } catch (err) {
@@ -653,7 +618,7 @@ export async function compileScene(
           const instanceWrapper = doc.createNode(item.instanceId).addChild(clonedRoot);
 
           const itemMaterial = resolveItemMaterial(item, materials);
-          applyMaterialToSubtree(clonedRoot, itemMaterial, doc, assetsDirectory);
+          applyMaterialToSubtree(clonedRoot, itemMaterial, doc);
 
           // GLB doors placed via insert-door have doorHostWallId set. Their
           // position is the exact Python-computed void center — use it directly
@@ -717,7 +682,7 @@ export async function compileScene(
               doc,
               buffer,
               `${item.instanceId}_geometry`,
-              behavior.applyMaterialOverrides ? { materialOverrides: materials, assetsDirectory } : {}
+              behavior.applyMaterialOverrides ? { materialOverrides: materials } : {}
             );
           } catch (err) {
             console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): extractGeometry failed - ${(err as Error).message}`);
@@ -727,7 +692,7 @@ export async function compileScene(
           // Furniture material overrides are keyed by the placed instance in
           // current frontend state, not by the source IFC GlobalId.
           if (assetType === AssetType.FURNITURE) {
-            applyMaterialToSubtree(tempSubtree, resolveItemMaterial(item, materials), doc, assetsDirectory);
+            applyMaterialToSubtree(tempSubtree, resolveItemMaterial(item, materials), doc);
           }
 
           const instanceWrapper = doc.createNode(item.instanceId).addChild(tempSubtree);
