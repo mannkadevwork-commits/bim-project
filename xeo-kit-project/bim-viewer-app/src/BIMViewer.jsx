@@ -16,7 +16,7 @@ import { AssetContextMenu } from './components/AssetContextMenu';
 import { MATERIAL_LIBRARY, COLOR_LIBRARY, FABRIC_LIBRARY, TEXTURE_LIBRARY } from './utils/materialCatalog';
 import { useCatalog } from './hooks/useCatalog';
 
-const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
+const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSavedLayout }) => {
   const { file, jobId, fileName } = activeProject || {};
   const containerRef = useRef(null);
   const tooltipRef = useRef(null);
@@ -48,6 +48,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
+    savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout,
     toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, applyMaterialDefinition, applyMaterialDefinitionToAllWalls, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage, saveNow
@@ -343,6 +344,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     }
   };
 
+  const handleSaveAsLayout = async (name, renderResult, renderConfig) => {
+    const savedLayout = await saveRenderedLayout(name, renderResult, renderConfig);
+    setToastMessage(`Saved “${savedLayout.name}” to Layouts.`);
+    setTimeout(() => setToastMessage(null), 2200);
+    return savedLayout;
+  };
+
   const handleManualSave = async () => {
     if (!file || !jobId) return;
     setIsManualSaving(true);
@@ -386,6 +394,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
       }
     });
   }, [engineActions, updateAsset]);
+
+
+  const handleOpenSaveLayout = () => {
+    setRenderConfig((previous) => ({ ...previous, type: '360' }));
+    setShowRenderStudio(true);
+  };
 
   return (
     <div
@@ -436,6 +450,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           onRestoreView={restoreCameraView}
           onDeleteView={deleteCameraView}
           onResetCamera={() => engineActions.camera.reset()}
+          onSaveLayout={handleOpenSaveLayout}
           />
         </>
       )}
@@ -601,6 +616,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             availableLayouts={availableLayouts}
             layoutsLoading={layoutsLoading}
             layoutsError={layoutsError}
+            savedLayouts={savedLayouts}
+            savedLayoutsLoading={savedLayoutsLoading}
+            savedLayoutsError={savedLayoutsError}
+            onOpenSavedLayout={onOpenSavedLayout}
             onSelectLayout={onReplaceProject}
             onApplyTemplate={(templateId) => applyTemplate(templateId, engineActions.loadIFCAssetIntoScene)}
             placementMode={engineState.placementMode}
@@ -688,6 +707,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
         {...renderState}
         setRenderResult={setRenderResult}
         setRenderError={setRenderError}
+        onSaveAsLayout={handleSaveAsLayout}
       />
       
       {engineState.isLoading && (

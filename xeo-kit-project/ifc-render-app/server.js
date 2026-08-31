@@ -25,6 +25,11 @@ if (!fs.existsSync(assetsDir)) fs.mkdirSync(assetsDir, { recursive: true });
 const materialAssetsDir = path.join(assetsDir, 'materials');
 if (!fs.existsSync(materialAssetsDir)) fs.mkdirSync(materialAssetsDir, { recursive: true });
 
+// Global saved-layout index. Saved layouts belong to the Layouts left panel,
+// not to whichever base project is currently active.
+const savedLayoutsRegistryDir = path.join(jobsDir, 'saved_layouts_registry');
+if (!fs.existsSync(savedLayoutsRegistryDir)) fs.mkdirSync(savedLayoutsRegistryDir, { recursive: true });
+
 // Project/job identity + manifest helpers.
 function generateJobId() {
   let id;
@@ -54,6 +59,71 @@ function touchManifest(jobDir) {
     manifest.updatedAt = new Date().toISOString();
     writeManifest(jobDir, manifest);
   }
+}
+
+function generateSavedLayoutId() {
+  let id;
+  do {
+    id = `layout_${crypto.randomBytes(6).toString('hex')}`;
+  } while (fs.existsSync(path.join(jobsDir, id)));
+  return id;
+}
+
+function parseSavedLayoutFile(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  } catch (error) {
+    console.warn(`[SavedLayouts] Failed to read ${path.basename(filePath)}:`, error.message);
+    return null;
+  }
+}
+
+function readSavedLayouts(jobId) {
+  const layoutsDir = path.join(jobsDir, jobId, 'saved_layouts');
+  if (!fs.existsSync(layoutsDir)) return [];
+
+  return fs.readdirSync(layoutsDir, { withFileTypes: true })
+    .filter(entry => entry.isFile() && entry.name.endsWith('.json'))
+    .map(entry => parseSavedLayoutFile(path.join(layoutsDir, entry.name)))
+    .filter(Boolean)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+function readAllSavedLayouts() {
+  const byId = new Map();
+
+  // New layouts: global durable registry.
+  if (fs.existsSync(savedLayoutsRegistryDir)) {
+    fs.readdirSync(savedLayoutsRegistryDir, { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.endsWith('.json'))
+      .forEach(entry => {
+        const record = parseSavedLayoutFile(path.join(savedLayoutsRegistryDir, entry.name));
+        if (record?.id) byId.set(record.id, record);
+      });
+  }
+
+  // Legacy compatibility: layouts created before the global registry existed.
+  fs.readdirSync(jobsDir, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && entry.name !== 'saved_layouts_registry')
+    .forEach(entry => {
+      readSavedLayouts(entry.name).forEach(record => {
+        if (record?.id && !byId.has(record.id)) byId.set(record.id, record);
+      });
+    });
+
+  return Array.from(byId.values())
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+function decorateSavedLayout(layout) {
+  return {
+    ...layout,
+    thumbnailUrl: layout.thumbnailFile
+      ? `/jobs/${encodeURIComponent(layout.renderJobId)}/${encodeURIComponent(layout.thumbnailFile)}`
+      : null,
+    modelUrl: `/jobs/${encodeURIComponent(layout.renderJobId)}/output.glb`,
+    walkthroughUrl: `/walkthrough/${encodeURIComponent(layout.renderJobId)}`,
+  };
 }
 
 // HELPER: Require active project to block archived edits
@@ -109,6 +179,205 @@ app.get('/api/assets', (req, res) => {
     res.json(catalog);
 });
 
+
+// ==========================================
+// SAVED 360 LAYOUTS API
+// ==========================================
+// Each saved layout is an immutable snapshot of the already-rendered scene.
+// Its private render job contains the exact GLB + navigation artifacts used by
+// the React walkthrough, so reopening a saved layout does not mutate the active project.
+app.get('/api/saved-layouts', (req, res) => {
+  try {
+    res.json({ layouts: readAllSavedLayouts().map(decorateSavedLayout) });
+  } catch (error) {
+    console.error('[SavedLayouts] Global List Error:', error);
+    res.status(500).json({ error: 'Failed to list saved layouts.' });
+  }
+});
+
+// Backward-compatible route. It intentionally returns the GLOBAL collection.
+app.get('/api/projects/:jobId/saved-layouts', (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!fs.existsSync(path.join(jobsDir, jobId))) {
+      return res.status(404).json({ error: 'Project not found.' });
+    }
+    res.json({ layouts: readAllSavedLayouts().map(decorateSavedLayout) });
+  } catch (error) {
+    console.error('[SavedLayouts] List Error:', error);
+    res.status(500).json({ error: 'Failed to list saved layouts.' });
+  }
+});
+
+app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'), (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!requireActiveProject(jobId, res)) return;
+
+    const parentJobDir = path.join(jobsDir, jobId);
+    if (!fs.existsSync(path.join(parentJobDir, 'output.glb'))) {
+      return res.status(409).json({ error: 'Run the final 360 render before saving a layout.' });
+    }
+
+    const rawName = String(req.body?.name || '').trim();
+    if (!rawName) return res.status(400).json({ error: 'Layout name is required.' });
+    if (rawName.length > 80) return res.status(400).json({ error: 'Layout name must be 80 characters or fewer.' });
+
+    let projectState = {};
+    let renderConfig = {};
+    try { projectState = req.body?.projectState ? JSON.parse(req.body.projectState) : {}; }
+    catch (_) { return res.status(400).json({ error: 'Invalid projectState JSON.' }); }
+    try { renderConfig = req.body?.renderConfig ? JSON.parse(req.body.renderConfig) : {}; }
+    catch (_) { return res.status(400).json({ error: 'Invalid renderConfig JSON.' }); }
+
+    const renderJobId = generateSavedLayoutId();
+    const renderJobDir = path.join(jobsDir, renderJobId);
+    const layoutsDir = path.join(parentJobDir, 'saved_layouts');
+    fs.mkdirSync(renderJobDir, { recursive: true });
+    fs.mkdirSync(layoutsDir, { recursive: true });
+
+    // Freeze everything needed to reproduce the render AND restore the scene
+    // back into the normal xeokit editor later.
+    //
+    // input.ifc = the exact IFC that was used for the final render, including
+    // any edits that were baked into the IFC (door cuts/rescale/etc.).
+    // original.ifc = kept for the normal project validation/continue-work flow.
+    // project_state.json below = the authored editor state (materials, furniture,
+    // structural edits, matrices, calibration, etc.).
+    [
+      'output.glb',
+      'navigation_surface.json',
+      'walk_areas.json',
+      'navigation_navmesh.bin',
+      'input.ifc',
+      'original.ifc',
+    ].forEach(fileName => {
+      const source = path.join(parentJobDir, fileName);
+      if (fs.existsSync(source)) fs.copyFileSync(source, path.join(renderJobDir, fileName));
+    });
+
+    if (req.file?.buffer) fs.writeFileSync(path.join(renderJobDir, 'thumbnail.jpg'), req.file.buffer);
+
+    const now = new Date().toISOString();
+    const manifest = {
+      jobId: renderJobId,
+      type: 'saved_layout',
+      parentJobId: jobId,
+      name: rawName,
+      originalFileName: `Saved Layout - ${rawName}`,
+      createdAt: now,
+      updatedAt: now,
+      status: 'active',
+    };
+    writeManifest(renderJobDir, manifest);
+    fs.writeFileSync(path.join(renderJobDir, 'project_state.json'), JSON.stringify(projectState, null, 2));
+    fs.writeFileSync(path.join(renderJobDir, 'saved_layout_state.json'), JSON.stringify({ projectState, renderConfig }, null, 2));
+
+    const layoutRecord = {
+      id: renderJobId,
+      renderJobId,
+      parentJobId: jobId,
+      name: rawName,
+      createdAt: now,
+      updatedAt: now,
+      renderType: '360',
+      thumbnailFile: fs.existsSync(path.join(renderJobDir, 'thumbnail.jpg')) ? 'thumbnail.jpg' : null,
+    };
+    const layoutRecordJson = JSON.stringify(layoutRecord, null, 2);
+    fs.writeFileSync(path.join(layoutsDir, `${renderJobId}.json`), layoutRecordJson);
+    fs.writeFileSync(path.join(savedLayoutsRegistryDir, `${renderJobId}.json`), layoutRecordJson);
+    touchManifest(parentJobDir);
+
+    res.json({
+      success: true,
+      layout: {
+        ...decorateSavedLayout(layoutRecord),
+      },
+    });
+  } catch (error) {
+    console.error('[SavedLayouts] Create Error:', error);
+    res.status(500).json({ error: 'Failed to save 360 layout.' });
+  }
+});
+
+// Restore a saved layout as a normal working project.
+// The saved layout itself remains untouched; the user gets a fresh project
+// containing the exact IFC + project state captured when the layout was saved.
+app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
+  try {
+    const { jobId, layoutId } = req.params;
+    if (!requireActiveProject(jobId, res)) return;
+
+    const layouts = readAllSavedLayouts();
+    const layout = layouts.find(item => item.id === layoutId || item.renderJobId === layoutId);
+    if (!layout) {
+      return res.status(404).json({ error: 'Saved layout not found.' });
+    }
+
+    const sourceJobId = layout.renderJobId;
+    const sourceJobDir = path.join(jobsDir, sourceJobId);
+    if (!fs.existsSync(sourceJobDir)) {
+      return res.status(404).json({ error: 'Saved layout render snapshot is missing.' });
+    }
+
+    const inputIfcPath = path.join(sourceJobDir, 'input.ifc');
+    const originalIfcPath = path.join(sourceJobDir, 'original.ifc');
+    const statePath = path.join(sourceJobDir, 'project_state.json');
+
+    if (!fs.existsSync(inputIfcPath) || !fs.existsSync(statePath)) {
+      return res.status(409).json({ error: 'Saved layout snapshot is incomplete.' });
+    }
+
+    const newJobId = generateJobId();
+    const newJobDir = path.join(jobsDir, newJobId);
+    fs.mkdirSync(newJobDir, { recursive: true });
+
+    // The restored workspace must start from the exact IFC captured by the
+    // saved layout, not the currently active project's IFC.
+    fs.copyFileSync(inputIfcPath, path.join(newJobDir, 'input.ifc'));
+    fs.copyFileSync(
+      fs.existsSync(originalIfcPath) ? originalIfcPath : inputIfcPath,
+      path.join(newJobDir, 'original.ifc')
+    );
+    fs.copyFileSync(statePath, path.join(newJobDir, 'project_state.json'));
+
+    const now = new Date().toISOString();
+    const sourceManifest = readManifest(sourceJobDir);
+    writeManifest(newJobDir, {
+      jobId: newJobId,
+      originalFileName: (() => {
+        const n = sourceManifest?.originalFileName || `Saved Layout - ${layout.name}`;
+        return /\.ifc$/i.test(n) ? n : `${n}.ifc`;
+      })(),
+      createdAt: now,
+      updatedAt: now,
+      status: 'active',
+      restoredFromSavedLayoutId: layout.id,
+      restoredFromLayoutName: layout.name,
+      savedLayoutsSourceJobId: jobId,
+    });
+
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.headers.host;
+
+    return res.json({
+      success: true,
+      sourceJobId,
+      newJobId,
+      fileName: (() => {
+        const n = sourceManifest?.originalFileName || `Saved Layout - ${layout.name}`;
+        return /\.ifc$/i.test(n) ? n : `${n}.ifc`;
+      })(),
+      fileUrl: `${protocol}://${host}/jobs/${newJobId}/input.ifc`,
+      savedLayoutsSourceJobId: jobId,
+      savedLayoutId: layout.id,
+      savedLayoutName: layout.name,
+    });
+  } catch (error) {
+    console.error('[SavedLayouts] Restore Error:', error);
+    res.status(500).json({ error: 'Failed to restore saved layout.' });
+  }
+});
 
 // ==========================================
 // PREDEFINED IFC LAYOUTS API
@@ -266,6 +535,7 @@ app.get('/api/projects', (req, res) => {
         const projects = entries
             .map((name) => readManifest(path.join(jobsDir, name)))
             .filter(Boolean)
+            .filter((manifest) => manifest.type !== 'saved_layout')
             .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 
         res.json({ projects });
@@ -918,6 +1188,20 @@ app.delete('/api/projects/:jobId', (req, res) => {
         nextManifest.updatedAt = new Date().toISOString();
 
         writeManifest(jobDir, nextManifest);
+
+        // Remove saved render snapshots that belonged to this project.
+        try {
+            for (const entry of fs.readdirSync(jobsDir, { withFileTypes: true })) {
+                if (!entry.isDirectory()) continue;
+                const candidateDir = path.join(jobsDir, entry.name);
+                const candidateManifest = readManifest(candidateDir);
+                if (candidateManifest?.type === 'saved_layout' && candidateManifest.parentJobId === jobId) {
+                    fs.rmSync(candidateDir, { recursive: true, force: true });
+                }
+            }
+        } catch (cleanupError) {
+            console.warn(`[Delete Project] Saved layout cleanup failed for ${jobId}:`, cleanupError.message);
+        }
 
         // IMPORTANT:
         // Do NOT create a replacement project here.

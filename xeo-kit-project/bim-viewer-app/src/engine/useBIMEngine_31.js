@@ -1489,9 +1489,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     }
 
     clearScene();
-    const fileExtension = activeProject?.savedLayoutId
-      ? 'ifc'
-      : fileName.split('.').pop().toLowerCase();
+    const fileExtension = fileName.split('.').pop().toLowerCase();
 
     setIsLoading(true);
 

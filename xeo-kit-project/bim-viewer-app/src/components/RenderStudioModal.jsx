@@ -6,15 +6,42 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 export const RenderStudioModal = ({
   show, onClose, renderConfig, setRenderConfig, onExecute,
   isRendering, renderResult, renderTime, renderError, setRenderResult, setRenderError,
+  onSaveAsLayout,
 }) => {
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState(null);
+  const [layoutName, setLayoutName] = useState('');
+  const [isSavingLayout, setIsSavingLayout] = useState(false);
+  const [saveLayoutMessage, setSaveLayoutMessage] = useState(null);
 
   if (!show) return null;
 
   const jobId = renderResult?.jobId;
   const walkthroughUrl = renderResult?.walkthroughUrl || (jobId ? `${window.location.origin}/walkthrough/${encodeURIComponent(jobId)}` : null);
   const modelUrl = renderResult?.modelUrl || (jobId ? `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb` : null);
+
+  const handleSaveAsLayout = async () => {
+    if (!onSaveAsLayout || isSavingLayout) return;
+
+    const name = layoutName.trim();
+    if (!name) {
+      setSaveLayoutMessage({ type: 'error', text: 'Enter a name for this layout.' });
+      return;
+    }
+
+    setIsSavingLayout(true);
+    setSaveLayoutMessage(null);
+
+    try {
+      await onSaveAsLayout(name, renderResult, renderConfig);
+      setSaveLayoutMessage({ type: 'success', text: `Saved “${name}” to Layouts.` });
+      setLayoutName('');
+    } catch (error) {
+      setSaveLayoutMessage({ type: 'error', text: error.message || 'Failed to save this layout.' });
+    } finally {
+      setIsSavingLayout(false);
+    }
+  };
 
   const downloadModel = async () => {
     if (!modelUrl || isDownloading) return;
@@ -78,6 +105,33 @@ export const RenderStudioModal = ({
         <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex flex-wrap justify-end items-center gap-3 bg-slate-50 dark:bg-slate-800/50">
           {renderConfig.type === '360' ? (
             <>
+              {!renderResult?.isSavedLayout && onSaveAsLayout && (
+                <div className="flex w-full flex-col gap-2 rounded-xl border border-indigo-200 dark:border-indigo-900/60 bg-indigo-50/60 dark:bg-indigo-950/25 p-3 lg:w-auto lg:min-w-[360px]">
+                  <div className="flex gap-2">
+                    <input
+                      value={layoutName}
+                      onChange={(e) => setLayoutName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') handleSaveAsLayout(); }}
+                      maxLength={80}
+                      placeholder="e.g. Final Living Room"
+                      className="min-w-0 flex-1 rounded-lg border border-indigo-200 dark:border-indigo-800 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-800 dark:text-white outline-none focus:border-indigo-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleSaveAsLayout}
+                      disabled={isSavingLayout}
+                      className="shrink-0 rounded-lg bg-[#ff914d] hover:bg-[#ff7a28] px-4 py-2 text-xs font-bold text-white transition disabled:cursor-wait disabled:opacity-60"
+                    >
+                      {isSavingLayout ? 'Saving…' : 'Save as Layout'}
+                    </button>
+                  </div>
+                  {saveLayoutMessage && (
+                    <p className={`text-[11px] ${saveLayoutMessage.type === 'success' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                      {saveLayoutMessage.text}
+                    </p>
+                  )}
+                </div>
+              )}
               <button
                 type="button"
                 onClick={downloadModel}

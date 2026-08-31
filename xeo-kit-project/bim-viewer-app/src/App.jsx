@@ -9,6 +9,13 @@ import ContactForm from './components/ContactForm';
 import { AlertTriangle } from 'lucide-react';
 import ProjectStartModal from './components/ProjectStartModal';
 import WalkthroughPage from './pages/WalkthroughPage';
+
+const ensureIfcFileName = (value, fallback = 'model.ifc') => {
+  const name = String(value || '').trim();
+  if (!name) return fallback;
+  return /\.ifc$/i.test(name) ? name : `${name}.ifc`;
+};
+
 function ViewerApp() {
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isBooting, setIsBooting] = useState(true);
@@ -81,6 +88,9 @@ function ViewerApp() {
         setPreviousProject({
           jobId,
           fileName,
+          savedLayoutsSourceJobId: savedProject.savedLayoutsSourceJobId || null,
+          savedLayoutId: savedProject.savedLayoutId || null,
+          savedLayoutName: savedProject.savedLayoutName || null,
         });
         setShowStartChoice(true);
         setIsUploadOpen(false);
@@ -129,8 +139,9 @@ function ViewerApp() {
     setIsContinuingProject(true);
 
     try {
+      const previousFilePath = previousProject.savedLayoutId ? 'input.ifc' : 'original.ifc';
       const response = await fetch(
-        `${API_BASE_URL}/jobs/${previousProject.jobId}/original.ifc`,
+        `${API_BASE_URL}/jobs/${previousProject.jobId}/${previousFilePath}`,
         { cache: 'no-store' }
       );
 
@@ -139,14 +150,20 @@ function ViewerApp() {
       }
 
       const blob = await response.blob();
-      const file = new File([blob], previousProject.fileName, {
+      const resolvedFileName = previousProject.savedLayoutId
+        ? ensureIfcFileName(previousProject.fileName, 'Saved Layout.ifc')
+        : previousProject.fileName;
+      const file = new File([blob], resolvedFileName, {
         type: 'application/octet-stream',
       });
 
       setActiveProject({
         jobId: previousProject.jobId,
         file,
-        fileName: previousProject.fileName,
+        fileName: resolvedFileName,
+        savedLayoutsSourceJobId: previousProject.savedLayoutsSourceJobId || null,
+        savedLayoutId: previousProject.savedLayoutId || null,
+        savedLayoutName: previousProject.savedLayoutName || null,
       });
       setShowStartChoice(false);
       setIsUploadOpen(false);
@@ -175,7 +192,10 @@ function ViewerApp() {
     setActiveProject(projectData);
     localStorage.setItem('hci_active_project', JSON.stringify({
       jobId: projectData.jobId,
-      fileName: projectData.fileName
+      fileName: projectData.fileName,
+      savedLayoutsSourceJobId: projectData.savedLayoutsSourceJobId || null,
+      savedLayoutId: projectData.savedLayoutId || null,
+      savedLayoutName: projectData.savedLayoutName || null,
     }));
     setIsUploadOpen(false);
     setShowStartChoice(false);
@@ -227,6 +247,67 @@ function ViewerApp() {
     }
   };
 
+  const handleOpenSavedLayout = async (layout) => {
+    if (!activeProject?.jobId || !layout?.id || !layout?.renderJobId || isSwitchingLayout) return;
+
+    const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+    setIsSwitchingLayout(true);
+
+    try {
+      // Create a fresh working project from the saved snapshot. This is the
+      // important distinction from the 360 preview: the editor receives the
+      // snapshot IFC + project_state and restores it through the normal xeokit
+      // project-loading path.
+      const response = await fetch(
+        `${API_BASE_URL}/api/projects/${encodeURIComponent(activeProject.jobId)}/saved-layouts/${encodeURIComponent(layout.id)}/restore`,
+        { method: 'POST' }
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success || !data.newJobId) {
+        throw new Error(data.error || `Saved layout restore failed (${response.status})`);
+      }
+
+      const fileUrl = data.fileUrl || `${API_BASE_URL}/jobs/${encodeURIComponent(data.newJobId)}/input.ifc`;
+      const responseIfc = await fetch(fileUrl, { cache: 'no-store' });
+      if (!responseIfc.ok) throw new Error(`Saved layout IFC could not be loaded (${responseIfc.status}).`);
+
+      const blob = await responseIfc.blob();
+      const fileName = ensureIfcFileName(
+        data.fileName,
+        `Saved Layout - ${layout.name}.ifc`
+      );
+      const file = new File([blob], fileName, { type: 'application/octet-stream' });
+
+      const nextProject = {
+        jobId: data.newJobId,
+        file,
+        fileName,
+        savedLayoutsSourceJobId: data.savedLayoutsSourceJobId || activeProject.jobId,
+        savedLayoutId: data.savedLayoutId || layout.id,
+        savedLayoutName: data.savedLayoutName || layout.name,
+      };
+
+      localStorage.removeItem('hci_startup_mode');
+      setStartupMode(null);
+      localStorage.setItem('hci_active_project', JSON.stringify({
+        jobId: nextProject.jobId,
+        fileName: nextProject.fileName,
+        savedLayoutsSourceJobId: nextProject.savedLayoutsSourceJobId,
+        savedLayoutId: nextProject.savedLayoutId,
+        savedLayoutName: nextProject.savedLayoutName,
+      }));
+
+      setActiveProject(nextProject);
+      setIsUploadOpen(false);
+      setShowStartChoice(false);
+    } catch (error) {
+      console.error('[App] Failed to restore saved layout:', error);
+      alert(`Failed to load ${layout.name}: ${error.message}`);
+    } finally {
+      setIsSwitchingLayout(false);
+    }
+  };
+
   const handleLayoutReplace = async (layout) => {
     if (!activeProject?.jobId || !layout?.id) return;
 
@@ -266,6 +347,9 @@ function ViewerApp() {
         jobId: newJobId,
         file,
         fileName: data.fileName || layout.fileName || file.name,
+        savedLayoutsSourceJobId: null,
+        savedLayoutId: null,
+        savedLayoutName: null,
       };
 
       localStorage.removeItem('hci_startup_mode');
@@ -273,6 +357,9 @@ function ViewerApp() {
       localStorage.setItem('hci_active_project', JSON.stringify({
         jobId: newJobId,
         fileName: nextProject.fileName,
+        savedLayoutsSourceJobId: null,
+        savedLayoutId: null,
+        savedLayoutName: null,
       }));
 
       // Changing the project key forces BIMViewer to unmount the old viewer
@@ -304,6 +391,7 @@ function ViewerApp() {
             onDelete={handleDeleteRequest}
             onAdd={() => setIsUploadOpen(true)}
             onReplaceProject={handleLayoutReplace}
+            onOpenSavedLayout={handleOpenSavedLayout}
           />
         ) : null}
       </div>

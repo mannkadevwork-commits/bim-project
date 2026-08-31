@@ -26,8 +26,7 @@ export const useCloudRender = (activeProject, projectStateRef) => {
     formData.append('angle', actualAngle);
     formData.append('lighting', renderConfig.lighting);
     formData.append('quality', renderConfig.quality);
-    const renderedProjectState = JSON.parse(JSON.stringify(projectStateRef.current || {}));
-    formData.append('projectState', JSON.stringify(renderedProjectState));
+    formData.append('projectState', JSON.stringify(projectStateRef.current));
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/render`, { method: 'POST', body: formData });
@@ -39,8 +38,6 @@ export const useCloudRender = (activeProject, projectStateRef) => {
         jobId,
         modelUrl: `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`,
         walkthroughUrl: `${window.location.origin}/walkthrough/${encodeURIComponent(jobId)}`,
-        projectState: renderedProjectState,
-        renderConfig: { ...renderConfig },
       });
       setRenderTime(((Date.now() - startTime) / 1000).toFixed(1));
     } catch (error) {

@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
 import { applyMaterialDefinitionToSceneTarget as applySceneMaterial, applyMaterialDefinitionToObjects as applySceneMaterials, normalizeMaterialDefinition } from '../utils/materialScene';
-import { generateGlbThumbnail } from '../utils/glbThumbnail';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -43,9 +42,6 @@ export const useProjectSync = (activeProject) => {
   
   const [availableAssets, setAvailableAssets] = useState([]);
   const [availableLayouts, setAvailableLayouts] = useState([]);
-  const [savedLayouts, setSavedLayouts] = useState([]);
-  const [savedLayoutsLoading, setSavedLayoutsLoading] = useState(false);
-  const [savedLayoutsError, setSavedLayoutsError] = useState(null);
   const [layoutsLoading, setLayoutsLoading] = useState(false);
   const [layoutsError, setLayoutsError] = useState(null);
   const [homeTemplates, setHomeTemplates] = useState(MOCK_ROOM_TEMPLATES);
@@ -119,27 +115,6 @@ export const useProjectSync = (activeProject) => {
         setAvailableLayouts([]);
       })
       .finally(() => setLayoutsLoading(false));
-
-    if (jobId) {
-      setSavedLayoutsLoading(true);
-      setSavedLayoutsError(null);
-      fetch(`${API_BASE_URL}/api/projects/${encodeURIComponent(jobId)}/saved-layouts`, { cache: 'no-store' })
-        .then(res => {
-          if (!res.ok) throw new Error(`Failed to load saved layouts (${res.status})`);
-          return res.json();
-        })
-        .then(data => setSavedLayouts(Array.isArray(data?.layouts) ? data.layouts.map(normalizeSavedLayout) : []))
-        .catch(err => {
-          console.error('[ProjectSync] Failed to load saved layouts:', err);
-          setSavedLayoutsError(err.message);
-          setSavedLayouts([]);
-        })
-        .finally(() => setSavedLayoutsLoading(false));
-    } else {
-      setSavedLayouts([]);
-      setSavedLayoutsLoading(false);
-      setSavedLayoutsError(null);
-    }
   }, [file, jobId]);
 
   // 2. AUTO-SAVE: Safe sequential queue
@@ -202,94 +177,6 @@ export const useProjectSync = (activeProject) => {
       console.error('[ProjectSync] Manual save failed:', err);
       setSaveStatus('error');
     }
-  };
-
-
-  const normalizeSavedLayout = (layout) => {
-    if (!layout) return layout;
-
-    const resolveUrl = (value) => {
-      if (!value) return value;
-      try {
-        return new URL(value, API_BASE_URL).toString();
-      } catch {
-        return value;
-      }
-    };
-
-    return {
-      ...layout,
-      thumbnailUrl: resolveUrl(layout.thumbnailUrl),
-      modelUrl: resolveUrl(layout.modelUrl),
-      walkthroughUrl: resolveUrl(layout.walkthroughUrl),
-    };
-  };
-
-  const refreshSavedLayouts = async () => {
-    if (!jobId) return [];
-    const response = await fetch(
-      `${API_BASE_URL}/api/projects/${encodeURIComponent(jobId)}/saved-layouts`,
-      { cache: 'no-store' }
-    );
-    if (!response.ok) throw new Error(`Failed to refresh saved layouts (${response.status})`);
-    const data = await response.json();
-    const layouts = Array.isArray(data?.layouts) ? data.layouts.map(normalizeSavedLayout) : [];
-    setSavedLayouts(layouts);
-    return layouts;
-  };
-
-  const saveRenderedLayout = async (name, renderResult, renderConfig) => {
-    if (!jobId) throw new Error('No active project is available.');
-
-    const trimmedName = String(name || '').trim();
-    if (!trimmedName) throw new Error('Please enter a layout name.');
-    if (!renderResult?.jobId) throw new Error('The 360 render is not available to save.');
-
-    const sourceModelUrl = renderResult.modelUrl ||
-      `${API_BASE_URL}/jobs/${encodeURIComponent(renderResult.jobId)}/output.glb`;
-
-    const modelResponse = await fetch(sourceModelUrl, { cache: 'no-store' });
-    if (!modelResponse.ok) {
-      throw new Error(`Could not read the final 360 model (${modelResponse.status}).`);
-    }
-
-    const modelBlob = await modelResponse.blob();
-    let thumbnailBlob = null;
-
-    try {
-      const modelFile = new File(
-        [modelBlob],
-        `${renderResult.jobId}.glb`,
-        { type: 'model/gltf-binary' }
-      );
-      thumbnailBlob = await generateGlbThumbnail(modelFile, 320);
-    } catch (thumbnailError) {
-      console.warn('[ProjectSync] Thumbnail generation failed; saving layout without thumbnail.', thumbnailError);
-    }
-
-    const formData = new FormData();
-    formData.append('name', trimmedName);
-    formData.append('projectState', JSON.stringify(projectStateRef.current || {}));
-    formData.append('renderConfig', JSON.stringify(renderConfig || {}));
-    if (thumbnailBlob) formData.append('thumbnail', thumbnailBlob, 'thumbnail.jpg');
-
-    const response = await fetch(
-      `${API_BASE_URL}/api/projects/${encodeURIComponent(jobId)}/saved-layouts`,
-      { method: 'POST', body: formData }
-    );
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok || !data?.success || !data?.layout) {
-      throw new Error(data?.error || `Failed to save layout (${response.status})`);
-    }
-
-    const normalizedLayout = normalizeSavedLayout(data.layout);
-    setSavedLayouts(prev => [
-      normalizedLayout,
-      ...prev.filter(item => item.id !== normalizedLayout.id),
-    ]);
-
-    return normalizedLayout;
   };
 
   const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray) => {
@@ -799,9 +686,6 @@ export const useProjectSync = (activeProject) => {
     availableLayouts,
     layoutsLoading,
     layoutsError,
-    savedLayouts,
-    savedLayoutsLoading,
-    savedLayoutsError,
     homeTemplates,
     toastMessage,
     customColor,
@@ -820,7 +704,5 @@ export const useProjectSync = (activeProject) => {
     setToastMessage,
     setCustomColor,
     saveNow,
-    refreshSavedLayouts,
-    saveRenderedLayout,
   };
 };
