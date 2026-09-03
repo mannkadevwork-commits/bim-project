@@ -196,6 +196,8 @@ export const ViewportToolbar = ({
           )}
         </div>
 
+        <div className="mx-0.5 h-8 w-px bg-slate-700/80" />
+
         <button
           type="button"
           onClick={onSaveLayout}

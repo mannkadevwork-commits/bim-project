@@ -123,7 +123,7 @@ export const useProjectSync = (activeProject) => {
     if (jobId) {
       setSavedLayoutsLoading(true);
       setSavedLayoutsError(null);
-      fetch(`${API_BASE_URL}/api/projects/${encodeURIComponent(jobId)}/saved-layouts`, { cache: 'no-store' })
+      fetch(`${API_BASE_URL}/api/saved-layouts`, { cache: 'no-store' })
         .then(res => {
           if (!res.ok) throw new Error(`Failed to load saved layouts (${res.status})`);
           return res.json();
@@ -132,7 +132,6 @@ export const useProjectSync = (activeProject) => {
         .catch(err => {
           console.error('[ProjectSync] Failed to load saved layouts:', err);
           setSavedLayoutsError(err.message);
-          setSavedLayouts([]);
         })
         .finally(() => setSavedLayoutsLoading(false));
     } else {
@@ -207,28 +206,33 @@ export const useProjectSync = (activeProject) => {
 
   const normalizeSavedLayout = (layout) => {
     if (!layout) return layout;
-
     const resolveUrl = (value) => {
       if (!value) return value;
-      try {
-        return new URL(value, API_BASE_URL).toString();
-      } catch {
-        return value;
-      }
+      try { return new URL(value, API_BASE_URL).toString(); }
+      catch { return value; }
     };
+    // Asset URLs belong to the backend, but the walkthrough is a React route.
+    // Resolving walkthroughUrl against API_BASE_URL would incorrectly navigate
+    // to the Express server (for example /walkthrough/:jobId), which returns
+    // `Cannot GET` because that route exists in the frontend router.
+    const walkthroughUrl = layout.walkthroughUrl
+      ? (String(layout.walkthroughUrl).startsWith('http')
+        ? String(layout.walkthroughUrl)
+        : `${window.location.origin}${String(layout.walkthroughUrl).startsWith('/') ? '' : '/'}${String(layout.walkthroughUrl)}`)
+      : layout.walkthroughUrl;
 
     return {
       ...layout,
       thumbnailUrl: resolveUrl(layout.thumbnailUrl),
       modelUrl: resolveUrl(layout.modelUrl),
-      walkthroughUrl: resolveUrl(layout.walkthroughUrl),
+      walkthroughUrl,
     };
   };
 
   const refreshSavedLayouts = async () => {
     if (!jobId) return [];
     const response = await fetch(
-      `${API_BASE_URL}/api/projects/${encodeURIComponent(jobId)}/saved-layouts`,
+      `${API_BASE_URL}/api/saved-layouts`,
       { cache: 'no-store' }
     );
     if (!response.ok) throw new Error(`Failed to refresh saved layouts (${response.status})`);
@@ -238,11 +242,20 @@ export const useProjectSync = (activeProject) => {
     return layouts;
   };
 
-  const saveRenderedLayout = async (name, renderResult, renderConfig) => {
+  const saveRenderedLayout = async (metadata, renderResult, renderConfig) => {
     if (!jobId) throw new Error('No active project is available.');
 
-    const trimmedName = String(name || '').trim();
+    const layoutMetadata = typeof metadata === 'string'
+      ? { name: metadata }
+      : (metadata || {});
+    const trimmedName = String(layoutMetadata.name || '').trim();
     if (!trimmedName) throw new Error('Please enter a layout name.');
+    if (!layoutMetadata.categoryType || !String(layoutMetadata.categoryName || '').trim()) {
+      throw new Error('Please choose a layout category.');
+    }
+    if (!String(layoutMetadata.subCategory || '').trim()) {
+      throw new Error('Please choose a sub-category.');
+    }
     if (!renderResult?.jobId) throw new Error('The 360 render is not available to save.');
 
     const sourceModelUrl = renderResult.modelUrl ||
@@ -269,6 +282,9 @@ export const useProjectSync = (activeProject) => {
 
     const formData = new FormData();
     formData.append('name', trimmedName);
+    formData.append('categoryType', layoutMetadata.categoryType);
+    formData.append('categoryName', String(layoutMetadata.categoryName || '').trim());
+    formData.append('subCategory', String(layoutMetadata.subCategory || '').trim());
     formData.append('projectState', JSON.stringify(projectStateRef.current || {}));
     formData.append('renderConfig', JSON.stringify(renderConfig || {}));
     if (thumbnailBlob) formData.append('thumbnail', thumbnailBlob, 'thumbnail.jpg');
@@ -290,6 +306,42 @@ export const useProjectSync = (activeProject) => {
     ]);
 
     return normalizedLayout;
+  };
+
+  const updateSavedLayout = async (layoutId, metadata) => {
+    if (!layoutId) throw new Error('Saved layout id is required.');
+    const response = await fetch(
+      `${API_BASE_URL}/api/saved-layouts/${encodeURIComponent(layoutId)}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(metadata || {}),
+      }
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data?.success || !data?.layout) {
+      throw new Error(data?.error || `Failed to update layout (${response.status})`);
+    }
+
+    const normalizedLayout = normalizeSavedLayout(data.layout);
+    setSavedLayouts(prev => prev.map(item => (
+      item.id === normalizedLayout.id ? normalizedLayout : item
+    )));
+    return normalizedLayout;
+  };
+
+  const deleteSavedLayout = async (layoutId) => {
+    if (!layoutId) throw new Error('Saved layout id is required.');
+    const response = await fetch(
+      `${API_BASE_URL}/api/saved-layouts/${encodeURIComponent(layoutId)}`,
+      { method: 'DELETE' }
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data?.success) {
+      throw new Error(data?.error || `Failed to delete layout (${response.status})`);
+    }
+    setSavedLayouts(prev => prev.filter(item => item.id !== layoutId));
+    return true;
   };
 
   const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray) => {
@@ -822,5 +874,7 @@ export const useProjectSync = (activeProject) => {
     saveNow,
     refreshSavedLayouts,
     saveRenderedLayout,
+    updateSavedLayout,
+    deleteSavedLayout,
   };
 };

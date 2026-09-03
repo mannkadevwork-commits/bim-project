@@ -69,6 +69,48 @@ function generateSavedLayoutId() {
   return id;
 }
 
+function normalizeSavedLayoutMetadata(body = {}) {
+  const categoryType = body.categoryType === 'project' ? 'project' : 'floorplan';
+  const categoryName = String(body.categoryName || '').trim();
+  const subCategory = String(body.subCategory || '').trim();
+
+  if (!categoryName) throw new Error('Layout category is required.');
+  if (!subCategory) throw new Error('Layout sub-category is required.');
+  if (categoryName.length > 60) throw new Error('Category name must be 60 characters or fewer.');
+  if (subCategory.length > 60) throw new Error('Sub-category must be 60 characters or fewer.');
+
+  return { categoryType, categoryName, subCategory };
+}
+
+function findSavedLayout(layoutId) {
+  return readAllSavedLayouts().find(item => item.id === layoutId || item.renderJobId === layoutId) || null;
+}
+
+function writeSavedLayoutRecord(record) {
+  const json = JSON.stringify(record, null, 2);
+  fs.writeFileSync(path.join(savedLayoutsRegistryDir, `${record.id}.json`), json);
+
+  if (record.parentJobId) {
+    const parentLayoutsDir = path.join(jobsDir, record.parentJobId, 'saved_layouts');
+    if (fs.existsSync(parentLayoutsDir)) {
+      fs.writeFileSync(path.join(parentLayoutsDir, `${record.id}.json`), json);
+    }
+  }
+}
+
+function removeSavedLayoutRecord(record) {
+  const registryPath = path.join(savedLayoutsRegistryDir, `${record.id}.json`);
+  if (fs.existsSync(registryPath)) fs.unlinkSync(registryPath);
+
+  if (record.parentJobId) {
+    const parentRecordPath = path.join(jobsDir, record.parentJobId, 'saved_layouts', `${record.id}.json`);
+    if (fs.existsSync(parentRecordPath)) fs.unlinkSync(parentRecordPath);
+  }
+
+  const snapshotDir = path.join(jobsDir, record.renderJobId || record.id);
+  if (fs.existsSync(snapshotDir)) fs.rmSync(snapshotDir, { recursive: true, force: true });
+}
+
 function parseSavedLayoutFile(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
@@ -86,7 +128,7 @@ function readSavedLayouts(jobId) {
     .filter(entry => entry.isFile() && entry.name.endsWith('.json'))
     .map(entry => parseSavedLayoutFile(path.join(layoutsDir, entry.name)))
     .filter(Boolean)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
 }
 
 function readAllSavedLayouts() {
@@ -112,7 +154,7 @@ function readAllSavedLayouts() {
     });
 
   return Array.from(byId.values())
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
 }
 
 function decorateSavedLayout(layout) {
@@ -223,6 +265,13 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     if (!rawName) return res.status(400).json({ error: 'Layout name is required.' });
     if (rawName.length > 80) return res.status(400).json({ error: 'Layout name must be 80 characters or fewer.' });
 
+    let metadata;
+    try {
+      metadata = normalizeSavedLayoutMetadata(req.body || {});
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
     let projectState = {};
     let renderConfig = {};
     try { projectState = req.body?.projectState ? JSON.parse(req.body.projectState) : {}; }
@@ -264,14 +313,15 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
       type: 'saved_layout',
       parentJobId: jobId,
       name: rawName,
-      originalFileName: `Saved Layout - ${rawName}`,
+      originalFileName: `Saved Layout - ${rawName}.ifc`,
+      ...metadata,
       createdAt: now,
       updatedAt: now,
       status: 'active',
     };
     writeManifest(renderJobDir, manifest);
     fs.writeFileSync(path.join(renderJobDir, 'project_state.json'), JSON.stringify(projectState, null, 2));
-    fs.writeFileSync(path.join(renderJobDir, 'saved_layout_state.json'), JSON.stringify({ projectState, renderConfig }, null, 2));
+    fs.writeFileSync(path.join(renderJobDir, 'saved_layout_state.json'), JSON.stringify({ projectState, renderConfig, ...metadata, name: rawName }, null, 2));
 
     const layoutRecord = {
       id: renderJobId,
@@ -281,6 +331,9 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
       createdAt: now,
       updatedAt: now,
       renderType: '360',
+      categoryType: metadata.categoryType,
+      categoryName: metadata.categoryName,
+      subCategory: metadata.subCategory,
       thumbnailFile: fs.existsSync(path.join(renderJobDir, 'thumbnail.jpg')) ? 'thumbnail.jpg' : null,
     };
     const layoutRecordJson = JSON.stringify(layoutRecord, null, 2);
@@ -297,6 +350,78 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
   } catch (error) {
     console.error('[SavedLayouts] Create Error:', error);
     res.status(500).json({ error: 'Failed to save 360 layout.' });
+  }
+});
+
+// Edit saved-layout metadata without changing the frozen render snapshot.
+app.patch('/api/saved-layouts/:layoutId', (req, res) => {
+  try {
+    const layout = findSavedLayout(req.params.layoutId);
+    if (!layout) return res.status(404).json({ error: 'Saved layout not found.' });
+
+    const rawName = String(req.body?.name || '').trim();
+    if (!rawName) return res.status(400).json({ error: 'Layout name is required.' });
+    if (rawName.length > 80) return res.status(400).json({ error: 'Layout name must be 80 characters or fewer.' });
+
+    let metadata;
+    try {
+      metadata = normalizeSavedLayoutMetadata(req.body || {});
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    const updated = {
+      ...layout,
+      name: rawName,
+      ...metadata,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Keep the snapshot metadata aligned with the visible layout record.
+    const snapshotDir = path.join(jobsDir, updated.renderJobId || updated.id);
+    const savedLayoutStatePath = path.join(snapshotDir, 'saved_layout_state.json');
+    if (fs.existsSync(savedLayoutStatePath)) {
+      try {
+        const savedLayoutState = JSON.parse(fs.readFileSync(savedLayoutStatePath, 'utf-8'));
+        fs.writeFileSync(
+          savedLayoutStatePath,
+          JSON.stringify({ ...savedLayoutState, ...metadata, name: rawName }, null, 2)
+        );
+      } catch (_) {
+        console.warn(`[SavedLayouts] Could not update saved_layout_state.json for ${updated.id}`);
+      }
+    }
+
+    const snapshotManifest = readManifest(snapshotDir);
+    if (snapshotManifest) {
+      snapshotManifest.name = updated.name;
+      snapshotManifest.originalFileName = `Saved Layout - ${updated.name}.ifc`;
+      snapshotManifest.categoryType = updated.categoryType;
+      snapshotManifest.categoryName = updated.categoryName;
+      snapshotManifest.subCategory = updated.subCategory;
+      snapshotManifest.updatedAt = updated.updatedAt;
+      writeManifest(snapshotDir, snapshotManifest);
+    }
+
+    writeSavedLayoutRecord(updated);
+    res.json({ success: true, layout: decorateSavedLayout(updated) });
+  } catch (error) {
+    console.error('[SavedLayouts] Update Error:', error);
+    res.status(500).json({ error: 'Failed to update saved layout.' });
+  }
+});
+
+// Delete a saved layout and its immutable render snapshot.
+app.delete('/api/saved-layouts/:layoutId', (req, res) => {
+  try {
+    const layout = findSavedLayout(req.params.layoutId);
+    if (!layout) return res.status(404).json({ error: 'Saved layout not found.' });
+
+    removeSavedLayoutRecord(layout);
+    res.json({ success: true, deletedLayoutId: layout.id });
+  } catch (error) {
+    console.error('[SavedLayouts] Delete Error:', error);
+    res.status(500).json({ error: 'Failed to delete saved layout.' });
   }
 });
 

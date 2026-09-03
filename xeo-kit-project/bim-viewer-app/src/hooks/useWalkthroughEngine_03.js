@@ -97,7 +97,7 @@ class WalkRuntime {
   _bind() {
     this.onKeyDown = (e) => {
       const key = e.key.toLowerCase();
-      if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'shift', 'q', 'e'].includes(key)) {
+      if (['w', 'a', 's', 'd', 'shift', 'q', 'e'].includes(key)) {
         e.preventDefault();
         this.keys.add(key);
       }
@@ -215,40 +215,10 @@ class WalkRuntime {
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z, 1);
-
-    // IFC/GLB files can contain distant helper geometry or stale bounds.
-    // For the initial camera framing, prefer the semantic walk-area footprint
-    // because those points describe the actual house people can move through.
-    let overviewWidth = Math.max(size.x, 1);
-    let overviewDepth = Math.max(size.z, 1);
-    let overviewTarget = center.clone();
-    if (this.walkAreas.length >= 2) {
-      const xs = this.walkAreas.map((area) => Number(area.center[0])).filter(Number.isFinite);
-      const zs = this.walkAreas.map((area) => Number(area.center[2])).filter(Number.isFinite);
-      const ys = this.walkAreas.map((area) => Number(area.center[1])).filter(Number.isFinite);
-      if (xs.length && zs.length) {
-        const minX = Math.min(...xs);
-        const maxX = Math.max(...xs);
-        const minZ = Math.min(...zs);
-        const maxZ = Math.max(...zs);
-        const footprintPadding = Math.max(this.metersPerUnit * 2, Math.min(size.x, size.z) * 0.08);
-        overviewWidth = Math.max(maxX - minX + footprintPadding * 2, this.metersPerUnit * 4);
-        overviewDepth = Math.max(maxZ - minZ + footprintPadding * 2, this.metersPerUnit * 4);
-        overviewTarget.set(
-          (minX + maxX) * 0.5,
-          ys.length ? THREE.MathUtils.clamp(ys.reduce((a, b) => a + b, 0) / ys.length, box.min.y, box.max.y) : box.min.y,
-          (minZ + maxZ) * 0.5,
-        );
-      }
-    }
-
-    this.viewTarget.copy(overviewTarget);
-    this.overviewWidth = overviewWidth;
-    this.overviewDepth = overviewDepth;
-    // Keep legacy preset framing for perspective/isometric/front/side, while
-    // Top view computes its distance from the actual horizontal footprint.
-    this.viewDistance = Math.max(maxDim, 1) * 1.65;
-    this.overviewPanSpeed = Math.max(overviewWidth, overviewDepth, 1) * 0.6;
+    this.viewTarget.copy(center);
+    // Fit the camera so the full scene is visible on load.
+    this.viewDistance = Math.max(size.x, size.y, size.z, 1) * 1.65;
+    this.overviewPanSpeed = Math.max(size.x, size.y, size.z, 1) * 0.6;
     this.orbitControls.target.copy(center);
     this.orbitControls.minDistance = Math.max(maxDim * 0.04, 0.3);
     this.orbitControls.maxDistance = Math.max(maxDim * 12, 30);
@@ -256,10 +226,8 @@ class WalkRuntime {
     this.camera.far = Math.max(200, maxDim * 20);
     this.camera.updateProjectionMatrix();
 
-    // Presentation start: center the camera over the actual house footprint.
-    // A top view is more useful as the default because it immediately establishes
-    // the floorplan/house context before the user enters walkthrough mode.
-    this.setViewPreset('top');
+    // Presentation start: a clean, slightly pulled-back perspective overview.
+    this.setViewPreset('perspective');
 
     const startSeed = this.walkAreas[0]?.center || [center.x, 0, center.z];
     const start = this._closestWalkPoint(startSeed);
@@ -501,6 +469,7 @@ class WalkRuntime {
   }
 
   setViewPreset(name) {
+    const distance = this.viewDistance;
     const target = this.viewTarget.clone();
     const presets = {
       top: new THREE.Vector3(0, 1, 0),
@@ -509,57 +478,6 @@ class WalkRuntime {
       perspective: new THREE.Vector3(0.72, 0.62, 0.72),
       isometric: new THREE.Vector3(0.86, 0.78, 0.86),
     };
-
-    let distance = this.viewDistance;
-    // if (name === 'top') {
-    //   // Top view is framed from the house footprint instead of the model's
-    //   // potentially inflated Y/diagonal bounding-box dimension.
-    //   const aspect = Math.max(this.camera.aspect || 1, 0.1);
-    //   const verticalFov = THREE.MathUtils.degToRad(this.camera.fov);
-    //   const horizontalFov = 2 * Math.atan(Math.tan(verticalFov * 0.5) * aspect);
-    //   const verticalDistance = (this.overviewDepth * 0.5) / Math.tan(verticalFov * 0.5);
-    //   const horizontalDistance = (this.overviewWidth * 0.5) / Math.tan(horizontalFov * 0.5);
-    //   distance = Math.max(verticalDistance, horizontalDistance, this.metersPerUnit * 3) * 1.7;
-
-    //   // The walkthrough UI intentionally overlays the left side of the canvas
-    //   // (Rooms panel). Centering the floorplan on the raw canvas therefore makes
-    //   // it feel pushed to the right. Shift only the TOP preset toward the
-    //   // unobstructed visual area; orbit/perspective presets keep the true model center.
-    //   // const visualOffsetX = this.overviewWidth * 0.12;
-    //   // target.x -= visualOffsetX;
-    // }
-if (name === 'top') {
-  const aspect = Math.max(this.camera.aspect || 1, 0.1);
-  const verticalFov = THREE.MathUtils.degToRad(this.camera.fov);
-
-  const horizontalFov =
-    2 * Math.atan(
-      Math.tan(verticalFov * 0.5) * aspect
-    );
-
-  const verticalDistance =
-    (this.overviewDepth * 0.5) /
-    Math.tan(verticalFov * 0.5);
-
-  const horizontalDistance =
-    (this.overviewWidth * 0.5) /
-    Math.tan(horizontalFov * 0.5);
-
-  distance = Math.max(
-    verticalDistance,
-    horizontalDistance,
-    this.metersPerUnit * 3
-  ) * 1.7;
-
-  // Small visual compensation for the walkthrough UI.
-  // Positive X moves the floorplan visually left.
-  // Positive Z moves the floorplan visually upward in this top-down camera.
-  const visualOffsetX = this.overviewWidth * 0.06;
-  const visualOffsetZ = this.overviewDepth * 0.05;
-
-  target.x += visualOffsetX;
-  target.z += visualOffsetZ;
-}
     const dir = (presets[name] || presets.perspective).normalize().multiplyScalar(distance);
     this.viewMode = 'overview';
     this.orbitControls.enabled = true;
@@ -671,10 +589,10 @@ if (name === 'top') {
     const forward = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     const right = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
     const wish = new THREE.Vector3();
-    if (this.keys.has('w') || this.keys.has('arrowup')) wish.add(forward);
-    if (this.keys.has('s') || this.keys.has('arrowdown')) wish.sub(forward);
-    if (this.keys.has('d') || this.keys.has('arrowright')) wish.add(right);
-    if (this.keys.has('a') || this.keys.has('arrowleft')) wish.sub(right);
+    if (this.keys.has('w')) wish.add(forward);
+    if (this.keys.has('s')) wish.sub(forward);
+    if (this.keys.has('d')) wish.add(right);
+    if (this.keys.has('a')) wish.sub(right);
     if (this.keys.has('q')) this.heightOffset = Math.min(this.heightOffset + 0.35 * dt, 0.35);
     if (this.keys.has('e')) this.heightOffset = Math.max(this.heightOffset - 0.35 * dt, -0.15);
 
@@ -778,10 +696,10 @@ if (name === 'top') {
     const right = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 0).setY(0).normalize();
     const fwd = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 2).negate().setY(0).normalize();
     const pan = new THREE.Vector3();
-    if (this.keys.has('w') || this.keys.has('arrowup')) pan.addScaledVector(fwd, speed * dt);
-    if (this.keys.has('s') || this.keys.has('arrowdown')) pan.addScaledVector(fwd, -speed * dt);
-    if (this.keys.has('a') || this.keys.has('arrowleft')) pan.addScaledVector(right, -speed * dt);
-    if (this.keys.has('d') || this.keys.has('arrowright')) pan.addScaledVector(right, speed * dt);
+    if (this.keys.has('w')) pan.addScaledVector(fwd, speed * dt);
+    if (this.keys.has('s')) pan.addScaledVector(fwd, -speed * dt);
+    if (this.keys.has('a')) pan.addScaledVector(right, -speed * dt);
+    if (this.keys.has('d')) pan.addScaledVector(right, speed * dt);
     if (this.keys.has('q')) this.zoom(-1);
     if (this.keys.has('e')) this.zoom(1);
     if (pan.lengthSq() > 0) {

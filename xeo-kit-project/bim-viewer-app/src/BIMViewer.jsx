@@ -48,7 +48,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
-    savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout,
+    savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout, updateSavedLayout, deleteSavedLayout,
     toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, applyMaterialDefinition, applyMaterialDefinitionToAllWalls, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage, saveNow
@@ -344,8 +344,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     }
   };
 
-  const handleSaveAsLayout = async (name, renderResult, renderConfig) => {
-    const savedLayout = await saveRenderedLayout(name, renderResult, renderConfig);
+  const handleSaveAsLayout = async (metadata, renderResult, renderConfig) => {
+    const savedLayout = await saveRenderedLayout(metadata, renderResult, renderConfig);
     setToastMessage(`Saved “${savedLayout.name}” to Layouts.`);
     setTimeout(() => setToastMessage(null), 2200);
     return savedLayout;
@@ -620,6 +620,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             savedLayoutsLoading={savedLayoutsLoading}
             savedLayoutsError={savedLayoutsError}
             onOpenSavedLayout={onOpenSavedLayout}
+            onEditSavedLayout={updateSavedLayout}
+            onDeleteSavedLayout={deleteSavedLayout}
+            fileNameForLayoutMetadata={fileName}
             onSelectLayout={onReplaceProject}
             onApplyTemplate={(templateId) => applyTemplate(templateId, engineActions.loadIFCAssetIntoScene)}
             placementMode={engineState.placementMode}
@@ -708,6 +711,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         setRenderResult={setRenderResult}
         setRenderError={setRenderError}
         onSaveAsLayout={handleSaveAsLayout}
+        activeFileName={fileName}
+        existingSavedLayouts={savedLayouts}
       />
       
       {engineState.isLoading && (

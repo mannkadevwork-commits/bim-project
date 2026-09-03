@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { Camera, Orbit, Image as ImageIcon, Sun, Moon, X, Loader2, Clock, Download, ExternalLink, AlertCircle, Box } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Camera, Orbit, Image as ImageIcon, Sun, Moon, X, Loader2, Clock, Download, ExternalLink, AlertCircle, Box, Layers3 } from 'lucide-react';
+import { LayoutMetadataForm } from './LayoutMetadataForm';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -7,12 +8,22 @@ export const RenderStudioModal = ({
   show, onClose, renderConfig, setRenderConfig, onExecute,
   isRendering, renderResult, renderTime, renderError, setRenderResult, setRenderError,
   onSaveAsLayout,
+  activeFileName = '',
+  existingSavedLayouts = [],
 }) => {
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState(null);
-  const [layoutName, setLayoutName] = useState('');
+  const [showLayoutForm, setShowLayoutForm] = useState(false);
   const [isSavingLayout, setIsSavingLayout] = useState(false);
   const [saveLayoutMessage, setSaveLayoutMessage] = useState(null);
+
+  useEffect(() => {
+    if (!show) {
+      setShowLayoutForm(false);
+      setSaveLayoutMessage(null);
+      setIsSavingLayout(false);
+    }
+  }, [show]);
 
   if (!show) return null;
 
@@ -20,22 +31,14 @@ export const RenderStudioModal = ({
   const walkthroughUrl = renderResult?.walkthroughUrl || (jobId ? `${window.location.origin}/walkthrough/${encodeURIComponent(jobId)}` : null);
   const modelUrl = renderResult?.modelUrl || (jobId ? `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb` : null);
 
-  const handleSaveAsLayout = async () => {
+  const handleSaveAsLayout = async (metadata) => {
     if (!onSaveAsLayout || isSavingLayout) return;
-
-    const name = layoutName.trim();
-    if (!name) {
-      setSaveLayoutMessage({ type: 'error', text: 'Enter a name for this layout.' });
-      return;
-    }
-
     setIsSavingLayout(true);
     setSaveLayoutMessage(null);
-
     try {
-      await onSaveAsLayout(name, renderResult, renderConfig);
-      setSaveLayoutMessage({ type: 'success', text: `Saved “${name}” to Layouts.` });
-      setLayoutName('');
+      await onSaveAsLayout(metadata, renderResult, renderConfig);
+      setSaveLayoutMessage({ type: 'success', text: `Saved “${metadata.name}” to Layouts.` });
+      setShowLayoutForm(false);
     } catch (error) {
       setSaveLayoutMessage({ type: 'error', text: error.message || 'Failed to save this layout.' });
     } finally {
@@ -106,30 +109,23 @@ export const RenderStudioModal = ({
           {renderConfig.type === '360' ? (
             <>
               {!renderResult?.isSavedLayout && onSaveAsLayout && (
-                <div className="flex w-full flex-col gap-2 rounded-xl border border-indigo-200 dark:border-indigo-900/60 bg-indigo-50/60 dark:bg-indigo-950/25 p-3 lg:w-auto lg:min-w-[360px]">
-                  <div className="flex gap-2">
-                    <input
-                      value={layoutName}
-                      onChange={(e) => setLayoutName(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter') handleSaveAsLayout(); }}
-                      maxLength={80}
-                      placeholder="e.g. Final Living Room"
-                      className="min-w-0 flex-1 rounded-lg border border-indigo-200 dark:border-indigo-800 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-800 dark:text-white outline-none focus:border-indigo-500"
-                    />
-                    <button
-                      type="button"
-                      onClick={handleSaveAsLayout}
-                      disabled={isSavingLayout}
-                      className="shrink-0 rounded-lg bg-[#ff914d] hover:bg-[#ff7a28] px-4 py-2 text-xs font-bold text-white transition disabled:cursor-wait disabled:opacity-60"
-                    >
-                      {isSavingLayout ? 'Saving…' : 'Save as Layout'}
-                    </button>
+                <div className="flex w-full items-center gap-3 rounded-xl border border-indigo-200/80 bg-indigo-50/60 p-3 dark:border-indigo-900/50 dark:bg-indigo-950/25 lg:w-auto">
+                  <div className="hidden sm:flex h-9 w-9 items-center justify-center rounded-lg bg-white text-indigo-500 shadow-sm dark:bg-slate-900">
+                    <Layers3 className="h-4 w-4" />
                   </div>
-                  {saveLayoutMessage && (
-                    <p className={`text-[11px] ${saveLayoutMessage.type === 'success' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
-                      {saveLayoutMessage.text}
-                    </p>
-                  )}
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-bold text-slate-800 dark:text-white">Save this render as a reusable layout</p>
+                    <p className="mt-0.5 text-[10px] text-slate-500 dark:text-slate-400">Choose category → sub-category → layout name.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { setSaveLayoutMessage(null); setShowLayoutForm(true); }}
+                    disabled={isSavingLayout}
+                    className="shrink-0 rounded-lg bg-[#ff914d] px-4 py-2.5 text-xs font-bold text-white transition hover:bg-[#ff7a28] disabled:cursor-wait disabled:opacity-60"
+                  >
+                    Save as Layout
+                  </button>
+                  {saveLayoutMessage && <span className={`hidden max-w-[220px] text-[11px] sm:block ${saveLayoutMessage.type === 'success' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>{saveLayoutMessage.text}</span>}
                 </div>
               )}
               <button
@@ -157,6 +153,34 @@ export const RenderStudioModal = ({
             </a>
           )}
         </div>
+      {showLayoutForm && (
+        <div className="absolute inset-0 z-[140] flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-md">
+          <div className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+            <div className="shrink-0 border-b border-slate-200 p-5 dark:border-slate-800">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-indigo-500">Save Layout</p>
+                <h3 className="mt-1 text-lg font-bold text-slate-900 dark:text-white">Organize this layout</h3>
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">The snapshot keeps the IFC and all scene edits exactly as rendered.</p>
+              </div>
+              <button type="button" onClick={() => setShowLayoutForm(false)} className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-white/5 dark:hover:text-white" aria-label="Close save layout form">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-5">
+            <LayoutMetadataForm
+              mode="create"
+              fileName={activeFileName}
+              existingLayouts={existingSavedLayouts}
+              submitting={isSavingLayout}
+              onSubmit={handleSaveAsLayout}
+              onCancel={() => setShowLayoutForm(false)}
+            />
+            </div>
+          </div>
+        </div>
+      )}
       </div>
     </div>
   );
@@ -204,5 +228,5 @@ export const RenderStudioModal = ({
         <button onClick={onExecute} className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-lg shadow-lg shadow-indigo-600/30 transition-all active:scale-[0.98] flex items-center justify-center gap-2"><Camera className="w-5 h-5" /> Start Render</button>
       </div>
     </div>
-  );
+  )
 };
