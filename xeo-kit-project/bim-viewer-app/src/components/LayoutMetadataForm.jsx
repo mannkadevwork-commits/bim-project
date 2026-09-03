@@ -243,7 +243,6 @@ export const LayoutMetadataForm = ({
             onChange={(event) => setLayoutName(event.target.value)}
             maxLength={80}
             placeholder="e.g. Warm Wood Final"
-            autoFocus={mode === 'create'}
             className="w-full rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm font-semibold text-slate-800 outline-none focus:border-indigo-500 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
           />
         </div>
