@@ -32,7 +32,7 @@ export const LeftPanel = ({
   const projectGroups = useMemo(() => {
     const map = new Map();
     (savedLayouts || [])
-      .filter((layout) => layout?.categoryType === 'project' && String(layout.categoryName || '').trim())
+      .filter((layout) => ['project', 'floorplan'].includes(layout?.categoryType) && String(layout.categoryName || '').trim())
       .forEach((layout) => {
         const name = String(layout.categoryName).trim();
         if (!map.has(name)) map.set(name, []);
@@ -59,11 +59,13 @@ export const LeftPanel = ({
 
   const selectedLayouts = useMemo(() => {
     if (layoutPath.level !== 'layouts') return [];
-    return (savedLayouts || []).filter((layout) =>
-      layout?.categoryType === layoutPath.type &&
-      String(layout.categoryName || '').trim() === layoutPath.category &&
-      String(layout.subCategory || '').trim() === layoutPath.subCategory
-    );
+    return (savedLayouts || []).filter((layout) => {
+      const isProjectLayout = ['project', 'floorplan'].includes(layout?.categoryType) && layoutPath.type === 'project';
+      const isExactType = layout?.categoryType === layoutPath.type;
+      return (isProjectLayout || isExactType) &&
+        String(layout.categoryName || '').trim() === layoutPath.category &&
+        String(layout.subCategory || '').trim() === layoutPath.subCategory;
+    });
   }, [savedLayouts, layoutPath]);
 
   const selectedCategory = useMemo(() => {
@@ -184,7 +186,7 @@ export const LeftPanel = ({
         ) : layoutPath.level === 'subcategories' ? (
           <div className="space-y-2 p-4">
             {selectedSubCategories.length ? selectedSubCategories.map(sub => {
-              const count = (savedLayouts || []).filter((layout) => layout.categoryType === layoutPath.type && String(layout.categoryName || '').trim() === layoutPath.category && String(layout.subCategory || '').trim() === sub).length;
+              const count = (savedLayouts || []).filter((layout) => { const isProjectLayout = ['project', 'floorplan'].includes(layout?.categoryType) && layoutPath.type === 'project'; const isExactType = layout?.categoryType === layoutPath.type; return (isProjectLayout || isExactType) && String(layout.categoryName || '').trim() === layoutPath.category && String(layout.subCategory || '').trim() === sub; }).length;
               return <button key={sub} type="button" onClick={() => openLayouts(sub)} className="group flex w-full items-center justify-between rounded-xl border border-slate-200 bg-white p-4 text-left transition hover:border-indigo-300 hover:shadow-sm dark:border-slate-700 dark:bg-slate-800/60"><div><p className="text-sm font-bold text-slate-900 dark:text-white">{sub}</p><p className="mt-1 text-[10px] text-slate-400">{count} layout{count === 1 ? '' : 's'}</p></div><span className="text-xl text-slate-300 group-hover:text-indigo-500">›</span></button>;
             }) : <div className="rounded-xl border border-dashed border-slate-200 p-6 text-center text-xs text-slate-400 dark:border-slate-700">No sub-categories exist under this project yet.</div>}
           </div>

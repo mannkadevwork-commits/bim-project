@@ -48,7 +48,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
-    savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout, updateSavedLayout, deleteSavedLayout,
+    savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout, updateSavedLayout, updateSavedLayoutSnapshot, deleteSavedLayout,
     toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, applyMaterialDefinition, applyMaterialDefinitionToAllWalls, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage, saveNow
@@ -351,6 +351,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     return savedLayout;
   };
 
+  const handleUpdateSavedLayoutSnapshot = async (layoutId, renderResult, renderConfig) => {
+    const updatedLayout = await updateSavedLayoutSnapshot(layoutId, renderResult, renderConfig);
+    setToastMessage(`Updated “${updatedLayout.name}” in Layouts.`);
+    setTimeout(() => setToastMessage(null), 2200);
+    return updatedLayout;
+  };
+
   const handleManualSave = async () => {
     if (!file || !jobId) return;
     setIsManualSaving(true);
@@ -396,10 +403,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   }, [engineActions, updateAsset]);
 
 
-  const handleOpenSaveLayout = () => {
-    setRenderConfig((previous) => ({ ...previous, type: '360' }));
-    setShowRenderStudio(true);
-  };
 
   return (
     <div
@@ -450,7 +453,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           onRestoreView={restoreCameraView}
           onDeleteView={deleteCameraView}
           onResetCamera={() => engineActions.camera.reset()}
-          onSaveLayout={handleOpenSaveLayout}
           />
         </>
       )}
@@ -711,6 +713,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         setRenderResult={setRenderResult}
         setRenderError={setRenderError}
         onSaveAsLayout={handleSaveAsLayout}
+        onUpdateSavedLayoutSnapshot={handleUpdateSavedLayoutSnapshot}
+        currentSavedLayout={savedLayouts.find((layout) => layout.id === activeProject?.savedLayoutId) || null}
         activeFileName={fileName}
         existingSavedLayouts={savedLayouts}
       />

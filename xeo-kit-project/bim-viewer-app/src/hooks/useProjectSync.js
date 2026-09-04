@@ -53,7 +53,6 @@ export const useProjectSync = (activeProject) => {
   const [lastSavedTime, setLastSavedTime] = useState(null);
   const [toastMessage, setToastMessage] = useState(null);
   const [customColor, setCustomColor] = useState('#ffffff');
-  const savedLayoutsRequestSeqRef = useRef(0);
 
   // Concurrency controls for saving
   const isSavingRef = useRef(false);
@@ -121,8 +120,6 @@ export const useProjectSync = (activeProject) => {
       })
       .finally(() => setLayoutsLoading(false));
 
-    const savedLayoutsRequestId = ++savedLayoutsRequestSeqRef.current;
-
     if (jobId) {
       setSavedLayoutsLoading(true);
       setSavedLayoutsError(null);
@@ -131,20 +128,12 @@ export const useProjectSync = (activeProject) => {
           if (!res.ok) throw new Error(`Failed to load saved layouts (${res.status})`);
           return res.json();
         })
-        .then(data => {
-          if (savedLayoutsRequestId !== savedLayoutsRequestSeqRef.current) return;
-          setSavedLayouts(Array.isArray(data?.layouts) ? data.layouts.map(normalizeSavedLayout) : []);
-        })
+        .then(data => setSavedLayouts(Array.isArray(data?.layouts) ? data.layouts.map(normalizeSavedLayout) : []))
         .catch(err => {
-          if (savedLayoutsRequestId !== savedLayoutsRequestSeqRef.current) return;
           console.error('[ProjectSync] Failed to load saved layouts:', err);
           setSavedLayoutsError(err.message);
         })
-        .finally(() => {
-          if (savedLayoutsRequestId === savedLayoutsRequestSeqRef.current) {
-            setSavedLayoutsLoading(false);
-          }
-        });
+        .finally(() => setSavedLayoutsLoading(false));
     } else {
       setSavedLayouts([]);
       setSavedLayoutsLoading(false);
@@ -242,23 +231,14 @@ export const useProjectSync = (activeProject) => {
 
   const refreshSavedLayouts = async () => {
     if (!jobId) return [];
-
-    const requestId = ++savedLayoutsRequestSeqRef.current;
     const response = await fetch(
       `${API_BASE_URL}/api/saved-layouts`,
       { cache: 'no-store' }
     );
     if (!response.ok) throw new Error(`Failed to refresh saved layouts (${response.status})`);
-
     const data = await response.json();
     const layouts = Array.isArray(data?.layouts) ? data.layouts.map(normalizeSavedLayout) : [];
-
-    // Ignore stale responses. This matters in production where a slower
-    // initial GET can otherwise overwrite a layout we just created.
-    if (requestId === savedLayoutsRequestSeqRef.current) {
-      setSavedLayouts(layouts);
-    }
-
+    setSavedLayouts(layouts);
     return layouts;
   };
 
@@ -320,23 +300,12 @@ export const useProjectSync = (activeProject) => {
     }
 
     const normalizedLayout = normalizeSavedLayout(data.layout);
+    setSavedLayouts(prev => [
+      normalizedLayout,
+      ...prev.filter(item => item.id !== normalizedLayout.id),
+    ]);
 
-    // Refresh from the server after creation so the Layouts panel uses the
-    // canonical persisted collection. The request sequence guard prevents a
-    // slower pre-save GET from replacing this newer state with stale data.
-    try {
-      const refreshedLayouts = await refreshSavedLayouts();
-      return refreshedLayouts.find(item => item.id === normalizedLayout.id) || normalizedLayout;
-    } catch (refreshError) {
-      // The save already succeeded. Keep the newly-created item visible even
-      // if the follow-up refresh fails transiently.
-      console.warn('[ProjectSync] Saved layout refresh failed after create:', refreshError);
-      setSavedLayouts(prev => [
-        normalizedLayout,
-        ...prev.filter(item => item.id !== normalizedLayout.id),
-      ]);
-      return normalizedLayout;
-    }
+    return normalizedLayout;
   };
 
   const updateSavedLayout = async (layoutId, metadata) => {
@@ -351,7 +320,55 @@ export const useProjectSync = (activeProject) => {
     );
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data?.success || !data?.layout) {
-      throw new Error(data?.error || `Failed to update layout (${response.status})`);
+      throw new Error(data?.error || `Failed to update layout metadata (${response.status})`);
+    }
+
+    const normalizedLayout = normalizeSavedLayout(data.layout);
+    setSavedLayouts(prev => prev.map(item => (
+      item.id === normalizedLayout.id ? normalizedLayout : item
+    )));
+    return normalizedLayout;
+  };
+
+  const updateSavedLayoutSnapshot = async (layoutId, renderResult, renderConfig) => {
+    if (!layoutId) throw new Error('Saved layout id is required.');
+    if (!jobId) throw new Error('No active project is available.');
+    if (!renderResult?.jobId || renderResult.jobId !== jobId) {
+      throw new Error('Render the current project before updating the saved layout.');
+    }
+
+    // Generate a fresh thumbnail from the just-rendered working-project GLB.
+    // The backend treats the working job as the canonical source for the new
+    // immutable saved-layout snapshot.
+    let thumbnailBlob = null;
+    const sourceModelUrl = renderResult.modelUrl ||
+      `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`;
+
+    try {
+      const modelResponse = await fetch(sourceModelUrl, { cache: 'no-store' });
+      if (!modelResponse.ok) {
+        throw new Error(`Could not read the final 360 model (${modelResponse.status}).`);
+      }
+      const modelBlob = await modelResponse.blob();
+      const modelFile = new File([modelBlob], `${jobId}.glb`, { type: 'model/gltf-binary' });
+      thumbnailBlob = await generateGlbThumbnail(modelFile, 320);
+    } catch (thumbnailError) {
+      console.warn('[ProjectSync] Updated-layout thumbnail generation failed; keeping the previous thumbnail.', thumbnailError);
+    }
+
+    const formData = new FormData();
+    formData.append('sourceJobId', jobId);
+    formData.append('renderConfig', JSON.stringify(renderConfig || {}));
+    if (thumbnailBlob) formData.append('thumbnail', thumbnailBlob, 'thumbnail.jpg');
+
+    const response = await fetch(
+      `${API_BASE_URL}/api/saved-layouts/${encodeURIComponent(layoutId)}/snapshot`,
+      { method: 'PUT', body: formData }
+    );
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok || !data?.success || !data?.layout) {
+      throw new Error(data?.error || `Failed to update saved layout (${response.status})`);
     }
 
     const normalizedLayout = normalizeSavedLayout(data.layout);
@@ -906,6 +923,7 @@ export const useProjectSync = (activeProject) => {
     refreshSavedLayouts,
     saveRenderedLayout,
     updateSavedLayout,
+    updateSavedLayoutSnapshot,
     deleteSavedLayout,
   };
 };

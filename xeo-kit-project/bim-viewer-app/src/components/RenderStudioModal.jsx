@@ -8,6 +8,8 @@ export const RenderStudioModal = ({
   show, onClose, renderConfig, setRenderConfig, onExecute,
   isRendering, renderResult, renderTime, renderError, setRenderResult, setRenderError,
   onSaveAsLayout,
+  onUpdateSavedLayoutSnapshot,
+  currentSavedLayout = null,
   activeFileName = '',
   existingSavedLayouts = [],
 }) => {
@@ -41,6 +43,29 @@ export const RenderStudioModal = ({
       setShowLayoutForm(false);
     } catch (error) {
       setSaveLayoutMessage({ type: 'error', text: error.message || 'Failed to save this layout.' });
+    } finally {
+      setIsSavingLayout(false);
+    }
+  };
+
+  const handleUpdateSavedLayout = async () => {
+    if (!onUpdateSavedLayoutSnapshot || !currentSavedLayout?.id || isSavingLayout) return;
+    setIsSavingLayout(true);
+    setSaveLayoutMessage(null);
+    try {
+      const updatedLayout = await onUpdateSavedLayoutSnapshot(currentSavedLayout.id, renderResult, renderConfig);
+      const nextWalkthroughUrl = updatedLayout.walkthroughUrl || walkthroughUrl;
+      const nextModelUrl = updatedLayout.modelUrl || modelUrl;
+      setRenderResult?.((previous) => previous ? ({
+        ...previous,
+        jobId: updatedLayout.renderJobId || previous.jobId,
+        modelUrl: nextModelUrl,
+        walkthroughUrl: nextWalkthroughUrl,
+        isSavedLayout: true,
+      }) : previous);
+      setSaveLayoutMessage({ type: 'success', text: `Updated “${updatedLayout.name}”.` });
+    } catch (error) {
+      setSaveLayoutMessage({ type: 'error', text: error.message || 'Failed to update this layout.' });
     } finally {
       setIsSavingLayout(false);
     }
@@ -108,7 +133,38 @@ export const RenderStudioModal = ({
         <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex flex-wrap justify-end items-center gap-3 bg-slate-50 dark:bg-slate-800/50">
           {renderConfig.type === '360' ? (
             <>
-              {!renderResult?.isSavedLayout && onSaveAsLayout && (
+              {currentSavedLayout?.id && onUpdateSavedLayoutSnapshot ? (
+                <>
+                  <div className="flex w-full items-center gap-3 rounded-xl border border-emerald-200/80 bg-emerald-50/60 p-3 dark:border-emerald-900/50 dark:bg-emerald-950/20 lg:w-auto">
+                    <div className="hidden sm:flex h-9 w-9 items-center justify-center rounded-lg bg-white text-emerald-600 shadow-sm dark:bg-slate-900">
+                      <Layers3 className="h-4 w-4" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-bold text-slate-800 dark:text-white">Update saved layout</p>
+                      <p className="mt-0.5 max-w-[260px] truncate text-[10px] text-slate-500 dark:text-slate-400">{currentSavedLayout.name} · save the current design as its latest version.</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleUpdateSavedLayout}
+                      disabled={isSavingLayout}
+                      className="shrink-0 rounded-lg bg-[#ff914d] px-4 py-2.5 text-xs font-bold text-white transition hover:bg-[#ff7a28] disabled:cursor-wait disabled:opacity-60"
+                    >
+                      {isSavingLayout ? 'Updating…' : 'Update Layout'}
+                    </button>
+                    {saveLayoutMessage && <span className={`hidden max-w-[220px] text-[11px] sm:block ${saveLayoutMessage.type === 'success' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>{saveLayoutMessage.text}</span>}
+                  </div>
+                  {onSaveAsLayout && (
+                    <button
+                      type="button"
+                      onClick={() => { setSaveLayoutMessage(null); setShowLayoutForm(true); }}
+                      disabled={isSavingLayout}
+                      className="shrink-0 rounded-xl border border-indigo-200 bg-indigo-50/70 px-4 py-3 text-xs font-bold text-indigo-600 transition hover:border-indigo-300 hover:bg-indigo-100 disabled:cursor-wait disabled:opacity-60 dark:border-indigo-900/60 dark:bg-indigo-950/20 dark:text-indigo-300 dark:hover:bg-indigo-950/40"
+                    >
+                      Save as New Layout
+                    </button>
+                  )}
+                </>
+              ) : onSaveAsLayout ? (
                 <div className="flex w-full items-center gap-3 rounded-xl border border-indigo-200/80 bg-indigo-50/60 p-3 dark:border-indigo-900/50 dark:bg-indigo-950/25 lg:w-auto">
                   <div className="hidden sm:flex h-9 w-9 items-center justify-center rounded-lg bg-white text-indigo-500 shadow-sm dark:bg-slate-900">
                     <Layers3 className="h-4 w-4" />
@@ -127,7 +183,7 @@ export const RenderStudioModal = ({
                   </button>
                   {saveLayoutMessage && <span className={`hidden max-w-[220px] text-[11px] sm:block ${saveLayoutMessage.type === 'success' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>{saveLayoutMessage.text}</span>}
                 </div>
-              )}
+              ) : null}
               <button
                 type="button"
                 onClick={downloadModel}

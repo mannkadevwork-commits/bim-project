@@ -353,6 +353,146 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
   }
 });
 
+// Update a saved layout with the latest rendered state from a working project.
+// The public saved-layout id remains stable while a new immutable render snapshot
+// is created and atomically promoted as the latest version.
+app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'), (req, res) => {
+  let newSnapshotDir = null;
+  try {
+    const { layoutId } = req.params;
+    const sourceJobId = String(req.body?.sourceJobId || '').trim();
+    if (!sourceJobId) return res.status(400).json({ error: 'sourceJobId is required.' });
+
+    const layout = findSavedLayout(layoutId);
+    if (!layout) return res.status(404).json({ error: 'Saved layout not found.' });
+
+    const sourceJobDir = path.join(jobsDir, sourceJobId);
+    if (!fs.existsSync(sourceJobDir)) {
+      return res.status(404).json({ error: 'Source working project not found.' });
+    }
+
+    const sourceManifest = readManifest(sourceJobDir);
+    if (sourceManifest?.status === 'archived') {
+      return res.status(403).json({ error: 'The current working project is archived and cannot update a saved layout.' });
+    }
+
+    const requiredFiles = [
+      'output.glb',
+      'navigation_surface.json',
+      'walk_areas.json',
+      'navigation_navmesh.bin',
+      'input.ifc',
+      'original.ifc',
+    ];
+    const missingFiles = requiredFiles.filter((fileName) => !fs.existsSync(path.join(sourceJobDir, fileName)));
+    if (missingFiles.length) {
+      return res.status(409).json({
+        error: `Render snapshot is incomplete. Missing: ${missingFiles.join(', ')}`,
+      });
+    }
+
+    let renderConfig = {};
+    if (req.body?.renderConfig) {
+      try {
+        renderConfig = JSON.parse(req.body.renderConfig);
+      } catch (_) {
+        return res.status(400).json({ error: 'Invalid renderConfig JSON.' });
+      }
+    }
+
+    let projectState = {};
+    const sourceStatePath = path.join(sourceJobDir, 'project_state.json');
+    if (fs.existsSync(sourceStatePath)) {
+      try {
+        projectState = JSON.parse(fs.readFileSync(sourceStatePath, 'utf-8'));
+      } catch (_) {
+        return res.status(409).json({ error: 'Current project state is invalid JSON.' });
+      }
+    }
+
+    // Stage the complete new immutable snapshot before touching the live layout
+    // record. A failure therefore leaves the previous saved version usable.
+    const newRenderJobId = generateSavedLayoutId();
+    newSnapshotDir = path.join(jobsDir, newRenderJobId);
+    fs.mkdirSync(newSnapshotDir, { recursive: true });
+
+    requiredFiles.forEach((fileName) => {
+      fs.copyFileSync(
+        path.join(sourceJobDir, fileName),
+        path.join(newSnapshotDir, fileName)
+      );
+    });
+
+    if (req.file?.buffer) {
+      fs.writeFileSync(path.join(newSnapshotDir, 'thumbnail.jpg'), req.file.buffer);
+    } else {
+      const previousThumbnail = layout.thumbnailFile
+        ? path.join(jobsDir, layout.renderJobId || layout.id, layout.thumbnailFile)
+        : null;
+      if (previousThumbnail && fs.existsSync(previousThumbnail)) {
+        fs.copyFileSync(previousThumbnail, path.join(newSnapshotDir, 'thumbnail.jpg'));
+      }
+    }
+
+    const now = new Date().toISOString();
+    writeManifest(newSnapshotDir, {
+      jobId: newRenderJobId,
+      type: 'saved_layout',
+      parentJobId: layout.parentJobId || sourceJobId,
+      name: layout.name,
+      originalFileName: `Saved Layout - ${layout.name}.ifc`,
+      categoryType: layout.categoryType,
+      categoryName: layout.categoryName,
+      subCategory: layout.subCategory,
+      createdAt: layout.createdAt || now,
+      updatedAt: now,
+      status: 'active',
+      updatedFromProjectJobId: sourceJobId,
+    });
+
+    fs.writeFileSync(
+      path.join(newSnapshotDir, 'project_state.json'),
+      JSON.stringify(projectState, null, 2)
+    );
+    fs.writeFileSync(
+      path.join(newSnapshotDir, 'saved_layout_state.json'),
+      JSON.stringify({
+        projectState,
+        renderConfig,
+        categoryType: layout.categoryType,
+        categoryName: layout.categoryName,
+        subCategory: layout.subCategory,
+        name: layout.name,
+        updatedAt: now,
+      }, null, 2)
+    );
+
+    const nextLayout = {
+      ...layout,
+      renderJobId: newRenderJobId,
+      updatedAt: now,
+      thumbnailFile: fs.existsSync(path.join(newSnapshotDir, 'thumbnail.jpg')) ? 'thumbnail.jpg' : null,
+    };
+
+    // Promote the new snapshot only after all files are present.
+    writeSavedLayoutRecord(nextLayout);
+
+    const previousRenderJobId = layout.renderJobId || layout.id;
+    const previousSnapshotDir = path.join(jobsDir, previousRenderJobId);
+    if (previousRenderJobId !== newRenderJobId && previousRenderJobId !== sourceJobId && fs.existsSync(previousSnapshotDir)) {
+      fs.rmSync(previousSnapshotDir, { recursive: true, force: true });
+    }
+
+    return res.json({ success: true, layout: decorateSavedLayout(nextLayout) });
+  } catch (error) {
+    if (newSnapshotDir && fs.existsSync(newSnapshotDir)) {
+      try { fs.rmSync(newSnapshotDir, { recursive: true, force: true }); } catch (_) {}
+    }
+    console.error('[SavedLayouts] Snapshot Update Error:', error);
+    return res.status(500).json({ error: 'Failed to update saved layout snapshot.' });
+  }
+});
+
 // Edit saved-layout metadata without changing the frozen render snapshot.
 app.patch('/api/saved-layouts/:layoutId', (req, res) => {
   try {

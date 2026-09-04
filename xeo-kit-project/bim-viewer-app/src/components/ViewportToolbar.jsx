@@ -45,7 +45,6 @@ export const ViewportToolbar = ({
   onRestoreView,
   onDeleteView,
   onResetCamera,
-  onSaveLayout,
 }) => {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [showSavedViews, setShowSavedViews] = useState(false);
@@ -196,20 +195,6 @@ export const ViewportToolbar = ({
           )}
         </div>
 
-        <div className="mx-0.5 h-8 w-px bg-slate-700/80" />
-
-        <button
-          type="button"
-          onClick={onSaveLayout}
-          className="flex h-10 items-center justify-center gap-2 rounded-xl bg-[#ff914d] px-3 text-[11px] font-bold text-white shadow-md shadow-[#ff914d]/20 transition hover:bg-[#ff7a28]"
-          title="Save current design as a reusable layout"
-          aria-label="Save current design as a reusable layout"
-        >
-          <Save className="h-4 w-4" />
-          <span>Save Layout</span>
-        </button>
-
-        <div className="mx-0.5 h-8 w-px bg-slate-700/80" />
 
         <button
           type="button"
