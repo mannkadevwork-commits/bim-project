@@ -74,6 +74,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const cameraManagerRef = useRef(null);
   const [selectedObject, setSelectedObject] = useState(null);
   const [selectedAssetId, setSelectedAssetId] = useState(null);
+  const [selectedElements, setSelectedElements] = useState([]);
+  const [multiSelectMode, setMultiSelectMode] = useState(false);
+  const selectedElementsRef = useRef([]);
+  const multiSelectModeRef = useRef(false);
+  useEffect(() => { selectedElementsRef.current = selectedElements; }, [selectedElements]);
+  useEffect(() => { multiSelectModeRef.current = multiSelectMode; }, [multiSelectMode]);
   const selectedAssetIdRef = useRef(null);
   const setSelectedAssetIdSafe = (id) => {
     selectedAssetIdRef.current = id ?? null;
@@ -133,6 +139,37 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     viewerRef, stretchHandlesRef, selectionCageRef, stretchFaceAdjacencyRef,
     revealedFaceKeyRef, revealedHandlesRef, stretchAnimFramesRef,
     hoveredStretchMeshRef, activeResizeFaceKeyRef, canvasRef
+  };
+
+  const clearSelection = () => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+
+    const ids = [...viewer.scene.selectedObjectIds];
+
+    for (const id of ids) {
+      const object = viewer.scene.objects[id];
+      if (object) object.selected = false;
+    }
+
+    for (const model of Object.values(viewer.scene.models || {})) {
+      if (model) model.selected = false;
+    }
+
+    setSelectedElements([]);
+    selectedElementsRef.current = [];
+    setSelectedObject(null);
+    setSelectedAssetIdSafe(null);
+
+    // Clearing the selection also leaves multi-select mode. This gives the
+    // user one predictable reset action (Clear / Esc / blank canvas click).
+    setMultiSelectMode(false);
+    multiSelectModeRef.current = false;
+
+    destroyStretchHandlesRef.current?.(stretchCtx);
+
+    transformModeRef.current = 'select';
+    setTransformMode('select');
   };
 
   const measureOriginalProjectCenter = async () => {
@@ -827,21 +864,6 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     viewerRef.current = viewer;
     initializeIFCEngine();
-    
-    // Clear BOTH object-level and model-level selection. This matters because
-    // the scene now contains the native IFC model plus separately loaded
-    // editable/ghost models.
-    const clearSelection = () => {
-      const ids = [...viewer.scene.selectedObjectIds];
-      for (const id of ids) {
-        const object = viewer.scene.objects[id];
-        if (object) object.selected = false;
-      }
-
-      for (const model of Object.values(viewer.scene.models || {})) {
-        if (model) model.selected = false;
-      }
-    };
 
     const isPlacedAssetEntity = (entity) => {
       const model = entity?.model;
@@ -854,10 +876,115 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       return !!model._assetMeta;
     };
 
+    const buildSelectionRecord = (entity, isPlacedAsset) => {
+      if (!entity) return null;
+
+      const metaObject = viewer.metaScene.metaObjects[entity.id];
+
+      if (isPlacedAsset) {
+        const model = entity.model;
+        const assetId = model?.id;
+        if (!assetId) return null;
+
+        const furnitureItem = (projectStateRef.current.furniture || [])
+          .find(item => item.instanceId === assetId);
+
+        const groupedProperties = {};
+        groupedProperties['General Details'] = [
+          { name: 'Element Name', value: metaObject?.name || furnitureItem?.name || 'Unnamed Asset' },
+          { name: 'IFC Class', value: metaObject?.type || 'GLB Asset' },
+          { name: 'Global ID', value: metaObject?.id || assetId },
+        ];
+
+        if (metaObject?.propertySets) {
+          metaObject.propertySets.forEach((propSet) => {
+            const groupName = propSet?.name || 'Other Properties';
+            if (!groupedProperties[groupName]) groupedProperties[groupName] = [];
+            (propSet.properties || []).forEach((prop) => {
+              groupedProperties[groupName].push({
+                name: prop?.name || 'Property',
+                value: prop?.value,
+              });
+            });
+          });
+        }
+
+        return {
+          id: assetId,
+          name: metaObject?.name || furnitureItem?.name || model?._assetMeta?.fileType?.toUpperCase() || '3D Asset',
+          type: metaObject?.type || (furnitureItem?.fileType === 'glb' || furnitureItem?.file_type === 'glb' ? 'GLB Furniture' : '3D Asset'),
+          groupedProperties,
+          isAsset: true,
+          isWall: false,
+        };
+      }
+
+      const type = metaObject?.type || entity.type || 'Generic Component';
+      const groupedProperties = {};
+      groupedProperties['General Details'] = [
+        { name: 'Element Name', value: metaObject?.name || 'Unnamed Object' },
+        { name: 'IFC Class', value: metaObject?.type || type },
+        { name: 'Global ID', value: metaObject?.id || entity.id },
+      ];
+
+      if (metaObject?.propertySets) {
+        metaObject.propertySets.forEach((propSet) => {
+          const groupName = propSet?.name || 'Other Properties';
+          if (!groupedProperties[groupName]) groupedProperties[groupName] = [];
+          (propSet.properties || []).forEach((prop) => {
+            groupedProperties[groupName].push({
+              name: prop?.name || 'Property',
+              value: prop?.value,
+            });
+          });
+        });
+      }
+
+      return {
+        id: entity.id,
+        name: metaObject?.name || 'Unnamed Object',
+        type,
+        groupedProperties,
+        isAsset: false,
+        isWall: String(type).toLowerCase().includes('ifcwall'),
+      };
+    };
+
+    const applySelectionState = (records) => {
+      selectedElementsRef.current = records;
+      setSelectedElements(records);
+      if (!records.length) {
+        setSelectedObject(null);
+        setSelectedAssetIdSafe(null);
+        destroyStretchHandlesRef.current?.(stretchCtx);
+        transformModeRef.current = 'select';
+        setTransformMode('select');
+        return;
+      }
+      if (records.length === 1) {
+        const record = records[0];
+        setSelectedAssetIdSafe(record.isAsset ? record.id : null);
+        setSelectedObject(record);
+        return;
+      }
+      const allWalls = records.every(record => record.isWall);
+      setSelectedAssetIdSafe(null);
+      setSelectedObject({
+        id: '__multi_selection__',
+        name: `${records.length} elements selected`,
+        type: allWalls ? 'IFCWALLMULTI' : 'Multiple Elements',
+        groupedProperties: {},
+      });
+      destroyStretchHandlesRef.current?.(stretchCtx);
+      transformModeRef.current = 'select';
+      setTransformMode('select');
+    };
+
+
+
     viewer.cameraControl.on('picked', (pickResult) => {
       if (isMeasuringRef.current) return;
       if (pickResult.entity?._stretchMeta?.isStretchHandle) return;
-      
       if (placementModeRef.current) {
         if (placementModeRef.current.type === 'door') {
           const wallSnap = getWallSnapData(viewerRef, pickResult.canvasPos);
@@ -870,121 +997,56 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         setPlacementMode(null);
         return;
       }
-      
       if (!pickResult.entity) return;
-      
+
       const entity = pickResult.entity;
       setIsRightPanelOpen(true);
       setRightTab('properties');
-
-      // IMPORTANT: Do not classify native IFC objects using
-      // entity.model.id !== currentModelRef.current.id. A native pick can
-      // legitimately expose a model wrapper whose ID does not compare equal,
-      // which incorrectly routes the click into the asset branch and selects
-      // the entire IFC model.
       const isPlacedAsset = isPlacedAssetEntity(entity);
+      const record = buildSelectionRecord(entity, isPlacedAsset);
+      if (!record?.id) return;
 
+      if (multiSelectModeRef.current) {
+        const currentSelection = selectedElementsRef.current;
+        const existing = currentSelection.find(item => item.id === record.id);
+        if (existing) {
+          if (isPlacedAsset) {
+            if (entity.model) entity.model.selected = false;
+          } else {
+            entity.selected = false;
+          }
+          applySelectionState(currentSelection.filter(item => item.id !== record.id));
+          return;
+        }
+
+        if (isPlacedAsset) {
+          if (entity.model) entity.model.selected = true;
+        } else {
+          entity.selected = true;
+          if (entity.model) entity.model.selected = false;
+        }
+        applySelectionState([...currentSelection, record]);
+        return;
+      }
+
+      clearSelection();
       if (isPlacedAsset) {
-        clearSelection();
         const assetModel = entity.model;
         if (!assetModel) return;
         assetModel.selected = true;
-        const assetId = assetModel.id;
-        if (!assetId) return;
-        setSelectedAssetIdSafe(assetId);
-        
-        buildStretchHandlesRef.current?.(stretchCtx, entity.model.id, true);
-        
-        transformModeRef.current = 'select';
-        setTransformMode('select');
+        buildStretchHandlesRef.current?.(stretchCtx, assetModel.id, true);
         setTimeout(() => configureTransformHandles('select'), 0);
-        
-        const assetMetaObject = viewer.metaScene.metaObjects[entity.id];
-        const furnitureItem = (projectStateRef.current.furniture || [])
-          .find(item => item.instanceId === entity.model.id);
-
-        if (assetMetaObject) {
-          const groupedProps = {};
-          groupedProps['General Details'] = [
-            { name: 'Element Name', value: assetMetaObject.name || furnitureItem?.name || 'Unnamed' },
-            { name: 'IFC Class', value: assetMetaObject.type || 'GLB Asset' },
-            { name: 'Global ID', value: assetMetaObject.id },
-          ];
-          if (assetMetaObject.propertySets) {
-            assetMetaObject.propertySets.forEach(propSet => {
-              const groupName = propSet.name || 'Other Properties';
-              if (!groupedProps[groupName]) groupedProps[groupName] = [];
-              if (propSet.properties) {
-                propSet.properties.forEach(prop =>
-                  groupedProps[groupName].push({ name: prop.name, value: prop.value })
-                );
-              }
-            });
-          }
-          setSelectedObject({
-            id: entity.model.id,
-            name: assetMetaObject.name || furnitureItem?.name || 'Unnamed Asset',
-            type: assetMetaObject.type || 'GLB Furniture',
-            groupedProperties: groupedProps,
-          });
-        } else {
-          setSelectedObject({
-            id: entity.model.id,
-            name: furnitureItem?.name || viewer.scene.models[entity.model.id]?._assetMeta?.fileType?.toUpperCase() || '3D Asset',
-            type: furnitureItem?.fileType === 'glb' || furnitureItem?.file_type === 'glb'
-              ? 'GLB Furniture'
-              : '3D Asset',
-            groupedProperties: {
-              'Asset Details': [
-                { name: 'Format', value: furnitureItem?.fileType || furnitureItem?.file_type || viewer.scene.models[entity.model.id]?._assetMeta?.fileType || 'unknown' },
-                { name: 'Instance ID', value: entity.model.id },
-              ],
-            },
-          });
-        }
-        return;
+      } else {
+        if (entity.model) entity.model.selected = false;
+        entity.selected = true;
       }
-      
-      // Native element branch.
-      // Directly set selected on the picked entity only.
-      // Do NOT use setObjectsSelected — it calls withObjects() which, if the
-      // id is not found in scene.objects directly, falls back to globalizing
-      // the id against every model and can match unintended objects.
-      clearSelection();
-      setSelectedAssetIdSafe(null);
-      if (entity.model) entity.model.selected = false;
-      entity.selected = true;
-      destroyStretchHandlesRef.current?.(stretchCtx);
-      transformModeRef.current = 'select';
-      setTransformMode('select');
-      
-      const metaObject = viewer.metaScene.metaObjects[entity.id];
-      if (metaObject) {
-        const groupedProps = {};
-        groupedProps['General Details'] = [
-          { name: 'Element Name', value: metaObject.name || 'Unnamed' },
-          { name: 'IFC Class', value: metaObject.type || 'Unknown' },
-          { name: 'Global ID', value: metaObject.id },
-        ];
-        if (metaObject.propertySets) {
-          metaObject.propertySets.forEach(propSet => {
-            const groupName = propSet.name || 'Other Properties';
-            if (!groupedProps[groupName]) groupedProps[groupName] = [];
-            if (propSet.properties) {
-              propSet.properties.forEach(prop =>
-                groupedProps[groupName].push({ name: prop.name, value: prop.value })
-              );
-            }
-          });
-        }
-        setSelectedObject({
-          id: entity.id,
-          name: metaObject.name || 'Unnamed Object',
-          type: metaObject.type || 'Generic Component',
-          groupedProperties: groupedProps
-        });
-      }
+      applySelectionState([record]);
     });
+
+    const onMultiSelectionKeyDown = (event) => {
+      if (event.key === 'Escape' && selectedElements.length) clearSelection();
+    };
+    window.addEventListener('keydown', onMultiSelectionKeyDown);
     
     const canvas = canvasRef.current;
     
@@ -1401,6 +1463,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     });
     
     return () => {
+      window.removeEventListener('keydown', onMultiSelectionKeyDown);
       canvas.removeEventListener('mousedown', onCanvasMouseDown, { capture: true });
       canvas.removeEventListener('mousemove', onCanvasHoverMove);
       canvas.removeEventListener('wheel', onCanvasWheel, { passive: false });
@@ -1483,12 +1546,20 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     if (!file || !jobId || !fileName) {
       clearScene();
+      setSelectedElements([]);
+      selectedElementsRef.current = [];
+      setMultiSelectMode(false);
+      multiSelectModeRef.current = false;
       setSelectedObject(null);
       setSelectedAssetIdSafe(null);
       return;
     }
 
     clearScene();
+    setSelectedElements([]);
+    selectedElementsRef.current = [];
+    setSelectedObject(null);
+    setSelectedAssetIdSafe(null);
     const fileExtension = activeProject?.savedLayoutId
       ? 'ifc'
       : fileName.split('.').pop().toLowerCase();
@@ -1693,6 +1764,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       navMode,
       selectedObject,
       selectedAssetId,
+      selectedElements,
+      multiSelectMode,
       placementMode,
       isMeasuring,
       measurementPhase,
@@ -1717,6 +1790,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       setNavMode,
       setSelectedObject,
       setSelectedAssetId: setSelectedAssetIdSafe,
+      setSelectedElements,
+      toggleMultiSelectMode: () => setMultiSelectMode(value => !value),
+      setMultiSelectMode,
+      clearSelection,
       setPlacementMode,
       camera: {
         fitScene: () => cameraManagerRef.current?.fitScene(),

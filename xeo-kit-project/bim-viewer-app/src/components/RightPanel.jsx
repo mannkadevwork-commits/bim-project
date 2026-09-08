@@ -19,7 +19,7 @@ const PREDEFINED_COLORS = {
 
 export const RightPanel = ({
   isOpen, onClose, rightTab, setRightTab,
-  selectedObject, activeAsset, selectedAssetId,
+  selectedObject, selectedElements = [], multiSelectMode = false, onToggleMultiSelect, onClearSelection, activeAsset, selectedAssetId,
   customColor, handleCustomColorChange,
   updateSelectedAsset, deleteSelectedAsset, projectState,
   engineState, engineActions, adoptIsolatedAsset, updateStructuralEdit,
@@ -28,6 +28,11 @@ export const RightPanel = ({
 }) => {
   const [propertySubTab, setPropertySubTab] = useState('details');
   const [materialMode, setMaterialMode] = useState('color');
+  const [wallSurfaceScope, setWallSurfaceScope] = useState('both');
+  const isMultiSelection = selectedElements.length > 1;
+  const selectedWallCount = selectedElements.filter(item => item?.isWall).length;
+  const selectedAssetCount = selectedElements.length - selectedWallCount;
+  const hasWallSelection = selectedWallCount > 0 || String(selectedObject?.type || '').toLowerCase().includes('ifcwall');
 
   // Unified State for Transform
   const [liveTransform, setLiveTransform] = useState({ 
@@ -75,7 +80,7 @@ export const RightPanel = ({
     let cancelled = false;
 
     // A "native element" is one where selectedObject exists but activeAsset doesn't
-    if (selectedObject && !activeAsset) {
+    if (selectedObject && !activeAsset && !isMultiSelection) {
       setIsInspecting(true);
       engineActions.inspectNativeElement(selectedObject.id).then((data) => {
         if (cancelled) return;
@@ -100,7 +105,7 @@ export const RightPanel = ({
     }
 
     return () => { cancelled = true; };
-  }, [selectedObject?.id]);
+  }, [selectedObject?.id, isMultiSelection]);
 
   const handleSlider = (axis, rawValue, type) => {
     const value = parseFloat(rawValue);
@@ -171,6 +176,16 @@ export const RightPanel = ({
               )}
             </div>
 
+            {(multiSelectMode || isMultiSelection) && (
+              <div className="flex items-center gap-2 rounded-lg border border-cyan-400/20 bg-cyan-500/10 px-2 py-1">
+                <span className="text-[9px] font-bold text-cyan-300">{selectedElements.length} selected</span>
+                {multiSelectMode && (
+                  <button type="button" onClick={() => onToggleMultiSelect?.()} className="text-[9px] font-semibold text-cyan-300 hover:text-white">Done</button>
+                )}
+                <button type="button" onClick={onClearSelection} className="text-[9px] font-semibold text-slate-400 hover:text-white">Clear</button>
+              </div>
+            )}
+
             <div className="flex bg-slate-200 dark:bg-slate-800 rounded-md p-0.5">
                 <button onClick={() => setRightTab('properties')} className={`px-3 py-1 text-[10px] font-bold rounded shadow-sm transition-all ${rightTab === 'properties' ? 'bg-white dark:bg-slate-700 text-indigo-600 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>Properties</button>
                 <button onClick={() => setRightTab('settings')} className={`px-3 py-1 text-[10px] font-bold rounded shadow-sm transition-all ${rightTab === 'settings' ? 'bg-white dark:bg-slate-700 text-indigo-600 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>Settings</button>
@@ -190,8 +205,8 @@ export const RightPanel = ({
             ) : (
                 <>
                     <div className="px-5 py-4 border-b border-slate-100 dark:border-slate-800 shrink-0">
-                        <h3 className="text-slate-900 dark:text-white font-bold text-sm break-all">{activeAsset ? projectState.furniture.find(f => f.instanceId === selectedAssetId)?.name : selectedObject.name}</h3>
-                        <span className="text-indigo-500 dark:text-indigo-400 text-[10px] uppercase tracking-wider font-bold">{activeAsset ? 'Placed IFC Asset' : selectedObject.type}</span>
+                        <h3 className="text-slate-900 dark:text-white font-bold text-sm break-all">{isMultiSelection ? `${selectedElements.length} elements selected` : (activeAsset ? projectState.furniture.find(f => f.instanceId === selectedAssetId)?.name : selectedObject.name)}</h3>
+                        <span className="text-indigo-500 dark:text-indigo-400 text-[10px] uppercase tracking-wider font-bold">{isMultiSelection ? `${selectedWallCount} walls${selectedAssetCount ? ` · ${selectedAssetCount} other` : ''}` : (activeAsset ? 'Placed IFC Asset' : selectedObject.type)}</span>
                     </div>
 
                     <div className="flex border-b border-slate-200 dark:border-slate-800 shrink-0">
@@ -203,7 +218,7 @@ export const RightPanel = ({
                         
                         {propertySubTab === 'details' && selectedObject && (
                             <div className="space-y-6">
-                                {Object.entries(selectedObject.groupedProperties).map(([groupName, properties]) => (
+                                {Object.entries(selectedObject?.groupedProperties || {}).map(([groupName, properties]) => (
                                     <div key={groupName}>
                                         <h4 className="py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 border-b border-slate-100 dark:border-slate-800/50">{groupName}</h4>
                                         <div className="space-y-1.5">
@@ -237,6 +252,25 @@ export const RightPanel = ({
                                     <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><Palette className="w-3.5 h-3.5"/> Surface Finish</h4>
                                     <span className="text-[9px] text-slate-400 dark:text-slate-500">Separate color, fabric and texture</span>
                                   </div>
+                                  {!activeAsset && hasWallSelection && (
+                                    <div className="mb-3 rounded-xl border border-indigo-200/80 bg-indigo-50/70 p-2.5 dark:border-indigo-500/20 dark:bg-indigo-500/5">
+                                      <div className="flex items-center justify-between gap-3">
+                                        <div>
+                                          <p className="text-[9px] font-bold uppercase tracking-[0.14em] text-indigo-500 dark:text-indigo-300">Apply to wall side</p>
+                                          <p className="mt-0.5 text-[8px] text-slate-500 dark:text-slate-400">Choose the side before picking a finish.</p>
+                                        </div>
+                                        <select
+                                          value={wallSurfaceScope}
+                                          onChange={(e) => setWallSurfaceScope(e.target.value)}
+                                          className="rounded-lg border border-indigo-200 bg-white px-2.5 py-1.5 text-[9px] font-bold text-slate-700 outline-none focus:border-indigo-400 dark:border-indigo-500/30 dark:bg-slate-900 dark:text-slate-200"
+                                        >
+                                          <option value="interior">Interior</option>
+                                          <option value="exterior">Exterior</option>
+                                          <option value="both">Both sides</option>
+                                        </select>
+                                      </div>
+                                    </div>
+                                  )}
                                   <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 mb-3">
                                     {['color','fabric','texture'].map(tab => (
                                       <button key={tab} type="button" onClick={() => setMaterialMode(tab)} className={`flex-1 py-1.5 rounded-lg text-[9px] font-bold capitalize transition-colors ${materialMode === tab ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>{tab}</button>
@@ -247,13 +281,13 @@ export const RightPanel = ({
                                       <div className="flex items-center gap-3">
                                         <label className="relative w-11 h-11 rounded-xl border border-slate-200 dark:border-slate-600 overflow-hidden shrink-0 cursor-pointer shadow-sm">
                                           <span className="absolute inset-0" style={{ backgroundColor: customColor || '#FFFFFF' }} />
-                                          <input aria-label="Choose material color" type="color" value={customColor || '#FFFFFF'} onChange={handleCustomColorChange} className="absolute inset-0 opacity-0 cursor-pointer" />
+                                          <input aria-label="Choose material color" type="color" value={customColor || '#FFFFFF'} onChange={(e) => handleCustomColorChange(e, wallSurfaceScope)} className="absolute inset-0 opacity-0 cursor-pointer" />
                                         </label>
                                         <div><div className="text-[9px] text-slate-400 uppercase tracking-wider">Current color</div><div className="font-mono text-xs text-slate-700 dark:text-slate-200 mt-1">{(customColor || '#FFFFFF').toUpperCase()}</div></div>
                                       </div>
                                       <div className="grid grid-cols-5 gap-2">
                                         {materialLibrary.filter(m => m.kind === 'color').map(material => (
-                                          <button key={material.id} type="button" title={material.name} onClick={() => onApplyMaterial?.(material)} style={{backgroundColor: material.color}} className={`aspect-square rounded-lg border transition-all hover:scale-105 ${selectedMaterial?.kind === 'color' && selectedMaterial?.color?.toUpperCase() === material.color.toUpperCase() ? 'border-[#ff914d] ring-2 ring-[#ff914d]/20' : 'border-slate-200 dark:border-slate-600'}`} />
+                                          <button key={material.id} type="button" title={material.name} onClick={() => onApplyMaterial?.(material, wallSurfaceScope)} style={{backgroundColor: material.color}} className={`aspect-square rounded-lg border transition-all hover:scale-105 ${selectedMaterial?.kind === 'color' && selectedMaterial?.color?.toUpperCase() === material.color.toUpperCase() ? 'border-[#ff914d] ring-2 ring-[#ff914d]/20' : 'border-slate-200 dark:border-slate-600'}`} />
                                         ))}
                                       </div>
                                     </div>
@@ -261,16 +295,16 @@ export const RightPanel = ({
                                   {materialMode !== 'color' && (
                                     <div className="grid grid-cols-2 gap-2">
                                       {materialLibrary.filter(m => m.kind === materialMode).map(material => (
-                                        <button key={material.id} type="button" onClick={() => onApplyMaterial?.(material)} className={`group flex items-center gap-2 p-2 rounded-xl border text-left transition-all ${selectedMaterial?.kind === material.kind && selectedMaterial?.texture?.id === material.id ? 'border-[#ff914d] bg-orange-50 dark:bg-orange-500/10 ring-1 ring-[#ff914d]/30' : 'border-slate-200/80 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600'}`}>
+                                        <button key={material.id} type="button" onClick={() => onApplyMaterial?.(material, wallSurfaceScope)} className={`group flex items-center gap-2 p-2 rounded-xl border text-left transition-all ${selectedMaterial?.kind === material.kind && selectedMaterial?.texture?.id === material.id ? 'border-[#ff914d] bg-orange-50 dark:bg-orange-500/10 ring-1 ring-[#ff914d]/30' : 'border-slate-200/80 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600'}`}>
                                           <span className="w-10 h-10 rounded-lg border border-black/10 dark:border-white/10 shrink-0 overflow-hidden shadow-sm bg-cover bg-center" style={{ backgroundColor: material.color, backgroundImage: material.textureSrc ? `url(${material.textureSrc})` : 'none' }} />
                                           <span className="min-w-0"><span className="block text-[9px] font-semibold text-slate-700 dark:text-slate-200 truncate">{material.name}</span><span className="block text-[8px] text-slate-400 mt-0.5">{material.category}</span></span>
                                         </button>
                                       ))}
                                     </div>
                                   )}
-                                  {onApplyMaterialToAllWalls && selectedObject && String(selectedObject.type || '').toLowerCase().includes('ifcwall') && (selectedMaterial || materialMode === 'color') && (selectedMaterial || customColor) && (
+                                  {onApplyMaterialToAllWalls && hasWallSelection && (selectedMaterial || materialMode === 'color') && (selectedMaterial || customColor) && (
                                     <div className="pt-3 mt-3 border-t border-slate-200 dark:border-slate-700/50">
-                                      <button type="button" onClick={() => onApplyMaterialToAllWalls(selectedMaterial || materialLibrary.find(m => m.kind === 'color' && m.color.toUpperCase() === (customColor || '').toUpperCase()) || { kind:'color', color:customColor, rgb:[parseInt(customColor.slice(1,3),16)/255,parseInt(customColor.slice(3,5),16)/255,parseInt(customColor.slice(5,7),16)/255] })} className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border border-indigo-200 dark:border-indigo-500/25 bg-indigo-50 dark:bg-indigo-500/8 text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-500/14 transition-colors">
+                                      <button type="button" onClick={() => onApplyMaterialToAllWalls(selectedMaterial || materialLibrary.find(m => m.kind === 'color' && m.color.toUpperCase() === (customColor || '').toUpperCase()) || { kind:'color', color:customColor, rgb:[parseInt(customColor.slice(1,3),16)/255,parseInt(customColor.slice(3,5),16)/255,parseInt(customColor.slice(5,7),16)/255] }, wallSurfaceScope)} className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border border-indigo-200 dark:border-indigo-500/25 bg-indigo-50 dark:bg-indigo-500/8 text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-500/14 transition-colors">
                                         <span className="text-left"><span className="block text-[10px] font-bold">Apply finish to all walls</span><span className="block text-[9px] text-indigo-500/80 dark:text-indigo-300/70 mt-0.5">Match the selected color, fabric or texture</span></span>
                                         <span className="text-[9px] font-bold uppercase tracking-wider">Apply →</span>
                                       </button>
@@ -278,6 +312,8 @@ export const RightPanel = ({
                                   )}
                                 </div>
 
+                                {!isMultiSelection && (
+                                  <>
                                 {/* Position */}
                                 <div>
                                     <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-1.5">
@@ -454,7 +490,15 @@ export const RightPanel = ({
                                     </button>
                                 )}
 
-                                {selectedObject && !activeAsset && (
+                                  </>
+                                )}
+
+                                {isMultiSelection ? (
+                                    <div className="mt-4 rounded-xl border border-cyan-400/15 bg-cyan-500/5 p-3 text-[10px] text-slate-400 leading-relaxed">
+                                        <Info className="w-3 h-3 inline mb-0.5 mr-1 text-cyan-300"/>
+                                        Multi-select is active. Choose a finish above and it will be applied to all selected elements. Wall-side scope affects walls; other elements receive the finish normally.
+                                    </div>
+                                ) : selectedObject && !activeAsset && (
                                     <div className="mt-4 p-3 bg-slate-50 dark:bg-slate-800 rounded text-[10px] text-slate-500 leading-relaxed border border-slate-100 dark:border-slate-700">
                                         <Info className="w-3 h-3 inline mb-0.5 mr-1 text-slate-400"/>
                                         You are inspecting a native architectural element. You can apply materials and move it via offset.

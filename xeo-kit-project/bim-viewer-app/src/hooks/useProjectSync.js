@@ -320,55 +320,7 @@ export const useProjectSync = (activeProject) => {
     );
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data?.success || !data?.layout) {
-      throw new Error(data?.error || `Failed to update layout metadata (${response.status})`);
-    }
-
-    const normalizedLayout = normalizeSavedLayout(data.layout);
-    setSavedLayouts(prev => prev.map(item => (
-      item.id === normalizedLayout.id ? normalizedLayout : item
-    )));
-    return normalizedLayout;
-  };
-
-  const updateSavedLayoutSnapshot = async (layoutId, renderResult, renderConfig) => {
-    if (!layoutId) throw new Error('Saved layout id is required.');
-    if (!jobId) throw new Error('No active project is available.');
-    if (!renderResult?.jobId || renderResult.jobId !== jobId) {
-      throw new Error('Render the current project before updating the saved layout.');
-    }
-
-    // Generate a fresh thumbnail from the just-rendered working-project GLB.
-    // The backend treats the working job as the canonical source for the new
-    // immutable saved-layout snapshot.
-    let thumbnailBlob = null;
-    const sourceModelUrl = renderResult.modelUrl ||
-      `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`;
-
-    try {
-      const modelResponse = await fetch(sourceModelUrl, { cache: 'no-store' });
-      if (!modelResponse.ok) {
-        throw new Error(`Could not read the final 360 model (${modelResponse.status}).`);
-      }
-      const modelBlob = await modelResponse.blob();
-      const modelFile = new File([modelBlob], `${jobId}.glb`, { type: 'model/gltf-binary' });
-      thumbnailBlob = await generateGlbThumbnail(modelFile, 320);
-    } catch (thumbnailError) {
-      console.warn('[ProjectSync] Updated-layout thumbnail generation failed; keeping the previous thumbnail.', thumbnailError);
-    }
-
-    const formData = new FormData();
-    formData.append('sourceJobId', jobId);
-    formData.append('renderConfig', JSON.stringify(renderConfig || {}));
-    if (thumbnailBlob) formData.append('thumbnail', thumbnailBlob, 'thumbnail.jpg');
-
-    const response = await fetch(
-      `${API_BASE_URL}/api/saved-layouts/${encodeURIComponent(layoutId)}/snapshot`,
-      { method: 'PUT', body: formData }
-    );
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok || !data?.success || !data?.layout) {
-      throw new Error(data?.error || `Failed to update saved layout (${response.status})`);
+      throw new Error(data?.error || `Failed to update layout (${response.status})`);
     }
 
     const normalizedLayout = normalizeSavedLayout(data.layout);
@@ -392,35 +344,64 @@ export const useProjectSync = (activeProject) => {
     return true;
   };
 
-  const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray) => {
+  const withWallSurfaceScope = (definition, surfaceScope) => ({
+    ...definition,
+    surfaceScope: ['interior', 'exterior', 'both'].includes(surfaceScope) ? surfaceScope : 'both',
+  });
+
+  const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray, surfaceScope = 'both') => {
     if (!selectedObject || !viewerRef.current) return 0;
-    const definition = { kind: 'color', color: hexColor, rgb: rgbArray };
+    const definition = withWallSurfaceScope({ kind: 'color', color: hexColor, rgb: rgbArray }, surfaceScope);
     applyMaterialDefinition(viewerRef, selectedObject, definition);
     return 1;
   };
 
   const applyMaterialDefinition = (viewerRef, selectedObject, definition) => {
     if (!selectedObject || !viewerRef.current || !definition) return 0;
-    const normalized = normalizeMaterialDefinition(definition);
-    void applySceneMaterial(viewerRef.current, selectedObject.id, normalized);
+    const isWall = String(selectedObject.type || '').toLowerCase().includes('ifcwall');
+    const normalized = normalizeMaterialDefinition(
+      isWall ? { ...definition, surfaceScope: definition.surfaceScope || 'both' } : definition
+    );
+    const previous = projectStateRef.current?.materials?.[selectedObject.id];
+
+    let sceneDefinition = normalized;
+    let nextWallState = null;
+
+    if (isWall && normalized.surfaceScope) {
+      const currentInterior = previous?.surfaces?.interior || previous?.interior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+      const currentExterior = previous?.surfaces?.exterior || previous?.exterior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+      const nextInterior = normalized.surfaceScope === 'exterior' ? currentInterior : { ...normalized, surfaceScope: null };
+      const nextExterior = normalized.surfaceScope === 'interior' ? currentExterior : { ...normalized, surfaceScope: null };
+
+      nextWallState = {
+        ...normalized,
+        surfaceScope: 'scoped',
+        surfaces: { interior: nextInterior || null, exterior: nextExterior || null },
+      };
+      sceneDefinition = nextWallState;
+    }
+
+    // Render from the full side-aware state immediately. This prevents changing
+    // the interior from accidentally clearing an already-customized exterior.
+    void applySceneMaterial(viewerRef.current, selectedObject.id, sceneDefinition);
     if (normalized.color) setCustomColor(normalized.color);
-    setProjectState(prev => ({
-      ...prev,
-      materials: { ...(prev.materials || {}), [selectedObject.id]: normalized },
-    }));
+
+    setProjectState(prev => {
+      const nextMaterials = { ...(prev.materials || {}) };
+      nextMaterials[selectedObject.id] = nextWallState || normalized;
+      return { ...prev, materials: nextMaterials };
+    });
     return 1;
   };
 
-  // ACTION: Apply one material color to every native wall in the current IFC scene.
-  // Scope is deliberately semantic (IFC class from metaObjects), not name matching.
-  const applyMaterialToAllWalls = (viewerRef, hexColor, rgbArray) => {
-    return applyMaterialDefinitionToAllWalls(viewerRef, { kind: 'color', color: hexColor, rgb: rgbArray });
+  const applyMaterialToAllWalls = (viewerRef, hexColor, rgbArray, surfaceScope = 'both') => {
+    return applyMaterialDefinitionToAllWalls(viewerRef, withWallSurfaceScope({ kind: 'color', color: hexColor, rgb: rgbArray }, surfaceScope));
   };
 
   const applyMaterialDefinitionToAllWalls = (viewerRef, definition) => {
     const viewer = viewerRef.current;
     if (!viewer || !definition) return 0;
-    const normalized = normalizeMaterialDefinition(definition);
+    const normalized = normalizeMaterialDefinition({ ...definition, surfaceScope: definition.surfaceScope || 'both' });
 
     const wallIds = [];
     const metaObjects = viewer.metaScene?.metaObjects || {};
@@ -431,16 +412,38 @@ export const useProjectSync = (activeProject) => {
       if (!id || !viewer.scene.objects[id]) return;
       wallIds.push(id);
     });
-
     if (!wallIds.length) return 0;
 
-    void applySceneMaterials(viewer, wallIds, normalized);
+    const stateBeforeApply = projectStateRef.current;
+    wallIds.forEach(id => {
+      const previous = stateBeforeApply?.materials?.[id];
+      const currentInterior = previous?.surfaces?.interior || previous?.interior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+      const currentExterior = previous?.surfaces?.exterior || previous?.exterior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+      const nextInterior = normalized.surfaceScope === 'exterior' ? currentInterior : { ...normalized, surfaceScope: null };
+      const nextExterior = normalized.surfaceScope === 'interior' ? currentExterior : { ...normalized, surfaceScope: null };
+      const sceneDefinition = {
+        ...normalized,
+        surfaceScope: 'scoped',
+        surfaces: { interior: nextInterior || null, exterior: nextExterior || null },
+      };
+      void applySceneMaterial(viewer, id, sceneDefinition);
+    });
 
     setCustomColor(normalized.color);
     setProjectState(prev => {
       const nextMaterials = { ...(prev.materials || {}) };
       wallIds.forEach(id => {
-        nextMaterials[id] = normalized;
+        const previous = nextMaterials[id];
+        const currentInterior = previous?.surfaces?.interior || previous?.interior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+        const currentExterior = previous?.surfaces?.exterior || previous?.exterior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+        nextMaterials[id] = {
+          ...normalized,
+          surfaceScope: 'scoped',
+          surfaces: {
+            interior: normalized.surfaceScope === 'exterior' ? currentInterior : { ...normalized, surfaceScope: null },
+            exterior: normalized.surfaceScope === 'interior' ? currentExterior : { ...normalized, surfaceScope: null },
+          },
+        };
       });
       return { ...prev, materials: nextMaterials };
     });
@@ -923,7 +926,6 @@ export const useProjectSync = (activeProject) => {
     refreshSavedLayouts,
     saveRenderedLayout,
     updateSavedLayout,
-    updateSavedLayoutSnapshot,
     deleteSavedLayout,
   };
 };

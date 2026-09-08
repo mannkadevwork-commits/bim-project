@@ -23,7 +23,7 @@ export const disposeNativeIFCMaterialController = (viewer) => {
   nativeControllers.delete(viewer);
 };
 
-export const normalizeMaterialDefinition = (definition) => ({
+const normalizeBaseMaterialDefinition = (definition) => ({
   kind: ['color', 'fabric', 'texture'].includes(definition?.kind) ? definition.kind : 'color',
   id: definition?.id || definition?.textureId || definition?.texture?.id || null,
   name: definition?.name || definition?.texture?.name || null,
@@ -36,6 +36,25 @@ export const normalizeMaterialDefinition = (definition) => ({
   roughness: Number.isFinite(definition?.roughness) ? definition.roughness : 0.8,
   metallic: Number.isFinite(definition?.metallic) ? definition.metallic : 0,
 });
+
+export const normalizeMaterialDefinition = (definition) => {
+  const base = normalizeBaseMaterialDefinition(definition);
+  const normalized = {
+    ...base,
+    surfaceScope: ['interior', 'exterior', 'both', 'scoped'].includes(definition?.surfaceScope)
+      ? definition.surfaceScope
+      : null,
+  };
+
+  if (definition?.surfaces && typeof definition.surfaces === 'object') {
+    normalized.surfaces = {
+      interior: definition.surfaces.interior ? normalizeBaseMaterialDefinition(definition.surfaces.interior) : null,
+      exterior: definition.surfaces.exterior ? normalizeBaseMaterialDefinition(definition.surfaces.exterior) : null,
+    };
+  }
+
+  return normalized;
+};
 
 const resolveTargets = (viewer, targetId) => {
   const direct = viewer?.scene?.objects?.[targetId];

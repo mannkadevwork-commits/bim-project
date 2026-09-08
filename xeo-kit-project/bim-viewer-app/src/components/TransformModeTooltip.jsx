@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Move, RotateCw, Scaling, Lock, Unlock, MoreHorizontal, Trash2, Palette, CircleHelp, Square, Diamond, Box } from 'lucide-react';
+import { Move, RotateCw, Scaling, Lock, Unlock, MoreHorizontal, Trash2, Palette, CircleHelp, CopyPlus, Square, Diamond, Box } from 'lucide-react';
 
 const QUICK_COLORS = ['#FFFFFF', '#000000', '#E74C3C', '#3498DB', '#F5DEB3', '#7F8C8D'];
 
@@ -12,12 +12,19 @@ export const TransformModeTooltip = ({
   currentColor = '#FFFFFF',
   materialLibrary = [],
   selectedMaterial = null,
+  selectionCount = 1,
+  isMultiSelection = false,
+  multiSelectMode = false,
   onMaterialSelect,
   canApplyToAllWalls = false,
   onApplyToAllWalls,
   onApplyMaterialToAllWalls,
+  wallSurfaceScope = 'both',
+  onWallSurfaceScopeChange,
   isNative,
   onIsolate,
+  onToggleMultiSelect,
+
   isDarkMode = true,
   resizeSubmode = 'face',
   onResizeSubmodeChange,
@@ -35,6 +42,7 @@ export const TransformModeTooltip = ({
   const helpRef = useRef(null);
 
   useEffect(() => {
+    if (isMultiSelection) setShowMore(true);
     const updatePlacement = () => {
       const rect = toolbarRef.current?.getBoundingClientRect();
       if (!rect) return;
@@ -70,7 +78,7 @@ export const TransformModeTooltip = ({
       window.removeEventListener('resize', updatePlacement);
       window.removeEventListener('scroll', updatePlacement, true);
     };
-  }, [anchorX, anchorY, showMore, showHelp, isNative, assetName]);
+  }, [anchorX, anchorY, showMore, showHelp, isNative, assetName, isMultiSelection]);
 
   useLayoutEffect(() => {
     const positionPopover = (node, setState, preferredSide = 'below') => {
@@ -201,11 +209,11 @@ export const TransformModeTooltip = ({
                 {assetName || 'Selected element'}
               </div>
               <div className="text-[8px] uppercase tracking-[0.17em] text-slate-500 mt-0.5">
-                {isNative ? 'Native element' : 'Editable transform'}
+                {isMultiSelection ? 'Multi-selection' : (isNative ? 'Native element' : 'Editable transform')}
               </div>
             </div>
             <span className={`shrink-0 text-[8px] px-1.5 py-0.5 rounded-md font-bold uppercase tracking-wider ${isNative ? 'bg-slate-700 text-slate-100 border border-slate-600' : 'bg-[#ff914d]/12 text-[#ffb07a] border border-[#ff914d]/25'}`}>
-              {isNative ? 'Native' : 'Editable'}
+              {isMultiSelection ? `${selectionCount} selected` : (isNative ? 'Native' : 'Editable')}
             </span>
           </div>
 
@@ -214,8 +222,8 @@ export const TransformModeTooltip = ({
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); handleModeClick('move'); }}
-            disabled={isNative}
-            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--move w-10 h-10 rounded-xl border border-transparent ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'move', 'move')}`}
+            disabled={isNative || isMultiSelection}
+            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--move w-10 h-10 rounded-xl border border-transparent ${isNative || isMultiSelection ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'move', 'move')}`}
             title={isNative ? 'Unlock Element first' : 'Move · W'}
           >
             <Move className="w-5 h-5" />
@@ -225,8 +233,8 @@ export const TransformModeTooltip = ({
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); handleModeClick('rotate'); }}
-            disabled={isNative}
-            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--rotate w-10 h-10 rounded-xl border border-transparent ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'rotate', 'rotate')}`}
+            disabled={isNative || isMultiSelection}
+            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--rotate w-10 h-10 rounded-xl border border-transparent ${isNative || isMultiSelection ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'rotate', 'rotate')}`}
             title={isNative ? 'Unlock Element first' : 'Rotate · E'}
           >
             <RotateCw className="w-5 h-5" />
@@ -236,8 +244,8 @@ export const TransformModeTooltip = ({
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); handleModeClick('stretch'); }}
-            disabled={isNative}
-            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--resize w-10 h-10 rounded-xl border border-transparent ${isNative ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'stretch', 'resize')}`}
+            disabled={isNative || isMultiSelection}
+            className={`relative flex items-center justify-center hci-transform-action hci-transform-action--resize w-10 h-10 rounded-xl border border-transparent ${isNative || isMultiSelection ? 'opacity-30 cursor-not-allowed text-slate-500' : buttonClass(mode === 'stretch', 'resize')}`}
             title={isNative ? 'Unlock Element first' : 'Resize · R'}
           >
             <Scaling className="w-5 h-5" />
@@ -246,7 +254,7 @@ export const TransformModeTooltip = ({
 
           <div className="w-px h-7 bg-slate-700/70 mx-0.5" />
 
-          <button
+          {!isMultiSelection && <button
             type="button"
             onClick={(e) => { e.stopPropagation(); if (isNative && onIsolate) onIsolate(); }}
             disabled={!isNative || !onIsolate}
@@ -254,6 +262,19 @@ export const TransformModeTooltip = ({
             title={isNative ? 'Unlock element for editing · U' : 'Editing already enabled'}
           >
             {isNative ? <Lock className="w-[17px] h-[17px]" /> : <Unlock className="w-[17px] h-[17px]" />}
+          </button>}
+
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleMultiSelect?.();
+            }}
+            className={`flex items-center justify-center hci-transform-action w-10 h-10 rounded-xl border ${multiSelectMode ? 'bg-cyan-400/15 text-cyan-300 ring-1 ring-cyan-300/35 border-cyan-300/20' : 'text-slate-400 hover:text-cyan-200 hover:bg-cyan-400/10 hover:border-cyan-300/20'}`}
+            title={multiSelectMode ? 'Exit multi-select mode' : 'Add elements to this selection'}
+            aria-label={multiSelectMode ? 'Exit multi-select mode' : 'Enable multi-select'}
+          >
+            <CopyPlus className="w-[17px] h-[17px]" strokeWidth={2.25} />
           </button>
 
           <button
@@ -381,31 +402,46 @@ export const TransformModeTooltip = ({
                   <div><div className="text-[9px] font-bold text-slate-300 uppercase tracking-[0.15em]">Surface finish</div><div className="text-[8px] text-slate-600 mt-0.5">Color, fabric and texture are separate tools</div></div>
                   <span className="w-6 h-6 rounded-lg border border-slate-600 shadow-inner bg-cover bg-center" style={{ backgroundColor: selectedMaterial?.color || currentColor, backgroundImage: selectedMaterial?.texture?.src ? `url(${selectedMaterial.texture.src})` : 'none' }} />
                 </div>
+                {canApplyToAllWalls && (
+                  <div className="mb-2 rounded-xl border border-indigo-400/20 bg-indigo-500/8 p-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-[8px] font-bold uppercase tracking-[0.14em] text-indigo-300">Wall side</div>
+                        <div className="text-[7px] text-slate-500">Choose before applying a finish</div>
+                      </div>
+                      <select value={wallSurfaceScope} onChange={(e)=>{e.stopPropagation();onWallSurfaceScopeChange?.(e.target.value)}} className="rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-[8px] font-bold text-slate-200 outline-none">
+                        <option value="interior">Interior</option>
+                        <option value="exterior">Exterior</option>
+                        <option value="both">Both sides</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
                 <div className="flex p-1 rounded-lg bg-slate-900/80 border border-slate-700 mb-2">
                   {['color','fabric','texture'].map(tab => <button key={tab} type="button" onClick={(e)=>{e.stopPropagation();setMaterialMode(tab)}} className={`flex-1 py-1.5 rounded-md text-[8px] font-bold capitalize ${materialMode===tab ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>{tab}</button>)}
                 </div>
                 {materialMode === 'color' ? (
                   <div className="grid grid-cols-5 gap-1.5">
-                    {materialLibrary.filter(m => m.kind === 'color').map(material => <button key={material.id} type="button" title={material.name} onClick={(e)=>{e.stopPropagation();onMaterialSelect?.(material)}} style={{backgroundColor:material.color}} className={`aspect-square rounded-md border ${selectedMaterial?.kind==='color' && selectedMaterial?.color?.toUpperCase()===material.color.toUpperCase() ? 'border-[#ff914d] ring-1 ring-[#ff914d]/40' : 'border-slate-700'}`} />)}
+                    {materialLibrary.filter(m => m.kind === 'color').map(material => <button key={material.id} type="button" title={material.name} onClick={(e)=>{e.stopPropagation();onMaterialSelect?.(material, wallSurfaceScope)}} style={{backgroundColor:material.color}} className={`aspect-square rounded-md border ${selectedMaterial?.kind==='color' && selectedMaterial?.color?.toUpperCase()===material.color.toUpperCase() ? 'border-[#ff914d] ring-1 ring-[#ff914d]/40' : 'border-slate-700'}`} />)}
                   </div>
                 ) : (
                   <div className="grid grid-cols-2 gap-1.5">
-                    {materialLibrary.filter(m => m.kind === materialMode).map(material => <button key={material.id} type="button" onClick={(e)=>{e.stopPropagation();onMaterialSelect?.(material)}} className={`flex items-center gap-2 p-1.5 rounded-lg border text-left ${selectedMaterial?.kind===material.kind && selectedMaterial?.texture?.id===material.id ? 'border-[#ff914d] bg-orange-500/10' : 'border-slate-700 bg-slate-900/50'}`}>
+                    {materialLibrary.filter(m => m.kind === materialMode).map(material => <button key={material.id} type="button" onClick={(e)=>{e.stopPropagation();onMaterialSelect?.(material, wallSurfaceScope)}} className={`flex items-center gap-2 p-1.5 rounded-lg border text-left ${selectedMaterial?.kind===material.kind && selectedMaterial?.texture?.id===material.id ? 'border-[#ff914d] bg-orange-500/10' : 'border-slate-700 bg-slate-900/50'}`}>
                       <span className="w-7 h-7 rounded-md border border-white/10 bg-cover bg-center" style={{backgroundColor:material.color,backgroundImage:material.textureSrc?`url(${material.textureSrc})`:'none'}} />
                       <span className="text-[8px] text-slate-200 truncate">{material.name}</span>
                     </button>)}
                   </div>
                 )}
                 <div className="flex gap-2 mt-2">
-                  <label className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg border border-slate-700 bg-slate-900/70 text-[9px] font-semibold text-slate-300 hover:border-slate-500 cursor-pointer"><Palette className="w-3 h-3"/> Custom color<input type="color" aria-label="Choose custom color" value={currentColor || '#FFFFFF'} className="sr-only" onChange={(e)=>onColorChange?.(e.target.value)} /></label>
+                  <label className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg border border-slate-700 bg-slate-900/70 text-[9px] font-semibold text-slate-300 hover:border-slate-500 cursor-pointer"><Palette className="w-3 h-3"/> Custom color<input type="color" aria-label="Choose custom color" value={currentColor || '#FFFFFF'} className="sr-only" onChange={(e)=>onColorChange?.(e.target.value, wallSurfaceScope)} /></label>
                 </div>
                 {canApplyToAllWalls && onApplyMaterialToAllWalls && selectedMaterial && (
-                  <button type="button" onClick={(e)=>{e.stopPropagation();onApplyMaterialToAllWalls(selectedMaterial)}} className="w-full mt-2.5 flex items-center justify-between px-2.5 py-2 rounded-lg border border-indigo-400/20 bg-indigo-500/8 text-indigo-200 hover:bg-indigo-500/15 hover:border-indigo-300/35 transition-colors"><span className="text-left"><span className="block text-[9px] font-bold">Apply finish to all walls</span><span className="block text-[7px] text-indigo-300/65 mt-0.5">Use the selected finish across every wall</span></span><span className="text-[8px] font-bold uppercase tracking-wider">Apply</span></button>
+                  <button type="button" onClick={(e)=>{e.stopPropagation();onApplyMaterialToAllWalls(selectedMaterial, wallSurfaceScope)}} className="w-full mt-2.5 flex items-center justify-between px-2.5 py-2 rounded-lg border border-indigo-400/20 bg-indigo-500/8 text-indigo-200 hover:bg-indigo-500/15 hover:border-indigo-300/35 transition-colors"><span className="text-left"><span className="block text-[9px] font-bold">Apply finish to all walls</span><span className="block text-[7px] text-indigo-300/65 mt-0.5">Use the selected finish across every wall</span></span><span className="text-[8px] font-bold uppercase tracking-wider">Apply</span></button>
                 )}
               </div>
             )}
             {onColorChange && onDelete && <div className="w-full h-px bg-slate-800 my-3" />}
-            {onDelete && (
+            {onDelete && !isMultiSelection && (
               <button
                 type="button"
                 onClick={(e) => { e.stopPropagation(); onDelete(); setShowMore(false); }}
