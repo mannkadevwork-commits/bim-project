@@ -331,50 +331,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     tooltipRef.current.innerHTML = '';
   };
 
-  const showSelectionTooltip = (clientX, clientY) => {
-    const tooltip = tooltipRef.current;
-    const selected = engineState.selectedObject;
-    if (!tooltip || !selected || selected.id === '__multi_selection__') {
-      hideCursorTooltip();
-      return;
-    }
-
-    const title = selected.name || 'Selected element';
-    const isMultiActive = !!engineState.multiSelectMode;
-
-    tooltip.style.display = 'flex';
-    tooltip.style.pointerEvents = 'auto';
-    tooltip.style.transform = `translate(${clientX + 15}px, ${clientY + 15}px)`;
-    tooltip.innerHTML = `
-      <div class="flex flex-col gap-2 min-w-[190px]">
-        <div>
-          <div class="text-[9px] uppercase tracking-wider text-slate-500 font-bold">Selected</div>
-          <div class="mt-0.5 max-w-[230px] truncate text-[11px] font-semibold text-white" title="${String(title).replace(/"/g, '&quot;')}">${title}</div>
-        </div>
-        <div class="flex items-center gap-2">
-          <button
-            data-selection-action="toggle-multi"
-            type="button"
-            class="rounded-lg border border-cyan-400/40 bg-cyan-400/10 px-2.5 py-1.5 text-[10px] font-bold text-cyan-300 hover:bg-cyan-400/20"
-          >
-            ${isMultiActive ? 'Multi-select active' : 'Multi-select'}
-          </button>
-          <span class="text-[9px] text-slate-500">Click another element to add</span>
-        </div>
-      </div>
-    `;
-
-    const button = tooltip.querySelector('[data-selection-action="toggle-multi"]');
-    if (button) {
-      button.onclick = (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        engineActions.setMultiSelectMode?.(true);
-        setTimeout(() => showSelectionTooltip(lastClickPos.x, lastClickPos.y), 0);
-      };
-    }
-  };
-
   const updateCursorTooltip = (clientX, clientY, offsetX, offsetY) => {
     if (!tooltipRef.current || !engineActions.getCursorWorldPosition) return;
     if (engineState.selectedObject && engineState.selectedObject.id !== '__multi_selection__') {
@@ -401,13 +357,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     }
   };
 
-  useEffect(() => {
-    if (engineState.selectedObject && engineState.selectedObject.id !== '__multi_selection__') {
-      showSelectionTooltip(lastClickPos.x, lastClickPos.y);
-    } else {
-      hideCursorTooltip();
-    }
-  }, [engineState.selectedObject?.id, engineState.multiSelectMode, engineState.selectedElements?.length]);
+
 
   const handlePointerDown = (e) => {
     refs.canvasRef.current?.focus();
@@ -603,15 +553,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           isNative={!!engineState.selectedObject && !activeAsset && engineState.selectedElements?.length <= 1}
           isDarkMode={isDarkMode}
           selectionCount={materialTargets.length}
+          selectedElements={materialTargets}
           isMultiSelection={materialTargets.length > 1}
           multiSelectMode={engineState.multiSelectMode}
-          onToggleMultiSelect={() => {
-            if (engineState.multiSelectMode) {
-              engineActions.setMultiSelectMode(false);
-            } else {
-              engineActions.setMultiSelectMode(true);
-            }
-          }}
+          onToggleMultiSelect={() => engineActions.toggleMultiSelectMode()}
           onIsolate={async () => {
             if (!engineState.selectedObject || activeAsset) return;
 

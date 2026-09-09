@@ -13,6 +13,7 @@ export const TransformModeTooltip = ({
   materialLibrary = [],
   selectedMaterial = null,
   selectionCount = 1,
+  selectedElements = [],
   isMultiSelection = false,
   multiSelectMode = false,
   onMaterialSelect,
@@ -203,14 +204,26 @@ export const TransformModeTooltip = ({
           onPointerDown={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <div className="flex items-center gap-2 px-2.5 min-w-0 max-w-[205px]">
+          <div className="flex items-center gap-2 px-2.5 min-w-0 max-w-[330px]">
             <div className="min-w-0">
               <div className="text-[11px] font-semibold text-white truncate" title={assetName}>
-                {assetName || 'Selected element'}
+                {isMultiSelection ? `${selectionCount} elements selected` : (assetName || 'Selected element')}
               </div>
               <div className="text-[8px] uppercase tracking-[0.17em] text-slate-500 mt-0.5">
                 {isMultiSelection ? 'Multi-selection' : (isNative ? 'Native element' : 'Editable transform')}
               </div>
+              {selectedElements.length > 1 && (
+                <div className="mt-1.5 flex items-center gap-1.5 overflow-hidden">
+                  {selectedElements.slice(0, 3).map((item) => (
+                    <span key={item.id} className="max-w-[105px] truncate rounded-md border border-slate-700/80 bg-slate-800/80 px-1.5 py-0.5 text-[8px] text-slate-300" title={item.name}>
+                      {item.name || item.type || 'Element'}
+                    </span>
+                  ))}
+                  {selectedElements.length > 3 && (
+                    <span className="shrink-0 text-[8px] text-slate-500">+{selectedElements.length - 3} more</span>
+                  )}
+                </div>
+              )}
             </div>
             <span className={`shrink-0 text-[8px] px-1.5 py-0.5 rounded-md font-bold uppercase tracking-wider ${isNative ? 'bg-slate-700 text-slate-100 border border-slate-600' : 'bg-[#ff914d]/12 text-[#ffb07a] border border-[#ff914d]/25'}`}>
               {isMultiSelection ? `${selectionCount} selected` : (isNative ? 'Native' : 'Editable')}
@@ -270,11 +283,15 @@ export const TransformModeTooltip = ({
               e.stopPropagation();
               onToggleMultiSelect?.();
             }}
-            className={`flex items-center justify-center hci-transform-action w-10 h-10 rounded-xl border ${multiSelectMode ? 'bg-cyan-400/15 text-cyan-300 ring-1 ring-cyan-300/35 border-cyan-300/20' : 'text-slate-400 hover:text-cyan-200 hover:bg-cyan-400/10 hover:border-cyan-300/20'}`}
-            title={multiSelectMode ? 'Exit multi-select mode' : 'Add elements to this selection'}
+            className={`flex h-10 items-center gap-1.5 rounded-xl border px-2.5 transition-colors ${multiSelectMode ? 'border-cyan-300/25 bg-cyan-400/12 text-cyan-200 ring-1 ring-cyan-300/20' : 'border-slate-700/80 bg-slate-900/30 text-slate-300 hover:border-cyan-300/20 hover:bg-cyan-400/8 hover:text-cyan-200'}`}
+            title={multiSelectMode ? 'Multi-select ON · click again or press Esc to finish' : 'Enable multi-select'}
             aria-label={multiSelectMode ? 'Exit multi-select mode' : 'Enable multi-select'}
           >
             <CopyPlus className="w-[17px] h-[17px]" strokeWidth={2.25} />
+            <span className="text-[8px] font-bold uppercase tracking-wider">Multi-select</span>
+            <span className={`rounded-md px-1.5 py-0.5 text-[7px] font-extrabold tracking-wider ${multiSelectMode ? 'bg-cyan-300/15 text-cyan-200' : 'bg-slate-800 text-slate-500'}`}>
+              {multiSelectMode ? 'ON' : 'OFF'}
+            </span>
           </button>
 
           <button

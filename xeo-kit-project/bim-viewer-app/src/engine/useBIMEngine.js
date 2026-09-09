@@ -80,6 +80,24 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const multiSelectModeRef = useRef(false);
   useEffect(() => { selectedElementsRef.current = selectedElements; }, [selectedElements]);
   useEffect(() => { multiSelectModeRef.current = multiSelectMode; }, [multiSelectMode]);
+
+  useEffect(() => {
+    const handleMultiSelectEscape = (event) => {
+      if (event.key !== 'Escape' || !multiSelectModeRef.current) return;
+      multiSelectModeRef.current = false;
+      setMultiSelectMode(false);
+    };
+
+    window.addEventListener('keydown', handleMultiSelectEscape);
+    return () => window.removeEventListener('keydown', handleMultiSelectEscape);
+  }, []);
+
+  const toggleMultiSelectMode = () => {
+    const next = !multiSelectModeRef.current;
+    multiSelectModeRef.current = next;
+    setMultiSelectMode(next);
+    return next;
+  };
   const selectedAssetIdRef = useRef(null);
   const setSelectedAssetIdSafe = (id) => {
     selectedAssetIdRef.current = id ?? null;
@@ -1791,8 +1809,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       setSelectedObject,
       setSelectedAssetId: setSelectedAssetIdSafe,
       setSelectedElements,
-      toggleMultiSelectMode: () => setMultiSelectMode(value => !value),
-      setMultiSelectMode,
+      toggleMultiSelectMode,
+      setMultiSelectMode: (value) => {
+        multiSelectModeRef.current = !!value;
+        setMultiSelectMode(!!value);
+      },
       clearSelection,
       setPlacementMode,
       camera: {
