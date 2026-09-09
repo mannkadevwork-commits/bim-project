@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
-  ArrowLeft, Camera, ChevronDown, ChevronUp, CircleHelp, Expand, Eye, EyeOff,
-  Fullscreen, Gauge, Minus, Move3d, Play, Plus, RotateCcw,
-  RotateCw, Settings2, Square, StopCircle, Target, View, X,
+  ArrowLeft, Camera, ChevronDown, ChevronUp, CircleHelp, Fullscreen, Gauge,
+  Minus, Map, Move3d, MousePointer2, Play, Plus, RotateCcw, RotateCw,
+  Settings2, Target, View, X,
 } from 'lucide-react';
 import { useWalkthroughEngine } from '../hooks/useWalkthroughEngine';
 
@@ -28,7 +28,7 @@ export default function WalkthroughPage() {
   const viewportRef = useRef(null);
   const [railOpen, setRailOpen] = useState(true);
   const [touring, setTouring] = useState(false);
-  const [heightOffset, setHeightOffset] = useState(0);
+  const [heightOffset, setHeightOffset] = useState(0.35);
   const [sensitivity, setSensitivity] = useState(0.0048);
   const [viewMode, setViewMode] = useState('overview');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -38,10 +38,14 @@ export default function WalkthroughPage() {
   const lockToastTimer = useRef(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [autoRotate, setAutoRotate] = useState(false);
-  const [fov, setFov] = useState(70);
+  const [fov, setFov] = useState(120);
+  const [walkMode, setWalkMode] = useState('guided');
 
   const walkthrough = useWalkthroughEngine({ containerRef: viewportRef, jobId });
   const areas = walkthrough.areas || [];
+  const navigationPlan = walkthrough.navigationPlan || null;
+  const navigationHotspots = navigationPlan?.hotspots || [];
+  const effectiveWalkMode = walkthrough.walkMode || walkMode;
 
   useEffect(() => {
     if (walkthrough.lookLocked === undefined) return;
@@ -60,11 +64,14 @@ export default function WalkthroughPage() {
   const statusText = useMemo(() => {
     if (walkthrough.status === 'loading') return 'Loading walkthrough…';
     if (walkthrough.status === 'error') return walkthrough.message || 'Walkthrough unavailable';
+    if (walkthrough.stuck) return 'Navigation paused · choose a nearby floor marker or reposition safely';
     if (walkthrough.message) return walkthrough.message;
-    return viewMode === 'walk'
-      ? (walkthrough.lookLocked ? 'View locked · double-click to unlock · W/A/S/D walk' : 'Free look · W/A/S/D walk · double-click to lock')
-      : 'Overview · orbit / wheel zoom · W/A/S/D pan · Q/E zoom · click Start Walkthrough';
-  }, [walkthrough.status, walkthrough.message, viewMode]);
+    if (viewMode === 'overview') return 'Preview · orbit and zoom · click Start Walkthrough';
+    if (effectiveWalkMode === 'guided') return 'Guided · click a floor destination to move · camera slowly pans automatically';
+    return walkthrough.lookLocked
+      ? 'Explore · view locked · double-click to unlock'
+      : 'Explore · move with W/A/S/D · move mouse to look';
+  }, [walkthrough.status, walkthrough.message, viewMode, effectiveWalkMode, walkthrough.lookLocked]);
 
   const applyFov = (value) => {
     const next = Number(value);
@@ -82,6 +89,16 @@ export default function WalkthroughPage() {
     const next = Number(value);
     setHeightOffset(next);
     walkthrough.setHeightOffset(next);
+  };
+
+  const switchWalkMode = (mode) => {
+    setWalkMode(mode);
+    walkthrough.setWalkMode(mode);
+    if (mode === 'guided') {
+      walkthrough.setLookLocked(true);
+    } else {
+      walkthrough.setLookLocked(false);
+    }
   };
 
   const switchViewMode = (mode) => {
@@ -105,6 +122,8 @@ export default function WalkthroughPage() {
     if (!areas.length) return;
     setTouring(true);
     setViewMode('walk');
+    setWalkMode('guided');
+    walkthrough.setWalkMode('guided');
     walkthrough.setViewMode('walk');
     for (const area of areas) {
       if (!touring) break;
@@ -147,37 +166,99 @@ export default function WalkthroughPage() {
         </div>
       )} */}
 
-      <div className="absolute left-4 top-20 z-30 w-[270px] rounded-2xl border border-white/10 bg-slate-950/72 shadow-2xl backdrop-blur-xl">
-        <button className="flex w-full items-center justify-between px-4 py-3 text-left" onClick={() => setRailOpen((v) => !v)}>
-          <div>
-            <div className="text-sm font-semibold">Rooms</div>
-            <div className="mt-0.5 text-[11px] text-slate-400">Quick room switch</div>
-          </div>
-          {railOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-        </button>
-        {railOpen && (
-          <div className="max-h-[56vh] overflow-y-auto border-t border-white/10 p-2">
-            {areas.map((area) => {
-              const active = walkthrough.activeArea === area.label;
-              return (
-                <button
-                  key={area.id || area.label}
-                  type="button"
-                  onClick={() => walkthrough.switchRoom(area)}
-                  className={`mb-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition ${active ? 'bg-[#ff914d]/15 text-[#ffb27a]' : 'text-slate-200 hover:bg-white/5'}`}
-                >
-                  <span className={`h-2 w-2 rounded-full ${active ? 'bg-[#ff914d] shadow-[0_0_10px_rgba(255,145,77,.7)]' : 'border border-slate-500'}`} />
-                  <span className="text-sm font-medium">{area.label}</span>
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
       {viewMode === 'walk' && (
+        <div className="absolute left-4 top-20 z-30 w-[320px] overflow-hidden rounded-3xl border border-white/10 bg-slate-950/62 shadow-[0_24px_80px_rgba(0,0,0,.35)] backdrop-blur-2xl">
+          <button
+            type="button"
+            className="flex w-full items-center justify-between px-4 py-3.5 text-left"
+            onClick={() => setRailOpen((v) => !v)}
+          >
+            <div className="flex items-center gap-3">
+              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-white/10 bg-white/[0.05]">
+                <Map className="h-4 w-4 text-[#ff914d]" />
+              </div>
+              <div>
+                <div className="text-sm font-semibold text-white">Floor map</div>
+                <div className="mt-0.5 text-[11px] text-slate-400">{navigationHotspots.length} walkable destinations</div>
+              </div>
+            </div>
+            {railOpen ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
+          </button>
+
+          {railOpen && (
+            <div className="border-t border-white/10 p-3">
+              {!navigationPlan ? (
+                <div className="flex h-[220px] items-center justify-center rounded-2xl border border-dashed border-white/10 text-xs text-slate-500">
+                  Building floor map…
+                </div>
+              ) : (
+                <div className="relative aspect-[4/3] overflow-hidden rounded-2xl border border-white/10 bg-slate-900/65 shadow-inner pointer-events-auto">
+                  <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_45%,rgba(255,145,77,.07),transparent_58%)]" />
+                  <svg
+                    className="absolute inset-0 h-full w-full"
+                    viewBox={`${navigationPlan.bounds.minX} ${navigationPlan.bounds.minZ} ${Math.max(0.001, navigationPlan.bounds.maxX - navigationPlan.bounds.minX)} ${Math.max(0.001, navigationPlan.bounds.maxZ - navigationPlan.bounds.minZ)}`}
+                    preserveAspectRatio="xMidYMid meet"
+                    role="img"
+                    aria-label="Floor navigation map"
+                  >
+                    <g opacity="0.46">
+                      {navigationPlan.triangles.map((tri, index) => (
+                        <polygon
+                          key={`floor-${index}`}
+                          points={`${tri[0]},${tri[1]} ${tri[2]},${tri[3]} ${tri[4]},${tri[5]}`}
+                          fill="rgba(255,255,255,0.055)"
+                        />
+                      ))}
+                    </g>
+                    <g>
+                      {navigationHotspots.map((hotspot, index) => {
+                        const active = walkthrough.activeHotspotId === hotspot.id;
+                        const size = Math.max(0.055, Math.min(0.16, Math.min(navigationPlan.bounds.maxX - navigationPlan.bounds.minX, navigationPlan.bounds.maxZ - navigationPlan.bounds.minZ) * 0.012));
+                        return (
+                          <g
+                            key={hotspot.id}
+                            role="button"
+                            tabIndex={0}
+                            aria-label={`Go to ${hotspot.label}`}
+                            onClick={() => walkthrough.navigateToHotspot({ id: hotspot.id, label: hotspot.label, x: hotspot.x, y: 0, z: hotspot.z })}
+                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); walkthrough.navigateToHotspot({ id: hotspot.id, label: hotspot.label, x: hotspot.x, y: 0, z: hotspot.z }); } }}
+                            className="cursor-pointer outline-none"
+                          >
+                            <circle cx={hotspot.x} cy={hotspot.z} r={active ? size * 2.05 : size * 1.65} fill="rgba(255,145,77,0.10)" />
+                            <circle cx={hotspot.x} cy={hotspot.z} r={active ? size * 1.25 : size * 1.05} fill={active ? 'rgba(255,145,77,0.95)' : 'rgba(255,145,77,0.72)'} stroke="rgba(255,214,186,0.95)" strokeWidth={size * 0.22} />
+                            <text x={hotspot.x} y={hotspot.z + size * 0.35} textAnchor="middle" fontSize={Math.max(0.08, size * 0.9)} fill="white" fontWeight="700" pointerEvents="none">{index + 1}</text>
+                            <title>Go to {hotspot.label || `Navigation ${index + 1}`}</title>
+                          </g>
+                        );
+                      })}
+                    </g>
+                  </svg>
+                  <div className="pointer-events-none absolute bottom-2 left-2 rounded-lg border border-white/10 bg-slate-950/55 px-2 py-1 text-[10px] text-slate-400 backdrop-blur-md">
+                    Click a point to move
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
+                <span>Orange = walkable destination</span>
+                <span>{effectiveWalkMode === 'guided' ? 'Guided' : 'Explore'}</span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {viewMode === 'walk' && walkthrough.stuck && walkthrough.recoveryAvailable && (
+        <div className="absolute bottom-24 left-5 z-40 w-[290px] rounded-2xl border border-[#ff914d]/25 bg-slate-950/88 p-3 shadow-2xl backdrop-blur-xl">
+          <div className="text-xs font-semibold text-white">Need a safe position?</div>
+          <div className="mt-1 text-[11px] leading-4 text-slate-400">The current location has limited navigation clearance. Reposition to the nearest safe floor marker.</div>
+          <button type="button" onClick={() => walkthrough.recoverToSafeSpot()} className="mt-3 w-full rounded-xl bg-[#ff914d] px-3 py-2 text-xs font-bold text-slate-950 transition hover:bg-[#ff7a28]">Move to safe position</button>
+        </div>
+      )}
+
+      {viewMode === 'walk' && effectiveWalkMode === 'explore' && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-          <div className="h-2.5 w-2.5 rounded-full border border-white/80 bg-white/10 shadow-[0_0_16px_rgba(255,255,255,.45)]" />
+          <div className="h-2.5 w-2.5 rounded-full border border-white/75 bg-white/10 shadow-[0_0_16px_rgba(255,255,255,.4)]" />
         </div>
       )}
 
@@ -202,12 +283,12 @@ export default function WalkthroughPage() {
           <div className="space-y-4">
             <label className="block">
               <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Field of view (FOV)</span><span className="font-mono text-slate-500">{fov}°</span></div>
-              <input className="w-full accent-[#ff914d]" type="range" min="30" max="110" step="1" value={fov} onChange={(e) => applyFov(e.target.value)} />
-              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Narrow</span><span>Normal (70°)</span><span>Wide</span></div>
+              <input className="w-full accent-[#ff914d]" type="range" min="30" max="120" step="1" value={fov} onChange={(e) => applyFov(e.target.value)} />
+              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Narrow</span><span>Presentation</span><span>Wide</span></div>
             </label>
-            <label className="block">
+            <label className={`block ${''}`}>
               <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Mouse sensitivity</span><span className="font-mono text-slate-500">{sensitivity.toFixed(4)}</span></div>
-              <input className="w-full accent-[#ff914d]" type="range" min="0.0015" max="0.009" step="0.0001" value={sensitivity} onChange={(e) => applySensitivity(e.target.value)} />
+              <input disabled={effectiveWalkMode === 'guided'} className="w-full accent-[#ff914d]" type="range" min="0.0015" max="0.009" step="0.0001" value={sensitivity} onChange={(e) => applySensitivity(e.target.value)} />
               <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Precise</span><span>Fast</span></div>
             </label>
             <label className="block">
@@ -215,7 +296,7 @@ export default function WalkthroughPage() {
               <input className="w-full accent-[#ff914d]" type="range" min="-0.15" max="0.35" step="0.01" value={heightOffset} onChange={(e) => applyHeight(e.target.value)} />
               <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Lower</span><span>Neutral</span><span>Higher</span></div>
             </label>
-            <button type="button" onClick={() => { applyHeight(0); applyFov(70); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-300 hover:bg-white/[0.06]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
+            <button type="button" onClick={() => { applyHeight(0.35); applyFov(120); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-300 hover:bg-white/[0.06]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
           </div>
         </div>
       )}
@@ -248,11 +329,12 @@ export default function WalkthroughPage() {
         <div className="absolute bottom-24 right-5 z-40 w-[300px] rounded-2xl border border-white/10 bg-slate-950/92 p-4 text-sm text-slate-300 shadow-2xl backdrop-blur-2xl">
           <div className="mb-3 flex items-center justify-between"><span className="font-semibold text-white">Walkthrough help</span><IconButton title="Close help" onClick={() => setHelpOpen(false)}><X className="h-4 w-4" /></IconButton></div>
           <div className="space-y-2 text-xs leading-5 text-slate-400">
-            <div><b className="text-slate-200">Walk:</b> mouse looks freely · W/A/S/D moves · Shift runs · Q/E adjust height.</div>
+            <div><b className="text-slate-200">Guided:</b> click a circular floor destination to travel with a slow cinematic camera pan.</div>
+            <div><b className="text-slate-200">Explore:</b> W/A/S/D moves · mouse looks freely · Shift runs. Mouse movement is smoothed.</div>
             <div><b className="text-slate-200">Overview:</b> W/A/S/D pan · Q/E zoom · mouse orbit · wheel zoom · +/- keys zoom.</div>
-            <div><b className="text-slate-200">Rooms:</b> left rail switches instantly between semantic room destinations.</div>
+            <div><b className="text-slate-200">Floor map:</b> glass map shows every validated navigation destination; click a point to travel there.</div>
             <div><b className="text-slate-200">Views:</b> Top/Front/Side/Perspective/Isometric presets + Fit model.</div>
-            <div><b className="text-slate-200">Look lock:</b> double-click the 3D scene to lock your current view. Double-click again to unlock.</div>
+            <div><b className="text-slate-200">View lock:</b> available in Explore mode via double-click. Guided mode uses a slow cinematic pan and fixed presentation pitch by design.</div>
           </div>
         </div>
       )}
@@ -263,7 +345,9 @@ export default function WalkthroughPage() {
           onClick={() => {
             if (viewMode === 'walk') {
               walkthrough.stopTravel();
-              walkthrough.setLookLocked(false);
+              setWalkMode('guided');
+              walkthrough.setWalkMode('guided');
+              walkthrough.setLookLocked(true);
               walkthrough.setViewPreset('perspective');
               setViewMode('overview');
               setSettingsOpen(false);
@@ -278,11 +362,18 @@ export default function WalkthroughPage() {
         </IconButton>
         <div className="mx-1 h-7 w-px bg-white/10" />
         {viewMode === 'overview' ? (
-          <button type="button" onClick={() => switchViewMode('walk')} className="flex h-9 items-center gap-2 rounded-xl bg-[#ff914d] px-3 text-xs font-bold text-slate-950 transition hover:bg-[#ff7a28]">
+          <button type="button" onClick={() => { setWalkMode('guided'); walkthrough.setWalkMode('guided'); switchViewMode('walk'); }} className="flex h-9 items-center gap-2 rounded-xl bg-[#ff914d] px-3 text-xs font-bold text-slate-950 transition hover:bg-[#ff7a28]">
             <Play className="h-4 w-4" /> Start Walkthrough
           </button>
         ) : (
-          <IconButton title="Walk mode" active onClick={() => switchViewMode('walk')}><Move3d className="h-4 w-4" /></IconButton>
+          <div className="flex items-center rounded-xl border border-white/10 bg-white/[0.03] p-0.5" aria-label="Walkthrough interaction mode">
+            <button type="button" onClick={() => switchWalkMode('guided')} title="Guided mode: click destinations, slow cinematic camera pan" className={`flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-semibold transition ${effectiveWalkMode === 'guided' ? 'bg-[#ff914d] text-slate-950 shadow-sm' : 'text-slate-300 hover:bg-white/[0.06]'}`}>
+              <MousePointer2 className="h-3.5 w-3.5" /> Guided
+            </button>
+            <button type="button" onClick={() => switchWalkMode('explore')} title="Explore mode: W/A/S/D movement and free mouse look" className={`flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-semibold transition ${effectiveWalkMode === 'explore' ? 'bg-[#ff914d] text-slate-950 shadow-sm' : 'text-slate-300 hover:bg-white/[0.06]'}`}>
+              <Move3d className="h-3.5 w-3.5" /> Explore
+            </button>
+          </div>
         )}
         <IconButton title="Camera views" active={viewsOpen} onClick={() => { setViewsOpen((v) => !v); setMoreOpen(false); setSettingsOpen(false); }}><Camera className="h-4 w-4" /></IconButton>
         <IconButton title="Walk settings" active={settingsOpen} onClick={() => { setSettingsOpen((v) => !v); setViewsOpen(false); setMoreOpen(false); }}><Settings2 className="h-4 w-4" /></IconButton>

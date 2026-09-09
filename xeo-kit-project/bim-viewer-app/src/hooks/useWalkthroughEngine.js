@@ -5,12 +5,15 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { init as initRecast, importNavMesh, NavMeshQuery, QueryFilter } from 'recast-navigation';
 
-const DEFAULT_SPEEDS = { walk: 1.8, run: 4.5 };
-const DEFAULT_EYE_HEIGHT_METERS = 1.6;
-const DEFAULT_HEIGHT_OFFSET_METERS = 0.35;
+const DEFAULT_SPEEDS = { walk: 1.65, run: 3.2 };
+const DEFAULT_EYE_HEIGHT_METERS = 1.84;
+const DEFAULT_HEIGHT_OFFSET_METERS = 0.0;
 const MIN_HEIGHT_OFFSET_METERS = -0.45;
 const MAX_HEIGHT_OFFSET_METERS = 1.0;
-const DEFAULT_FOV_DEGREES = 110;
+const DEFAULT_FOV_DEGREES = 115;
+const GUIDED_CAMERA_HEIGHT_METERS = 2.16;
+const GUIDED_PAN_AMPLITUDE_DEG = 13;
+const GUIDED_PAN_RATE_RAD_PER_SEC = 0.035;
 
 class WalkRuntime {
   constructor({ canvas, onState }) {
@@ -40,6 +43,9 @@ class WalkRuntime {
     this.lookSmoothing = 18;
     this.lookSensitivity = 0.0048;
     this.headBobTime = 0;
+    this.navSurfaceMesh = null;
+    this.activeHotspotId = null;
+    this.pointerDownAt = 0;
     this.running = true;
     this.animationFrame = 0;
     this.model = null;
@@ -47,6 +53,7 @@ class WalkRuntime {
     this.query = null;
     this.filter = null;
     this.walkAreas = [];
+    this.hotspots = [];
     this.path = null;
     this.pathIndex = 0;
     this.pathVelocity = new THREE.Vector3();
@@ -63,12 +70,26 @@ class WalkRuntime {
     this.heightOffset = DEFAULT_HEIGHT_OFFSET_METERS;
     // Start in a presentation-friendly perspective overview. Walk activates only after an explicit user action.
     this.viewMode = 'overview';
+    // Customer-facing walk styles: guided keeps a stable presentation camera;
+    // explore enables responsive cursor/mouse-look with WASD movement.
+    this.walkMode = 'guided';
+    this.guidedPitch = -0.045;
+    // Guided presentation uses a slow continuous panoramic yaw, similar to
+    // an architectural showcase walkthrough. Position/path movement and camera
+    // orientation remain independent so destination clicks never force a look-at.
+    this.guidedYawRate = GUIDED_PAN_RATE_RAD_PER_SEC;
+    this.guidedYawAmplitude = THREE.MathUtils.degToRad(GUIDED_PAN_AMPLITUDE_DEG);
+    this.guidedYawCenter = 0;
+    this.guidedPanPhase = 0;
+    this.guidedAutoRotate = true;
+    this.guidedTravelRotating = false;
     this.lookLocked = false;
     this.autoRotate = false;
     this.lastMoveDirection = new THREE.Vector3();
     this.blockedTime = 0;
     this.portalClickSuppressedUntil = 0;
-    this.pendingSemanticFallback = null;
+    this.stuck = false;
+    this.recoveryAvailable = false;
 
     this.viewTarget = new THREE.Vector3();
     this.viewDistance = 1;
@@ -113,10 +134,15 @@ class WalkRuntime {
     this.onKeyUp = (e) => this.keys.delete(e.key.toLowerCase());
     this.onContextMenu = (e) => e.preventDefault();
     this.onPointerDown = (e) => {
-      if (e.button === 0) this._pickPortal(e);
+      if (e.button !== 0 || this.viewMode !== 'walk') return;
+      this.pointerDownAt = performance.now();
+      // Guided mode is intentionally view-locked, but floor/hotspot clicks
+      // must still be interactive. Only Explore's optional look-lock blocks clicks.
+      if (this.walkMode === 'explore' && this.lookLocked) return;
+      this._handleWalkPointer(e);
     };
     this.onDoubleClick = (e) => {
-      if (this.viewMode !== 'walk') return;
+      if (this.viewMode !== 'walk' || this.walkMode !== 'explore') return;
       e.preventDefault();
       e.stopPropagation();
       this.portalClickSuppressedUntil = performance.now() + 350;
@@ -128,17 +154,21 @@ class WalkRuntime {
       }
     };
     this.onPointerMove = (e) => {
-      if (this.lookLocked || this.viewMode !== 'walk') return;
+      if (this.lookLocked || this.viewMode !== 'walk' || this.walkMode !== 'explore') return;
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+      const rect = this.renderer.domElement.getBoundingClientRect();
       const dx = e.movementX || (e.clientX - this.lastPointer.x);
       const dy = e.movementY || (e.clientY - this.lastPointer.y);
       this.lastPointer.x = e.clientX;
       this.lastPointer.y = e.clientY;
+
+      // Cursor-driven free look with damping. Movement remains independent of
+      // the camera destination, so clicking a floor target never reorients view.
       this.targetYaw -= dx * this.lookSensitivity;
       this.targetPitch = THREE.MathUtils.clamp(
         this.targetPitch - dy * (this.lookSensitivity * 0.82),
         -Math.PI * 0.43,
-        Math.PI * 0.43,
+        Math.PI * 0.28,
       );
     };
 
@@ -164,11 +194,15 @@ class WalkRuntime {
     const jobBase = `${baseUrl.replace(/\/$/, '')}/jobs/${encodeURIComponent(jobId)}`;
     this.onState?.({ type: 'loading', value: true });
 
-    const [surfacePayload, areasPayload, navBuffer, gltf] = await Promise.all([
+    const [surfacePayload, areasPayload, hotspotsPayload, navBuffer, gltf] = await Promise.all([
       fetch(`${jobBase}/navigation_surface.json`, { cache: 'no-store' }).then(this._assertJson('navigation_surface.json')),
       fetch(`${jobBase}/walk_areas.json`, { cache: 'no-store' }).then(this._assertJson('walk_areas.json')).catch((error) => {
         console.warn('[Walkthrough] walk_areas.json unavailable; using fallback destination list.', error);
         return { areas: [] };
+      }),
+      fetch(`${jobBase}/walk_hotspots.json`, { cache: 'no-store' }).then(this._assertJson('walk_hotspots.json')).catch((error) => {
+        console.warn('[Walkthrough] walk_hotspots.json unavailable; deriving limited hotspots from room areas.', error);
+        return { hotspots: [] };
       }),
       fetch(`${jobBase}/navigation_navmesh.bin`, { cache: 'no-store' }).then(async (r) => {
         if (!r.ok) throw new Error(`navigation_navmesh.bin returned ${r.status}`);
@@ -185,10 +219,33 @@ class WalkRuntime {
     this.query = new NavMeshQuery(this.navMesh);
     this.filter = new QueryFilter();
     this.walkAreas = Array.isArray(areasPayload?.areas) ? areasPayload.areas.filter((a) => Array.isArray(a?.center) && a.center.length >= 3) : [];
+    const loadedHotspots = Array.isArray(hotspotsPayload?.hotspots)
+      ? hotspotsPayload.hotspots.filter((h) => Array.isArray(h?.position) && h.position.length >= 3)
+      : [];
     this.metersPerUnit = Number(surfacePayload?.metadata?.physicalMetersPerUnit) > 0 ? Number(surfacePayload.metadata.physicalMetersPerUnit) : 1;
-    this.eyeHeight = Number(surfacePayload?.metadata?.eyeHeightMeters) > 0 ? Number(surfacePayload.metadata.eyeHeightMeters) : DEFAULT_EYE_HEIGHT_METERS;
-    this.heightOffset = DEFAULT_HEIGHT_OFFSET_METERS;
-    this.fov = DEFAULT_FOV_DEGREES;
+    const fallbackHotspots = this.walkAreas.map((area, index) => ({
+      id: `legacy-hotspot-${index + 1}`,
+      position: [Number(area.center[0]), Number(area.center[1]) || 0, Number(area.center[2])],
+      clearanceMeters: 0,
+      score: 0,
+      source: 'room-anchor',
+      areaId: area.id,
+    }));
+    const rawHotspots = loadedHotspots.length ? loadedHotspots : fallbackHotspots;
+
+    const navigationPlan = this._buildNavigationPlan(surfacePayload, rawHotspots);
+    this.navigationPlan = navigationPlan;
+    // Keep the visual camera independently tuned from the navigation agent.
+    // The NavMesh can remain authored around its 1.6m agent clearance while the
+    // customer-facing camera sits slightly higher for architectural presentation.
+    this.eyeHeight = DEFAULT_EYE_HEIGHT_METERS;
+    // Guided presentation uses a dedicated architectural eye height instead of
+    // the Explore slider maximum. This prevents the camera from feeling like a
+    // drone while still giving a slightly elevated view over furniture.
+    this.heightOffset = this.walkMode === 'guided'
+      ? GUIDED_CAMERA_HEIGHT_METERS - this.eyeHeight
+      : DEFAULT_HEIGHT_OFFSET_METERS;
+    this.fov = this.walkMode === 'guided' ? 120 : DEFAULT_FOV_DEGREES;
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
     this.radius = Number(surfacePayload?.metadata?.agentRadiusMeters) > 0 ? Number(surfacePayload.metadata.agentRadiusMeters) : 0.15;
@@ -198,6 +255,8 @@ class WalkRuntime {
     this.model = gltf.scene;
     this.model.updateMatrixWorld(true);
     this.scene.add(this.model);
+
+    this._buildNavigationSurface(surfacePayload);
 
     // GLB bounding volumes can be stale/invalid after compiler-side transforms.
     // Disable frustum culling for walkthrough rendering until bounds are verified.
@@ -210,6 +269,26 @@ class WalkRuntime {
       obj.frustumCulled = false;
       visibleMeshCount += obj.visible ? 1 : 0;
     });
+
+    // Never expose or spawn on destinations where the presentation camera would
+    // be underneath a low object (e.g. a bed, table, cabinet) even if the
+    // architectural slab is technically walkable beneath it.
+    const safeRenderedHotspots = rawHotspots.filter((hotspot) => this._hasCameraClearance(hotspot.position));
+    const augmentedHotspots = this._augmentHotspotsFromFloor(surfacePayload, safeRenderedHotspots, 18);
+    this.hotspots = augmentedHotspots;
+    this.navigationPlan = this._buildNavigationPlan(surfacePayload, augmentedHotspots);
+    if (safeRenderedHotspots.length !== rawHotspots.length) {
+      console.info('[Walkthrough] Removed unsafe low-clearance hotspots', {
+        removed: rawHotspots.length - safeRenderedHotspots.length,
+        remaining: augmentedHotspots.length,
+      });
+    }
+    if (augmentedHotspots.length > safeRenderedHotspots.length) {
+      console.info('[Walkthrough] Added safe presentation hotspots', {
+        added: augmentedHotspots.length - safeRenderedHotspots.length,
+        total: augmentedHotspots.length,
+      });
+    }
 
     const box = new THREE.Box3().setFromObject(this.model);
     const size = box.getSize(new THREE.Vector3());
@@ -261,17 +340,32 @@ class WalkRuntime {
     // the floorplan/house context before the user enters walkthrough mode.
     this.setViewPreset('top');
 
-    const startSeed = this.walkAreas[0]?.center || [center.x, 0, center.z];
-    const start = this._closestWalkPoint(startSeed);
-    if (!start) throw new Error('Serialized NavMesh has no reachable spawn point.');
+    const spawnCandidates = [...this.hotspots]
+      .filter((hotspot) => Array.isArray(hotspot.position))
+      .map((hotspot) => ({ hotspot, openness: this._presentationOpenSpaceScore(hotspot.position) }))
+      .filter((entry) => entry.openness > 0)
+      .sort((a, b) => b.openness - a.openness || (Number(b.hotspot.score) || 0) - (Number(a.hotspot.score) || 0));
+    let start = null;
+    for (const entry of spawnCandidates) {
+      const candidate = this._closestWalkPoint(entry.hotspot.position);
+      if (!candidate || !this._hasCameraClearance([candidate.x, candidate.y, candidate.z])) continue;
+      start = candidate;
+      break;
+    }
+    if (!start) {
+      const emergencySeed = this.walkAreas[0]?.center || [center.x, 0, center.z];
+      start = this._findSafeSpawnFromSurface(surfacePayload, emergencySeed);
+    }
+    if (!start) throw new Error('No safe walkthrough spawn position was found on the walkable floor.');
 
     this.position.set(start.x, start.y, start.z);
     this.currentPolyRef = start.polyRef || 0;
     this.currentYaw = this.yaw;
     this.targetYaw = this.yaw;
+    this.guidedYawCenter = this.yaw;
+    this.guidedPanPhase = 0;
     this.currentPitch = this.pitch;
     this.targetPitch = this.pitch;
-    this._lookForwardTo(this.walkAreas[1]?.center || [center.x, center.y, center.z]);
     // Keep the player position prepared in the background, but leave the camera in overview mode.
     this._buildPortals();
 
@@ -284,6 +378,7 @@ class WalkRuntime {
       cameraPosition: this.camera.position.toArray(),
       cameraNearFar: [this.camera.near, this.camera.far],
       destinationCount: this.walkAreas.length,
+      hotspotCount: this.hotspots.length,
       navMeshBytes: navBuffer.byteLength,
       meshCount,
       visibleMeshCount,
@@ -291,6 +386,124 @@ class WalkRuntime {
 
     this.onState?.({ type: 'loaded', areas: this.walkAreas, size, center });
     return { areas: this.walkAreas, size, center };
+  }
+
+  _augmentHotspotsFromFloor(surfacePayload, existing, targetCount = 18) {
+    const base = Array.isArray(existing) ? [...existing] : [];
+    if (base.length >= targetCount) return base;
+
+    const positions = Array.isArray(surfacePayload?.positions) ? surfacePayload.positions : [];
+    const indices = Array.isArray(surfacePayload?.indices) ? surfacePayload.indices : [];
+    if (positions.length < 9 || indices.length < 3) return base;
+
+    const candidates = [];
+    const triangleCount = Math.floor(indices.length / 3);
+    const step = Math.max(1, Math.floor(triangleCount / 700));
+    for (let t = 0; t < triangleCount; t += step) {
+      const ia = Number(indices[t * 3]) * 3;
+      const ib = Number(indices[t * 3 + 1]) * 3;
+      const ic = Number(indices[t * 3 + 2]) * 3;
+      if (![ia, ib, ic].every((i) => Number.isFinite(i) && i >= 0 && i + 2 < positions.length)) continue;
+
+      const candidate = [
+        (Number(positions[ia]) + Number(positions[ib]) + Number(positions[ic])) / 3,
+        (Number(positions[ia + 1]) + Number(positions[ib + 1]) + Number(positions[ic + 1])) / 3,
+        (Number(positions[ia + 2]) + Number(positions[ib + 2]) + Number(positions[ic + 2])) / 3,
+      ];
+      const snapped = this._closestWalkPoint(candidate);
+      if (!snapped) continue;
+      const point = [snapped.x, snapped.y, snapped.z];
+      if (!this._hasCameraClearance(point)) continue;
+
+      const openness = this._presentationOpenSpaceScore(point);
+      if (!(openness > 0)) continue;
+
+      let nearestExisting = Infinity;
+      for (const h of base) {
+        if (!Array.isArray(h.position)) continue;
+        nearestExisting = Math.min(nearestExisting, Math.hypot(point[0] - h.position[0], point[2] - h.position[2]));
+      }
+      // Keep destinations meaningfully separated. Unit is GLB-space-aware.
+      const minSpacing = 1.25 * Math.max(this.metersPerUnit, 0.000001);
+      if (nearestExisting < minSpacing) continue;
+      candidates.push({ point, openness });
+    }
+
+    candidates.sort((a, b) => b.openness - a.openness);
+    const selected = [];
+    const minSpacing = 1.35 * Math.max(this.metersPerUnit, 0.000001);
+    for (const candidate of candidates) {
+      let tooClose = false;
+      for (const h of [...base, ...selected]) {
+        if (!Array.isArray(h.position)) continue;
+        if (Math.hypot(candidate.point[0] - h.position[0], candidate.point[2] - h.position[2]) < minSpacing) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (tooClose) continue;
+      selected.push({
+        id: `generated-hotspot-${selected.length + 1}`,
+        position: candidate.point,
+        clearanceMeters: candidate.openness,
+        score: candidate.openness,
+        source: 'navmesh-floor',
+        label: `Navigation point ${base.length + selected.length + 1}`,
+      });
+      if (base.length + selected.length >= targetCount) break;
+    }
+    return [...base, ...selected];
+  }
+
+  _buildNavigationPlan(surfacePayload, hotspots) {
+    const positions = Array.isArray(surfacePayload?.positions) ? surfacePayload.positions : [];
+    const indices = Array.isArray(surfacePayload?.indices) ? surfacePayload.indices : [];
+    const points = [];
+    const maxTriangles = 520;
+
+    if (positions.length >= 9 && indices.length >= 3) {
+      const triangleCount = Math.floor(indices.length / 3);
+      const step = Math.max(1, Math.ceil(triangleCount / maxTriangles));
+      for (let t = 0; t < triangleCount; t += step) {
+        const base = t * 3;
+        const ia = Number(indices[base]) * 3;
+        const ib = Number(indices[base + 1]) * 3;
+        const ic = Number(indices[base + 2]) * 3;
+        if (![ia, ib, ic].every((i) => Number.isFinite(i) && i >= 0 && i + 2 < positions.length)) continue;
+        points.push([
+          Number(positions[ia]), Number(positions[ia + 2]),
+          Number(positions[ib]), Number(positions[ib + 2]),
+          Number(positions[ic]), Number(positions[ic + 2]),
+        ]);
+      }
+    }
+
+    const allHotspots = (hotspots || []).map((h, i) => ({
+      id: h.id || `hotspot-${i + 1}`,
+      x: Number(h.position?.[0]),
+      z: Number(h.position?.[2]),
+      label: h.label || `Navigation ${i + 1}`,
+    })).filter((h) => Number.isFinite(h.x) && Number.isFinite(h.z));
+
+    const xs = [];
+    const zs = [];
+    points.forEach((tri) => {
+      for (let i = 0; i < tri.length; i += 2) { xs.push(tri[i]); zs.push(tri[i + 1]); }
+    });
+    allHotspots.forEach((h) => { xs.push(h.x); zs.push(h.z); });
+
+    if (!xs.length || !zs.length) return null;
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minZ = Math.min(...zs);
+    const maxZ = Math.max(...zs);
+    const pad = Math.max((maxX - minX) * 0.04, (maxZ - minZ) * 0.04, 0.2);
+
+    return {
+      bounds: { minX: minX - pad, maxX: maxX + pad, minZ: minZ - pad, maxZ: maxZ + pad },
+      triangles: points,
+      hotspots: allHotspots,
+    };
   }
 
   _assertJson(name) {
@@ -315,6 +528,82 @@ class WalkRuntime {
     };
   }
 
+  _hasCameraClearance(point) {
+    if (!this.model || !Array.isArray(point) || point.length < 3) return true;
+
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const originY = Number(point[1]) + Math.max(0.06 * unit, 0.01);
+    const cameraClearance = (this.eyeHeight + 0.10) * unit;
+
+    // Vertical ray catches the exact class of failure seen in the screenshot:
+    // a valid floor position exists underneath a bed/table, but there isn't
+    // enough head room for the walkthrough camera.
+    this.raycaster.set(
+      new THREE.Vector3(Number(point[0]), originY, Number(point[2])),
+      new THREE.Vector3(0, 1, 0),
+    );
+    const verticalHits = this.raycaster.intersectObject(this.model, true);
+    if (verticalHits.length && verticalHits[0].distance < cameraClearance) return false;
+
+    // Also reject destinations with a very tight horizontal envelope around the
+    // avatar. This is intentionally conservative for customer-facing hotspots.
+    const horizontalOrigin = new THREE.Vector3(Number(point[0]), originY + 0.25 * unit, Number(point[2]));
+    const clearance = 0.34 * unit;
+    for (let i = 0; i < 8; i++) {
+      const angle = (Math.PI * 2 * i) / 8;
+      const direction = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
+      this.raycaster.set(horizontalOrigin, direction);
+      const hits = this.raycaster.intersectObject(this.model, true);
+      if (hits.length && hits[0].distance < clearance) return false;
+    }
+    return true;
+  }
+
+  _presentationOpenSpaceScore(point) {
+    if (!this.model || !Array.isArray(point) || point.length < 3) return 1;
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const origin = new THREE.Vector3(Number(point[0]), Number(point[1]) + 0.12 * unit, Number(point[2]));
+    const requiredHeadroom = (this.eyeHeight + 0.08) * unit;
+    this.raycaster.set(origin, new THREE.Vector3(0, 1, 0));
+    const ceilingHit = this.raycaster.intersectObject(this.model, true)[0];
+    if (ceilingHit && ceilingHit.distance < requiredHeadroom) return 0;
+
+    let nearest = Infinity;
+    for (let i = 0; i < 16; i++) {
+      const angle = (Math.PI * 2 * i) / 16;
+      const dir = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
+      this.raycaster.set(origin, dir);
+      const hit = this.raycaster.intersectObject(this.model, true)[0];
+      if (hit) nearest = Math.min(nearest, hit.distance);
+    }
+    const comfort = 0.55 * unit;
+    if (nearest < comfort) return 0;
+    return Math.min(nearest / Math.max(unit, 0.000001), 4);
+  }
+
+  _findSafeSpawnFromSurface(surfacePayload, fallbackCenter) {
+    const positions = surfacePayload?.positions;
+    const indices = surfacePayload?.indices;
+    if (Array.isArray(positions) && Array.isArray(indices) && positions.length >= 9 && indices.length >= 3) {
+      const step = Math.max(1, Math.floor((indices.length / 3) / 500));
+      for (let t = 0; t < indices.length / 3; t += step) {
+        const ia = indices[t * 3] * 3;
+        const ib = indices[t * 3 + 1] * 3;
+        const ic = indices[t * 3 + 2] * 3;
+        const candidate = [
+          (positions[ia] + positions[ib] + positions[ic]) / 3,
+          (positions[ia + 1] + positions[ib + 1] + positions[ic + 1]) / 3,
+          (positions[ia + 2] + positions[ib + 2] + positions[ic + 2]) / 3,
+        ];
+        if (!this._hasCameraClearance(candidate)) continue;
+        const snapped = this._closestWalkPoint(candidate);
+        if (snapped && this._hasCameraClearance([snapped.x, snapped.y, snapped.z])) return snapped;
+      }
+    }
+    if (fallbackCenter && this._hasCameraClearance(fallbackCenter)) return this._closestWalkPoint(fallbackCenter);
+    return null;
+  }
+
   _lookForwardTo(target) {
     const delta = new THREE.Vector3(target[0] - this.position.x, 0, target[2] - this.position.z);
     if (delta.lengthSq() < 1e-8) return;
@@ -328,66 +617,235 @@ class WalkRuntime {
     this.targetPitch = -0.05;
   }
 
+  _buildNavigationSurface(surfacePayload) {
+    this.navSurfaceMesh?.geometry?.dispose?.();
+    this.navSurfaceMesh?.material?.dispose?.();
+    this.navSurfaceMesh && this.scene.remove(this.navSurfaceMesh);
+    this.navSurfaceMesh = null;
+
+    const positions = surfacePayload?.positions;
+    const indices = surfacePayload?.indices;
+    if (!Array.isArray(positions) || !Array.isArray(indices) || positions.length < 9 || indices.length < 3) {
+      return;
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setIndex(indices);
+    geometry.computeBoundingSphere();
+
+    // The navigation surface is an invisible raycast target. It is deliberately
+    // not rendered: the user interacts with the same floor representation that
+    // powers the authoritative Recast NavMesh.
+    const material = new THREE.MeshBasicMaterial({
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    this.navSurfaceMesh = new THREE.Mesh(geometry, material);
+    this.navSurfaceMesh.userData.isNavigationSurface = true;
+    this.navSurfaceMesh.frustumCulled = false;
+    this.scene.add(this.navSurfaceMesh);
+  }
+
   _buildPortals() {
-    this.portalObjects.forEach((o) => {
-      o.material.map?.dispose();
-      o.material.dispose();
+    this.portalObjects.forEach((object) => {
+      object.traverse?.((child) => {
+        child.geometry?.dispose?.();
+        child.material?.dispose?.();
+      });
+      this.scene.remove(object);
     });
     this.portalObjects = [];
     this.portalTargets.clear();
 
-    this.walkAreas.forEach((area) => {
-      const texture = this._makePortalTexture(area.label || 'Node');
-      const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false });
-      const sprite = new THREE.Sprite(mat);
-      sprite.scale.set(1.25 * this.metersPerUnit, 0.42 * this.metersPerUnit, 1);
-      sprite.position.set(area.center[0], area.center[1] + this.eyeHeight * this.metersPerUnit * 0.7, area.center[2]);
-      sprite.userData.walkTarget = area.center;
-      sprite.userData.walkLabel = area.label || 'Node';
-      this.scene.add(sprite);
-      this.portalObjects.push(sprite);
-      this.portalTargets.set(area.label, area.center);
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const diskRadius = 0.17 * unit;
+    const ringRadius = 0.25 * unit;
+    const haloRadius = 0.48 * unit;
+    const lift = Math.max(0.006 * unit, 0.002);
+
+    const diskGeometry = new THREE.CircleGeometry(diskRadius, 48);
+    const ringGeometry = new THREE.RingGeometry(diskRadius * 1.18, ringRadius, 48);
+    const haloGeometry = new THREE.CircleGeometry(haloRadius, 48);
+
+    this.hotspots.forEach((hotspot) => {
+      const group = new THREE.Group();
+      const diskMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff914d,
+        transparent: true,
+        opacity: 0.28,
+        depthTest: true,
+        depthWrite: false,
+      });
+      const disk = new THREE.Mesh(diskGeometry.clone(), diskMaterial);
+      disk.rotation.x = -Math.PI / 2;
+      disk.renderOrder = 6;
+
+      const ringMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff914d,
+        transparent: true,
+        opacity: 0.95,
+        depthTest: true,
+        depthWrite: false,
+      });
+      const ring = new THREE.Mesh(ringGeometry.clone(), ringMaterial);
+      ring.rotation.x = -Math.PI / 2;
+      ring.renderOrder = 7;
+
+      const haloMaterial = new THREE.MeshBasicMaterial({
+        color: 0xff914d,
+        transparent: true,
+        opacity: 0.07,
+        depthTest: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      const halo = new THREE.Mesh(haloGeometry.clone(), haloMaterial);
+      halo.rotation.x = -Math.PI / 2;
+      halo.renderOrder = 5;
+
+      group.add(halo, disk, ring);
+      group.position.set(
+        Number(hotspot.position[0]),
+        Number(hotspot.position[1]) + lift,
+        Number(hotspot.position[2]),
+      );
+      group.userData.walkTarget = [
+        Number(hotspot.position[0]),
+        Number(hotspot.position[1]),
+        Number(hotspot.position[2]),
+      ];
+      group.userData.walkLabel = hotspot.label || 'Floor destination';
+      group.userData.hotspotId = hotspot.id;
+      group.userData.source = hotspot.source;
+      group.visible = false;
+      this.scene.add(group);
+      this.portalObjects.push(group);
+      this.portalTargets.set(hotspot.id, group.userData.walkTarget);
     });
   }
 
-  _makePortalTexture(label) {
-    const c = document.createElement('canvas');
-    c.width = 360; c.height = 140;
-    const ctx = c.getContext('2d');
-    ctx.clearRect(0, 0, c.width, c.height);
-    ctx.save();
-    ctx.shadowColor = '#ff914d';
-    ctx.shadowBlur = 18;
-    ctx.fillStyle = '#ff914d';
-    ctx.beginPath();
-    ctx.moveTo(32, 86); ctx.lineTo(56, 48); ctx.lineTo(80, 86);
-    ctx.closePath(); ctx.fill();
-    ctx.restore();
-    ctx.fillStyle = 'rgba(20, 25, 30, 0.78)';
-    ctx.beginPath(); ctx.roundRect(98, 43, 232, 46, 18); ctx.fill();
-    ctx.fillStyle = '#ffffff';
-    ctx.font = '600 24px Inter, Arial, sans-serif';
-    ctx.fillText(label, 118, 73);
-    const tex = new THREE.CanvasTexture(c);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    return tex;
+  _pickPortal(event) {
+    const hits = this._raycastHotspots(event);
+    if (!hits.length) return false;
+    const group = hits[0].object.parent?.isGroup ? hits[0].object.parent : hits[0].object;
+    if (!group?.userData?.walkTarget) return false;
+    this.activeHotspotId = group.userData.hotspotId || null;
+    const label = group.userData.walkLabel || 'Floor destination';
+    this.travelTo(group.userData.walkTarget, label).then((ok) => {
+      if (!ok) this._startEmergencyRecovery(group.userData.walkTarget, label);
+    });
+    return true;
   }
 
-  _pickPortal(event) {
-    if (performance.now() < this.portalClickSuppressedUntil) return;
+  _raycastHotspots(event) {
+    if (this.viewMode !== 'walk') return [];
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, this.camera);
-    const hits = this.raycaster.intersectObjects(this.portalObjects, false);
-    if (!hits.length) return;
-    const sprite = hits[0].object;
-    const label = sprite.userData.walkLabel;
-    this.travelTo(sprite.userData.walkTarget, label);
+    const visiblePortals = this.portalObjects.filter((portal) => portal.visible && portal.userData?.walkTarget);
+    const hotspotHits = this.raycaster.intersectObjects(visiblePortals, true);
+    if (!hotspotHits.length) return [];
+
+    // A destination is clickable only when it is actually visible from the current
+    // camera. Raycaster does not treat CSS/UI visibility as an interaction rule,
+    // so explicitly reject portals hidden behind walls/doors/furniture.
+    if (this.model) {
+      const portalHit = hotspotHits[0];
+      const sceneHit = this.raycaster.intersectObject(this.model, true)[0];
+      if (sceneHit && sceneHit.distance + 0.02 * Math.max(this.metersPerUnit, 0.000001) < portalHit.distance) return [];
+    }
+    return hotspotHits;
+  }
+
+  _raycastNavigationSurface(event) {
+    if (!this.navSurfaceMesh || this.viewMode !== 'walk') return null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+
+    const floorHits = this.raycaster.intersectObject(this.navSurfaceMesh, false);
+    if (!floorHits.length) return null;
+
+    // Do not allow a floor click to pass through a visible bed, sofa, cabinet,
+    // wall, etc. Compare the rendered scene hit against the invisible floor hit.
+    const sceneHits = this.model
+      ? this.raycaster.intersectObject(this.model, true)
+      : [];
+    const floorHit = floorHits[0];
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const occludedByObject = sceneHits.some((hit) =>
+      hit.distance + 0.035 * unit < floorHit.distance
+    );
+    if (occludedByObject) return null;
+
+    return floorHit.point;
+  }
+
+  _handleWalkPointer(event) {
+    if (performance.now() < this.portalClickSuppressedUntil) return;
+    if (this.path || this.directTravel) return;
+
+    // Hotspots remain the preferred interaction target. They are prevalidated
+    // physical destinations and therefore give deterministic travel behavior.
+    if (this._pickPortal(event)) return;
+
+    // A clean floor click is also a valid destination. Raycasting the invisible
+    // exported navigation surface guarantees that we only accept actual floor,
+    // never beds, sofas, walls, or other rendered geometry.
+    const floorPoint = this._raycastNavigationSurface(event);
+    if (!floorPoint) return;
+    this.activeHotspotId = null;
+    this.travelTo([floorPoint.x, floorPoint.y, floorPoint.z], 'Floor destination');
+  }
+
+  async navigateToHotspot(hotspot) {
+    if (!hotspot || this.viewMode !== 'walk') return false;
+    if (this.path || this.directTravel) return false;
+
+    // Floor-map markers are rendered as {x, z}, while in-scene hotspots carry
+    // a full position tuple. Accept both shapes so the map is a first-class
+    // destination navigator instead of silently failing on a shape mismatch.
+    const rawPosition = Array.isArray(hotspot.position)
+      ? hotspot.position
+      : [hotspot.x, Number(hotspot.y) || 0, hotspot.z];
+    if (!Number.isFinite(Number(rawPosition[0])) || !Number.isFinite(Number(rawPosition[2]))) {
+      return false;
+    }
+
+    const point = this._closestWalkPoint(rawPosition);
+    if (!point || !this._hasCameraClearance([point.x, point.y, point.z])) {
+      this.onState?.({ type: 'error', message: 'That navigation point is no longer available.' });
+      return false;
+    }
+
+    this.activeHotspotId = hotspot.id || null;
+    const label = hotspot.label || 'Navigation point';
+    const start = { x: this.position.x, y: this.position.y, z: this.position.z };
+    const result = this.query?.computePath(start, point, {
+      filter: this.filter,
+      maxStraightPathSize: 256,
+      maxPathSize: 256,
+    });
+
+    if (result?.success && result.path?.length) {
+      return this.travelTo([point.x, point.y, point.z], label);
+    }
+
+    // Floor-map navigation is intentionally semantic: every shown marker has
+    // already passed camera-clearance validation, so a point can still be selected
+    // even when there is no continuous physical NavMesh route (for example a
+    // doorway/partition makes the current component disconnected). The map is a
+    // destination navigator, not a representation of physical connectivity.
+    return this._startDirectRoomTravel(point, label, 'map-jump');
   }
 
   async travelTo(target, label = 'Destination') {
-    if (!this.query) return false;
+    if (!this.query || this.viewMode !== 'walk' || this.path || this.directTravel) return false;
     const start = { x: this.position.x, y: this.position.y, z: this.position.z };
     const closest = this._closestWalkPoint(target);
     if (!closest) {
@@ -400,27 +858,87 @@ class WalkRuntime {
       maxPathSize: 256,
     });
     if (!result.success || !result.path?.length) {
-      // Explicit destination requests should never strand the user.
-      // Fall back to semantic room switching when physical pathing is blocked.
-      return this._startDirectRoomTravel(closest, label, 'path-fallback');
+      this.onState?.({ type: 'error', message: `${label} is not reachable from here.` });
+      this.stuck = true;
+      this.recoveryAvailable = this.hotspots.length > 0;
+      this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
+      return false;
     }
     this.directTravel = null;
-    this.pendingSemanticFallback = { closest, label };
     this.path = result.path.map((p) => ({ x: p.x, y: p.y, z: p.z }));
     this.pathIndex = 0;
     this.pathVelocity.set(0, 0, 0);
-    this.onState?.({ type: 'travel', label, active: true, mode: 'path' });
+    this.blockedTime = 0;
+    this.stuck = false;
+    this.recoveryAvailable = false;
+    this.onState?.({ type: 'stuck', available: false });
+    this.onState?.({ type: 'travel', label, active: true, mode: 'path', hotspotId: this.activeHotspotId });
     return true;
   }
 
   async switchRoom(target, label = 'Node') {
     if (!this.query) return false;
-    const closest = this._closestWalkPoint(target);
-    if (!closest) {
-      this.onState?.({ type: 'error', message: `No walkable destination found for ${label}.` });
-      return false;
+
+    const areaId = target?.id;
+    const targetPoint = Array.isArray(target?.center) ? target.center : [0, 0, 0];
+    const pool = this.hotspots
+      .filter((hotspot) => !areaId || hotspot.areaId === areaId)
+      .filter((hotspot) => Array.isArray(hotspot.position) && this._hasCameraClearance(hotspot.position));
+
+    const candidates = (pool.length ? pool : this.hotspots)
+      .map((hotspot) => ({ hotspot, distance: Math.hypot(hotspot.position[0] - targetPoint[0], hotspot.position[2] - targetPoint[2]) }))
+      .sort((a, b) => a.distance - b.distance);
+
+    for (const candidate of candidates) {
+      const ok = await this.travelTo(candidate.hotspot.position, label);
+      if (ok) return true;
     }
-    return this._startDirectRoomTravel(closest, label, 'room-switch');
+
+    // Semantic room navigation may cross a blocked doorway, but the arrival point
+    // must still be a verified safe hotspot. Never direct-travel to an arbitrary
+    // NavMesh point that could sit behind a door or inside furniture.
+    const safe = candidates[0]?.hotspot;
+    if (safe) {
+      const closest = this._closestWalkPoint(safe.position);
+      if (closest && this._hasCameraClearance([closest.x, closest.y, closest.z])) {
+        return this._startDirectRoomTravel(closest, label, 'room-recovery');
+      }
+    }
+
+    this.onState?.({ type: 'error', message: `${label} has no safe reachable presentation destination.` });
+    return false;
+  }
+
+  _startEmergencyRecovery(target, label = 'Safe position') {
+    if (!this.query) return false;
+
+    const current = this._closestWalkPoint([this.position.x, this.position.y, this.position.z]);
+    const start = current || { x: this.position.x, y: this.position.y, z: this.position.z };
+    const pool = this.hotspots
+      .filter((hotspot) => Array.isArray(hotspot.position) && this._hasCameraClearance(hotspot.position))
+      .map((hotspot) => {
+        const destination = this._closestWalkPoint(hotspot.position);
+        if (!destination) return null;
+        const result = this.query.computePath(start, destination, {
+          filter: this.filter, maxStraightPathSize: 128, maxPathSize: 128,
+        });
+        if (!result.success || !result.path?.length) return null;
+        return { hotspot, destination, distance: Math.hypot(destination.x - start.x, destination.z - start.z) };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.distance - b.distance);
+
+    const chosen = pool[0];
+    if (chosen) {
+      this.activeHotspotId = chosen.hotspot.id;
+      return this.travelTo(chosen.destination, label);
+    }
+
+    const fallback = target ? this._closestWalkPoint(target) : null;
+    if (fallback && this._hasCameraClearance([fallback.x, fallback.y, fallback.z])) {
+      return this._startDirectRoomTravel(fallback, label, 'recovery');
+    }
+    return false;
   }
 
   _startDirectRoomTravel(closest, label, mode = 'room-switch') {
@@ -464,8 +982,37 @@ class WalkRuntime {
     this.lookSensitivity = THREE.MathUtils.clamp(Number(value) || 0.0048, 0.0015, 0.009);
   }
 
+  setWalkMode(mode) {
+    const next = mode === 'explore' ? 'explore' : 'guided';
+    if (next === this.walkMode) return;
+    this.walkMode = next;
+
+    // Switching from Explore -> Guided freezes the current composition.
+    // Switching back restores mouse-look immediately without a view jump.
+    if (next === 'guided') {
+      this.guidedYawCenter = this.currentYaw;
+      this.guidedPitch = this.currentPitch;
+      this.targetPitch = this.currentPitch;
+      this.heightOffset = GUIDED_CAMERA_HEIGHT_METERS - this.eyeHeight;
+      this.fov = 120;
+      this.camera.fov = this.fov;
+      this.camera.updateProjectionMatrix();
+      this._notifyCameraSettings();
+      this.lookLocked = true;
+      this.onState?.({ type: 'look-lock', locked: true });
+    } else {
+      this.lookLocked = false;
+      this.onState?.({ type: 'look-lock', locked: false });
+    }
+    this.onState?.({ type: 'walk-mode', mode: this.walkMode });
+  }
+
   setLookLocked(value, notify = false) {
-    this.lookLocked = Boolean(value);
+    if (this.walkMode === 'guided') {
+      this.lookLocked = true;
+    } else {
+      this.lookLocked = Boolean(value);
+    }
     if (notify) this.onState?.({ type: 'look-lock', locked: this.lookLocked });
   }
 
@@ -489,8 +1036,19 @@ class WalkRuntime {
     } else {
       this.orbitControls.enabled = false;
       this._resetWalkCameraDefaults();
+      // Guided is the stable presentation mode. Explore is free-look.
+      if (this.walkMode === 'guided') {
+        this.lookLocked = true;
+        this.onState?.({ type: 'look-lock', locked: true });
+      } else {
+        this.lookLocked = false;
+        this.onState?.({ type: 'look-lock', locked: false });
+      }
       this._syncCamera();
     }
+    this.stuck = false;
+    this.recoveryAvailable = false;
+    this.onState?.({ type: 'stuck', available: false });
     this.onState?.({ type: 'view-mode', mode: this.viewMode });
   }
 
@@ -580,7 +1138,7 @@ if (name === 'top') {
   }
 
   setFov(value) {
-    this.fov = THREE.MathUtils.clamp(Number(value) || DEFAULT_FOV_DEGREES, 30, 110);
+    this.fov = THREE.MathUtils.clamp(Number(value) || DEFAULT_FOV_DEGREES, 30, 120);
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
     this._notifyCameraSettings();
@@ -606,7 +1164,6 @@ if (name === 'top') {
     this.pathIndex = 0;
     this.pathVelocity.set(0, 0, 0);
     this.directTravel = null;
-    this.pendingSemanticFallback = null;
     this.onState?.({ type: 'travel', active: false });
   }
 
@@ -621,10 +1178,14 @@ if (name === 'top') {
       this.pathVelocity.set(0, 0, 0);
       this.blockedTime = 0;
       if (t >= 1) {
+        const arrivalDirection = this.directTravel.end.clone().sub(this.directTravel.start).setY(0);
+        this._prepareGuidedArrivalView(this.directTravel.end, arrivalDirection);
         this.currentPolyRef = this.directTravel.targetPolyRef || this.currentPolyRef;
         this.directTravel = null;
-        this.pendingSemanticFallback = null;
-        this.onState?.({ type: 'travel', active: false });
+            this.stuck = false;
+            this.recoveryAvailable = false;
+            this.onState?.({ type: 'stuck', available: false });
+            this.onState?.({ type: 'travel', active: false });
       }
       return;
     }
@@ -635,11 +1196,14 @@ if (name === 'top') {
       if (delta.length() < Math.max(0.05 * this.metersPerUnit, 0.06)) {
         this.pathIndex += 1;
         if (this.pathIndex >= this.path.length) {
+          this._prepareGuidedArrivalView(this.position, this.lastMoveDirection);
           this.path = null;
           this.pathIndex = 0;
           this.pathVelocity.set(0, 0, 0);
           this.velocity.set(0, 0, 0);
-          this.pendingSemanticFallback = null;
+          this.stuck = false;
+          this.recoveryAvailable = false;
+          this.onState?.({ type: 'stuck', available: false });
           this.onState?.({ type: 'travel', active: false });
           return;
         }
@@ -656,10 +1220,17 @@ if (name === 'top') {
           const recovered = this._recoverFromStall();
           if (recovered) this.blockedTime = 0;
         }
-        if (this.blockedTime > 1.25 && this.pendingSemanticFallback) {
-          const fallback = this.pendingSemanticFallback;
-          this.pendingSemanticFallback = null;
-          this._startDirectRoomTravel(fallback.closest, fallback.label, 'unstuck-fallback');
+        if (this.blockedTime > 1.25) {
+          this.path = null;
+          this.pathIndex = 0;
+          this.pathVelocity.set(0, 0, 0);
+          this.velocity.set(0, 0, 0);
+          this.blockedTime = 0;
+          this.stuck = true;
+          this.recoveryAvailable = this.hotspots.length > 0;
+          this.onState?.({ type: 'travel', active: false });
+          this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
+          this.onState?.({ type: 'error', message: 'Navigation paused. Choose a nearby safe floor marker to continue.' });
           return;
         }
       } else {
@@ -675,8 +1246,7 @@ if (name === 'top') {
     if (this.keys.has('s') || this.keys.has('arrowdown')) wish.sub(forward);
     if (this.keys.has('d') || this.keys.has('arrowright')) wish.add(right);
     if (this.keys.has('a') || this.keys.has('arrowleft')) wish.sub(right);
-    if (this.keys.has('q')) this.heightOffset = Math.min(this.heightOffset + 0.35 * dt, 0.35);
-    if (this.keys.has('e')) this.heightOffset = Math.max(this.heightOffset - 0.35 * dt, -0.15);
+    // Camera height is a presentation setting, not a walk-time keyboard control.
 
     const moving = wish.lengthSq() > 1e-8;
     if (moving) wish.normalize();
@@ -701,9 +1271,7 @@ if (name === 'top') {
       } else {
         this.blockedTime = 0;
       }
-      this.headBobTime += dt * (moving ? (this.keys.has('shift') ? 10.5 : 8.5) : 5);
     } else {
-      this.headBobTime += dt * 2;
     }
   }
 
@@ -715,7 +1283,6 @@ if (name === 'top') {
     const response = 5.5;
     this.pathVelocity.lerp(desiredVelocity, 1 - Math.exp(-response * dt));
     this._moveTo(this.position.clone().addScaledVector(this.pathVelocity, dt));
-    this.headBobTime += dt * (speed > this.walkSpeed * 1.05 ? 10.5 : 8.5);
   }
 
   _recoverFromStall() {
@@ -739,7 +1306,7 @@ if (name === 'top') {
       if (!result.success) continue;
       const point = new THREE.Vector3(result.point.x, result.point.y, result.point.z);
       const d = point.distanceTo(candidate);
-      if (d < bestDist && point.distanceTo(this.position) > 0.01 * Math.max(1, this.metersPerUnit)) {
+      if (d < bestDist && point.distanceTo(this.position) > 0.01 * Math.max(1, this.metersPerUnit) && this._hasCameraClearance([point.x, point.y, point.z])) {
         best = { point, polyRef: result.polyRef ?? result.ref ?? 0 };
         bestDist = d;
       }
@@ -756,6 +1323,9 @@ if (name === 'top') {
   }
 
   _moveTo(desired) {
+    if (!this._hasCameraClearance([desired.x, desired.y, desired.z])) {
+      return false;
+    }
     const startRef = this.currentPolyRef || 0;
     const result = this.query.moveAlongSurface(
       startRef,
@@ -767,7 +1337,9 @@ if (name === 'top') {
       this.position.set(result.resultPosition.x, result.resultPosition.y, result.resultPosition.z);
       if (result.visited?.length) this.currentPolyRef = result.visited[result.visited.length - 1];
       if (result.resultPolyRef) this.currentPolyRef = result.resultPolyRef;
+      return true;
     }
+    return false;
   }
 
   _updateOverviewKeys(dt) {
@@ -791,23 +1363,97 @@ if (name === 'top') {
     }
   }
 
+  _prepareGuidedArrivalView(referencePosition = this.position, incomingDirection = this.lastMoveDirection) {
+    if (this.walkMode !== 'guided') return;
+
+    const base = new THREE.Vector3(referencePosition.x, referencePosition.y, referencePosition.z);
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const eyeHeight = this.eyeHeight * unit + this.heightOffset * unit;
+    const eye = new THREE.Vector3(base.x, base.y + eyeHeight, base.z);
+    const incoming = new THREE.Vector3(incomingDirection?.x || 0, 0, incomingDirection?.z || 0);
+    if (incoming.lengthSq() > 1e-8) incoming.normalize();
+
+    const candidates = [];
+    for (const hotspot of this.hotspots) {
+      if (!Array.isArray(hotspot?.position)) continue;
+      const target = new THREE.Vector3(Number(hotspot.position[0]), Number(hotspot.position[1]), Number(hotspot.position[2]));
+      const offset = new THREE.Vector3().subVectors(target, base);
+      offset.y = 0;
+      const distance = offset.length();
+      if (!Number.isFinite(distance) || distance < 1.2 * unit || distance > 11 * unit) continue;
+      if (!this._hasCameraClearance([target.x, target.y, target.z])) continue;
+      const dir = offset.normalize();
+
+      let visible = true;
+      if (this.model) {
+        const toTarget = target.clone().sub(eye);
+        const targetDistance = toTarget.length();
+        if (targetDistance > 1e-6) {
+          this.raycaster.set(eye, toTarget.normalize());
+          const hit = this.raycaster.intersectObject(this.model, true)[0];
+          visible = !hit || hit.distance >= targetDistance - 0.10 * unit;
+        }
+      }
+      if (!visible) continue;
+
+      const forwardBonus = incoming.lengthSq() > 1e-8 ? Math.max(0, incoming.dot(dir)) : 0;
+      candidates.push({ hotspot, target, dir, distance, score: (1 / Math.max(distance / unit, 0.5)) + forwardBonus * 0.55 });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+
+    // Prefer a destination that is clearly visible from the new position and
+    // naturally lies ahead of the arrival path. We intentionally rotate only
+    // toward one useful destination instead of averaging every nearby marker;
+    // this creates a clean composition and keeps the next action discoverable.
+    const chosen = candidates[0];
+    let desiredYaw = null;
+    if (chosen) {
+      desiredYaw = Math.atan2(-chosen.dir.x, -chosen.dir.z);
+    } else if (incoming.lengthSq() > 1e-8) {
+      desiredYaw = Math.atan2(-incoming.x, -incoming.z);
+    }
+
+    if (Number.isFinite(desiredYaw)) {
+      this.guidedYawCenter = desiredYaw;
+      this.targetYaw = desiredYaw;
+      this.guidedPanPhase = 0;
+      this.targetPitch = this.guidedPitch;
+    }
+  }
+
   _syncCamera() {
     const smoothing = 1 - Math.exp(-this.lookSmoothing * (this._lastDt || 0.016));
+    const dt = this._lastDt || 0.016;
+    const isTravelling = Boolean(this.path?.length || this.directTravel);
+
+    // Guided mode is a presentation camera: it slowly pans continuously, not
+    // only while travelling. The pitch stays fixed so the user gets a stable
+    // architectural horizon, while movement follows the NavMesh independently.
+    if (this.walkMode === 'guided' && this.guidedAutoRotate) {
+      // Guided mode gets a subtle cinematic pan around the CURRENT heading.
+      // The center is deliberately updated when a new destination is chosen,
+      // so a previous room cannot leave the next room staring into a wall.
+      this.guidedPanPhase += dt * this.guidedYawRate;
+      this.targetYaw = this.guidedYawCenter + Math.sin(this.guidedPanPhase) * this.guidedYawAmplitude;
+      this.targetPitch = this.guidedPitch;
+      this.guidedTravelRotating = true;
+    } else if (!isTravelling) {
+      this.guidedTravelRotating = false;
+    }
+
     this.currentYaw = THREE.MathUtils.lerp(this.currentYaw, this.targetYaw, smoothing);
     this.currentPitch = THREE.MathUtils.lerp(this.currentPitch, this.targetPitch, smoothing);
     this.yaw = this.currentYaw;
     this.pitch = this.currentPitch;
 
     const baseH = this.eyeHeight * this.metersPerUnit + this.heightOffset * this.metersPerUnit;
-    const isMoving = this.velocity.lengthSq() > 0.0025;
-    const bobAmplitude = Math.min(this.metersPerUnit * 0.018, 0.018);
-    const bob = isMoving ? Math.sin(this.headBobTime) * bobAmplitude : 0;
-    const sway = isMoving ? Math.cos(this.headBobTime * 0.5) * bobAmplitude * 0.35 : 0;
-
+    // Interior-design walkthroughs should feel like a stabilized architectural
+    // camera, not a first-person game. Keep walking motion visually stable.
     this.camera.position.set(
-      this.position.x + sway * Math.cos(this.currentYaw),
-      this.position.y + baseH + bob,
-      this.position.z - sway * Math.sin(this.currentYaw),
+      this.position.x,
+      this.position.y + baseH,
+      this.position.z,
     );
 
     this.camera.rotation.order = 'YXZ';
@@ -815,16 +1461,88 @@ if (name === 'top') {
   }
 
   _updatePortals() {
+    const visibleLimit = 7;
+    const maxDistance = 11 * Math.max(this.metersPerUnit, 0.000001);
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
-    this.portalObjects.forEach((sprite) => {
-      const to = sprite.position.clone().sub(this.camera.position);
-      const dist = to.length();
-      sprite.visible = dist < 18 * this.metersPerUnit;
-      if (!sprite.visible) return;
-      to.normalize();
-      const dot = forward.dot(to);
-      sprite.visible = dot > -0.15;
-      if (sprite.visible) sprite.quaternion.copy(this.camera.quaternion);
+
+    if (this.viewMode !== 'walk') {
+      this.portalObjects.forEach((portal) => { portal.visible = false; });
+      return;
+    }
+
+    const candidates = [];
+    for (const portal of this.portalObjects) {
+      const to = portal.position.clone().sub(this.position);
+      const dist = Math.hypot(to.x, to.z);
+      if (dist < 0.35 * this.metersPerUnit || dist > maxDistance) {
+        portal.visible = false;
+        continue;
+      }
+      const flatTo = new THREE.Vector3(to.x, 0, to.z).normalize();
+      const dot = forward.dot(flatTo);
+      if (dot < -0.18) {
+        portal.visible = false;
+        continue;
+      }
+      candidates.push({ portal, dist, dot, angle: Math.atan2(flatTo.x, flatTo.z) });
+    }
+
+    candidates.sort((a, b) => {
+      const scoreA = a.dist - Math.max(0, a.dot) * 1.8 * this.metersPerUnit;
+      const scoreB = b.dist - Math.max(0, b.dot) * 1.8 * this.metersPerUnit;
+      return scoreA - scoreB;
+    });
+
+    // Select nearby destinations with angular diversity so the user can see
+    // choices distributed across the room instead of seven markers stacked in
+    // the same direction.
+    const selected = [];
+    const minAngularSeparation = THREE.MathUtils.degToRad(16);
+    for (const candidate of candidates) {
+      const separated = selected.every((chosen) => {
+        const delta = Math.atan2(Math.sin(candidate.angle - chosen.angle), Math.cos(candidate.angle - chosen.angle));
+        return Math.abs(delta) >= minAngularSeparation;
+      });
+      if (separated) selected.push(candidate);
+      if (selected.length >= visibleLimit) break;
+    }
+    if (selected.length < visibleLimit) {
+      for (const candidate of candidates) {
+        if (!selected.includes(candidate)) selected.push(candidate);
+        if (selected.length >= visibleLimit) break;
+      }
+    }
+
+    const selectedSet = new Set(selected.map((entry) => entry.portal));
+    const hoveredHits = this.raycaster.intersectObjects(
+      selected.map((entry) => entry.portal),
+      true,
+    );
+    const hoveredGroup = hoveredHits.length
+      ? (hoveredHits[0].object.parent?.isGroup ? hoveredHits[0].object.parent : hoveredHits[0].object)
+      : null;
+
+    candidates.forEach((entry) => {
+      const portal = entry.portal;
+      portal.visible = selectedSet.has(portal) && !this.path && !this.directTravel;
+      if (!portal.visible) return;
+      const pulse = 1 + Math.sin(performance.now() * 0.0025 + portal.position.x * 2.7 + portal.position.z) * 0.035;
+      const hover = portal === hoveredGroup ? 1.16 : 1;
+      portal.scale.setScalar(pulse * hover);
+      const distanceFade = THREE.MathUtils.clamp(1 - entry.dist / maxDistance, 0.25, 1);
+      const proximity = THREE.MathUtils.clamp(1 - entry.dist / (4.5 * Math.max(this.metersPerUnit, 0.000001)), 0, 1);
+      const hoverBoost = portal === hoveredGroup ? 1.35 : 1;
+      const glow = 0.55 + proximity * 0.45;
+      const halo = portal.children[0];
+      const disk = portal.children[1];
+      const ring = portal.children[2];
+      if (halo?.material) halo.material.opacity = (0.04 + proximity * 0.16) * distanceFade * hoverBoost;
+      if (disk?.material) disk.material.opacity = (0.18 + proximity * 0.20) * distanceFade * hoverBoost;
+      if (ring?.material) ring.material.opacity = (0.72 + proximity * 0.24) * distanceFade * hoverBoost;
+      portal.children.forEach((child) => {
+        if (child.material) child.material.needsUpdate = false;
+      });
+      portal.userData.glowStrength = glow;
     });
   }
 
@@ -858,7 +1576,17 @@ if (name === 'top') {
     this.renderer.domElement.removeEventListener('pointermove', this.onPointerMove);
     this.renderer.domElement.removeEventListener('dblclick', this.onDoubleClick);
     window.removeEventListener('resize', this.resize);
-    this.portalObjects.forEach((o) => { o.material.map?.dispose(); o.material.dispose(); });
+    this.portalObjects.forEach((o) => {
+      o.traverse?.((child) => {
+        child.geometry?.dispose?.();
+        child.material?.dispose?.();
+      });
+      o.parent?.remove?.(o);
+    });
+    this.navSurfaceMesh?.geometry?.dispose?.();
+    this.navSurfaceMesh?.material?.dispose?.();
+    this.navSurfaceMesh?.parent?.remove?.(this.navSurfaceMesh);
+    this.navSurfaceMesh = null;
     this.orbitControls.dispose();
     this.navMesh?.destroy?.();
     this.query?.destroy?.();
@@ -875,20 +1603,22 @@ if (name === 'top') {
 
 export function useWalkthroughEngine({ containerRef, jobId }) {
   const runtimeRef = useRef(null);
-  const [state, setState] = useState({ status: 'idle', areas: [], activeArea: null, message: '', lookLocked: false, cameraHeightMeters: DEFAULT_EYE_HEIGHT_METERS + DEFAULT_HEIGHT_OFFSET_METERS, heightOffsetMeters: DEFAULT_HEIGHT_OFFSET_METERS, cameraFov: DEFAULT_FOV_DEGREES });
+  const [state, setState] = useState({ status: 'idle', areas: [], navigationPlan: null, activeArea: null, activeHotspotId: null, message: '', lookLocked: true, walkMode: 'guided', cameraHeightMeters: DEFAULT_EYE_HEIGHT_METERS + DEFAULT_HEIGHT_OFFSET_METERS, heightOffsetMeters: DEFAULT_HEIGHT_OFFSET_METERS, cameraFov: DEFAULT_FOV_DEGREES, stuck: false, recoveryAvailable: false });
 
   useEffect(() => {
     if (!containerRef.current || !jobId) return undefined;
     const runtime = new WalkRuntime({
       canvas: containerRef.current,
       onState: (event) => {
-        if (event.type === 'loaded') setState({ status: 'ready', areas: event.areas || [], activeArea: null, message: '', lookLocked: runtimeRef.current?.lookLocked ?? false });
+        if (event.type === 'loaded') setState({ status: 'ready', areas: event.areas || [], navigationPlan: runtimeRef.current?.navigationPlan || null, activeArea: null, activeHotspotId: null, message: '', lookLocked: runtimeRef.current?.lookLocked ?? false, walkMode: runtimeRef.current?.walkMode ?? 'guided', cameraHeightMeters: (runtimeRef.current?.eyeHeight || DEFAULT_EYE_HEIGHT_METERS) + (runtimeRef.current?.heightOffset || 0), heightOffsetMeters: runtimeRef.current?.heightOffset || 0, cameraFov: runtimeRef.current?.fov || DEFAULT_FOV_DEGREES, stuck: false, recoveryAvailable: false });
         if (event.type === 'loading') setState((prev) => ({ ...prev, status: 'loading' }));
-        if (event.type === 'travel') setState((prev) => ({ ...prev, activeArea: event.label || null, message: event.active ? `Walking to ${event.label}…` : '' }));
+        if (event.type === 'travel') setState((prev) => ({ ...prev, activeArea: event.label || null, activeHotspotId: event.hotspotId || prev.activeHotspotId || null, message: event.active ? `Walking to ${event.label}…` : '' }));
         if (event.type === 'error') setState((prev) => ({ ...prev, message: event.message || 'Navigation failed.' }));
         if (event.type === 'look-lock') setState((prev) => ({ ...prev, lookLocked: event.locked }));
+        if (event.type === 'walk-mode') setState((prev) => ({ ...prev, walkMode: event.mode }));
         if (event.type === 'camera-settings') setState((prev) => ({ ...prev, cameraHeightMeters: event.cameraHeightMeters, heightOffsetMeters: event.heightOffsetMeters, cameraFov: event.fov }));
-        if (event.type === 'unstuck') setState((prev) => ({ ...prev, message: 'Recovered walk position.' }));
+        if (event.type === 'unstuck') setState((prev) => ({ ...prev, message: 'Recovered walk position.', stuck: false, recoveryAvailable: false }));
+        if (event.type === 'stuck') setState((prev) => ({ ...prev, stuck: Boolean(event.available), recoveryAvailable: Boolean(event.available) }));
         if (event.type === 'escape') setState((prev) => ({ ...prev, message: '' }));
       },
     });
@@ -896,7 +1626,7 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
     const base = import.meta.env.VITE_API_URL || 'http://localhost:3000';
     runtime.load(jobId, base).catch((error) => {
       console.error('[Walkthrough] Failed to load job:', error);
-      setState({ status: 'error', areas: [], activeArea: null, message: error.message, lookLocked: false });
+      setState({ status: 'error', areas: [], activeArea: null, message: error.message, lookLocked: true, walkMode: 'guided', stuck: false, recoveryAvailable: false });
     });
     return () => {
       runtime.dispose();
@@ -905,10 +1635,12 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
   }, [containerRef, jobId]);
 
   const travelTo = useCallback((area) => runtimeRef.current?.travelTo(area.center, area.label), []);
-  const switchRoom = useCallback((area) => runtimeRef.current?.switchRoom(area.center, area.label), []);
+  const switchRoom = useCallback((area) => runtimeRef.current?.switchRoom(area, area?.label), []);
+  const navigateToHotspot = useCallback((hotspot) => runtimeRef.current?.navigateToHotspot(hotspot), []);
   const stopTravel = useCallback(() => runtimeRef.current?.stopTravel(), []);
   const setHeightOffset = useCallback((value) => runtimeRef.current?.setHeightOffset(value), []);
   const setSensitivity = useCallback((value) => runtimeRef.current?.setSensitivity(value), []);
+  const setWalkMode = useCallback((value) => runtimeRef.current?.setWalkMode(value), []);
   const setLookLocked = useCallback((value) => runtimeRef.current?.setLookLocked(value), []);
   const setFov = useCallback((value) => runtimeRef.current?.setFov(value), []);
   const setViewMode = useCallback((value) => runtimeRef.current?.setViewMode(value), []);
@@ -916,5 +1648,6 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
   const setViewPreset = useCallback((value) => runtimeRef.current?.setViewPreset(value), []);
   const zoom = useCallback((value) => runtimeRef.current?.zoom(value), []);
   const fitView = useCallback(() => runtimeRef.current?.fitView(), []);
-  return { ...state, travelTo, switchRoom, stopTravel, setHeightOffset, setSensitivity, setLookLocked, setViewMode, setAutoRotate, setViewPreset, zoom, fitView, setFov };
+  const recoverToSafeSpot = useCallback(() => runtimeRef.current?.recoverToSafeSpot(), []);
+  return { ...state, travelTo, switchRoom, navigateToHotspot, stopTravel, recoverToSafeSpot, setHeightOffset, setSensitivity, setWalkMode, setLookLocked, setViewMode, setAutoRotate, setViewPreset, zoom, fitView, setFov };
 }

@@ -7,6 +7,7 @@ import {
   getNavMeshPositionsAndIndices,
   init as initRecast,
   NavMesh,
+  NavMeshQuery,
 } from "recast-navigation";
 import { generateSoloNavMesh } from "recast-navigation/generators";
 
@@ -40,6 +41,22 @@ interface MeshRecord {
   upwardMeanY: number;
   upwardMinY: number;
   upwardMaxY: number;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  minZ: number;
+  maxZ: number;
+}
+
+interface ObstacleFootprint {
+  name: string;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  minZ: number;
+  maxZ: number;
 }
 
 interface ExtractedGeometry {
@@ -47,6 +64,7 @@ interface ExtractedGeometry {
   indices: number[];
   labels: string[];
   meshes: MeshRecord[];
+  obstacleFootprints: ObstacleFootprint[];
   floorMeshNames: string[];
   floorElevation: number;
 }
@@ -164,6 +182,12 @@ async function extractFinalGlb(glbPath: string): Promise<ExtractedGeometry> {
     let upwardAreaWeight = 0;
     let upwardMinY = Infinity;
     let upwardMaxY = -Infinity;
+    let meshMinX = Infinity;
+    let meshMaxX = -Infinity;
+    let meshMinY = Infinity;
+    let meshMaxY = -Infinity;
+    let meshMinZ = Infinity;
+    let meshMaxZ = -Infinity;
 
     for (const primitive of mesh.listPrimitives()) {
       const mode = primitive.getMode();
@@ -179,6 +203,12 @@ async function extractFinalGlb(glbPath: string): Promise<ExtractedGeometry> {
         v.set(localPositions[i * 3], localPositions[i * 3 + 1], localPositions[i * 3 + 2]);
         v.applyMatrix4(worldMatrix);
         positions.push(v.x, v.y, v.z);
+        meshMinX = Math.min(meshMinX, v.x);
+        meshMaxX = Math.max(meshMaxX, v.x);
+        meshMinY = Math.min(meshMinY, v.y);
+        meshMaxY = Math.max(meshMaxY, v.y);
+        meshMinZ = Math.min(meshMinZ, v.z);
+        meshMaxZ = Math.max(meshMaxZ, v.z);
       }
 
       const localIndices = triangleIndicesForPrimitive(primitive, mode, vertexCount);
@@ -214,6 +244,8 @@ async function extractFinalGlb(glbPath: string): Promise<ExtractedGeometry> {
         upwardMeanY: upwardAreaWeight > 0 ? upwardYSum / upwardAreaWeight : Infinity,
         upwardMinY: upwardMinY === Infinity ? Infinity : upwardMinY,
         upwardMaxY: upwardMaxY === -Infinity ? -Infinity : upwardMaxY,
+        minX: meshMinX, maxX: meshMaxX, minY: meshMinY, maxY: meshMaxY,
+        minZ: meshMinZ, maxZ: meshMaxZ,
       });
     }
   });
@@ -231,6 +263,23 @@ async function extractFinalGlb(glbPath: string): Promise<ExtractedGeometry> {
     .map((mesh) => mesh.name);
 
   const floorNameSet = new Set(floorMeshNames);
+  const obstacleFootprints: ObstacleFootprint[] = meshes
+    .filter((mesh) => !floorNameSet.has(mesh.name))
+    .map((mesh) => ({
+      name: mesh.name,
+      minX: mesh.minX,
+      maxX: mesh.maxX,
+      minY: mesh.minY,
+      maxY: mesh.maxY,
+      minZ: mesh.minZ,
+      maxZ: mesh.maxZ,
+    }))
+    .filter((b) =>
+      Number.isFinite(b.minX) && Number.isFinite(b.maxX) &&
+      Number.isFinite(b.minY) && Number.isFinite(b.maxY) &&
+      Number.isFinite(b.minZ) && Number.isFinite(b.maxZ)
+    );
+
   for (const mesh of meshes) {
     if (!floorNameSet.has(mesh.name)) continue;
     for (let t = 0; t < mesh.triangleCount; t++) labels[mesh.triangleStart + t] = "floor_candidate";
@@ -240,7 +289,7 @@ async function extractFinalGlb(glbPath: string): Promise<ExtractedGeometry> {
   console.log(`[WalkNav] Floor elevation: ${Number.isFinite(floorElevation) ? floorElevation : "unknown"}`);
   console.log(`[WalkNav] Floor threshold area: ${areaThreshold}`);
 
-  return { positions, indices, labels, meshes, floorMeshNames, floorElevation };
+  return { positions, indices, labels, meshes, obstacleFootprints, floorMeshNames, floorElevation };
 }
 
 function buildFilteredSoup(input: ExtractedGeometry, slopeAngle: number) {
@@ -341,13 +390,223 @@ function buildAreas(surfacePositions: number[], surfaceIndices: number[], cellSi
 
   const areas = Array.from(buckets.values())
     .filter((b) => b.count >= 3)
-    .map((b, i) => ({ id: `area-${i + 1}`, label: `Node ${i + 1}`, center: [b.x / b.count, floorY, b.z / b.count] as [number, number, number] }));
+    .map((b, i) => ({ id: `area-${i + 1}`, label: `Room ${i + 1}`, center: [b.x / b.count, floorY, b.z / b.count] as [number, number, number] }));
 
   // Sort spatially for deterministic presentation/tour order.
   areas.sort((a, b) => (a.center[2] - b.center[2]) || (a.center[0] - b.center[0]));
-  areas.forEach((a, i) => { a.id = `area-${i + 1}`; a.label = `Node ${i + 1}`; });
+  areas.forEach((a, i) => { a.id = `area-${i + 1}`; a.label = `Room ${i + 1}`; });
 
   return areas;
+}
+
+
+
+type Hotspot = {
+  id: string;
+  position: [number, number, number];
+  clearanceMeters: number;
+  score: number;
+  source: "navmesh" | "room-anchor";
+  areaId?: string;
+};
+
+function distanceXZ(a: [number, number, number], b: [number, number, number]): number {
+  return Math.hypot(a[0] - b[0], a[2] - b[2]);
+}
+
+function isInsideObstacleFootprint(
+  point: [number, number, number],
+  obstacleFootprints: ObstacleFootprint[],
+  floorY: number,
+  physicalMetersPerUnit: number,
+): boolean {
+  const margin = 0.26 * physicalMetersPerUnit;
+  const maxBaseAboveFloor = 0.28 * physicalMetersPerUnit;
+  const minObstacleHeight = 0.30 * physicalMetersPerUnit;
+
+  for (const obstacle of obstacleFootprints) {
+    if (!Number.isFinite(obstacle.minX) || !Number.isFinite(obstacle.maxX)) continue;
+    const baseAboveFloor = obstacle.minY - floorY;
+    const heightAboveFloor = obstacle.maxY - floorY;
+    if (baseAboveFloor > maxBaseAboveFloor || heightAboveFloor < minObstacleHeight) continue;
+
+    if (
+      point[0] >= obstacle.minX - margin &&
+      point[0] <= obstacle.maxX + margin &&
+      point[2] >= obstacle.minZ - margin &&
+      point[2] <= obstacle.maxZ + margin
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isComfortableNavPoint(
+  query: NavMeshQuery,
+  point: [number, number, number],
+  sampleRadius: number,
+  tolerance: number,
+  floorY: number,
+  physicalMetersPerUnit: number,
+  obstacleFootprints: ObstacleFootprint[],
+): boolean {
+  if (isInsideObstacleFootprint(point, obstacleFootprints, floorY, physicalMetersPerUnit)) return false;
+
+  // Two concentric rings make the hotspot require a genuine standing area,
+  // instead of accepting a tiny NavMesh sliver hidden under a bed/table.
+  const rings = [
+    { radius: sampleRadius, required: 12 },
+    { radius: sampleRadius * 1.35, required: 8 },
+  ];
+
+  for (const ring of rings) {
+    const probeCount = 12;
+    let valid = 0;
+    for (let i = 0; i < probeCount; i++) {
+      const angle = (Math.PI * 2 * i) / probeCount;
+      const x = point[0] + Math.cos(angle) * ring.radius;
+      const z = point[2] + Math.sin(angle) * ring.radius;
+      const result = query.findClosestPoint(
+        { x, y: point[1], z },
+        { halfExtents: { x: tolerance, y: Math.max(0.35 * physicalMetersPerUnit, 0.08), z: tolerance } },
+      );
+      if (!result.success || !result.point) continue;
+      if (Math.abs(result.point.y - floorY) > Math.max(0.08 * physicalMetersPerUnit, tolerance * 0.5)) continue;
+      if (Math.hypot(result.point.x - x, result.point.z - z) > tolerance) continue;
+      if (isInsideObstacleFootprint([result.point.x, result.point.y, result.point.z], obstacleFootprints, floorY, physicalMetersPerUnit)) continue;
+      valid++;
+    }
+    if (valid < ring.required) return false;
+  }
+  return true;
+}
+
+function buildWalkHotspots(
+  navMesh: NavMesh,
+  surfacePositions: number[],
+  surfaceIndices: number[],
+  areas: Array<{ id: string; label: string; center: [number, number, number] }>,
+  physicalMetersPerUnit: number,
+  floorY: number,
+  obstacleFootprints: ObstacleFootprint[],
+): Hotspot[] {
+  const query = new NavMeshQuery(navMesh);
+  const spacing = 1.50 * physicalMetersPerUnit;
+  const snapTolerance = Math.max(0.35 * physicalMetersPerUnit, 0.15);
+  const comfortRadius = Math.max(0.52 * physicalMetersPerUnit, 0.22);
+  const cellSize = 2.40 * physicalMetersPerUnit;
+  const maxHotspots = 32;
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+  for (let i = 0; i < surfacePositions.length; i += 3) {
+    minX = Math.min(minX, surfacePositions[i]);
+    maxX = Math.max(maxX, surfacePositions[i]);
+    minZ = Math.min(minZ, surfacePositions[i + 2]);
+    maxZ = Math.max(maxZ, surfacePositions[i + 2]);
+  }
+  if (![minX, maxX, minZ, maxZ].every(Number.isFinite)) return [];
+
+  const candidates: Hotspot[] = [];
+  const seen = new Set<string>();
+
+  const addCandidate = (point: [number, number, number], source: Hotspot["source"], areaId?: string, score = 0) => {
+    if (!isComfortableNavPoint(query, point, comfortRadius, snapTolerance, floorY, physicalMetersPerUnit, obstacleFootprints)) return;
+    const ix = Math.floor(point[0] / (spacing * 0.5));
+    const iz = Math.floor(point[2] / (spacing * 0.5));
+    const key = `${ix}:${iz}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({
+      id: `hotspot-${candidates.length + 1}`,
+      position: point,
+      clearanceMeters: comfortRadius / Math.max(physicalMetersPerUnit, 0.000001),
+      score,
+      source,
+      areaId,
+    });
+  };
+
+  // Room-area centers are semantic anchors. Snap them to the actual NavMesh,
+  // then let the same comfort test reject anchors that happen to land inside
+  // furniture or a narrow obstacle pocket.
+  for (const area of areas) {
+    const result = query.findClosestPoint(
+      { x: area.center[0], y: area.center[1], z: area.center[2] },
+      { halfExtents: { x: spacing, y: 0.6, z: spacing } },
+    );
+    if (!result.success || !result.point) continue;
+    addCandidate(
+      [result.point.x, result.point.y, result.point.z],
+      "room-anchor",
+      area.id,
+      70,
+    );
+  }
+
+  // Regular samples provide coverage through rooms and corridors. The points
+  // are snapped by NavMeshQuery rather than projected onto arbitrary geometry.
+  const cols = Math.max(1, Math.ceil((maxX - minX) / spacing));
+  const rows = Math.max(1, Math.ceil((maxZ - minZ) / spacing));
+  for (let ix = 0; ix <= cols; ix++) {
+    const x = minX + (ix + 0.5) * spacing;
+    for (let iz = 0; iz <= rows; iz++) {
+      const z = minZ + (iz + 0.5) * spacing;
+      const result = query.findClosestPoint(
+        { x, y: floorY, z },
+        { halfExtents: { x: snapTolerance, y: 0.6, z: snapTolerance } },
+      );
+      if (!result.success || !result.point) continue;
+      const snapped: [number, number, number] = [result.point.x, result.point.y, result.point.z];
+      const snapDistance = Math.hypot(snapped[0] - x, snapped[2] - z);
+      if (snapDistance > snapTolerance) continue;
+      const openness = isComfortableNavPoint(query, snapped, comfortRadius, snapTolerance, floorY, physicalMetersPerUnit, obstacleFootprints) ? 1 : 0;
+      if (!openness) continue;
+      addCandidate(snapped, "navmesh", undefined, 20 - snapDistance / Math.max(physicalMetersPerUnit, 0.000001));
+    }
+  }
+
+  // Prefer one strong candidate per coarse area first, then fill additional
+  // coverage by score. This avoids a large living room consuming all markers.
+  const buckets = new Map<string, Hotspot[]>();
+  for (const candidate of candidates) {
+    const bx = Math.floor(candidate.position[0] / cellSize);
+    const bz = Math.floor(candidate.position[2] / cellSize);
+    const key = `${bx}:${bz}`;
+    const bucket = buckets.get(key) ?? [];
+    bucket.push(candidate);
+    buckets.set(key, bucket);
+  }
+
+  const selected: Hotspot[] = [];
+  const selectedMinSpacing = 1.30 * physicalMetersPerUnit;
+
+  const trySelect = (candidate: Hotspot) => {
+    if (selected.length >= maxHotspots) return false;
+    if (selected.some((existing) => distanceXZ(existing.position, candidate.position) < selectedMinSpacing)) return false;
+    selected.push(candidate);
+    return true;
+  };
+
+  for (const bucket of buckets.values()) {
+    bucket.sort((a, b) => b.score - a.score);
+    trySelect(bucket[0]);
+  }
+
+  const leftovers = candidates
+    .filter((candidate) => !selected.includes(candidate))
+    .sort((a, b) => b.score - a.score);
+  leftovers.forEach(trySelect);
+
+  selected.sort((a, b) =>
+    (a.position[2] - b.position[2]) || (a.position[0] - b.position[0])
+  );
+  selected.forEach((hotspot, index) => { hotspot.id = `hotspot-${index + 1}`; });
+
+  return selected;
 }
 
 function writeDebugObj(filePath: string, positions: Float32Array, indices: Uint32Array, labels: string[]) {
@@ -442,6 +701,31 @@ export class WalkNavigationPipeline {
     );
     fs.writeFileSync(path.join(debugDir, "walk_areas.json"), JSON.stringify({ version: 1, areas }, null, 2), "utf8");
 
+    const walkHotspots = buildWalkHotspots(
+      navMesh,
+      Array.from(surfacePositions),
+      Array.from(surfaceIndices),
+      areas,
+      physicalMetersPerUnit,
+      surface.metadata.floorElevation,
+      extracted.obstacleFootprints,
+    );
+    fs.writeFileSync(
+      path.join(debugDir, "walk_hotspots.json"),
+      JSON.stringify({
+        version: 1,
+        metadata: {
+          count: walkHotspots.length,
+          minSpacingMeters: 1.30,
+          candidateSpacingMeters: 1.50,
+          minimumComfortRadiusMeters: 0.52,
+          source: "recast-navmesh",
+        },
+        hotspots: walkHotspots,
+      }, null, 2),
+      "utf8",
+    );
+
     const navigationNodes = areas.map((area, index) => ({
       id: area.id,
       position: [area.center[0], area.center[1] + walkableHeight, area.center[2]],
@@ -472,12 +756,18 @@ export class WalkNavigationPipeline {
         injectSyntheticFloor: false,
       },
       areas: { count: areas.length },
+      hotspots: {
+        count: walkHotspots.length,
+        safety: { minClearanceMeters: 0.54, requiresClearFloorAroundCandidate: true },
+      },
+      obstacleFootprints: { count: extracted.obstacleFootprints.length },
       navMesh: { serializedBytes: serialized.length },
     };
     fs.writeFileSync(path.join(debugDir, "navigation_meta.json"), JSON.stringify(meta, null, 2), "utf8");
 
     console.log(`[WalkNav] Wrote navigation_navmesh.bin (${serialized.length} bytes)`);
     console.log(`[WalkNav] Wrote walk_areas.json (${areas.length} areas)`);
+    console.log(`[WalkNav] Wrote walk_hotspots.json (${walkHotspots.length} hotspots)`);
     console.log(`[WalkNav] Floor authority: ${extracted.floorMeshNames.join(", ") || "NONE"}`);
     console.log(`[WalkNav] Generated navigation is floor-constrained; no synthetic floor.`);
 
