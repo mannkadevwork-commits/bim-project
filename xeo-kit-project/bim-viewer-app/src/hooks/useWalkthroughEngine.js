@@ -89,6 +89,15 @@ class WalkRuntime {
     this.guidedManualActive = false;
     this.guidedPointerDown = null;
     this.guidedPointerDragging = false;
+    // Guided camera composition state.  The heading is chosen from actual
+    // nearby destinations/open-space checks instead of a blind perpetual spin.
+    this.guidedCompositionYaw = 0;
+    this.guidedCompositionTargetYaw = 0;
+    this.guidedLastCompositionAt = 0;
+    this.guidedCompositionIntervalMs = 5500;
+    this.guidedCompositionMinVisibleTargets = 2;
+    this.guidedCompositionSweepDeg = 34;
+    this.guidedCompositionLookaheadMeters = 8;
     this.lookLocked = false;
     this.autoRotate = false;
     this.lastMoveDirection = new THREE.Vector3();
@@ -198,8 +207,11 @@ class WalkRuntime {
         this.targetPitch = this.guidedPitch;
         this.currentPitch = this.guidedPitch;
         this.guidedManualActive = true;
-        this.guidedManualYawUntil = performance.now() + 2200;
+        this.guidedManualYawUntil = performance.now() + 2600;
         this.guidedYawCenter = this.targetYaw;
+        this.guidedCompositionYaw = this.targetYaw;
+        this.guidedCompositionTargetYaw = this.targetYaw;
+        this.guidedLastCompositionAt = performance.now();
         this.guidedPanPhase = 0;
         this.lastPointer.x = e.clientX;
         this.lastPointer.y = e.clientY;
@@ -410,6 +422,9 @@ class WalkRuntime {
     if (this.walkMode === 'guided' && Number.isFinite(this.targetYaw)) {
       this.currentYaw = this.targetYaw;
       this.guidedYawCenter = this.currentYaw;
+      this.guidedCompositionYaw = this.currentYaw;
+      this.guidedCompositionTargetYaw = this.currentYaw;
+      this.guidedLastCompositionAt = performance.now();
       this.guidedPanPhase = 0;
     }
     // Keep the player position prepared in the background, but leave the camera in overview mode.
@@ -1100,6 +1115,9 @@ class WalkRuntime {
     // Switching back restores mouse-look immediately without a view jump.
     if (next === 'guided') {
       this.guidedYawCenter = this.currentYaw;
+      this.guidedCompositionYaw = this.currentYaw;
+      this.guidedCompositionTargetYaw = this.currentYaw;
+      this.guidedLastCompositionAt = performance.now();
       this.guidedPitch = this.currentPitch;
       this.targetPitch = this.currentPitch;
       this.heightOffset = GUIDED_CAMERA_HEIGHT_METERS - this.eyeHeight;
@@ -1150,6 +1168,9 @@ class WalkRuntime {
         this.lookLocked = true;
         this.guidedManualActive = false;
         this.guidedManualYawUntil = 0;
+        this.guidedCompositionYaw = this.currentYaw;
+        this.guidedCompositionTargetYaw = this.currentYaw;
+        this.guidedLastCompositionAt = performance.now();
         this.currentPitch = this.guidedPitch;
         this.targetPitch = this.guidedPitch;
         // Put the camera at the walk position first, then choose an initial
@@ -1160,6 +1181,9 @@ class WalkRuntime {
         if (Number.isFinite(this.targetYaw)) {
           this.currentYaw = this.targetYaw;
           this.guidedYawCenter = this.currentYaw;
+          this.guidedCompositionYaw = this.currentYaw;
+          this.guidedCompositionTargetYaw = this.currentYaw;
+          this.guidedLastCompositionAt = performance.now();
           this.guidedPanPhase = 0;
         }
         this.onState?.({ type: 'look-lock', locked: true });
@@ -1564,63 +1588,124 @@ if (name === 'top') {
     }
   }
 
-  _prepareGuidedArrivalView(referencePosition = this.position, incomingDirection = this.lastMoveDirection) {
-    if (this.walkMode !== 'guided') return;
-
-    const base = new THREE.Vector3(referencePosition.x, referencePosition.y, referencePosition.z);
+  _getGuidedVisibleHotspots(referencePosition = this.position, yaw = this.currentYaw, maxDistanceMeters = this.guidedCompositionLookaheadMeters) {
+    if (!this.hotspots.length) return [];
     const unit = Math.max(this.metersPerUnit, 0.000001);
+    const base = new THREE.Vector3(referencePosition.x, referencePosition.y, referencePosition.z);
     const eyeHeight = this.eyeHeight * unit + this.heightOffset * unit;
     const eye = new THREE.Vector3(base.x, base.y + eyeHeight, base.z);
-    const incoming = new THREE.Vector3(incomingDirection?.x || 0, 0, incomingDirection?.z || 0);
-    if (incoming.lengthSq() > 1e-8) incoming.normalize();
+    const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+    const visible = [];
 
-    const candidates = [];
     for (const hotspot of this.hotspots) {
       if (!Array.isArray(hotspot?.position)) continue;
-      const target = new THREE.Vector3(Number(hotspot.position[0]), Number(hotspot.position[1]), Number(hotspot.position[2]));
-      const offset = new THREE.Vector3().subVectors(target, base);
-      offset.y = 0;
-      const distance = offset.length();
-      if (!Number.isFinite(distance) || distance < 1.2 * unit || distance > 11 * unit) continue;
+      const target = new THREE.Vector3(
+        Number(hotspot.position[0]),
+        Number(hotspot.position[1]),
+        Number(hotspot.position[2]),
+      );
+      const to = target.clone().sub(base);
+      to.y = 0;
+      const distance = to.length();
+      if (!Number.isFinite(distance) || distance < 0.65 * unit || distance > maxDistanceMeters * unit) continue;
       if (!this._hasCameraClearance([target.x, target.y, target.z])) continue;
-      const dir = offset.normalize();
 
-      let visible = true;
+      const direction = to.normalize();
+      const angle = Math.acos(THREE.MathUtils.clamp(forward.dot(direction), -1, 1));
+      if (angle > THREE.MathUtils.degToRad(82)) continue;
+
+      let occluded = false;
       if (this.model) {
         const toTarget = target.clone().sub(eye);
         const targetDistance = toTarget.length();
         if (targetDistance > 1e-6) {
           this.raycaster.set(eye, toTarget.normalize());
           const hit = this.raycaster.intersectObject(this.model, true)[0];
-          visible = !hit || hit.distance >= targetDistance - 0.10 * unit;
+          occluded = Boolean(hit && hit.distance < targetDistance - 0.06 * unit);
         }
       }
-      if (!visible) continue;
+      if (occluded) continue;
 
-      const forwardBonus = incoming.lengthSq() > 1e-8 ? Math.max(0, incoming.dot(dir)) : 0;
-      candidates.push({ hotspot, target, dir, distance, score: (1 / Math.max(distance / unit, 0.5)) + forwardBonus * 0.55 });
+      visible.push({ hotspot, distance, angle, target, direction });
     }
+    return visible;
+  }
+
+  _scoreGuidedHeading(referencePosition = this.position, candidateYaw = this.currentYaw, incomingDirection = this.lastMoveDirection) {
+    const visible = this._getGuidedVisibleHotspots(referencePosition, candidateYaw, this.guidedCompositionLookaheadMeters);
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const incoming = new THREE.Vector3(incomingDirection?.x || 0, 0, incomingDirection?.z || 0);
+    if (incoming.lengthSq() > 1e-8) incoming.normalize();
+
+    let score = 0;
+    for (const item of visible) {
+      const proximity = THREE.MathUtils.clamp(1 - item.distance / (this.guidedCompositionLookaheadMeters * unit), 0, 1);
+      const centered = 1 - THREE.MathUtils.clamp(item.angle / THREE.MathUtils.degToRad(75), 0, 1);
+      const forwardBonus = incoming.lengthSq() > 1e-8 ? Math.max(0, incoming.dot(item.direction)) : 0;
+      score += 1.8 + proximity * 1.4 + centered * 1.2 + forwardBonus * 0.55;
+    }
+
+    // A clear forward ray is a useful tie-breaker because a good presentation
+    // view should not immediately bury the user in a wall.
+    const eye = new THREE.Vector3(referencePosition.x, referencePosition.y + this.eyeHeight * unit + this.heightOffset * unit, referencePosition.z);
+    const lookDir = new THREE.Vector3(-Math.sin(candidateYaw), 0, -Math.cos(candidateYaw));
+    if (this.model) {
+      for (const meters of [2.0, 4.0, 7.0]) {
+        this.raycaster.set(eye, lookDir);
+        const hit = this.raycaster.intersectObject(this.model, true)[0];
+        if (!hit || hit.distance > meters * unit) score += 0.9;
+      }
+    }
+
+    return { score, visible };
+  }
+
+  _findBestGuidedComposition(referencePosition = this.position, incomingDirection = this.lastMoveDirection, preferredYaw = this.currentYaw) {
+    const offsets = [-72, -54, -36, -20, -8, 0, 8, 20, 36, 54, 72];
+    const candidates = offsets.map((offsetDeg) => {
+      const yaw = preferredYaw + THREE.MathUtils.degToRad(offsetDeg);
+      return { yaw, ...this._scoreGuidedHeading(referencePosition, yaw, incomingDirection) };
+    });
 
     candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    if (!best) return null;
 
-    // Prefer a destination that is clearly visible from the new position and
-    // naturally lies ahead of the arrival path. We intentionally rotate only
-    // toward one useful destination instead of averaging every nearby marker;
-    // this creates a clean composition and keeps the next action discoverable.
-    const chosen = candidates[0];
-    let desiredYaw = null;
-    if (chosen) {
-      desiredYaw = Math.atan2(-chosen.dir.x, -chosen.dir.z);
-    } else if (incoming.lengthSq() > 1e-8) {
-      desiredYaw = Math.atan2(-incoming.x, -incoming.z);
+    const angleDelta = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+    const current = candidates
+      .filter((candidate) => angleDelta(candidate.yaw, preferredYaw) <= THREE.MathUtils.degToRad(8))
+      .sort((a, b) => b.score - a.score)[0];
+
+    // Stability rule: don't rotate to a dramatically different composition for
+    // a negligible gain in quality.
+    if (current && best.score < current.score * 1.10) return current;
+    return best;
+  }
+
+  _prepareGuidedArrivalView(referencePosition = this.position, incomingDirection = this.lastMoveDirection) {
+    if (this.walkMode !== 'guided') return;
+
+    const preferredYaw = Number.isFinite(this.currentYaw)
+      ? this.currentYaw
+      : (incomingDirection?.lengthSq?.() > 1e-8 ? Math.atan2(-incomingDirection.x, -incomingDirection.z) : 0);
+    const best = this._findBestGuidedComposition(referencePosition, incomingDirection, preferredYaw);
+
+    if (best && Number.isFinite(best.yaw)) {
+      this.guidedCompositionYaw = best.yaw;
+      this.guidedCompositionTargetYaw = best.yaw;
+      this.guidedYawCenter = best.yaw;
+      this.targetYaw = best.yaw;
+    } else if (incomingDirection?.lengthSq?.() > 1e-8) {
+      const fallbackYaw = Math.atan2(-incomingDirection.x, -incomingDirection.z);
+      this.guidedCompositionYaw = fallbackYaw;
+      this.guidedCompositionTargetYaw = fallbackYaw;
+      this.guidedYawCenter = fallbackYaw;
+      this.targetYaw = fallbackYaw;
     }
 
-    if (Number.isFinite(desiredYaw)) {
-      this.guidedYawCenter = desiredYaw;
-      this.targetYaw = desiredYaw;
-      this.guidedPanPhase = 0;
-      this.targetPitch = this.guidedPitch;
-    }
+    this.guidedLastCompositionAt = performance.now();
+    this.guidedPanPhase = 0;
+    this.targetPitch = this.guidedPitch;
   }
 
   _syncCamera() {
@@ -1634,18 +1719,40 @@ if (name === 'top') {
     if (this.walkMode === 'guided' && this.guidedAutoRotate) {
       const now = performance.now();
       if (this.guidedManualActive) {
-        // Let the user own the view briefly after a drag. This prevents the
-        // automatic cinematic pan from fighting the user's intent.
         this.targetPitch = this.guidedPitch;
         if (now >= this.guidedManualYawUntil) {
           this.guidedManualActive = false;
+          this.guidedCompositionYaw = this.currentYaw;
+          this.guidedCompositionTargetYaw = this.currentYaw;
           this.guidedYawCenter = this.currentYaw;
+          this.guidedLastCompositionAt = now;
           this.guidedPanPhase = 0;
         }
-      }
-      if (!this.guidedManualActive) {
+      } else {
+        const due = now - this.guidedLastCompositionAt >= this.guidedCompositionIntervalMs;
+        if (due) {
+          const visible = this._getGuidedVisibleHotspots(this.position, this.currentYaw, this.guidedCompositionLookaheadMeters);
+          // Reframe periodically, but only when the current view is weak. During
+          // travel this keeps the next useful choices visible without making the
+          // camera feel as though it is chasing every waypoint.
+          if (visible.length < this.guidedCompositionMinVisibleTargets || !isTravelling) {
+            const best = this._findBestGuidedComposition(this.position, this.lastMoveDirection, this.currentYaw);
+            if (best && Number.isFinite(best.yaw)) this.guidedCompositionTargetYaw = best.yaw;
+          }
+          this.guidedLastCompositionAt = now;
+        }
+
+        this.guidedCompositionYaw = THREE.MathUtils.lerp(
+          this.guidedCompositionYaw,
+          this.guidedCompositionTargetYaw,
+          1 - Math.exp(-1.8 * dt),
+        );
+
+        // Very small cinematic drift around the chosen composition. This is no
+        // longer a one-direction spin: the selected composition is the anchor.
         this.guidedPanPhase += dt * this.guidedYawRate;
-        this.targetYaw = this.guidedYawCenter + Math.sin(this.guidedPanPhase) * this.guidedYawAmplitude;
+        const microSweep = Math.sin(this.guidedPanPhase) * THREE.MathUtils.degToRad(this.guidedCompositionSweepDeg) * 0.12;
+        this.targetYaw = this.guidedCompositionYaw + microSweep;
         this.targetPitch = this.guidedPitch;
       }
       this.guidedTravelRotating = !this.guidedManualActive;
