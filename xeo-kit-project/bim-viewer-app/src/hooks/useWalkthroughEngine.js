@@ -73,7 +73,7 @@ class WalkRuntime {
     // Customer-facing walk styles: guided keeps a stable presentation camera;
     // explore enables responsive cursor/mouse-look with WASD movement.
     this.walkMode = 'guided';
-    this.guidedPitch = -0.045;
+    this.guidedPitch = -0.085; // Slight downward architectural framing keeps floor destinations visible without feeling top-down.
     // Guided presentation uses a slow continuous panoramic yaw, similar to
     // an architectural showcase walkthrough. Position/path movement and camera
     // orientation remain independent so destination clicks never force a look-at.
@@ -528,6 +528,95 @@ class WalkRuntime {
     };
   }
 
+  _simplifyPath(points) {
+    if (!Array.isArray(points) || points.length <= 2) return points || [];
+
+    // Recast already gives us a valid corridor. For presentation movement we
+    // only need the meaningful turns, not every tiny intermediate sample.
+    // Removing nearly-collinear points prevents the camera from visibly
+    // "following a rope" around the corridor.
+    const simplified = [points[0]];
+    const minSegment = Math.max(0.12 * this.metersPerUnit, 0.08);
+    const minTurnDeg = 7;
+    let previous = points[0];
+    let previousDirection = null;
+
+    for (let i = 1; i < points.length - 1; i += 1) {
+      const next = points[i];
+      const dx = next.x - previous.x;
+      const dz = next.z - previous.z;
+      const len = Math.hypot(dx, dz);
+      if (len < minSegment) continue;
+
+      const direction = new THREE.Vector2(dx, dz).normalize();
+      let keep = false;
+      if (!previousDirection) {
+        keep = true;
+      } else {
+        const dot = THREE.MathUtils.clamp(previousDirection.dot(direction), -1, 1);
+        const angle = Math.acos(dot) * 180 / Math.PI;
+        keep = angle >= minTurnDeg;
+      }
+      if (keep) {
+        simplified.push(next);
+        previousDirection = direction;
+        previous = next;
+      }
+    }
+
+    simplified.push(points[points.length - 1]);
+    return simplified;
+  }
+
+  _pointAlongPath(startIndex, lookAheadDistance) {
+    if (!this.path?.length) return null;
+    let current = this.position.clone();
+    let remaining = Math.max(0, lookAheadDistance);
+
+    for (let i = Math.max(0, startIndex); i < this.path.length; i += 1) {
+      const node = this.path[i];
+      const dx = node.x - current.x;
+      const dz = node.z - current.z;
+      const segment = Math.hypot(dx, dz);
+      if (segment < 1e-6) {
+        current.set(node.x, node.y, node.z);
+        continue;
+      }
+      if (segment >= remaining) {
+        const t = remaining / segment;
+        return new THREE.Vector3(
+          current.x + dx * t,
+          current.y + (node.y - current.y) * t,
+          current.z + dz * t,
+        );
+      }
+      remaining -= segment;
+      current.set(node.x, node.y, node.z);
+    }
+    const last = this.path[this.path.length - 1];
+    return new THREE.Vector3(last.x, last.y, last.z);
+  }
+
+  _teleportToDestination(point, label = 'Destination', mode = 'map-jump') {
+    if (!point) return false;
+    this.path = null;
+    this.pathIndex = 0;
+    this.pathVelocity.set(0, 0, 0);
+    this.velocity.set(0, 0, 0);
+    this.directTravel = null;
+    this.blockedTime = 0;
+
+    this.position.set(point.x, point.y, point.z);
+    this.currentPolyRef = point.polyRef || this.currentPolyRef;
+    this._prepareGuidedArrivalView(this.position, this.lastMoveDirection);
+    this.stuck = false;
+    this.recoveryAvailable = false;
+    this.onState?.({ type: 'stuck', available: false });
+    this.onState?.({ type: 'travel', label, active: false, mode });
+    this.onState?.({ type: 'teleport', label, mode });
+    return true;
+  }
+
   _hasCameraClearance(point) {
     if (!this.model || !Array.isArray(point) || point.length < 3) return true;
 
@@ -836,12 +925,11 @@ class WalkRuntime {
       return this.travelTo([point.x, point.y, point.z], label);
     }
 
-    // Floor-map navigation is intentionally semantic: every shown marker has
-    // already passed camera-clearance validation, so a point can still be selected
-    // even when there is no continuous physical NavMesh route (for example a
-    // doorway/partition makes the current component disconnected). The map is a
-    // destination navigator, not a representation of physical connectivity.
-    return this._startDirectRoomTravel(point, label, 'map-jump');
+    // A floor-map point is an explicit user destination. When the physical
+    // NavMesh cannot connect the current location to it (for example a closed
+    // door or disconnected room), do not drag the camera through the scene.
+    // Teleport directly to the already-validated destination instead.
+    return this._teleportToDestination(point, label, 'map-teleport');
   }
 
   async travelTo(target, label = 'Destination') {
@@ -865,7 +953,8 @@ class WalkRuntime {
       return false;
     }
     this.directTravel = null;
-    this.path = result.path.map((p) => ({ x: p.x, y: p.y, z: p.z }));
+    const rawPath = result.path.map((p) => ({ x: p.x, y: p.y, z: p.z }));
+    this.path = this._simplifyPath(rawPath);
     this.pathIndex = 0;
     this.pathVelocity.set(0, 0, 0);
     this.blockedTime = 0;
@@ -1191,9 +1280,10 @@ if (name === 'top') {
     }
 
     if (this.path?.length) {
-      const target = this.path[this.pathIndex];
-      const delta = new THREE.Vector3(target.x - this.position.x, 0, target.z - this.position.z);
-      if (delta.length() < Math.max(0.05 * this.metersPerUnit, 0.06)) {
+      const waypoint = this.path[this.pathIndex];
+      const waypointDistance = Math.hypot(waypoint.x - this.position.x, waypoint.z - this.position.z);
+      const waypointThreshold = Math.max(0.12 * this.metersPerUnit, 0.08);
+      if (waypointDistance <= waypointThreshold) {
         this.pathIndex += 1;
         if (this.pathIndex >= this.path.length) {
           this._prepareGuidedArrivalView(this.position, this.lastMoveDirection);
@@ -1208,11 +1298,24 @@ if (name === 'top') {
           return;
         }
       }
-      const next = this.path[this.pathIndex];
+
+      // Game-style steering: aim a little ahead on the path instead of chasing
+      // each corner directly. This keeps turns fluid and prevents the camera
+      // from visibly zig-zagging around furniture.
+      const remainingDistance = this._estimateRemainingPathDistance();
+      const lookAhead = THREE.MathUtils.clamp(0.35 * this.metersPerUnit + this.pathVelocity.length() * 0.18, 0.32 * this.metersPerUnit, 0.9 * this.metersPerUnit);
+      const steerTarget = this._pointAlongPath(this.pathIndex, Math.min(lookAhead, Math.max(lookAhead, remainingDistance)));
+      const next = steerTarget || this.path[this.pathIndex];
       const before = this.position.clone();
       this.lastMoveDirection.set(next.x - this.position.x, 0, next.z - this.position.z);
       if (this.lastMoveDirection.lengthSq() > 1e-8) this.lastMoveDirection.normalize();
-      this._moveToward(next, dt, this.walkSpeed);
+
+      // Smooth acceleration, then brake naturally as we approach the destination.
+      const brakeDistance = Math.max(1.15 * this.metersPerUnit, 0.9);
+      const speedFactor = remainingDistance < brakeDistance
+        ? THREE.MathUtils.clamp(remainingDistance / brakeDistance, 0.38, 1)
+        : 1;
+      this._moveToward(next, dt, this.walkSpeed * speedFactor);
       const moved = before.distanceTo(this.position);
       if (moved < 0.0002 * Math.max(1, this.metersPerUnit)) {
         this.blockedTime += dt;
@@ -1275,6 +1378,18 @@ if (name === 'top') {
     }
   }
 
+  _estimateRemainingPathDistance() {
+    if (!this.path?.length || this.pathIndex >= this.path.length) return 0;
+    let distance = Math.hypot(this.path[this.pathIndex].x - this.position.x, this.path[this.pathIndex].z - this.position.z);
+    for (let i = this.pathIndex + 1; i < this.path.length; i += 1) {
+      distance += Math.hypot(
+        this.path[i].x - this.path[i - 1].x,
+        this.path[i].z - this.path[i - 1].z,
+      );
+    }
+    return distance;
+  }
+
   _moveToward(target, dt, speed) {
     const direction = new THREE.Vector3(target.x - this.position.x, 0, target.z - this.position.z);
     if (direction.lengthSq() < 1e-8) return;
@@ -1323,9 +1438,10 @@ if (name === 'top') {
   }
 
   _moveTo(desired) {
-    if (!this._hasCameraClearance([desired.x, desired.y, desired.z])) {
-      return false;
-    }
+    // Recast's agent radius is the physical collision authority during motion.
+    // Camera-clearance raycasts are reserved for spawn/destination validation;
+    // applying them every frame can incorrectly reject a valid corridor and
+    // make the character appear to snag or choose an odd side around furniture.
     const startRef = this.currentPolyRef || 0;
     const result = this.query.moveAlongSurface(
       startRef,
@@ -1461,7 +1577,7 @@ if (name === 'top') {
   }
 
   _updatePortals() {
-    const visibleLimit = 7;
+    const visibleLimit = 8;
     const maxDistance = 11 * Math.max(this.metersPerUnit, 0.000001);
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
 
@@ -1488,8 +1604,11 @@ if (name === 'top') {
     }
 
     candidates.sort((a, b) => {
-      const scoreA = a.dist - Math.max(0, a.dot) * 1.8 * this.metersPerUnit;
-      const scoreB = b.dist - Math.max(0, b.dot) * 1.8 * this.metersPerUnit;
+      // Prefer nearby destinations, but keep a useful view spread. A pure distance
+      // sort causes several close disks to consume the visible budget and hide
+      // farther choices in the same room.
+      const scoreA = (a.dist / Math.max(this.metersPerUnit, 0.000001)) - Math.max(0, a.dot) * 1.8;
+      const scoreB = (b.dist / Math.max(this.metersPerUnit, 0.000001)) - Math.max(0, b.dot) * 1.8;
       return scoreA - scoreB;
     });
 
@@ -1497,7 +1616,7 @@ if (name === 'top') {
     // choices distributed across the room instead of seven markers stacked in
     // the same direction.
     const selected = [];
-    const minAngularSeparation = THREE.MathUtils.degToRad(16);
+    const minAngularSeparation = THREE.MathUtils.degToRad(12);
     for (const candidate of candidates) {
       const separated = selected.every((chosen) => {
         const delta = Math.atan2(Math.sin(candidate.angle - chosen.angle), Math.cos(candidate.angle - chosen.angle));
