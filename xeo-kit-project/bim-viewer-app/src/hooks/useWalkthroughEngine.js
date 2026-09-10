@@ -14,6 +14,10 @@ const DEFAULT_FOV_DEGREES = 115;
 const GUIDED_CAMERA_HEIGHT_METERS = 2.16;
 const GUIDED_PAN_AMPLITUDE_DEG = 16;
 const GUIDED_PAN_RATE_RAD_PER_SEC = 0.045;
+const CAMERA_BODY_CLEARANCE_METERS = 0.28;
+const CAMERA_CLEARANCE_CHECK_INTERVAL_SEC = 0.10;
+const SAFE_ANCHOR_MIN_OPEN_SPACE_METERS = 0.90;
+const SAFE_ANCHOR_HISTORY_LIMIT = 14;
 
 class WalkRuntime {
   constructor({ canvas, onState }) {
@@ -60,7 +64,31 @@ class WalkRuntime {
     this.travelTotalDistance = 0;
     this.travelElapsed = 0;
     this.travelMode = null;
+    // Phase 8: destination choreography. Travel now has a small camera story:
+    // approach -> reveal -> settle -> presentation. The physical path remains
+    // unchanged; these fields only coordinate the Guided camera.
     this.arrivalSettleUntil = 0;
+    this.guidedApproachActive = false;
+    this.guidedApproachTargetYaw = 0;
+    this.guidedApproachStartYaw = 0;
+    this.guidedArrivalStartYaw = 0;
+    this.guidedArrivalTargetYaw = 0;
+    this.guidedArrivalSettleStartedAt = 0;
+    this.guidedArrivalSettleDurationMs = 1250;
+    // Phase 9: transition-aware choreography. Different architectural transitions
+    // get slightly different approach/settle characteristics without changing the
+    // physical NavMesh movement itself.
+    this.guidedTransitionKind = 'standard';
+    this.guidedTransitionApproachDistanceMeters = 2.8;
+    this.guidedApproachDistanceMeters = 2.8;
+    // Phase 10: room reveal choreography. For room entries/crossings, the camera
+    // begins composing the destination earlier than the final settle, using an
+    // offset reveal heading so the new space opens into view instead of appearing
+    // head-on like a point-to-point teleport.
+    this.guidedRevealActive = false;
+    this.guidedRevealTargetYaw = 0;
+    this.guidedRevealStartDistanceMeters = 4.8;
+    this.guidedRevealFinalDistanceMeters = 1.55;
     this.directTravel = null;
     this.position = new THREE.Vector3();
     this.velocity = new THREE.Vector3();
@@ -108,8 +136,34 @@ class WalkRuntime {
     this.guidedCompositionMinVisibleTargets = 2;
     this.guidedCompositionSweepDeg = 34;
     this.guidedCompositionLookaheadMeters = 8;
+    // Phase 11: presentation must remain semantically inside the current space
+    // unless the camera is deliberately executing a room-entry/crossing reveal.
+    this.guidedPresentationAreaId = null;
+    this.guidedWallDominancePenalty = 2.6;
+    this.guidedPanWallGuardMeters = 1.15;
     this.presentationHotspotIds = new Set();
     this.presentationHotspotScores = new Map();
+    // Phase 12: lightweight visual-subject index used only for camera composition.
+    // It helps the Guided camera favor actual design content (furniture, fixtures,
+    // doors/windows) instead of treating every visible ray as equally interesting.
+    this.presentationSubjects = [];
+    // Phase 13: lock the Guided presentation onto one meaningful visual subject
+    // during the arrival shot so the camera behaves like a deliberate architectural
+    // composition instead of continually re-solving the frame.
+    this.guidedShotSubject = null;
+    this.guidedShotSubjectId = null;
+    this.guidedShotSubjectUntil = 0;
+    // Phase 8B: guided architectural tour state. This layer chooses the next
+    // semantic destination; the NavMesh remains responsible for physical travel.
+    this.guidedTourArmed = false;
+    this.guidedTourNextAt = 0;
+    this.guidedTourHoldMs = 5000;
+    this.guidedTourVisitedHotspots = new Set();
+    this.guidedTourVisitedAreas = new Set();
+    this.guidedTourLastAreaId = null;
+    this.guidedTourLastVisitedHotspotId = null;
+    this.guidedTourLastRole = null;
+    this.guidedTourAdvanceLock = false;
     // Phase 5: semantic destination roles inferred from local floor context.
     // These roles are presentation hints; physical movement still uses the same
     // navigation/runtime path system as earlier phases.
@@ -124,6 +178,19 @@ class WalkRuntime {
     this.portalClickSuppressedUntil = 0;
     this.stuck = false;
     this.recoveryAvailable = false;
+    // Phase 6: navigation reliability. A safe anchor is a validated, connected
+    // customer-facing hotspot that can be used to recover from a bad route or
+    // camera collision. Keep a short breadcrumb history so recovery backtracks
+    // naturally instead of jumping to an arbitrary nearest point.
+    this.safeAnchorIds = new Set();
+    this.safeAnchorById = new Map();
+    this.navigationHistory = [];
+    this.lastSafeAnchorId = null;
+    this.lastSafeAnchorPosition = null;
+    this.recoveryAttemptedIds = new Set();
+    this.cameraClearanceTimer = 0;
+    this.lastMovementPosition = new THREE.Vector3();
+    this.progressWatchTime = 0;
 
     this.viewTarget = new THREE.Vector3();
     this.viewDistance = 1;
@@ -176,6 +243,16 @@ class WalkRuntime {
       // click until pointer-up and only treat it as a click when the pointer did
       // not move beyond a small drag threshold.
       if (this.walkMode === 'guided') {
+        // Manual interaction always wins over the cinematic director.
+        // An explicit destination click will re-arm the tour in navigateToHotspot.
+        this.guidedTourArmed = false;
+        this.guidedTourNextAt = 0;
+        this.guidedTourAdvanceLock = false;
+        this.arrivalSettleUntil = 0;
+        this.guidedShotSubject = null;
+        this.guidedShotSubjectId = null;
+        this.guidedShotSubjectUntil = 0;
+        this.guidedApproachActive = false;
         this.guidedPointerDown = { x: e.clientX, y: e.clientY };
         this.guidedLastPointer = { x: e.clientX, y: e.clientY, t: performance.now() };
         this.guidedPointerDragging = false;
@@ -326,7 +403,10 @@ class WalkRuntime {
     this.navMesh = imported.navMesh;
     this.query = new NavMeshQuery(this.navMesh);
     this.filter = new QueryFilter();
-    this.walkAreas = [];
+    const semanticAreas = Array.isArray(hotspotsPayload?.areas)
+      ? hotspotsPayload.areas.filter((area) => Array.isArray(area?.center) && area.center.length >= 3)
+      : [];
+    this.walkAreas = semanticAreas;
     const loadedHotspots = Array.isArray(hotspotsPayload?.hotspots)
       ? hotspotsPayload.hotspots.filter((h) => Array.isArray(h?.position) && h.position.length >= 3)
       : [];
@@ -355,6 +435,7 @@ class WalkRuntime {
     this.model = gltf.scene;
     this.model.updateMatrixWorld(true);
     this.scene.add(this.model);
+    this._buildPresentationSubjectIndex();
 
     this._buildNavigationSurface(surfacePayload);
 
@@ -374,9 +455,22 @@ class WalkRuntime {
     // be underneath a low object (e.g. a bed, table, cabinet) even if the
     // architectural slab is technically walkable beneath it.
     const safeRenderedHotspots = rawHotspots.filter((hotspot) => this._hasCameraClearance(hotspot.position));
-    const augmentedHotspots = this._augmentHotspotsFromFloor(surfacePayload, safeRenderedHotspots, 18);
+    // Phase 7: curated backend destinations are already spatially selected and
+    // semantically typed. Do not re-expand them into generic floor markers.
+    // Legacy/older jobs without curated metadata keep the Phase 6 augmentation
+    // fallback so they remain usable.
+    const isCuratedDestinationSet = hotspotsPayload?.metadata?.navigationQuality === 'curated-v1'
+      || safeRenderedHotspots.some((hotspot) => hotspot.presentationRole);
+    const augmentedHotspots = isCuratedDestinationSet
+      ? safeRenderedHotspots
+      : this._augmentHotspotsFromFloor(surfacePayload, safeRenderedHotspots, 18);
     this.hotspots = augmentedHotspots;
+    if (semanticAreas.length) {
+      const activeAreaIds = new Set(augmentedHotspots.map((hotspot) => hotspot.areaId).filter(Boolean));
+      this.walkAreas = semanticAreas.filter((area) => activeAreaIds.has(area.id));
+    }
     this._assignHotspotRoles();
+    this._buildSafeAnchorRegistry();
     this.navigationPlan = this._buildNavigationPlan(surfacePayload, augmentedHotspots);
     if (safeRenderedHotspots.length !== rawHotspots.length) {
       console.info('[Walkthrough] Removed unsafe low-clearance hotspots', {
@@ -461,6 +555,23 @@ class WalkRuntime {
 
     this.position.set(start.x, start.y, start.z);
     this.currentPolyRef = start.polyRef || 0;
+    this.lastMovementPosition.copy(this.position);
+    this._rememberNearestSafeAnchor(this.position, 'spawn');
+
+    // The architectural hotspot probe validates the floor and headroom. The
+    // movement guard below validates the actual camera envelope. If a stale or
+    // marginal hotspot leaves the camera too close to a wall, promote a known
+    // safe anchor before the user even enters walkthrough mode.
+    if (!this._hasCameraBodyClearance(this.position)) {
+      const recoveryCandidate = this._safeAnchorCandidates(this.position)
+        .find((entry) => Math.hypot(entry.point.x - this.position.x, entry.point.z - this.position.z) > 0.55 * Math.max(this.metersPerUnit, 0.000001));
+      if (recoveryCandidate?.point) {
+        this.position.set(recoveryCandidate.point.x, recoveryCandidate.point.y, recoveryCandidate.point.z);
+        this.currentPolyRef = recoveryCandidate.point.polyRef || this.currentPolyRef;
+        this.lastMovementPosition.copy(this.position);
+        this._rememberNearestSafeAnchor(this.position, 'spawn-recovery');
+      }
+    }
     // Prepare the very first Guided view immediately. Without this, the camera
     // could enter the walkthrough carrying the overview heading and stare into a
     // wall/ceiling before the first destination click caused a reframe.
@@ -491,6 +602,7 @@ class WalkRuntime {
       cameraNearFar: [this.camera.near, this.camera.far],
       destinationCount: this.walkAreas.length,
       hotspotCount: this.hotspots.length,
+      safeAnchorCount: this.safeAnchorIds.size,
       navMeshBytes: navBuffer.byteLength,
       meshCount,
       visibleMeshCount,
@@ -597,14 +709,17 @@ class WalkRuntime {
       const closeCount = neighbors.filter((distance) => distance <= radiusNear).length;
       const openness = Number(hotspot.clearanceMeters ?? hotspot.score ?? 0) || 0;
 
-      let role = 'walkpoint';
-      if ((hotspot.areaId && String(hotspot.areaId).trim()) || /entr(y|ance)/i.test(String(hotspot.label || ''))) {
+      const explicitRole = String(hotspot.presentationRole || hotspot.role || '').trim();
+      let role = ['room-center', 'room-entrance', 'viewpoint', 'transition', 'walkpoint'].includes(explicitRole)
+        ? explicitRole
+        : 'walkpoint';
+      if (!explicitRole && /entr(y|ance)/i.test(String(hotspot.label || ''))) {
         role = 'room-entrance';
-      } else if (closeCount <= 1 && openness >= 1.45) {
+      } else if (!explicitRole && closeCount <= 1 && openness >= 1.45) {
         role = 'viewpoint';
-      } else if (closeCount >= 5) {
+      } else if (!explicitRole && closeCount >= 5) {
         role = 'room-center';
-      } else if (closeCount >= 3 && openness < 1.0) {
+      } else if (!explicitRole && closeCount >= 3 && openness < 1.0) {
         role = 'transition';
       }
 
@@ -631,6 +746,132 @@ class WalkRuntime {
   _getHotspotRole(hotspot) {
     if (!hotspot?.id) return 'walkpoint';
     return this.hotspotRoles.get(hotspot.id) || hotspot.presentationRole || 'walkpoint';
+  }
+
+  _buildSafeAnchorRegistry() {
+    this.safeAnchorIds.clear();
+    this.safeAnchorById.clear();
+    this.navigationHistory = [];
+    this.lastSafeAnchorId = null;
+    this.lastSafeAnchorPosition = null;
+    this.recoveryAttemptedIds.clear();
+
+    for (const hotspot of this.hotspots || []) {
+      if (!hotspot?.id || !Array.isArray(hotspot.position)) continue;
+      const role = this._getHotspotRole(hotspot);
+      const openness = this._presentationOpenSpaceScore(hotspot.position);
+      const safeForRecovery =
+        openness >= SAFE_ANCHOR_MIN_OPEN_SPACE_METERS &&
+        role !== 'walkpoint' &&
+        this._hasCameraClearance(hotspot.position);
+      if (!safeForRecovery) continue;
+
+      const point = this._closestWalkPoint(hotspot.position, 0.45);
+      if (!point) continue;
+      if (!this._hasCameraClearance([point.x, point.y, point.z])) continue;
+
+      const metadata = {
+        hotspot,
+        point,
+        role,
+        openness,
+        score: (Number(hotspot.score) || 0) + openness,
+      };
+      this.safeAnchorIds.add(hotspot.id);
+      this.safeAnchorById.set(hotspot.id, metadata);
+    }
+
+    // Always retain at least one recovery anchor when the scene has any valid
+    // hotspot at all. Prefer the most open presentation destination.
+    if (!this.safeAnchorIds.size && this.hotspots?.length) {
+      const fallback = this.hotspots
+        .map((hotspot) => ({ hotspot, openness: this._presentationOpenSpaceScore(hotspot.position) }))
+        .filter((entry) => entry.openness > 0)
+        .sort((a, b) => b.openness - a.openness)[0];
+      if (fallback?.hotspot?.id) {
+        const point = this._closestWalkPoint(fallback.hotspot.position, 0.45);
+        if (point && this._hasCameraClearance([point.x, point.y, point.z])) {
+          const metadata = {
+            hotspot: fallback.hotspot,
+            point,
+            role: this._getHotspotRole(fallback.hotspot),
+            openness: fallback.openness,
+            score: (Number(fallback.hotspot.score) || 0) + fallback.openness,
+          };
+          this.safeAnchorIds.add(fallback.hotspot.id);
+          this.safeAnchorById.set(fallback.hotspot.id, metadata);
+        }
+      }
+    }
+  }
+
+  _rememberNearestSafeAnchor(position = this.position, reason = 'stable') {
+    if (!this.safeAnchorIds.size || !position) return null;
+
+    let best = null;
+    for (const id of this.safeAnchorIds) {
+      const entry = this.safeAnchorById.get(id);
+      if (!entry?.point) continue;
+      const distance = Math.hypot(entry.point.x - position.x, entry.point.z - position.z);
+      if (!best || distance < best.distance) best = { id, entry, distance };
+    }
+
+    const snapDistance = 1.15 * Math.max(this.metersPerUnit, 0.000001);
+    if (!best || best.distance > snapDistance) return null;
+
+    this.lastSafeAnchorId = best.id;
+    this.lastSafeAnchorPosition = best.entry.point;
+    this.recoveryAttemptedIds.delete(best.id);
+
+    const previous = this.navigationHistory[this.navigationHistory.length - 1];
+    if (!previous || previous.id !== best.id) {
+      this.navigationHistory.push({
+        id: best.id,
+        position: { x: best.entry.point.x, y: best.entry.point.y, z: best.entry.point.z },
+        timestamp: performance.now(),
+        reason,
+      });
+      if (this.navigationHistory.length > SAFE_ANCHOR_HISTORY_LIMIT) {
+        this.navigationHistory.splice(0, this.navigationHistory.length - SAFE_ANCHOR_HISTORY_LIMIT);
+      }
+    }
+
+    return best;
+  }
+
+  _safeAnchorCandidates(startPoint = this.position) {
+    const candidates = [];
+    for (const id of this.safeAnchorIds) {
+      const entry = this.safeAnchorById.get(id);
+      if (!entry?.point || this.recoveryAttemptedIds.has(id)) continue;
+      const distanceFromStart = Math.hypot(entry.point.x - startPoint.x, entry.point.z - startPoint.z);
+      if (distanceFromStart < 0.60 * Math.max(this.metersPerUnit, 0.000001)) continue;
+      const result = this.query.computePath(startPoint, entry.point, {
+        filter: this.filter,
+        maxStraightPathSize: 256,
+        maxPathSize: 256,
+      });
+      if (!result?.success || !result.path?.length) continue;
+
+      let length = 0;
+      let previous = startPoint;
+      for (const p of result.path) {
+        length += Math.hypot(p.x - previous.x, p.z - previous.z);
+        previous = p;
+      }
+
+      const historyIndex = this.navigationHistory.findIndex((item) => item.id === id);
+      const historyBonus = historyIndex >= 0 ? (historyIndex / Math.max(1, this.navigationHistory.length)) * 1.5 : 0;
+      const roleBonus = entry.role === 'room-center' ? 1.35
+        : entry.role === 'room-entrance' ? 1.05
+        : entry.role === 'viewpoint' ? 0.90
+        : 0.35;
+      const recentPenalty = id === this.lastSafeAnchorId ? 0.65 : 0;
+      const score = length / Math.max(this.metersPerUnit, 0.000001) - roleBonus - historyBonus + recentPenalty;
+      candidates.push({ id, ...entry, path: result.path, pathLength: length, score });
+    }
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates;
   }
 
   _buildNavigationPlan(surfacePayload, hotspots) {
@@ -758,15 +999,51 @@ class WalkRuntime {
     this.velocity.set(0, 0, 0);
     this.directTravel = null;
     this.blockedTime = 0;
+    this.guidedApproachActive = false;
+    this.guidedRevealActive = false;
+    this.guidedArrivalSettleStartedAt = 0;
 
     this.position.set(point.x, point.y, point.z);
     this.currentPolyRef = point.polyRef || this.currentPolyRef;
+    this.lastMovementPosition.copy(this.position);
+    this._rememberNearestSafeAnchor(this.position, 'teleport');
     this._prepareGuidedArrivalView(this.position, this.lastMoveDirection);
     this.stuck = false;
     this.recoveryAvailable = false;
     this.onState?.({ type: 'stuck', available: false });
     this.onState?.({ type: 'travel', label, active: false, mode });
     this.onState?.({ type: 'teleport', label, mode });
+    return true;
+  }
+
+  _hasCameraBodyClearance(point) {
+    if (!this.model || !Array.isArray(point) || point.length < 3) return true;
+
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const bodyRadius = CAMERA_BODY_CLEARANCE_METERS * unit;
+    const cameraY = Number(point[1]) + this.eyeHeight * unit + this.heightOffset * unit * 0.92;
+    const origin = new THREE.Vector3(Number(point[0]), cameraY, Number(point[2]));
+
+    // This is a deliberately cheaper movement-time collision test than the full
+    // hotspot clearance probe. It protects the camera body from entering walls or
+    // furniture while avoiding an 8-ray architectural validation every frame.
+    const directions = 12;
+    for (let i = 0; i < directions; i += 1) {
+      const angle = (Math.PI * 2 * i) / directions;
+      const direction = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
+      this.raycaster.set(origin, direction);
+      const hit = this.raycaster.intersectObject(this.model, true)[0];
+      if (hit && hit.distance < bodyRadius) return false;
+    }
+
+    // Also reject a position already embedded in geometry by probing a tiny
+    // outward shell in the opposite direction of the last movement.
+    if (this.lastMoveDirection.lengthSq() > 1e-8) {
+      const back = this.lastMoveDirection.clone().normalize().negate();
+      this.raycaster.set(origin, back);
+      const hit = this.raycaster.intersectObject(this.model, true)[0];
+      if (hit && hit.distance < bodyRadius * 0.72) return false;
+    }
     return true;
   }
 
@@ -974,9 +1251,13 @@ class WalkRuntime {
     if (!hits.length) return false;
     const group = hits[0].object.parent?.isGroup ? hits[0].object.parent : hits[0].object;
     if (!group?.userData?.walkTarget) return false;
-    this.activeHotspotId = group.userData.hotspotId || null;
-    const label = group.userData.walkLabel || 'Floor destination';
-    this.travelTo(group.userData.walkTarget, label).then((ok) => {
+    const hotspot = this.hotspots.find((item) => item?.id === group.userData.hotspotId) || {
+      id: group.userData.hotspotId || null,
+      position: group.userData.walkTarget,
+      label: group.userData.walkLabel || 'Floor destination',
+    };
+    const label = hotspot.label || 'Floor destination';
+    this.navigateToHotspot(hotspot).then((ok) => {
       if (!ok) this._startEmergencyRecovery(group.userData.walkTarget, label);
     });
     return true;
@@ -1049,24 +1330,56 @@ class WalkRuntime {
     if (!hotspot || this.viewMode !== 'walk') return false;
     if (this.path || this.directTravel) return false;
 
-    // Floor-map markers are rendered as {x, z}, while in-scene hotspots carry
-    // a full position tuple. Accept both shapes so the map is a first-class
-    // destination navigator instead of silently failing on a shape mismatch.
-    const rawPosition = Array.isArray(hotspot.position)
-      ? hotspot.position
-      : [hotspot.x, Number(hotspot.y) || 0, hotspot.z];
+    // Normalize map records back to the runtime's canonical hotspot whenever
+    // possible. The map intentionally stores a lightweight {x,y,z,id,label}
+    // record; re-resolving by id prevents a presentation-layer copy from being
+    // treated as a new/stale navigation point.
+    const canonical = hotspot.id
+      ? this.hotspots.find((item) => item?.id === hotspot.id)
+      : null;
+    const resolvedHotspot = canonical || hotspot;
+
+    // Floor-map markers may omit Y. In-scene hotspots always carry a full tuple.
+    const rawPosition = Array.isArray(resolvedHotspot.position)
+      ? resolvedHotspot.position
+      : [resolvedHotspot.x, Number(resolvedHotspot.y) || 0, resolvedHotspot.z];
     if (!Number.isFinite(Number(rawPosition[0])) || !Number.isFinite(Number(rawPosition[2]))) {
       return false;
     }
 
-    const point = this._closestWalkPoint(rawPosition);
-    if (!point || !this._hasCameraClearance([point.x, point.y, point.z])) {
+    // Hotspots in this.hotspots have already passed the camera-safety gate during
+    // load. Do not re-run that gate against a re-snapped point: a closest-point
+    // query can legally move a few centimeters to a neighbouring polygon and
+    // make an already-approved presentation destination look unsafe.
+    const usesCanonicalValidatedHotspot = Boolean(canonical);
+    let point = this._closestWalkPoint(rawPosition, usesCanonicalValidatedHotspot ? 1.0 : 0.6);
+    // Canonical hotspots were validated against the same NavMesh during load.
+    // If the serialized query lands just outside the small lookup envelope
+    // (for example after a raster/coordinate precision difference), retry with
+    // a wider search envelope before declaring the destination unavailable.
+    if (!point && usesCanonicalValidatedHotspot) {
+      point = this._closestWalkPoint(rawPosition, 2.5);
+      if (point) {
+        console.warn('[Walkthrough] Canonical hotspot resolved with relaxed NavMesh lookup.', {
+          hotspotId: resolvedHotspot.id,
+          requested: rawPosition,
+          resolved: [point.x, point.y, point.z],
+        });
+      }
+    }
+    if (!point) {
       this.onState?.({ type: 'error', message: 'That navigation point is no longer available.' });
       return false;
     }
 
-    this.activeHotspotId = hotspot.id || null;
-    const label = hotspot.label || 'Navigation point';
+    if (!usesCanonicalValidatedHotspot && !this._hasCameraClearance([point.x, point.y, point.z])) {
+      this.onState?.({ type: 'error', message: 'That navigation point is no longer available.' });
+      return false;
+    }
+
+    this.activeHotspotId = resolvedHotspot.id || null;
+    this._armGuidedTourForHotspot(resolvedHotspot);
+    const label = resolvedHotspot.label || 'Navigation point';
     const start = { x: this.position.x, y: this.position.y, z: this.position.z };
     const result = this.query?.computePath(start, point, {
       filter: this.filter,
@@ -1075,7 +1388,7 @@ class WalkRuntime {
     });
 
     if (result?.success && result.path?.length) {
-      return this.travelTo([point.x, point.y, point.z], label);
+      return this.travelTo([point.x, point.y, point.z], label, { resolvedPoint: point });
     }
 
     // A floor-map point is an explicit user destination. When the physical
@@ -1085,10 +1398,10 @@ class WalkRuntime {
     return this._teleportToDestination(point, label, 'map-teleport');
   }
 
-  async travelTo(target, label = 'Destination') {
+  async travelTo(target, label = 'Destination', options = null) {
     if (!this.query || this.viewMode !== 'walk' || this.path || this.directTravel) return false;
     const start = { x: this.position.x, y: this.position.y, z: this.position.z };
-    const closest = this._closestWalkPoint(target);
+    const closest = options?.resolvedPoint || this._closestWalkPoint(target);
     if (!closest) {
       this.onState?.({ type: 'error', message: `No walkable point found for ${label}.` });
       return false;
@@ -1113,7 +1426,13 @@ class WalkRuntime {
     this.travelElapsed = 0;
     this.travelMode = 'path';
     this.arrivalSettleUntil = 0;
+    this.guidedApproachActive = false;
+    this.guidedRevealActive = false;
+    this.guidedArrivalSettleStartedAt = 0;
     this.blockedTime = 0;
+    this.cameraClearanceTimer = 0;
+    this.progressWatchTime = 0;
+    this.lastMovementPosition.copy(this.position);
     this.stuck = false;
     this.recoveryAvailable = false;
     this.onState?.({ type: 'stuck', available: false });
@@ -1142,6 +1461,7 @@ class WalkRuntime {
       });
 
     for (const candidate of candidates) {
+      this._armGuidedTourForHotspot(candidate.hotspot);
       const ok = await this.travelTo(candidate.hotspot.position, label);
       if (ok) return true;
     }
@@ -1159,6 +1479,185 @@ class WalkRuntime {
 
     this.onState?.({ type: 'error', message: `${label} has no safe reachable presentation destination.` });
     return false;
+  }
+
+  _configureGuidedTransition(hotspot) {
+    const current = this.hotspots.find((item) => item.id === this.guidedTourLastVisitedHotspotId);
+    const currentArea = current?.areaId || this.guidedTourLastAreaId || null;
+    const nextArea = hotspot?.areaId || null;
+    const role = this._getHotspotRole(hotspot);
+
+    let kind = 'standard';
+    if (currentArea && nextArea && currentArea === nextArea) {
+      kind = 'same-space';
+    } else if (role === 'room-entrance') {
+      kind = 'room-entry';
+    } else if (currentArea && nextArea && currentArea !== nextArea) {
+      kind = 'room-crossing';
+    }
+
+    this.guidedTransitionKind = kind;
+    this.guidedTransitionApproachDistanceMeters = kind === 'room-entry'
+      ? 3.4
+      : kind === 'room-crossing'
+        ? 3.1
+        : kind === 'same-space'
+          ? 2.3
+          : 2.8;
+
+    this.guidedArrivalSettleDurationMs = kind === 'room-entry'
+      ? 1450
+      : kind === 'room-crossing'
+        ? 1500
+        : kind === 'same-space'
+          ? 950
+          : 1250;
+  }
+
+  _armGuidedTourForHotspot(hotspot) {
+    if (this.walkMode !== 'guided' || !hotspot?.id) return;
+    this.guidedTourArmed = true;
+    this.guidedPresentationAreaId = hotspot.areaId || this.guidedTourLastAreaId || null;
+    this._configureGuidedTransition(hotspot);
+    this.guidedTourNextAt = 0;
+    this.guidedTourAdvanceLock = false;
+    this.guidedTourVisitedHotspots.add(hotspot.id);
+    if (hotspot.areaId) {
+      this.guidedTourLastAreaId = hotspot.areaId;
+      this.guidedTourLastRole = this._getHotspotRole(hotspot);
+    }
+  }
+
+  _markGuidedTourArrival() {
+    if (this.walkMode !== 'guided' || !this.guidedTourArmed) return;
+    const current = this.hotspots.find((hotspot) => hotspot.id === this.activeHotspotId);
+    if (current?.id) {
+      this.guidedTourVisitedHotspots.add(current.id);
+      this.guidedTourLastVisitedHotspotId = current.id;
+    }
+    if (current?.areaId) {
+      this.guidedTourVisitedAreas.add(current.areaId);
+      this.guidedTourLastAreaId = current.areaId;
+      this.guidedTourLastRole = this._getHotspotRole(current);
+    }
+    this.guidedTourNextAt = performance.now() + this.guidedArrivalSettleDurationMs + this.guidedTourHoldMs;
+    this.guidedTourAdvanceLock = false;
+  }
+
+  _tourRolePriority(currentRole, candidateRole) {
+    if (currentRole === 'room-center') {
+      if (candidateRole === 'viewpoint') return 0;
+      if (candidateRole === 'room-entrance') return 1;
+      if (candidateRole === 'room-center') return 2;
+    } else if (currentRole === 'viewpoint') {
+      if (candidateRole === 'room-entrance') return 0;
+      if (candidateRole === 'room-center') return 1;
+      if (candidateRole === 'viewpoint') return 2;
+    } else if (currentRole === 'room-entrance') {
+      if (candidateRole === 'room-center') return 0;
+      if (candidateRole === 'viewpoint') return 1;
+      if (candidateRole === 'room-entrance') return 2;
+    }
+    return candidateRole === 'room-center' ? 0 : candidateRole === 'viewpoint' ? 1 : candidateRole === 'room-entrance' ? 2 : 3;
+  }
+
+  _chooseNextGuidedTourDestination() {
+    if (!this.guidedTourArmed || !this.query || !this.hotspots?.length) return null;
+    const current = this.hotspots.find((hotspot) => hotspot.id === this.activeHotspotId);
+    const currentRole = current ? this._getHotspotRole(current) : (this.guidedTourLastRole || 'room-center');
+    const currentAreaId = current?.areaId || this.guidedTourLastAreaId || null;
+    const candidates = [];
+
+    for (const hotspot of this.hotspots) {
+      if (!hotspot?.id || !Array.isArray(hotspot.position)) continue;
+      if (hotspot.id === this.activeHotspotId || this.guidedTourVisitedHotspots.has(hotspot.id)) continue;
+      const role = this._getHotspotRole(hotspot);
+      if (role === 'walkpoint' || role === 'transition') continue;
+      if (!this._hasCameraClearance(hotspot.position)) continue;
+
+      const point = this._closestWalkPoint(hotspot.position, 0.45);
+      if (!point) continue;
+      const result = this.query.computePath(
+        { x: this.position.x, y: this.position.y, z: this.position.z },
+        point,
+        { filter: this.filter, maxStraightPathSize: 256, maxPathSize: 256 },
+      );
+      if (!result?.success || !result.path?.length) continue;
+
+      let pathLength = 0;
+      let previous = this.position;
+      for (const p of result.path) {
+        pathLength += Math.hypot(p.x - previous.x, p.z - previous.z);
+        previous = p;
+      }
+      const distanceMeters = pathLength / Math.max(this.metersPerUnit, 1e-6);
+      if (!Number.isFinite(distanceMeters) || distanceMeters < 0.9 || distanceMeters > 18) continue;
+
+      const sameArea = Boolean(currentAreaId && hotspot.areaId && hotspot.areaId === currentAreaId);
+      const newArea = Boolean(hotspot.areaId && !this.guidedTourVisitedAreas.has(hotspot.areaId));
+      const rolePriority = this._tourRolePriority(currentRole, role);
+      let score = (3 - rolePriority) * 2.2;
+      score += sameArea ? 2.4 : 0;
+      score += newArea ? 5.0 : 0;
+      score += role === 'room-center' ? 2.1 : role === 'viewpoint' ? 1.4 : 0.4;
+      score -= Math.min(distanceMeters, 12) * 0.17;
+      if (currentRole === 'room-center' && role === 'viewpoint' && sameArea) score += 2.4;
+      if (currentRole === 'viewpoint' && role === 'room-entrance') score += 2.7;
+      if (currentRole === 'room-entrance' && role === 'room-center' && sameArea) score += 3.1;
+      if (role === 'room-center' && newArea) score += 2.0;
+      candidates.push({ hotspot, point, score, distanceMeters, sameArea, newArea });
+    }
+
+    candidates.sort((a, b) => {
+      if (Math.abs(b.score - a.score) > 0.12) return b.score - a.score;
+      if (a.newArea !== b.newArea) return a.newArea ? -1 : 1;
+      return a.distanceMeters - b.distanceMeters;
+    });
+
+    const best = candidates[0];
+    if (!best) return null;
+    const newRoomAlternative = candidates.find((candidate) => candidate.newArea && candidate.distanceMeters <= best.distanceMeters + 5);
+    if (newRoomAlternative && best.sameArea && best.score < newRoomAlternative.score + 1.6) return newRoomAlternative;
+    return best;
+  }
+
+  _advanceGuidedTour(now = performance.now()) {
+    if (
+      this.walkMode !== 'guided' ||
+      !this.guidedTourArmed ||
+      this.guidedTourAdvanceLock ||
+      this.arrivalSettleUntil > now ||
+      this.path ||
+      this.directTravel ||
+      now < this.guidedTourNextAt
+    ) return false;
+
+    const next = this._chooseNextGuidedTourDestination();
+    if (!next) {
+      this.guidedTourArmed = false;
+      this.guidedTourNextAt = 0;
+      this.guidedTourAdvanceLock = false;
+      this.onState?.({ type: 'tour-complete' });
+      return false;
+    }
+
+    this.guidedTourAdvanceLock = true;
+    this.guidedShotSubject = null;
+    this.guidedShotSubjectId = null;
+    this.guidedShotSubjectUntil = 0;
+    this._armGuidedTourForHotspot(next.hotspot);
+    const started = this.travelTo(next.point, next.hotspot.label || 'Next destination');
+    if (!started) this.guidedTourAdvanceLock = false;
+    if (started) {
+      this.onState?.({
+        type: 'tour-advance',
+        hotspotId: next.hotspot.id,
+        areaId: next.hotspot.areaId || null,
+        role: this._getHotspotRole(next.hotspot),
+        distanceMeters: Number(next.distanceMeters.toFixed(2)),
+      });
+    }
+    return started;
   }
 
   _startEmergencyRecovery(target, label = 'Safe position') {
@@ -1242,6 +1741,18 @@ class WalkRuntime {
     // Switching from Explore -> Guided freezes the current composition.
     // Switching back restores mouse-look immediately without a view jump.
     if (next === 'guided') {
+      this.guidedTourArmed = false;
+      this.guidedTourNextAt = 0;
+      this.guidedTourAdvanceLock = false;
+      this.guidedTourVisitedHotspots.clear();
+      this.guidedTourVisitedAreas.clear();
+      this.guidedTourLastAreaId = null;
+      this.guidedTourLastVisitedHotspotId = null;
+      this.guidedTourLastRole = null;
+      this.guidedPresentationAreaId = null;
+      this.arrivalSettleUntil = 0;
+      this.guidedApproachActive = false;
+      this.guidedArrivalSettleStartedAt = 0;
       this.guidedYawCenter = this.currentYaw;
       this.guidedCompositionYaw = this.currentYaw;
       this.guidedCompositionTargetYaw = this.currentYaw;
@@ -1280,6 +1791,9 @@ class WalkRuntime {
     if (next === this.viewMode) return;
     this.viewMode = next;
     if (next === 'overview') {
+      this.arrivalSettleUntil = 0;
+      this.guidedApproachActive = false;
+      this.guidedArrivalSettleStartedAt = 0;
       this.path = null;
       this.pathIndex = 0;
       this.directTravel = null;
@@ -1447,7 +1961,15 @@ if (name === 'top') {
     this.travelTotalDistance = 0;
     this.travelElapsed = 0;
     this.travelMode = null;
+    this.guidedTourArmed = false;
+    this.guidedTourNextAt = 0;
+    this.guidedTourAdvanceLock = false;
     this.arrivalSettleUntil = 0;
+    this.guidedApproachActive = false;
+    this.guidedRevealActive = false;
+    this.guidedArrivalSettleStartedAt = 0;
+    this.cameraClearanceTimer = 0;
+    this.progressWatchTime = 0;
     this.onState?.({ type: 'travel', active: false });
   }
 
@@ -1510,7 +2032,12 @@ if (name === 'top') {
         this._prepareGuidedArrivalView(this.directTravel.end, arrivalDirection);
         this.currentPolyRef = this.directTravel.targetPolyRef || this.currentPolyRef;
         this.directTravel = null;
-        this.arrivalSettleUntil = performance.now() + 260;
+        this.lastMovementPosition.copy(this.position);
+        this.cameraClearanceTimer = 0;
+        this.progressWatchTime = 0;
+        this._rememberNearestSafeAnchor(this.position, 'arrival');
+        this._markGuidedTourArrival();
+        this.arrivalSettleUntil = performance.now() + this.guidedArrivalSettleDurationMs;
             this.stuck = false;
             this.recoveryAvailable = false;
             this.onState?.({ type: 'stuck', available: false });
@@ -1531,10 +2058,15 @@ if (name === 'top') {
           this.pathIndex = 0;
           this.pathVelocity.set(0, 0, 0);
           this.velocity.set(0, 0, 0);
+          this.lastMovementPosition.copy(this.position);
+          this.cameraClearanceTimer = 0;
+          this.progressWatchTime = 0;
+          this._rememberNearestSafeAnchor(this.position, 'arrival');
+          this._markGuidedTourArrival();
           this.travelTotalDistance = 0;
           this.travelElapsed = 0;
           this.travelMode = null;
-          this.arrivalSettleUntil = performance.now() + 260;
+          this.arrivalSettleUntil = performance.now() + this.guidedArrivalSettleDurationMs;
           this.stuck = false;
           this.recoveryAvailable = false;
           this.onState?.({ type: 'stuck', available: false });
@@ -1549,6 +2081,21 @@ if (name === 'top') {
       this.travelElapsed += dt;
       const remainingDistance = this._estimateRemainingPathDistance();
       const speedFactor = this._cinematicSpeedFactor(remainingDistance);
+
+      // Phase 8: begin the destination reveal before the physical arrival. This
+      // is deliberately distance-based, not time-based, so short and long routes
+      // both reach the same visual choreography.
+      if (this.walkMode === 'guided' && !this.guidedApproachActive && this.path?.length) {
+        const finalPathPoint = this.path[this.path.length - 1];
+        const remainingMeters = remainingDistance / Math.max(this.metersPerUnit, 1e-6);
+        if (remainingMeters <= this.guidedTransitionApproachDistanceMeters) {
+          this._beginGuidedApproachView(
+            this.position,
+            finalPathPoint,
+            this.lastMoveDirection,
+          );
+        }
+      }
 
       // Look farther ahead at higher speed so turns are anticipated rather than
       // followed like a chain of rigid waypoints. The path itself remains intact.
@@ -1566,6 +2113,30 @@ if (name === 'top') {
       const targetSpeed = this.walkSpeed * speedFactor;
       this._moveToward(next, dt, targetSpeed);
       const moved = before.distanceTo(this.position);
+      if (moved > 0.01 * Math.max(this.metersPerUnit, 0.000001)) this._rememberNearestSafeAnchor(this.position, 'travel');
+      this.cameraClearanceTimer += dt;
+      this.progressWatchTime += dt;
+
+      // Recast keeps the movement point on the walkable surface, but its authored
+      // agent radius is intentionally smaller than the customer-facing camera
+      // envelope. Catch wall/furniture penetration at the camera level and force
+      // a controlled recovery instead of allowing the view to enter geometry.
+      const cameraBodySafe = this._hasCameraBodyClearance(this.position);
+      if (!cameraBodySafe && this.cameraClearanceTimer >= CAMERA_CLEARANCE_CHECK_INTERVAL_SEC) {
+        this.position.copy(before);
+        this.pathVelocity.set(0, 0, 0);
+        this.blockedTime += Math.max(dt, 0.12);
+        this.cameraClearanceTimer = 0;
+      }
+
+      const progressDistance = this.position.distanceTo(this.lastMovementPosition);
+      if (progressDistance > 0.035 * Math.max(this.metersPerUnit, 0.000001)) {
+        this.lastMovementPosition.copy(this.position);
+        this.progressWatchTime = 0;
+      } else if (this.progressWatchTime > 0.8 && moved < 0.001 * Math.max(1, this.metersPerUnit)) {
+        this.blockedTime += dt;
+      }
+
       if (moved < 0.0002 * Math.max(1, this.metersPerUnit)) {
         this.blockedTime += dt;
         if (this.blockedTime > 0.65) {
@@ -1652,68 +2223,87 @@ if (name === 'top') {
   recoverToSafeSpot(label = 'Safe position') {
     if (!this.query || !this.hotspots.length) return false;
 
-    // Cancel whatever was preventing movement and start a fresh destination search.
     this.path = null;
     this.pathIndex = 0;
     this.directTravel = null;
     this.pathVelocity.set(0, 0, 0);
     this.velocity.set(0, 0, 0);
     this.blockedTime = 0;
+    this.cameraClearanceTimer = 0;
+    this.progressWatchTime = 0;
 
-    const start = this._closestWalkPoint([this.position.x, this.position.y, this.position.z], 0.8);
+    const start = this._closestWalkPoint(
+      [this.position.x, this.position.y, this.position.z],
+      0.9,
+    );
     const startPoint = start || { x: this.position.x, y: this.position.y, z: this.position.z };
 
-    const candidates = [];
-    for (const hotspot of this.hotspots) {
-      if (!Array.isArray(hotspot?.position)) continue;
-      const destination = this._closestWalkPoint(hotspot.position, 0.45);
-      if (!destination) continue;
-      if (!this._hasCameraClearance([destination.x, destination.y, destination.z])) continue;
-
-      const result = this.query.computePath(startPoint, destination, {
+    // 1) Prefer an actual breadcrumb from the user's recent route. This creates
+    // a natural backtrack rather than teleporting to whichever hotspot happens
+    // to be numerically closest.
+    const history = [...this.navigationHistory].reverse();
+    for (const item of history) {
+      if (!item?.id || this.recoveryAttemptedIds.has(item.id)) continue;
+      const entry = this.safeAnchorById.get(item.id);
+      if (!entry?.point) continue;
+      const distanceFromStart = Math.hypot(entry.point.x - startPoint.x, entry.point.z - startPoint.z);
+      if (distanceFromStart < 0.60 * Math.max(this.metersPerUnit, 0.000001)) continue;
+      const result = this.query.computePath(startPoint, entry.point, {
         filter: this.filter,
         maxStraightPathSize: 256,
         maxPathSize: 256,
       });
-      if (!result?.success || !result.path?.length) continue;
-
-      let length = 0;
-      let previous = startPoint;
-      for (const p of result.path) {
-        length += Math.hypot(p.x - previous.x, p.z - previous.z);
-        previous = p;
+      if (!result?.success || !result.path?.length) {
+        this.recoveryAttemptedIds.add(item.id);
+        continue;
       }
-      candidates.push({ hotspot, destination, length });
-    }
 
-    candidates.sort((a, b) => a.length - b.length);
-    const chosen = candidates[0];
-
-    if (chosen) {
-      this.activeHotspotId = chosen.hotspot.id || null;
-      const ok = this._startPathToDestination(chosen.destination, label, 'recovery-path');
+      this.recoveryAttemptedIds.add(item.id);
+      this.activeHotspotId = item.id;
+      const ok = this._startPathToDestination(entry.point, label, 'recovery-backtrack');
       if (ok) {
         this.stuck = false;
         this.recoveryAvailable = false;
+        this.onState?.({ type: 'navigation-recovery', mode: 'backtrack', anchorId: item.id });
         this.onState?.({ type: 'stuck', available: false });
         return true;
       }
     }
 
-    // Last-resort recovery: only teleport to a validated hotspot. This is deliberately
-    // not an arbitrary NavMesh point; the user must still land at a safe destination.
-    const safe = this.hotspots
-      .map((hotspot) => ({ hotspot, point: this._closestWalkPoint(hotspot.position, 0.45) }))
-      .filter(({ point }) => point && this._hasCameraClearance([point.x, point.y, point.z]))
+    // 2) Re-plan to the best connected safe anchor. Score favors open, useful
+    // presentation anchors and known-good points while still respecting physical
+    // reachability from the current location.
+    const candidates = this._safeAnchorCandidates(startPoint);
+    const chosen = candidates[0];
+    if (chosen) {
+      this.recoveryAttemptedIds.add(chosen.id);
+      this.activeHotspotId = chosen.id;
+      const ok = this._startPathToDestination(chosen.point, label, 'recovery-reroute');
+      if (ok) {
+        this.stuck = false;
+        this.recoveryAvailable = false;
+        this.onState?.({ type: 'navigation-recovery', mode: 'reroute', anchorId: chosen.id });
+        this.onState?.({ type: 'stuck', available: false });
+        return true;
+      }
+    }
+
+    // 3) Only after route-based recovery fails do we use a controlled recovery
+    // teleport. The destination still has to be a safe anchor, never an arbitrary
+    // NavMesh point inside the building.
+    const teleportCandidate = [...this.safeAnchorById.entries()]
+      .map(([id, entry]) => ({ id, entry }))
+      .filter(({ id, entry }) => !this.recoveryAttemptedIds.has(id) && entry?.point)
       .sort((a, b) => {
-        const da = Math.hypot(a.point.x - this.position.x, a.point.z - this.position.z);
-        const db = Math.hypot(b.point.x - this.position.x, b.point.z - this.position.z);
+        const da = Math.hypot(a.entry.point.x - this.position.x, a.entry.point.z - this.position.z);
+        const db = Math.hypot(b.entry.point.x - this.position.x, b.entry.point.z - this.position.z);
         return da - db;
       })[0];
 
-    if (!safe?.point) return false;
-    this.activeHotspotId = safe.hotspot.id || null;
-    return this._teleportToDestination(safe.point, label, 'recovery-teleport');
+    if (!teleportCandidate) return false;
+    this.activeHotspotId = teleportCandidate.id;
+    this.onState?.({ type: 'navigation-recovery', mode: 'teleport', anchorId: teleportCandidate.id });
+    return this._teleportToDestination(teleportCandidate.entry.point, label, 'recovery-teleport');
   }
 
   _startPathToDestination(destination, label, mode = 'path') {
@@ -1731,7 +2321,13 @@ if (name === 'top') {
     this.travelElapsed = 0;
     this.travelMode = mode;
     this.arrivalSettleUntil = 0;
+    this.guidedApproachActive = false;
+    this.guidedRevealActive = false;
+    this.guidedArrivalSettleStartedAt = 0;
     this.blockedTime = 0;
+    this.cameraClearanceTimer = 0;
+    this.progressWatchTime = 0;
+    this.lastMovementPosition.copy(this.position);
     this.stuck = false;
     this.recoveryAvailable = false;
     this.currentPolyRef = destination.polyRef || this.currentPolyRef;
@@ -1753,7 +2349,9 @@ if (name === 'top') {
       { filter: this.filter, maxVisitedSize: 128 },
     );
     if (result.success) {
-      this.position.set(result.resultPosition.x, result.resultPosition.y, result.resultPosition.z);
+      const candidate = new THREE.Vector3(result.resultPosition.x, result.resultPosition.y, result.resultPosition.z);
+      if (!this._hasCameraBodyClearance(candidate)) return false;
+      this.position.copy(candidate);
       if (result.visited?.length) this.currentPolyRef = result.visited[result.visited.length - 1];
       if (result.resultPolyRef) this.currentPolyRef = result.resultPolyRef;
       return true;
@@ -1782,6 +2380,209 @@ if (name === 'top') {
     }
   }
 
+  _getGuidedPresentationAreaId() {
+    if (this.guidedPresentationAreaId) return this.guidedPresentationAreaId;
+    if (this.activeHotspotId) {
+      const active = this.hotspots.find((hotspot) => hotspot?.id === this.activeHotspotId);
+      if (active?.areaId) return active.areaId;
+    }
+    if (this.guidedTourLastAreaId) return this.guidedTourLastAreaId;
+    return null;
+  }
+
+  _buildPresentationSubjectIndex() {
+    this.presentationSubjects = [];
+    // Phase 13: lock the Guided presentation onto one meaningful visual subject
+    // during the arrival shot so the camera behaves like a deliberate architectural
+    // composition instead of continually re-solving the frame.
+    this.guidedShotSubject = null;
+    this.guidedShotSubjectId = null;
+    this.guidedShotSubjectUntil = 0;
+    if (!this.model) return;
+
+    const classify = (name = '') => {
+      const lower = String(name).toLowerCase();
+      if (/(sofa|couch|chair|table|desk|bed|cabinet|wardrobe|shelf|shelving|counter|stool|bench|tv|television|coffee)/.test(lower)) return 'furniture';
+      if (/(sink|toilet|bathtub|bath|shower|basin|hob|oven|fridge|refrigerator|appliance)/.test(lower)) return 'fixture';
+      if (/(window|glazing|glass|door|sliding|opening)/.test(lower)) return 'opening';
+      if (/(light|lamp|ceiling|pendant|fan|chandelier)/.test(lower)) return 'lighting';
+      if (/(plant|decor|art|painting|mirror|rug|carpet|curtain)/.test(lower)) return 'decor';
+      if (/(wall|floor|slab|ceiling|roof|column|beam|structural)/.test(lower)) return null;
+      return 'object';
+    };
+
+    this.model.traverse((obj) => {
+      if (!obj.isMesh || !obj.visible) return;
+      const role = classify(obj.name || obj.parent?.name || '');
+      if (!role) return;
+      const box = new THREE.Box3().setFromObject(obj);
+      if (box.isEmpty()) return;
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      if (!Number.isFinite(maxDim) || maxDim < 0.08) return;
+      const center = box.getCenter(new THREE.Vector3());
+      this.presentationSubjects.push({
+        object: obj,
+        role,
+        center,
+        size,
+        radius: Math.max(maxDim * 0.5, 0.12 * Math.max(this.metersPerUnit, 1e-6)),
+      });
+    });
+
+    // Avoid letting a huge set of decorative meshes dominate the composition.
+    // Keep the most useful subjects by world-space size, with a generous cap.
+    this.presentationSubjects.sort((a, b) => {
+      const priority = { furniture: 5, fixture: 4.5, opening: 3.7, decor: 3.2, lighting: 2.8, object: 2.5 };
+      return (priority[b.role] || 0) * b.radius - (priority[a.role] || 0) * a.radius;
+    });
+    if (this.presentationSubjects.length > 80) this.presentationSubjects.length = 80;
+  }
+
+  _chooseGuidedShotSubject(referencePosition = this.position, candidateYaw = this.currentYaw) {
+    if (!this.presentationSubjects.length) return null;
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const areaId = this._getGuidedPresentationAreaId();
+    const eye = new THREE.Vector3(
+      referencePosition.x,
+      referencePosition.y + this.eyeHeight * unit + this.heightOffset * unit,
+      referencePosition.z,
+    );
+    const forward = new THREE.Vector3(-Math.sin(candidateYaw), 0, -Math.cos(candidateYaw));
+    const maxDistance = 8.5 * unit;
+    const avoidId = this.guidedShotSubjectId;
+    const priority = { furniture: 5.0, fixture: 4.6, opening: 3.9, decor: 3.4, lighting: 2.7, object: 2.4 };
+    const candidates = [];
+
+    for (const subject of this.presentationSubjects) {
+      if (!subject?.object || !subject.object.visible) continue;
+      if (avoidId && subject.object.uuid === avoidId) continue;
+      const to = subject.center.clone().sub(referencePosition);
+      to.y = 0;
+      const distance = to.length();
+      if (!Number.isFinite(distance) || distance < 0.85 * unit || distance > maxDistance) continue;
+
+      const direction = to.normalize();
+      const angle = Math.acos(THREE.MathUtils.clamp(forward.dot(direction), -1, 1));
+      if (angle > THREE.MathUtils.degToRad(72)) continue;
+
+      // Subject must belong to the active semantic area when the current shot has one.
+      // This keeps the focus from leaking through a wall into another room.
+      if (areaId && subject.object.userData?.walkAreaId && subject.object.userData.walkAreaId !== areaId) continue;
+
+      const target = subject.center.clone();
+      target.y = THREE.MathUtils.clamp(
+        target.y,
+        referencePosition.y + 0.35 * unit,
+        referencePosition.y + 2.5 * unit,
+      );
+      const toTarget = target.clone().sub(eye);
+      const targetDistance = toTarget.length();
+      if (this.model && targetDistance > 1e-6) {
+        this.raycaster.set(eye, toTarget.normalize());
+        const hit = this.raycaster.intersectObject(this.model, true)[0];
+        if (hit && hit.object !== subject.object && hit.distance < targetDistance - 0.08 * unit) continue;
+      }
+
+      const angleQuality = 1 - angle / THREE.MathUtils.degToRad(72);
+      const distanceQuality = THREE.MathUtils.clamp(1 - distance / maxDistance, 0, 1);
+      const sizeQuality = THREE.MathUtils.clamp(Math.log1p(subject.radius / unit * 3) * 0.55, 0, 1.3);
+      const roleWeight = priority[subject.role] || 2.0;
+      const score = roleWeight * (0.65 + angleQuality * 1.75 + distanceQuality * 0.85 + sizeQuality * 0.55);
+      candidates.push({ subject, score, angle, distance, target });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0]?.subject || null;
+  }
+
+  _yawToGuidedSubject(referencePosition = this.position, subject = this.guidedShotSubject) {
+    if (!subject?.center) return null;
+    const dx = subject.center.x - referencePosition.x;
+    const dz = subject.center.z - referencePosition.z;
+    if (Math.hypot(dx, dz) < 0.15 * Math.max(this.metersPerUnit, 0.000001)) return null;
+    return Math.atan2(-dx, -dz);
+  }
+
+  _visualSubjectScore(referencePosition = this.position, candidateYaw = this.currentYaw) {
+    if (!this.presentationSubjects.length) return 0;
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const origin = new THREE.Vector3(referencePosition.x, referencePosition.y, referencePosition.z);
+    const eye = new THREE.Vector3(
+      origin.x,
+      origin.y + this.eyeHeight * unit + this.heightOffset * unit,
+      origin.z,
+    );
+    const forward = new THREE.Vector3(-Math.sin(candidateYaw), 0, -Math.cos(candidateYaw));
+    const maxDistance = 8.5 * unit;
+    let score = 0;
+    let visibleSubjects = 0;
+
+    for (const subject of this.presentationSubjects) {
+      const to = subject.center.clone().sub(origin);
+      to.y = 0;
+      const distance = to.length();
+      if (!Number.isFinite(distance) || distance < 0.75 * unit || distance > maxDistance) continue;
+      const direction = to.normalize();
+      const angle = Math.acos(THREE.MathUtils.clamp(forward.dot(direction), -1, 1));
+      if (angle > THREE.MathUtils.degToRad(68)) continue;
+
+      const target = subject.center.clone();
+      target.y = THREE.MathUtils.clamp(
+        target.y,
+        origin.y + 0.35 * unit,
+        origin.y + 2.6 * unit,
+      );
+      const toTarget = target.clone().sub(eye);
+      const targetDistance = toTarget.length();
+      if (this.model && targetDistance > 1e-6) {
+        this.raycaster.set(eye, toTarget.normalize());
+        const hit = this.raycaster.intersectObject(this.model, true)[0];
+        if (hit && hit.object !== subject.object && hit.distance < targetDistance - 0.08 * unit) continue;
+      }
+
+      const angleQuality = 1 - angle / THREE.MathUtils.degToRad(68);
+      const distanceQuality = THREE.MathUtils.clamp(1 - distance / maxDistance, 0, 1);
+      const sizeQuality = THREE.MathUtils.clamp(Math.log1p(subject.radius / unit * 3) * 0.55, 0, 1.3);
+      const roleWeight = subject.role === 'furniture' ? 1.35
+        : subject.role === 'fixture' ? 1.2
+        : subject.role === 'opening' ? 0.95
+        : subject.role === 'decor' ? 0.82
+        : subject.role === 'lighting' ? 0.65
+        : 0.55;
+
+      score += roleWeight * (0.7 + angleQuality * 1.7 + distanceQuality * 0.8 + sizeQuality * 0.5);
+      visibleSubjects += 1;
+      if (visibleSubjects >= 8) break;
+    }
+
+    return score;
+  }
+
+  _headingWallGuardScore(referencePosition = this.position, candidateYaw = this.currentYaw) {
+    if (!this.model) return 0;
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const origin = new THREE.Vector3(
+      referencePosition.x,
+      referencePosition.y + this.eyeHeight * unit + this.heightOffset * unit,
+      referencePosition.z,
+    );
+    const offsets = [-18, 0, 18];
+    let score = 0;
+    for (const offsetDeg of offsets) {
+      const yaw = candidateYaw + THREE.MathUtils.degToRad(offsetDeg);
+      const dir = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+      this.raycaster.set(origin, dir);
+      const hit = this.raycaster.intersectObject(this.model, true)[0];
+      const distance = hit?.distance ?? Infinity;
+      if (distance < 0.55 * unit) score -= 2.2;
+      else if (distance < this.guidedPanWallGuardMeters * unit) score -= 1.5;
+      else if (distance > 2.5 * unit) score += 0.45;
+      else score += 0.1;
+    }
+    return score;
+  }
+
   _getGuidedVisibleHotspots(referencePosition = this.position, yaw = this.currentYaw, maxDistanceMeters = this.guidedCompositionLookaheadMeters) {
     if (!this.hotspots.length) return [];
     const unit = Math.max(this.metersPerUnit, 0.000001);
@@ -1790,6 +2591,8 @@ if (name === 'top') {
     const eye = new THREE.Vector3(base.x, base.y + eyeHeight, base.z);
     const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
     const visible = [];
+    const presentationAreaId = this._getGuidedPresentationAreaId();
+    const allowCrossArea = this.guidedTransitionKind === 'room-entry' || this.guidedTransitionKind === 'room-crossing';
 
     for (const hotspot of this.hotspots) {
       if (!Array.isArray(hotspot?.position)) continue;
@@ -1802,6 +2605,7 @@ if (name === 'top') {
       to.y = 0;
       const distance = to.length();
       if (!Number.isFinite(distance) || distance < 0.65 * unit || distance > maxDistanceMeters * unit) continue;
+      if (presentationAreaId && hotspot.areaId && hotspot.areaId !== presentationAreaId && !allowCrossArea) continue;
       if (!this._hasCameraClearance([target.x, target.y, target.z])) continue;
 
       const direction = to.normalize();
@@ -1831,18 +2635,22 @@ if (name === 'top') {
     const incoming = new THREE.Vector3(incomingDirection?.x || 0, 0, incomingDirection?.z || 0);
     if (incoming.lengthSq() > 1e-8) incoming.normalize();
 
-    let score = 0;
+    let score = this._headingWallGuardScore(referencePosition, candidateYaw);
+    // Phase 12: prefer headings that actually show design content, not just open space.
+    score += this._visualSubjectScore(referencePosition, candidateYaw) * 0.72;
+    const presentationAreaId = this._getGuidedPresentationAreaId();
     for (const item of visible) {
       const proximity = THREE.MathUtils.clamp(1 - item.distance / (this.guidedCompositionLookaheadMeters * unit), 0, 1);
       const centered = 1 - THREE.MathUtils.clamp(item.angle / THREE.MathUtils.degToRad(75), 0, 1);
       const forwardBonus = incoming.lengthSq() > 1e-8 ? Math.max(0, incoming.dot(item.direction)) : 0;
       const role = this._getHotspotRole(item.hotspot);
+      const sameSpaceBonus = presentationAreaId && item.hotspot.areaId === presentationAreaId ? 1.35 : 0;
       const roleBonus = role === 'room-center' ? 0.9
         : role === 'viewpoint' ? 0.75
         : role === 'room-entrance' ? 0.45
         : role === 'transition' ? 0.25
         : 0.1;
-      score += 1.8 + proximity * 1.4 + centered * 1.2 + forwardBonus * 0.55 + roleBonus;
+      score += 1.8 + proximity * 1.4 + centered * 1.2 + forwardBonus * 0.55 + roleBonus + sameSpaceBonus;
     }
 
     // A clear forward ray is a useful tie-breaker because a good presentation
@@ -1871,6 +2679,18 @@ if (name === 'top') {
     const best = candidates[0];
     if (!best) return null;
 
+    // If there are no same-space presentation subjects, preserve the current
+    // composition rather than inventing a view through a wall into another room.
+    const bestEvaluation = this._scoreGuidedHeading(referencePosition, best.yaw, incomingDirection);
+    const currentEvaluation = this._scoreGuidedHeading(referencePosition, preferredYaw, incomingDirection);
+    const hasSameSpaceSubject = bestEvaluation.visible.some((item) => {
+      const areaId = this._getGuidedPresentationAreaId();
+      return !areaId || !item.hotspot.areaId || item.hotspot.areaId === areaId;
+    });
+    if (!hasSameSpaceSubject && currentEvaluation.score >= best.score - 0.45) {
+      return { yaw: preferredYaw, score: currentEvaluation.score };
+    }
+
     const angleDelta = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
     const current = candidates
       .filter((candidate) => angleDelta(candidate.yaw, preferredYaw) <= THREE.MathUtils.degToRad(8))
@@ -1882,31 +2702,150 @@ if (name === 'top') {
     return best;
   }
 
+  _angleLerp(a, b, t) {
+    const delta = Math.atan2(Math.sin(b - a), Math.cos(b - a));
+    return a + delta * THREE.MathUtils.clamp(t, 0, 1);
+  }
+
+  _findGuidedRevealYaw(referencePosition = this.position, destination = null, incomingDirection = this.lastMoveDirection) {
+    if (!destination) return this.currentYaw;
+
+    const toDestination = new THREE.Vector3(
+      destination.x - referencePosition.x,
+      0,
+      destination.z - referencePosition.z,
+    );
+    if (toDestination.lengthSq() < 1e-8) return this.currentYaw;
+    toDestination.normalize();
+
+    const destinationYaw = Math.atan2(-toDestination.x, -toDestination.z);
+    const sideSigns = [1, -1];
+    const offsets = [28, 42, 58, 72];
+    const candidates = [destinationYaw];
+
+    // Prefer a shallow side reveal: it lets a doorway/room open laterally in the
+    // frame instead of pointing the camera straight down the travel vector.
+    for (const sign of sideSigns) {
+      for (const offset of offsets) candidates.push(destinationYaw + THREE.MathUtils.degToRad(sign * offset));
+    }
+
+    const forwardTravel = incomingDirection?.clone?.().setY(0);
+    if (forwardTravel?.lengthSq?.() > 1e-8) forwardTravel.normalize();
+
+    let best = { yaw: destinationYaw, score: -Infinity };
+    const eye = new THREE.Vector3(
+      referencePosition.x,
+      referencePosition.y + this.eyeHeight * Math.max(this.metersPerUnit, 1e-6) + this.heightOffset * Math.max(this.metersPerUnit, 1e-6),
+      referencePosition.z,
+    );
+    const unit = Math.max(this.metersPerUnit, 1e-6);
+
+    for (const yaw of candidates) {
+      const dir = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+      const headingScore = this._scoreGuidedHeading(referencePosition, yaw, incomingDirection)?.score || 0;
+      let clearanceScore = 0;
+      if (this.model) {
+        for (const meters of [1.6, 2.8, 4.5]) {
+          this.raycaster.set(eye, dir);
+          const hit = this.raycaster.intersectObject(this.model, true)[0];
+          if (!hit || hit.distance > meters * unit) clearanceScore += 0.7;
+        }
+      }
+
+      const targetBias = Math.max(0, dir.dot(toDestination));
+      const lateralReveal = 1 - Math.abs(targetBias);
+      const wallGuard = this._headingWallGuardScore(referencePosition, yaw);
+      const travelContinuity = forwardTravel?.lengthSq?.() > 1e-8
+        ? Math.max(0, forwardTravel.dot(dir))
+        : 0;
+      const score = headingScore + clearanceScore + wallGuard + lateralReveal * 1.9 + targetBias * 1.25 + travelContinuity * 0.35;
+      if (score > best.score) best = { yaw, score };
+    }
+
+    return best.yaw;
+  }
+
+  _beginGuidedApproachView(referencePosition = this.position, destination = null, incomingDirection = this.lastMoveDirection) {
+    if (this.walkMode !== 'guided' || !destination || this.arrivalSettleUntil > performance.now()) return;
+
+    const destinationDirection = new THREE.Vector3(
+      destination.x - referencePosition.x,
+      0,
+      destination.z - referencePosition.z,
+    );
+    if (destinationDirection.lengthSq() < 1e-8) return;
+    destinationDirection.normalize();
+
+    const destinationYaw = Math.atan2(-destinationDirection.x, -destinationDirection.z);
+    const best = this._findBestGuidedComposition(
+      destination,
+      incomingDirection,
+      destinationYaw,
+    );
+    const finalYaw = Number.isFinite(best?.yaw) ? best.yaw : destinationYaw;
+    const revealYaw = this._findGuidedRevealYaw(referencePosition, destination, incomingDirection);
+    const isTransition = this.guidedTransitionKind === 'room-entry' || this.guidedTransitionKind === 'room-crossing';
+
+    // Phase 10: introduce a distinct reveal heading for architectural transitions.
+    // It stays subtle for same-space hops and more lateral for room crossings,
+    // creating a readable glimpse of the new space while the body keeps following
+    // the physical path.
+    this.guidedApproachStartYaw = this.currentYaw;
+    const revealBlend = isTransition ? 0.68 : 0.58;
+    const revealTarget = isTransition ? revealYaw : finalYaw;
+    this.guidedApproachTargetYaw = this._angleLerp(this.currentYaw, revealTarget, revealBlend);
+    this.guidedRevealTargetYaw = this._angleLerp(revealYaw, finalYaw, isTransition ? 0.34 : 0.18);
+    this.guidedApproachActive = true;
+    this.guidedRevealActive = isTransition;
+    this.guidedCompositionTargetYaw = this.guidedApproachTargetYaw;
+    this.guidedLastCompositionAt = performance.now();
+  }
+
   _prepareGuidedArrivalView(referencePosition = this.position, incomingDirection = this.lastMoveDirection) {
     if (this.walkMode !== 'guided') return;
+    if (this.activeHotspotId) {
+      const active = this.hotspots.find((hotspot) => hotspot?.id === this.activeHotspotId);
+      if (active?.areaId) this.guidedPresentationAreaId = active.areaId;
+    }
 
     const preferredYaw = Number.isFinite(this.currentYaw)
       ? this.currentYaw
       : (incomingDirection?.lengthSq?.() > 1e-8 ? Math.atan2(-incomingDirection.x, -incomingDirection.z) : 0);
     const best = this._findBestGuidedComposition(referencePosition, incomingDirection, preferredYaw);
+    const baseArrivalYaw = Number.isFinite(best?.yaw)
+      ? best.yaw
+      : (incomingDirection?.lengthSq?.() > 1e-8
+        ? Math.atan2(-incomingDirection.x, -incomingDirection.z)
+        : preferredYaw);
 
-    if (best && Number.isFinite(best.yaw)) {
-      this.guidedCompositionYaw = best.yaw;
-      this.guidedCompositionTargetYaw = best.yaw;
-      this.guidedYawCenter = best.yaw;
-      this.targetYaw = best.yaw;
-    } else if (incomingDirection?.lengthSq?.() > 1e-8) {
-      const fallbackYaw = Math.atan2(-incomingDirection.x, -incomingDirection.z);
-      this.guidedCompositionYaw = fallbackYaw;
-      this.guidedCompositionTargetYaw = fallbackYaw;
-      this.guidedYawCenter = fallbackYaw;
-      this.targetYaw = fallbackYaw;
-    }
+    // Phase 13: choose one visible design subject for the shot and let the camera
+    // settle toward it. If no trustworthy subject exists, keep the Phase 11/12
+    // composition instead of forcing a synthetic focus.
+    this.guidedShotSubject = this._chooseGuidedShotSubject(referencePosition, baseArrivalYaw);
+    this.guidedShotSubjectId = this.guidedShotSubject?.object?.uuid || null;
+    const subjectYaw = this._yawToGuidedSubject(referencePosition, this.guidedShotSubject);
+    const arrivalYaw = Number.isFinite(subjectYaw)
+      ? this._angleLerp(baseArrivalYaw, subjectYaw, 0.62)
+      : baseArrivalYaw;
 
-    this._refreshPresentationDestinations(referencePosition, Number.isFinite(this.targetYaw) ? this.targetYaw : preferredYaw);
-    this.guidedLastCompositionAt = performance.now();
-    this.guidedPanPhase = 0;
+    // Phase 8: do not snap on arrival. Freeze the current heading, then settle
+    // smoothly into the final architectural composition over ~1.25 seconds.
+    const now = performance.now();
+    this.guidedApproachActive = false;
+    this.guidedRevealActive = false;
+    this.guidedArrivalStartYaw = this.currentYaw;
+    this.guidedArrivalTargetYaw = arrivalYaw;
+    this.guidedArrivalSettleStartedAt = now;
+    this.arrivalSettleUntil = now + this.guidedArrivalSettleDurationMs;
+    this.guidedShotSubjectUntil = now + this.guidedArrivalSettleDurationMs + this.guidedTourHoldMs;
+    this.guidedCompositionYaw = this.currentYaw;
+    this.guidedCompositionTargetYaw = arrivalYaw;
+    this.guidedYawCenter = this.currentYaw;
+    this.targetYaw = this.currentYaw;
     this.targetPitch = this.guidedPitch;
+    this.guidedLastCompositionAt = now;
+    this.guidedPanPhase = 0;
+    this._refreshPresentationDestinations(referencePosition, arrivalYaw);
   }
 
   _refreshPresentationDestinations(referencePosition = this.position, yaw = this.currentYaw) {
@@ -1980,11 +2919,51 @@ if (name === 'top') {
     const isTravelling = Boolean(this.path?.length || this.directTravel);
 
     // Guided mode is a presentation camera: it slowly pans continuously, not
-    // only while travelling. The pitch stays fixed so the user gets a stable
-    // architectural horizon, while movement follows the NavMesh independently.
+    // only while travelling. Phase 8 adds two higher-priority cinematic states:
+    // a final-approach reveal and a short arrival settle.
     if (this.walkMode === 'guided' && this.guidedAutoRotate) {
       const now = performance.now();
-      if (this.guidedManualActive) {
+
+      if (!this.guidedManualActive && this.arrivalSettleUntil > now) {
+        const totalMs = Math.max(1, this.guidedArrivalSettleDurationMs);
+        const elapsedMs = Math.max(0, now - this.guidedArrivalSettleStartedAt);
+        const t = THREE.MathUtils.clamp(elapsedMs / totalMs, 0, 1);
+        const eased = t * t * (3 - 2 * t);
+        const settleYaw = this._angleLerp(this.guidedArrivalStartYaw, this.guidedArrivalTargetYaw, eased);
+        this.guidedCompositionYaw = settleYaw;
+        this.guidedCompositionTargetYaw = this.guidedArrivalTargetYaw;
+        this.targetYaw = settleYaw;
+        this.targetPitch = this.guidedPitch;
+        this.guidedPanPhase = 0;
+      } else if (!this.guidedManualActive && this.guidedApproachActive && isTravelling) {
+        let approachYaw = this.guidedApproachTargetYaw;
+        if (this.guidedRevealActive && this.path?.length) {
+          const remainingMeters = this._estimateRemainingPathDistance() / Math.max(this.metersPerUnit, 1e-6);
+          const span = Math.max(0.35, this.guidedRevealStartDistanceMeters - this.guidedRevealFinalDistanceMeters);
+          const revealT = THREE.MathUtils.clamp(
+            (this.guidedRevealStartDistanceMeters - remainingMeters) / span,
+            0,
+            1,
+          );
+          const easedReveal = revealT * revealT * (3 - 2 * revealT);
+          approachYaw = this._angleLerp(
+            this.guidedApproachTargetYaw,
+            this.guidedRevealTargetYaw,
+            easedReveal,
+          );
+          if (remainingMeters <= this.guidedRevealFinalDistanceMeters) {
+            this.guidedRevealActive = false;
+          }
+        }
+        this.guidedCompositionYaw = this._angleLerp(
+          this.guidedCompositionYaw,
+          approachYaw,
+          1 - Math.exp(-1.55 * dt),
+        );
+        this.guidedCompositionTargetYaw = approachYaw;
+        this.targetYaw = this.guidedCompositionYaw;
+        this.targetPitch = this.guidedPitch;
+      } else if (this.guidedManualActive) {
         this.targetPitch = this.guidedPitch;
 
         // Small inertia after release gives the camera a polished viewport feel.
@@ -2012,8 +2991,25 @@ if (name === 'top') {
           this._refreshPresentationDestinations(this.position, resumeYaw);
         }
       } else {
+        // Phase 13: while the current architectural shot is still being presented,
+        // preserve its chosen subject instead of letting periodic composition search
+        // pull the camera toward another room/object.
+        const subjectLockActive = this.guidedShotSubject && now < this.guidedShotSubjectUntil && !isTravelling;
+        if (subjectLockActive) {
+          const subjectYaw = this._yawToGuidedSubject(this.position, this.guidedShotSubject);
+          if (Number.isFinite(subjectYaw)) {
+            this.guidedCompositionTargetYaw = this._angleLerp(this.guidedCompositionTargetYaw, subjectYaw, 0.16);
+            this.guidedCompositionYaw = this._angleLerp(this.guidedCompositionYaw, this.guidedCompositionTargetYaw, 1 - Math.exp(-1.8 * dt));
+          }
+        }
+
+        // Phase 8B: continue the guided architectural story after the current shot
+        // has had time to settle. The user can interrupt at any time by dragging
+        // or clicking another destination.
+        this._advanceGuidedTour(now);
+
         const due = now - this.guidedLastCompositionAt >= this.guidedCompositionIntervalMs;
-        if (due) {
+        if (due && !subjectLockActive) {
           const visible = this._getGuidedVisibleHotspots(this.position, this.currentYaw, this.guidedCompositionLookaheadMeters);
           // Reframe periodically, but only when the current view is weak. During
           // travel this keeps the next useful choices visible without making the
@@ -2035,7 +3031,11 @@ if (name === 'top') {
         // Very small cinematic drift around the chosen composition. This is no
         // longer a one-direction spin: the selected composition is the anchor.
         this.guidedPanPhase += dt * this.guidedYawRate;
-        const microSweep = Math.sin(this.guidedPanPhase) * THREE.MathUtils.degToRad(this.guidedCompositionSweepDeg) * 0.12;
+        let microSweep = Math.sin(this.guidedPanPhase) * THREE.MathUtils.degToRad(this.guidedCompositionSweepDeg) * 0.12;
+        const sweepYaw = this.guidedCompositionYaw + microSweep;
+        if (this._headingWallGuardScore(this.position, sweepYaw) < -this.guidedWallDominancePenalty) {
+          microSweep *= 0.18;
+        }
         this.targetYaw = this.guidedCompositionYaw + microSweep;
         this.targetPitch = this.guidedPitch;
       }
@@ -2063,7 +3063,7 @@ if (name === 'top') {
   }
 
   _updatePortals() {
-    const visibleLimit = this.walkMode === 'guided' ? 7 : 9;
+    const visibleLimit = this.walkMode === 'guided' ? 5 : 8;
     const maxDistance = 11 * Math.max(this.metersPerUnit, 0.000001);
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
 
