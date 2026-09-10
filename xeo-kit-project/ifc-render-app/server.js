@@ -296,7 +296,6 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     [
       'output.glb',
       'navigation_surface.json',
-      'walk_areas.json',
       'walk_hotspots.json',
       'navigation_navmesh.bin',
       'input.ifc',
@@ -380,7 +379,6 @@ app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'
     const requiredFiles = [
       'output.glb',
       'navigation_surface.json',
-      'walk_areas.json',
       'walk_hotspots.json',
       'navigation_navmesh.bin',
       'input.ifc',

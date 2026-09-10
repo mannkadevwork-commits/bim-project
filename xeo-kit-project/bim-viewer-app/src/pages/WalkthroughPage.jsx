@@ -42,7 +42,6 @@ export default function WalkthroughPage() {
   const [walkMode, setWalkMode] = useState('guided');
 
   const walkthrough = useWalkthroughEngine({ containerRef: viewportRef, jobId });
-  const areas = walkthrough.areas || [];
   const navigationPlan = walkthrough.navigationPlan || null;
   const navigationHotspots = navigationPlan?.hotspots || [];
   const effectiveWalkMode = walkthrough.walkMode || walkMode;
@@ -119,16 +118,16 @@ export default function WalkthroughPage() {
       setTouring(false);
       return;
     }
-    if (!areas.length) return;
+    if (!navigationHotspots.length) return;
     setTouring(true);
     setViewMode('walk');
     setWalkMode('guided');
     walkthrough.setWalkMode('guided');
     walkthrough.setViewMode('walk');
-    for (const area of areas) {
+    for (const hotspot of navigationHotspots) {
       if (!touring) break;
       // eslint-disable-next-line no-await-in-loop
-      const ok = await walkthrough.travelTo(area);
+      const ok = await walkthrough.navigateToHotspot(hotspot);
       if (!ok) continue;
       await new Promise((resolve) => setTimeout(resolve, 450));
     }
@@ -179,7 +178,7 @@ export default function WalkthroughPage() {
               </div>
               <div>
                 <div className="text-sm font-semibold text-white">Floor map</div>
-                <div className="mt-0.5 text-[11px] text-slate-400">{navigationHotspots.length} walkable destinations</div>
+                <div className="mt-0.5 text-[11px] text-slate-400">{navigationHotspots.length} validated destinations</div>
               </div>
             </div>
             {railOpen ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
@@ -192,7 +191,7 @@ export default function WalkthroughPage() {
                   Building floor map…
                 </div>
               ) : (
-                <div className="relative aspect-[4/3] overflow-hidden rounded-2xl border border-white/10 bg-slate-900/65 shadow-inner pointer-events-auto">
+                <div className="relative aspect-[4/3] overflow-hidden rounded-2xl border border-white/10 bg-slate-900/65 shadow-inner">
                   <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_45%,rgba(255,145,77,.07),transparent_58%)]" />
                   <svg
                     className="absolute inset-0 h-full w-full"
@@ -220,14 +219,14 @@ export default function WalkthroughPage() {
                             role="button"
                             tabIndex={0}
                             aria-label={`Go to ${hotspot.label}`}
-                            onClick={() => walkthrough.navigateToHotspot({ id: hotspot.id, label: hotspot.label, x: hotspot.x, y: 0, z: hotspot.z })}
-                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); walkthrough.navigateToHotspot({ id: hotspot.id, label: hotspot.label, x: hotspot.x, y: 0, z: hotspot.z }); } }}
+                            onClick={() => walkthrough.navigateToHotspot(hotspot)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); walkthrough.navigateToHotspot(hotspot); } }}
                             className="cursor-pointer outline-none"
                           >
                             <circle cx={hotspot.x} cy={hotspot.z} r={active ? size * 2.05 : size * 1.65} fill="rgba(255,145,77,0.10)" />
-                            <circle cx={hotspot.x} cy={hotspot.z} r={active ? size * 1.25 : size * 1.05} fill={active ? 'rgba(255,145,77,0.95)' : 'rgba(255,145,77,0.72)'} stroke="rgba(255,214,186,0.95)" strokeWidth={size * 0.22} />
+                            <circle cx={hotspot.x} cy={hotspot.z} r={active ? size * 1.05 : size * 0.92} fill={active ? 'rgba(255,145,77,0.95)' : 'rgba(255,145,77,0.72)'} stroke="rgba(255,214,186,0.95)" strokeWidth={size * 0.18} />
                             <text x={hotspot.x} y={hotspot.z + size * 0.35} textAnchor="middle" fontSize={Math.max(0.08, size * 0.9)} fill="white" fontWeight="700" pointerEvents="none">{index + 1}</text>
-                            <title>Go to {hotspot.label || `Navigation ${index + 1}`}</title>
+                            <title>{hotspot.label || `Navigation ${index + 1}`}</title>
                           </g>
                         );
                       })}

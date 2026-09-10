@@ -194,14 +194,10 @@ class WalkRuntime {
     const jobBase = `${baseUrl.replace(/\/$/, '')}/jobs/${encodeURIComponent(jobId)}`;
     this.onState?.({ type: 'loading', value: true });
 
-    const [surfacePayload, areasPayload, hotspotsPayload, navBuffer, gltf] = await Promise.all([
+    const [surfacePayload, hotspotsPayload, navBuffer, gltf] = await Promise.all([
       fetch(`${jobBase}/navigation_surface.json`, { cache: 'no-store' }).then(this._assertJson('navigation_surface.json')),
-      fetch(`${jobBase}/walk_areas.json`, { cache: 'no-store' }).then(this._assertJson('walk_areas.json')).catch((error) => {
-        console.warn('[Walkthrough] walk_areas.json unavailable; using fallback destination list.', error);
-        return { areas: [] };
-      }),
       fetch(`${jobBase}/walk_hotspots.json`, { cache: 'no-store' }).then(this._assertJson('walk_hotspots.json')).catch((error) => {
-        console.warn('[Walkthrough] walk_hotspots.json unavailable; deriving limited hotspots from room areas.', error);
+        console.warn('[Walkthrough] walk_hotspots.json unavailable; no destinations will be shown.', error);
         return { hotspots: [] };
       }),
       fetch(`${jobBase}/navigation_navmesh.bin`, { cache: 'no-store' }).then(async (r) => {
@@ -218,20 +214,12 @@ class WalkRuntime {
     this.navMesh = imported.navMesh;
     this.query = new NavMeshQuery(this.navMesh);
     this.filter = new QueryFilter();
-    this.walkAreas = Array.isArray(areasPayload?.areas) ? areasPayload.areas.filter((a) => Array.isArray(a?.center) && a.center.length >= 3) : [];
+    this.walkAreas = [];
     const loadedHotspots = Array.isArray(hotspotsPayload?.hotspots)
       ? hotspotsPayload.hotspots.filter((h) => Array.isArray(h?.position) && h.position.length >= 3)
       : [];
     this.metersPerUnit = Number(surfacePayload?.metadata?.physicalMetersPerUnit) > 0 ? Number(surfacePayload.metadata.physicalMetersPerUnit) : 1;
-    const fallbackHotspots = this.walkAreas.map((area, index) => ({
-      id: `legacy-hotspot-${index + 1}`,
-      position: [Number(area.center[0]), Number(area.center[1]) || 0, Number(area.center[2])],
-      clearanceMeters: 0,
-      score: 0,
-      source: 'room-anchor',
-      areaId: area.id,
-    }));
-    const rawHotspots = loadedHotspots.length ? loadedHotspots : fallbackHotspots;
+    const rawHotspots = loadedHotspots;
 
     const navigationPlan = this._buildNavigationPlan(surfacePayload, rawHotspots);
     this.navigationPlan = navigationPlan;
@@ -513,13 +501,16 @@ class WalkRuntime {
     };
   }
 
-  _closestWalkPoint(point) {
+  _closestWalkPoint(point, toleranceMeters = 0.45) {
     const p = { x: Number(point[0]), y: Number(point[1]) || 0, z: Number(point[2]) };
+    const tolerance = Math.max(0.12, toleranceMeters * Math.max(this.metersPerUnit, 1e-6));
     const result = this.query.findClosestPoint(p, {
-      halfExtents: { x: 5, y: 3, z: 5 },
+      halfExtents: { x: tolerance, y: Math.max(0.6, 1.5 * Math.max(this.metersPerUnit, 1e-6)), z: tolerance },
       filter: this.filter,
     });
     if (!result.success) return null;
+    const distance = Math.hypot(result.point.x - p.x, result.point.z - p.z);
+    if (distance > tolerance * 1.05) return null;
     return {
       x: result.point.x,
       y: result.point.y,
@@ -530,42 +521,14 @@ class WalkRuntime {
 
   _simplifyPath(points) {
     if (!Array.isArray(points) || points.length <= 2) return points || [];
-
-    // Recast already gives us a valid corridor. For presentation movement we
-    // only need the meaningful turns, not every tiny intermediate sample.
-    // Removing nearly-collinear points prevents the camera from visibly
-    // "following a rope" around the corridor.
-    const simplified = [points[0]];
-    const minSegment = Math.max(0.12 * this.metersPerUnit, 0.08);
-    const minTurnDeg = 7;
-    let previous = points[0];
-    let previousDirection = null;
-
-    for (let i = 1; i < points.length - 1; i += 1) {
+    const minSegment = Math.max(0.06 * this.metersPerUnit, 0.04);
+    const compact = [points[0]];
+    for (let i = 1; i < points.length; i += 1) {
+      const prev = compact[compact.length - 1];
       const next = points[i];
-      const dx = next.x - previous.x;
-      const dz = next.z - previous.z;
-      const len = Math.hypot(dx, dz);
-      if (len < minSegment) continue;
-
-      const direction = new THREE.Vector2(dx, dz).normalize();
-      let keep = false;
-      if (!previousDirection) {
-        keep = true;
-      } else {
-        const dot = THREE.MathUtils.clamp(previousDirection.dot(direction), -1, 1);
-        const angle = Math.acos(dot) * 180 / Math.PI;
-        keep = angle >= minTurnDeg;
-      }
-      if (keep) {
-        simplified.push(next);
-        previousDirection = direction;
-        previous = next;
-      }
+      if (Math.hypot(next.x - prev.x, next.z - prev.z) >= minSegment || i === points.length - 1) compact.push(next);
     }
-
-    simplified.push(points[points.length - 1]);
-    return simplified;
+    return compact;
   }
 
   _pointAlongPath(startIndex, lookAheadDistance) {
@@ -953,8 +916,7 @@ class WalkRuntime {
       return false;
     }
     this.directTravel = null;
-    const rawPath = result.path.map((p) => ({ x: p.x, y: p.y, z: p.z }));
-    this.path = this._simplifyPath(rawPath);
+    this.path = this._simplifyPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
     this.pathIndex = 0;
     this.pathVelocity.set(0, 0, 0);
     this.blockedTime = 0;
@@ -1320,7 +1282,7 @@ if (name === 'top') {
       if (moved < 0.0002 * Math.max(1, this.metersPerUnit)) {
         this.blockedTime += dt;
         if (this.blockedTime > 0.65) {
-          const recovered = this._recoverFromStall();
+          const recovered = this.recoverToSafeSpot('Recovered walk position');
           if (recovered) this.blockedTime = 0;
         }
         if (this.blockedTime > 1.25) {
@@ -1368,7 +1330,7 @@ if (name === 'top') {
       if (moved < 0.0002 * Math.max(1, this.metersPerUnit)) {
         this.blockedTime += dt;
         if (this.blockedTime > 0.8) {
-          const recovered = this._recoverFromStall();
+          const recovered = this.recoverToSafeSpot('Recovered walk position');
           if (recovered) this.blockedTime = 0;
         }
       } else {
@@ -1400,41 +1362,91 @@ if (name === 'top') {
     this._moveTo(this.position.clone().addScaledVector(this.pathVelocity, dt));
   }
 
-  _recoverFromStall() {
-    if (!this.query) return;
-    const baseRadius = Math.max(this.radius * 2.2, 0.18 * this.metersPerUnit);
-    const directions = [];
-    const away = this.lastMoveDirection.clone().multiplyScalar(-1);
-    if (away.lengthSq() > 1e-8) directions.push(away.normalize());
-    for (let i = 0; i < 8; i++) {
-      const a = (Math.PI * 2 * i) / 8;
-      directions.push(new THREE.Vector3(Math.cos(a), 0, Math.sin(a)));
+  recoverToSafeSpot(label = 'Safe position') {
+    if (!this.query || !this.hotspots.length) return false;
+
+    // Cancel whatever was preventing movement and start a fresh destination search.
+    this.path = null;
+    this.pathIndex = 0;
+    this.directTravel = null;
+    this.pathVelocity.set(0, 0, 0);
+    this.velocity.set(0, 0, 0);
+    this.blockedTime = 0;
+
+    const start = this._closestWalkPoint([this.position.x, this.position.y, this.position.z], 0.8);
+    const startPoint = start || { x: this.position.x, y: this.position.y, z: this.position.z };
+
+    const candidates = [];
+    for (const hotspot of this.hotspots) {
+      if (!Array.isArray(hotspot?.position)) continue;
+      const destination = this._closestWalkPoint(hotspot.position, 0.45);
+      if (!destination) continue;
+      if (!this._hasCameraClearance([destination.x, destination.y, destination.z])) continue;
+
+      const result = this.query.computePath(startPoint, destination, {
+        filter: this.filter,
+        maxStraightPathSize: 256,
+        maxPathSize: 256,
+      });
+      if (!result?.success || !result.path?.length) continue;
+
+      let length = 0;
+      let previous = startPoint;
+      for (const p of result.path) {
+        length += Math.hypot(p.x - previous.x, p.z - previous.z);
+        previous = p;
+      }
+      candidates.push({ hotspot, destination, length });
     }
-    let best = null;
-    let bestDist = Infinity;
-    for (const dir of directions) {
-      const candidate = this.position.clone().addScaledVector(dir, baseRadius);
-      const result = this.query.findClosestPoint(
-        { x: candidate.x, y: candidate.y, z: candidate.z },
-        { halfExtents: { x: baseRadius * 1.8, y: Math.max(0.25, this.metersPerUnit), z: baseRadius * 1.8 }, filter: this.filter },
-      );
-      if (!result.success) continue;
-      const point = new THREE.Vector3(result.point.x, result.point.y, result.point.z);
-      const d = point.distanceTo(candidate);
-      if (d < bestDist && point.distanceTo(this.position) > 0.01 * Math.max(1, this.metersPerUnit) && this._hasCameraClearance([point.x, point.y, point.z])) {
-        best = { point, polyRef: result.polyRef ?? result.ref ?? 0 };
-        bestDist = d;
+
+    candidates.sort((a, b) => a.length - b.length);
+    const chosen = candidates[0];
+
+    if (chosen) {
+      this.activeHotspotId = chosen.hotspot.id || null;
+      const ok = this._startPathToDestination(chosen.destination, label, 'recovery-path');
+      if (ok) {
+        this.stuck = false;
+        this.recoveryAvailable = false;
+        this.onState?.({ type: 'stuck', available: false });
+        return true;
       }
     }
-    if (best) {
-      this.position.copy(best.point);
-      this.currentPolyRef = best.polyRef || this.currentPolyRef;
-      this.velocity.set(0, 0, 0);
-      this.pathVelocity.set(0, 0, 0);
-      this.onState?.({ type: 'unstuck' });
-      return true;
-    }
-    return false;
+
+    // Last-resort recovery: only teleport to a validated hotspot. This is deliberately
+    // not an arbitrary NavMesh point; the user must still land at a safe destination.
+    const safe = this.hotspots
+      .map((hotspot) => ({ hotspot, point: this._closestWalkPoint(hotspot.position, 0.45) }))
+      .filter(({ point }) => point && this._hasCameraClearance([point.x, point.y, point.z]))
+      .sort((a, b) => {
+        const da = Math.hypot(a.point.x - this.position.x, a.point.z - this.position.z);
+        const db = Math.hypot(b.point.x - this.position.x, b.point.z - this.position.z);
+        return da - db;
+      })[0];
+
+    if (!safe?.point) return false;
+    this.activeHotspotId = safe.hotspot.id || null;
+    return this._teleportToDestination(safe.point, label, 'recovery-teleport');
+  }
+
+  _startPathToDestination(destination, label, mode = 'path') {
+    const start = { x: this.position.x, y: this.position.y, z: this.position.z };
+    const result = this.query?.computePath(start, destination, {
+      filter: this.filter,
+      maxStraightPathSize: 256,
+      maxPathSize: 256,
+    });
+    if (!result?.success || !result.path?.length) return false;
+    this.path = this._simplifyPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
+    this.pathIndex = 0;
+    this.pathVelocity.set(0, 0, 0);
+    this.blockedTime = 0;
+    this.stuck = false;
+    this.recoveryAvailable = false;
+    this.currentPolyRef = destination.polyRef || this.currentPolyRef;
+    this.onState?.({ type: 'stuck', available: false });
+    this.onState?.({ type: 'travel', label, active: true, mode, hotspotId: this.activeHotspotId });
+    return true;
   }
 
   _moveTo(desired) {
