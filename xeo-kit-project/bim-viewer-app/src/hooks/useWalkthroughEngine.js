@@ -57,6 +57,10 @@ class WalkRuntime {
     this.path = null;
     this.pathIndex = 0;
     this.pathVelocity = new THREE.Vector3();
+    this.travelTotalDistance = 0;
+    this.travelElapsed = 0;
+    this.travelMode = null;
+    this.arrivalSettleUntil = 0;
     this.directTravel = null;
     this.position = new THREE.Vector3();
     this.velocity = new THREE.Vector3();
@@ -89,6 +93,12 @@ class WalkRuntime {
     this.guidedManualActive = false;
     this.guidedPointerDown = null;
     this.guidedPointerDragging = false;
+    // Phase 4: incremental pointer samples + a short inertial tail make Guided
+    // feel like a polished camera control instead of a raw FPS mouse mapping.
+    this.guidedLastPointer = null;
+    this.guidedYawVelocity = 0;
+    this.guidedManualResumeDelayMs = 2400;
+    this.guidedManualVelocityDamping = 7.5;
     // Guided camera composition state.  The heading is chosen from actual
     // nearby destinations/open-space checks instead of a blind perpetual spin.
     this.guidedCompositionYaw = 0;
@@ -98,6 +108,11 @@ class WalkRuntime {
     this.guidedCompositionMinVisibleTargets = 2;
     this.guidedCompositionSweepDeg = 34;
     this.guidedCompositionLookaheadMeters = 8;
+    this.presentationHotspotIds = new Set();
+    this.presentationHotspotScores = new Map();
+    this.presentationMaxVisible = 4;
+    this.presentationMaxDistanceMeters = 9;
+    this.presentationMinSeparationDeg = 16;
     this.lookLocked = false;
     this.autoRotate = false;
     this.lastMoveDirection = new THREE.Vector3();
@@ -158,7 +173,9 @@ class WalkRuntime {
       // not move beyond a small drag threshold.
       if (this.walkMode === 'guided') {
         this.guidedPointerDown = { x: e.clientX, y: e.clientY };
+        this.guidedLastPointer = { x: e.clientX, y: e.clientY, t: performance.now() };
         this.guidedPointerDragging = false;
+        this.guidedYawVelocity = 0;
         this.renderer.domElement.setPointerCapture?.(e.pointerId);
         return;
       }
@@ -177,7 +194,10 @@ class WalkRuntime {
       if (e.button === 0 && this.walkMode === 'guided' && this.viewMode === 'walk') {
         const wasDragging = this.guidedPointerDragging;
         this.guidedPointerDown = null;
+        this.guidedLastPointer = null;
         this.guidedPointerDragging = false;
+        this.guidedManualActive = wasDragging;
+        this.guidedManualYawUntil = performance.now() + this.guidedManualResumeDelayMs;
         this.renderer.domElement.releasePointerCapture?.(e.pointerId);
         if (!wasDragging && performance.now() >= this.portalClickSuppressedUntil) {
           this._handleWalkPointer(e);
@@ -193,25 +213,39 @@ class WalkRuntime {
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
 
       if (this.walkMode === 'guided') {
-        if (!this.guidedPointerDown) return;
-        const dx = e.clientX - this.guidedPointerDown.x;
-        const dy = e.clientY - this.guidedPointerDown.y;
-        const dragDistance = Math.hypot(dx, dy);
+        if (!this.guidedPointerDown || !this.guidedLastPointer) return;
+
+        const now = performance.now();
+        const totalDx = e.clientX - this.guidedPointerDown.x;
+        const totalDy = e.clientY - this.guidedPointerDown.y;
+        const dragDistance = Math.hypot(totalDx, totalDy);
         if (dragDistance < 4) return;
 
         this.guidedPointerDragging = true;
-        // Horizontal drag controls yaw only. Keep Guided pitch locked so the
-        // floor-marker composition remains stable.
-        this.targetYaw -= (e.movementX || dx) * (this.lookSensitivity * 0.78);
-        this.currentYaw += (e.movementX || dx) * -(this.lookSensitivity * 0.30);
+
+        // Consume only the incremental delta. Using the full distance from
+        // pointer-down on every event compounds the rotation and feels clunky.
+        const dx = e.clientX - this.guidedLastPointer.x;
+        const dtMs = Math.max(8, now - this.guidedLastPointer.t);
+        this.guidedLastPointer = { x: e.clientX, y: e.clientY, t: now };
+
+        const yawDelta = dx * (this.lookSensitivity * 0.72);
+        this.targetYaw -= yawDelta;
+        this.guidedYawVelocity = THREE.MathUtils.clamp(
+          -yawDelta / (dtMs / 1000),
+          -1.6,
+          1.6,
+        );
+
+        // Guided remains horizontal-look only; pitch is the presentation
+        // framing and stays stable so floor markers do not disappear.
         this.targetPitch = this.guidedPitch;
-        this.currentPitch = this.guidedPitch;
         this.guidedManualActive = true;
-        this.guidedManualYawUntil = performance.now() + 2600;
+        this.guidedManualYawUntil = now + this.guidedManualResumeDelayMs;
         this.guidedYawCenter = this.targetYaw;
         this.guidedCompositionYaw = this.targetYaw;
         this.guidedCompositionTargetYaw = this.targetYaw;
-        this.guidedLastCompositionAt = performance.now();
+        this.guidedLastCompositionAt = now;
         this.guidedPanPhase = 0;
         this.lastPointer.x = e.clientX;
         this.lastPointer.y = e.clientY;
@@ -237,8 +271,20 @@ class WalkRuntime {
     window.addEventListener('keydown', this.onKeyDown, { passive: false });
     window.addEventListener('keyup', this.onKeyUp);
     this.renderer.domElement.addEventListener('contextmenu', this.onContextMenu);
+    this.onPointerCancel = (e) => {
+      if (e.pointerId == null || this.walkMode !== 'guided') return;
+      const wasDragging = this.guidedPointerDragging;
+      this.guidedPointerDown = null;
+      this.guidedLastPointer = null;
+      this.guidedPointerDragging = false;
+      this.guidedManualActive = wasDragging;
+      this.guidedManualYawUntil = performance.now() + this.guidedManualResumeDelayMs;
+      this.renderer.domElement.releasePointerCapture?.(e.pointerId);
+    };
+
     this.renderer.domElement.addEventListener('pointerdown', this.onPointerDown);
     this.renderer.domElement.addEventListener('pointerup', this.onPointerUp);
+    this.renderer.domElement.addEventListener('pointercancel', this.onPointerCancel);
     this.renderer.domElement.addEventListener('pointermove', this.onPointerMove);
     this.renderer.domElement.addEventListener('dblclick', this.onDoubleClick);
     window.addEventListener('resize', this.resize);
@@ -992,6 +1038,10 @@ class WalkRuntime {
     this.path = this._simplifyPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
     this.pathIndex = 0;
     this.pathVelocity.set(0, 0, 0);
+    this.travelTotalDistance = this._estimatePathLengthFrom(this.position, 0);
+    this.travelElapsed = 0;
+    this.travelMode = 'path';
+    this.arrivalSettleUntil = 0;
     this.blockedTime = 0;
     this.stuck = false;
     this.recoveryAvailable = false;
@@ -1118,6 +1168,10 @@ class WalkRuntime {
       this.guidedCompositionYaw = this.currentYaw;
       this.guidedCompositionTargetYaw = this.currentYaw;
       this.guidedLastCompositionAt = performance.now();
+      this.guidedPointerDown = null;
+      this.guidedLastPointer = null;
+      this.guidedYawVelocity = 0;
+      this.guidedManualActive = false;
       this.guidedPitch = this.currentPitch;
       this.targetPitch = this.currentPitch;
       this.heightOffset = GUIDED_CAMERA_HEIGHT_METERS - this.eyeHeight;
@@ -1312,7 +1366,51 @@ if (name === 'top') {
     this.pathIndex = 0;
     this.pathVelocity.set(0, 0, 0);
     this.directTravel = null;
+    this.travelTotalDistance = 0;
+    this.travelElapsed = 0;
+    this.travelMode = null;
+    this.arrivalSettleUntil = 0;
     this.onState?.({ type: 'travel', active: false });
+  }
+
+  _estimatePathLengthFrom(position = this.position, startIndex = 0) {
+    if (!this.path?.length) return 0;
+    let previous = position;
+    let total = 0;
+    for (let i = Math.max(0, startIndex); i < this.path.length; i += 1) {
+      const p = this.path[i];
+      total += Math.hypot(p.x - previous.x, p.z - previous.z);
+      previous = p;
+    }
+    return total;
+  }
+
+  _cinematicSpeedFactor(remainingDistance) {
+    const unit = Math.max(this.metersPerUnit, 1e-6);
+    const remaining = Math.max(0, remainingDistance / unit);
+    const total = Math.max(0, this.travelTotalDistance / unit);
+
+    // Short hops should feel responsive; longer trips get a noticeable
+    // acceleration phase, comfortable cruise, then a deliberate arrival brake.
+    const accelDistance = THREE.MathUtils.clamp(total * 0.28, 0.45, 1.6);
+    const brakeDistance = THREE.MathUtils.clamp(total * 0.34, 0.75, 2.2);
+
+    const smooth01 = (value) => {
+      const t = THREE.MathUtils.clamp(value, 0, 1);
+      return t * t * (3 - 2 * t);
+    };
+
+    let accel = 1;
+    if (total > 0.05 && total - remaining < accelDistance) {
+      accel = THREE.MathUtils.lerp(0.18, 1, smooth01((total - remaining) / accelDistance));
+    }
+
+    let brake = 1;
+    if (remaining < brakeDistance) {
+      brake = THREE.MathUtils.lerp(0.28, 1, smooth01(remaining / brakeDistance));
+    }
+
+    return THREE.MathUtils.clamp(Math.min(accel, brake), 0.18, 1);
   }
 
   _updateMovement(dt) {
@@ -1321,7 +1419,11 @@ if (name === 'top') {
       const elapsed = now - this.directTravel.startTime;
       const t = THREE.MathUtils.clamp(elapsed / this.directTravel.duration, 0, 1);
       const eased = t * t * (3 - 2 * t);
-      this.position.lerpVectors(this.directTravel.start, this.directTravel.end, eased);
+      // Direct/semantic travel is intentionally decisive: use a smooth cinematic
+      // ease rather than the old constant-feeling drag. This path is used only
+      // for explicit map jumps / room transitions, not physical hotspot travel.
+      const cinematicT = eased * eased * (3 - 2 * eased);
+      this.position.lerpVectors(this.directTravel.start, this.directTravel.end, cinematicT);
       this.velocity.set(0, 0, 0);
       this.pathVelocity.set(0, 0, 0);
       this.blockedTime = 0;
@@ -1330,6 +1432,7 @@ if (name === 'top') {
         this._prepareGuidedArrivalView(this.directTravel.end, arrivalDirection);
         this.currentPolyRef = this.directTravel.targetPolyRef || this.currentPolyRef;
         this.directTravel = null;
+        this.arrivalSettleUntil = performance.now() + 260;
             this.stuck = false;
             this.recoveryAvailable = false;
             this.onState?.({ type: 'stuck', available: false });
@@ -1350,6 +1453,10 @@ if (name === 'top') {
           this.pathIndex = 0;
           this.pathVelocity.set(0, 0, 0);
           this.velocity.set(0, 0, 0);
+          this.travelTotalDistance = 0;
+          this.travelElapsed = 0;
+          this.travelMode = null;
+          this.arrivalSettleUntil = performance.now() + 260;
           this.stuck = false;
           this.recoveryAvailable = false;
           this.onState?.({ type: 'stuck', available: false });
@@ -1361,20 +1468,25 @@ if (name === 'top') {
       // Game-style steering: aim a little ahead on the path instead of chasing
       // each corner directly. This keeps turns fluid and prevents the camera
       // from visibly zig-zagging around furniture.
+      this.travelElapsed += dt;
       const remainingDistance = this._estimateRemainingPathDistance();
-      const lookAhead = THREE.MathUtils.clamp(0.35 * this.metersPerUnit + this.pathVelocity.length() * 0.18, 0.32 * this.metersPerUnit, 0.9 * this.metersPerUnit);
-      const steerTarget = this._pointAlongPath(this.pathIndex, Math.min(lookAhead, Math.max(lookAhead, remainingDistance)));
+      const speedFactor = this._cinematicSpeedFactor(remainingDistance);
+
+      // Look farther ahead at higher speed so turns are anticipated rather than
+      // followed like a chain of rigid waypoints. The path itself remains intact.
+      const lookAhead = THREE.MathUtils.clamp(
+        (0.42 + this.pathVelocity.length() * 0.22) * this.metersPerUnit,
+        0.35 * this.metersPerUnit,
+        1.25 * this.metersPerUnit,
+      );
+      const steerTarget = this._pointAlongPath(this.pathIndex, Math.min(lookAhead, Math.max(0.01, remainingDistance)));
       const next = steerTarget || this.path[this.pathIndex];
       const before = this.position.clone();
       this.lastMoveDirection.set(next.x - this.position.x, 0, next.z - this.position.z);
       if (this.lastMoveDirection.lengthSq() > 1e-8) this.lastMoveDirection.normalize();
 
-      // Smooth acceleration, then brake naturally as we approach the destination.
-      const brakeDistance = Math.max(1.15 * this.metersPerUnit, 0.9);
-      const speedFactor = remainingDistance < brakeDistance
-        ? THREE.MathUtils.clamp(remainingDistance / brakeDistance, 0.38, 1)
-        : 1;
-      this._moveToward(next, dt, this.walkSpeed * speedFactor);
+      const targetSpeed = this.walkSpeed * speedFactor;
+      this._moveToward(next, dt, targetSpeed);
       const moved = before.distanceTo(this.position);
       if (moved < 0.0002 * Math.max(1, this.metersPerUnit)) {
         this.blockedTime += dt;
@@ -1537,6 +1649,10 @@ if (name === 'top') {
     this.path = this._simplifyPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
     this.pathIndex = 0;
     this.pathVelocity.set(0, 0, 0);
+    this.travelTotalDistance = this._estimatePathLengthFrom(this.position, 0);
+    this.travelElapsed = 0;
+    this.travelMode = mode;
+    this.arrivalSettleUntil = 0;
     this.blockedTime = 0;
     this.stuck = false;
     this.recoveryAvailable = false;
@@ -1703,9 +1819,69 @@ if (name === 'top') {
       this.targetYaw = fallbackYaw;
     }
 
+    this._refreshPresentationDestinations(referencePosition, Number.isFinite(this.targetYaw) ? this.targetYaw : preferredYaw);
     this.guidedLastCompositionAt = performance.now();
     this.guidedPanPhase = 0;
     this.targetPitch = this.guidedPitch;
+  }
+
+  _refreshPresentationDestinations(referencePosition = this.position, yaw = this.currentYaw) {
+    this.presentationHotspotIds.clear();
+    this.presentationHotspotScores.clear();
+    if (!this.hotspots.length) return;
+
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
+    const origin = new THREE.Vector3(referencePosition.x, referencePosition.y, referencePosition.z);
+    const candidates = [];
+
+    for (const hotspot of this.hotspots) {
+      if (!hotspot?.id || !Array.isArray(hotspot.position)) continue;
+      const dx = Number(hotspot.position[0]) - origin.x;
+      const dz = Number(hotspot.position[2]) - origin.z;
+      const distance = Math.hypot(dx, dz);
+      if (!Number.isFinite(distance) || distance < 0.5 * unit || distance > this.presentationMaxDistanceMeters * unit) continue;
+      if (!this._hasCameraClearance(hotspot.position)) continue;
+
+      const direction = new THREE.Vector3(dx, 0, dz).normalize();
+      const dot = forward.dot(direction);
+      const angle = Math.acos(THREE.MathUtils.clamp(dot, -1, 1));
+      if (angle > THREE.MathUtils.degToRad(78)) continue;
+
+      let visible = true;
+      if (this.model) {
+        const eye = new THREE.Vector3(origin.x, origin.y + this.eyeHeight * unit + this.heightOffset * unit, origin.z);
+        const target = new THREE.Vector3(Number(hotspot.position[0]), Number(hotspot.position[1]), Number(hotspot.position[2]));
+        const toTarget = target.sub(eye);
+        const targetDistance = toTarget.length();
+        if (targetDistance > 1e-6) {
+          this.raycaster.set(eye, toTarget.normalize());
+          const hit = this.raycaster.intersectObject(this.model, true)[0];
+          visible = !hit || hit.distance >= targetDistance - 0.05 * unit;
+        }
+      }
+      if (!visible) continue;
+
+      const proximity = THREE.MathUtils.clamp(1 - distance / (this.presentationMaxDistanceMeters * unit), 0, 1);
+      const centered = 1 - angle / THREE.MathUtils.degToRad(78);
+      const score = proximity * 2.2 + centered * 2.0 + (Number(hotspot.score) || 0) * 0.15;
+      candidates.push({ hotspot, distance, angle, score });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    const minSep = THREE.MathUtils.degToRad(this.presentationMinSeparationDeg);
+    for (const candidate of candidates) {
+      const separated = [...this.presentationHotspotIds].every((id) => {
+        const previous = candidates.find((entry) => entry.hotspot.id === id);
+        if (!previous) return true;
+        const delta = Math.atan2(Math.sin(candidate.angle - previous.angle), Math.cos(candidate.angle - previous.angle));
+        return Math.abs(delta) >= minSep;
+      });
+      if (!separated) continue;
+      this.presentationHotspotIds.add(candidate.hotspot.id);
+      this.presentationHotspotScores.set(candidate.hotspot.id, candidate.score);
+      if (this.presentationHotspotIds.size >= this.presentationMaxVisible) break;
+    }
   }
 
   _syncCamera() {
@@ -1720,13 +1896,30 @@ if (name === 'top') {
       const now = performance.now();
       if (this.guidedManualActive) {
         this.targetPitch = this.guidedPitch;
-        if (now >= this.guidedManualYawUntil) {
+
+        // Small inertia after release gives the camera a polished viewport feel.
+        if (this.guidedPointerDown == null && Math.abs(this.guidedYawVelocity) > 0.0005) {
+          const inertiaDelta = this.guidedYawVelocity * dt * 0.18;
+          this.targetYaw += inertiaDelta;
+          this.guidedYawVelocity *= Math.exp(-this.guidedManualVelocityDamping * dt);
+        }
+
+        // Once the interaction pause has elapsed, hand control back to the
+        // intelligent composition director instead of snapping to an old center.
+        if (now >= this.guidedManualYawUntil && this.guidedPointerDown == null) {
           this.guidedManualActive = false;
+          const best = this._findBestGuidedComposition(
+            this.position,
+            this.lastMoveDirection,
+            this.currentYaw,
+          );
+          const resumeYaw = Number.isFinite(best?.yaw) ? best.yaw : this.currentYaw;
           this.guidedCompositionYaw = this.currentYaw;
-          this.guidedCompositionTargetYaw = this.currentYaw;
+          this.guidedCompositionTargetYaw = resumeYaw;
           this.guidedYawCenter = this.currentYaw;
           this.guidedLastCompositionAt = now;
           this.guidedPanPhase = 0;
+          this._refreshPresentationDestinations(this.position, resumeYaw);
         }
       } else {
         const due = now - this.guidedLastCompositionAt >= this.guidedCompositionIntervalMs;
@@ -1739,6 +1932,7 @@ if (name === 'top') {
             const best = this._findBestGuidedComposition(this.position, this.lastMoveDirection, this.currentYaw);
             if (best && Number.isFinite(best.yaw)) this.guidedCompositionTargetYaw = best.yaw;
           }
+          this._refreshPresentationDestinations(this.position, this.guidedCompositionTargetYaw);
           this.guidedLastCompositionAt = now;
         }
 
@@ -1779,7 +1973,7 @@ if (name === 'top') {
   }
 
   _updatePortals() {
-    const visibleLimit = 9;
+    const visibleLimit = this.walkMode === 'guided' ? 7 : 9;
     const maxDistance = 11 * Math.max(this.metersPerUnit, 0.000001);
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
 
@@ -1817,8 +2011,20 @@ if (name === 'top') {
     // Select nearby destinations with angular diversity so the user can see
     // choices distributed across the room instead of seven markers stacked in
     // the same direction.
+    if (this.walkMode === 'guided') {
+      const presentationEntries = candidates
+        .filter((candidate) => this.presentationHotspotIds.has(candidate.portal.userData?.hotspotId))
+        .sort((a, b) => (this.presentationHotspotScores.get(b.portal.userData?.hotspotId) || 0) - (this.presentationHotspotScores.get(a.portal.userData?.hotspotId) || 0));
+      candidates.sort((a, b) => {
+        const ap = this.presentationHotspotIds.has(a.portal.userData?.hotspotId) ? 0 : 1;
+        const bp = this.presentationHotspotIds.has(b.portal.userData?.hotspotId) ? 0 : 1;
+        if (ap !== bp) return ap - bp;
+        return ((this.presentationHotspotScores.get(b.portal.userData?.hotspotId) || 0) - (this.presentationHotspotScores.get(a.portal.userData?.hotspotId) || 0)) || (a.dist - b.dist);
+      });
+    }
+
     const selected = [];
-    const minAngularSeparation = THREE.MathUtils.degToRad(10);
+    const minAngularSeparation = THREE.MathUtils.degToRad(this.walkMode === 'guided' ? 12 : 10);
     for (const candidate of candidates) {
       const separated = selected.every((chosen) => {
         const delta = Math.atan2(Math.sin(candidate.angle - chosen.angle), Math.cos(candidate.angle - chosen.angle));
@@ -1894,6 +2100,7 @@ if (name === 'top') {
     this.renderer.domElement.removeEventListener('contextmenu', this.onContextMenu);
     this.renderer.domElement.removeEventListener('pointerdown', this.onPointerDown);
     this.renderer.domElement.removeEventListener('pointerup', this.onPointerUp);
+    this.renderer.domElement.removeEventListener('pointercancel', this.onPointerCancel);
     this.renderer.domElement.removeEventListener('pointermove', this.onPointerMove);
     this.renderer.domElement.removeEventListener('dblclick', this.onDoubleClick);
     window.removeEventListener('resize', this.resize);
