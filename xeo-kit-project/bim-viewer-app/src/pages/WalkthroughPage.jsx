@@ -66,7 +66,7 @@ export default function WalkthroughPage() {
     if (walkthrough.stuck) return 'Navigation paused · choose a nearby floor marker or reposition safely';
     if (walkthrough.message) return walkthrough.message;
     if (viewMode === 'overview') return 'Preview · orbit and zoom · click Start Walkthrough';
-    if (effectiveWalkMode === 'guided') return 'Guided · click a floor destination to move · camera slowly pans automatically';
+    if (effectiveWalkMode === 'guided') return 'Guided · click a floor destination to move · drag horizontally to look';
     return walkthrough.lookLocked
       ? 'Explore · view locked · double-click to unlock'
       : 'Explore · move with W/A/S/D · move mouse to look';

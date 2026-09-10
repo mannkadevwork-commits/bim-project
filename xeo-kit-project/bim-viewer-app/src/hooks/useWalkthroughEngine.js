@@ -83,6 +83,12 @@ class WalkRuntime {
     this.guidedPanPhase = 0;
     this.guidedAutoRotate = true;
     this.guidedTravelRotating = false;
+    // Guided-mode manual yaw is a temporary user override. It pauses the
+    // cinematic pan while the user drags, then resumes from the new heading.
+    this.guidedManualYawUntil = 0;
+    this.guidedManualActive = false;
+    this.guidedPointerDown = null;
+    this.guidedPointerDragging = false;
     this.lookLocked = false;
     this.autoRotate = false;
     this.lastMoveDirection = new THREE.Vector3();
@@ -136,8 +142,18 @@ class WalkRuntime {
     this.onPointerDown = (e) => {
       if (e.button !== 0 || this.viewMode !== 'walk') return;
       this.pointerDownAt = performance.now();
-      // Guided mode is intentionally view-locked, but floor/hotspot clicks
-      // must still be interactive. Only Explore's optional look-lock blocks clicks.
+
+      // Guided: left-drag is an explicit, modern way to yaw the camera.
+      // A simple click remains a navigation action, so we defer the floor/hotspot
+      // click until pointer-up and only treat it as a click when the pointer did
+      // not move beyond a small drag threshold.
+      if (this.walkMode === 'guided') {
+        this.guidedPointerDown = { x: e.clientX, y: e.clientY };
+        this.guidedPointerDragging = false;
+        this.renderer.domElement.setPointerCapture?.(e.pointerId);
+        return;
+      }
+
       if (this.walkMode === 'explore' && this.lookLocked) return;
       this._handleWalkPointer(e);
     };
@@ -149,14 +165,48 @@ class WalkRuntime {
       this.setLookLocked(!this.lookLocked, true);
     };
     this.onPointerUp = (e) => {
+      if (e.button === 0 && this.walkMode === 'guided' && this.viewMode === 'walk') {
+        const wasDragging = this.guidedPointerDragging;
+        this.guidedPointerDown = null;
+        this.guidedPointerDragging = false;
+        this.renderer.domElement.releasePointerCapture?.(e.pointerId);
+        if (!wasDragging && performance.now() >= this.portalClickSuppressedUntil) {
+          this._handleWalkPointer(e);
+        }
+        return;
+      }
       if (e.button === 2) {
-            this.renderer.domElement.releasePointerCapture?.(e.pointerId);
+        this.renderer.domElement.releasePointerCapture?.(e.pointerId);
       }
     };
     this.onPointerMove = (e) => {
-      if (this.lookLocked || this.viewMode !== 'walk' || this.walkMode !== 'explore') return;
+      if (this.viewMode !== 'walk') return;
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
-      const rect = this.renderer.domElement.getBoundingClientRect();
+
+      if (this.walkMode === 'guided') {
+        if (!this.guidedPointerDown) return;
+        const dx = e.clientX - this.guidedPointerDown.x;
+        const dy = e.clientY - this.guidedPointerDown.y;
+        const dragDistance = Math.hypot(dx, dy);
+        if (dragDistance < 4) return;
+
+        this.guidedPointerDragging = true;
+        // Horizontal drag controls yaw only. Keep Guided pitch locked so the
+        // floor-marker composition remains stable.
+        this.targetYaw -= (e.movementX || dx) * (this.lookSensitivity * 0.78);
+        this.currentYaw += (e.movementX || dx) * -(this.lookSensitivity * 0.30);
+        this.targetPitch = this.guidedPitch;
+        this.currentPitch = this.guidedPitch;
+        this.guidedManualActive = true;
+        this.guidedManualYawUntil = performance.now() + 2200;
+        this.guidedYawCenter = this.targetYaw;
+        this.guidedPanPhase = 0;
+        this.lastPointer.x = e.clientX;
+        this.lastPointer.y = e.clientY;
+        return;
+      }
+
+      if (this.lookLocked || this.walkMode !== 'explore') return;
       const dx = e.movementX || (e.clientX - this.lastPointer.x);
       const dy = e.movementY || (e.clientY - this.lastPointer.y);
       this.lastPointer.x = e.clientX;
@@ -348,12 +398,20 @@ class WalkRuntime {
 
     this.position.set(start.x, start.y, start.z);
     this.currentPolyRef = start.polyRef || 0;
+    // Prepare the very first Guided view immediately. Without this, the camera
+    // could enter the walkthrough carrying the overview heading and stare into a
+    // wall/ceiling before the first destination click caused a reframe.
     this.currentYaw = this.yaw;
     this.targetYaw = this.yaw;
-    this.guidedYawCenter = this.yaw;
-    this.guidedPanPhase = 0;
-    this.currentPitch = this.pitch;
-    this.targetPitch = this.pitch;
+    this.currentPitch = this.guidedPitch;
+    this.targetPitch = this.guidedPitch;
+    this._syncCamera();
+    this._prepareGuidedArrivalView(this.position, this.lastMoveDirection);
+    if (this.walkMode === 'guided' && Number.isFinite(this.targetYaw)) {
+      this.currentYaw = this.targetYaw;
+      this.guidedYawCenter = this.currentYaw;
+      this.guidedPanPhase = 0;
+    }
     // Keep the player position prepared in the background, but leave the camera in overview mode.
     this._buildPortals();
 
@@ -1090,9 +1148,24 @@ class WalkRuntime {
       // Guided is the stable presentation mode. Explore is free-look.
       if (this.walkMode === 'guided') {
         this.lookLocked = true;
+        this.guidedManualActive = false;
+        this.guidedManualYawUntil = 0;
+        this.currentPitch = this.guidedPitch;
+        this.targetPitch = this.guidedPitch;
+        // Put the camera at the walk position first, then choose an initial
+        // heading from safe nearby destinations. This makes the floor disks
+        // immediately visible instead of requiring a room/map click.
+        this._syncCamera();
+        this._prepareGuidedArrivalView(this.position, this.lastMoveDirection);
+        if (Number.isFinite(this.targetYaw)) {
+          this.currentYaw = this.targetYaw;
+          this.guidedYawCenter = this.currentYaw;
+          this.guidedPanPhase = 0;
+        }
         this.onState?.({ type: 'look-lock', locked: true });
       } else {
         this.lookLocked = false;
+        this.guidedManualActive = false;
         this.onState?.({ type: 'look-lock', locked: false });
       }
       this._syncCamera();
@@ -1559,13 +1632,23 @@ if (name === 'top') {
     // only while travelling. The pitch stays fixed so the user gets a stable
     // architectural horizon, while movement follows the NavMesh independently.
     if (this.walkMode === 'guided' && this.guidedAutoRotate) {
-      // Guided mode gets a subtle cinematic pan around the CURRENT heading.
-      // The center is deliberately updated when a new destination is chosen,
-      // so a previous room cannot leave the next room staring into a wall.
-      this.guidedPanPhase += dt * this.guidedYawRate;
-      this.targetYaw = this.guidedYawCenter + Math.sin(this.guidedPanPhase) * this.guidedYawAmplitude;
-      this.targetPitch = this.guidedPitch;
-      this.guidedTravelRotating = true;
+      const now = performance.now();
+      if (this.guidedManualActive) {
+        // Let the user own the view briefly after a drag. This prevents the
+        // automatic cinematic pan from fighting the user's intent.
+        this.targetPitch = this.guidedPitch;
+        if (now >= this.guidedManualYawUntil) {
+          this.guidedManualActive = false;
+          this.guidedYawCenter = this.currentYaw;
+          this.guidedPanPhase = 0;
+        }
+      }
+      if (!this.guidedManualActive) {
+        this.guidedPanPhase += dt * this.guidedYawRate;
+        this.targetYaw = this.guidedYawCenter + Math.sin(this.guidedPanPhase) * this.guidedYawAmplitude;
+        this.targetPitch = this.guidedPitch;
+      }
+      this.guidedTravelRotating = !this.guidedManualActive;
     } else if (!isTravelling) {
       this.guidedTravelRotating = false;
     }
@@ -1589,7 +1672,7 @@ if (name === 'top') {
   }
 
   _updatePortals() {
-    const visibleLimit = 8;
+    const visibleLimit = 9;
     const maxDistance = 11 * Math.max(this.metersPerUnit, 0.000001);
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
 
@@ -1628,7 +1711,7 @@ if (name === 'top') {
     // choices distributed across the room instead of seven markers stacked in
     // the same direction.
     const selected = [];
-    const minAngularSeparation = THREE.MathUtils.degToRad(12);
+    const minAngularSeparation = THREE.MathUtils.degToRad(10);
     for (const candidate of candidates) {
       const separated = selected.every((chosen) => {
         const delta = Math.atan2(Math.sin(candidate.angle - chosen.angle), Math.cos(candidate.angle - chosen.angle));
