@@ -330,6 +330,55 @@ export const useProjectSync = (activeProject) => {
     return normalizedLayout;
   };
 
+  const updateSavedLayoutSnapshot = async (layoutId, renderResult, renderConfig) => {
+    if (!layoutId) throw new Error('Saved layout id is required.');
+    if (!jobId) throw new Error('No active project is available.');
+    if (!renderResult?.jobId || renderResult.jobId != jobId) {
+      throw new Error('Render the current project before updating the saved layout.');
+    }
+
+    let thumbnailBlob = null;
+    const sourceModelUrl = renderResult.modelUrl ||
+      `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`;
+
+    try {
+      const modelResponse = await fetch(sourceModelUrl, { cache: 'no-store' });
+      if (!modelResponse.ok) {
+        throw new Error(`Could not read the final 360 model (${modelResponse.status}).`);
+      }
+      const modelBlob = await modelResponse.blob();
+      const modelFile = new File(
+        [modelBlob],
+        `${jobId}.glb`,
+        { type: 'model/gltf-binary' }
+      );
+      thumbnailBlob = await generateGlbThumbnail(modelFile, 320);
+    } catch (thumbnailError) {
+      console.warn('[ProjectSync] Updated-layout thumbnail generation failed; keeping previous thumbnail.', thumbnailError);
+    }
+
+    const formData = new FormData();
+    formData.append('sourceJobId', jobId);
+    formData.append('renderConfig', JSON.stringify(renderConfig || {}));
+    if (thumbnailBlob) formData.append('thumbnail', thumbnailBlob, 'thumbnail.jpg');
+
+    const response = await fetch(
+      `${API_BASE_URL}/api/saved-layouts/${encodeURIComponent(layoutId)}/snapshot`,
+      { method: 'PUT', body: formData }
+    );
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok || !data?.success || !data?.layout) {
+      throw new Error(data?.error || `Failed to update saved layout (${response.status})`);
+    }
+
+    const normalizedLayout = normalizeSavedLayout(data.layout);
+    setSavedLayouts(prev => prev.map(item => (
+      item.id === normalizedLayout.id ? normalizedLayout : item
+    )));
+    return normalizedLayout;
+  };
+
   const deleteSavedLayout = async (layoutId) => {
     if (!layoutId) throw new Error('Saved layout id is required.');
     const response = await fetch(
@@ -926,6 +975,7 @@ export const useProjectSync = (activeProject) => {
     refreshSavedLayouts,
     saveRenderedLayout,
     updateSavedLayout,
+    updateSavedLayoutSnapshot,
     deleteSavedLayout,
   };
 };

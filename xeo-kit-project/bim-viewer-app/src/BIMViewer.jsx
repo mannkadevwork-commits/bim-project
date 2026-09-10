@@ -49,7 +49,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
-    savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout, updateSavedLayout, deleteSavedLayout,
+    savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout, updateSavedLayout, updateSavedLayoutSnapshot, deleteSavedLayout,
     toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, applyMaterialDefinition, applyMaterialDefinitionToAllWalls, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage, saveNow
@@ -225,7 +225,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
 
   const handleCustomColorChange = (e, surfaceScope = wallSurfaceScope) => {
     const hex = e.target.value;
-    applyMaterialToSelection(hex, surfaceScope);
+    const r = parseInt(hex.substring(1, 3), 16) / 255;
+    const g = parseInt(hex.substring(3, 5), 16) / 255;
+    const b = parseInt(hex.substring(5, 7), 16) / 255;
+    const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
+    applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b], surfaceScope);
+    if (setCustomColor) setCustomColor(hex);
   };
 
   const handleApplyColorToAllWalls = (hexColor = customColor, surfaceScope = wallSurfaceScope) => {
@@ -244,78 +249,21 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     return count;
   };
 
-  const selectedElementsForMaterials = Array.isArray(engineState.selectedElements)
-    ? engineState.selectedElements.filter(item => item?.id)
-    : [];
-
-  const materialTargets = selectedElementsForMaterials.length
-    ? selectedElementsForMaterials
-    : (engineState.selectedObject ? [engineState.selectedObject] : (engineState.selectedAssetId ? [{ id: engineState.selectedAssetId, type: '3D Asset', isAsset: true }] : []));
-
-  const selectedMaterial = materialTargets.length === 1
-    ? projectState.materials?.[materialTargets[0]?.id] || null
-    : null;
-
-  const hasWallSelection = materialTargets.some(item =>
-    String(item?.type || '').toLowerCase().includes('ifcwall')
-  );
-
-  const applyMaterialToSelection = (hex, surfaceScope = wallSurfaceScope) => {
-    if (!/^#[0-9a-fA-F]{6}$/.test(hex) || !materialTargets.length) return 0;
-
-    const r = parseInt(hex.substring(1, 3), 16) / 255;
-    const g = parseInt(hex.substring(3, 5), 16) / 255;
-    const b = parseInt(hex.substring(5, 7), 16) / 255;
-
-    let count = 0;
-    materialTargets.forEach((target) => {
-      const isWall = String(target?.type || '').toLowerCase().includes('ifcwall');
-      applyMaterialDefinition(
-        refs.viewerRef,
-        target,
-        {
-          kind: 'color',
-          color: hex,
-          rgb: [r, g, b],
-          surfaceScope: isWall ? surfaceScope : undefined,
-        }
-      );
-      count += 1;
-    });
-
-    if (setCustomColor) setCustomColor(hex);
-    return count;
-  };
-
+  const selectedMaterial = projectState.materials?.[engineState.selectedObject?.id || engineState.selectedAssetId] || null;
   const applyLibraryMaterial = (material, surfaceScope = wallSurfaceScope) => {
-    if (!material || !materialTargets.length) return 0;
-
-    let count = 0;
-    materialTargets.forEach((target) => {
-      const isWall = String(target?.type || '').toLowerCase().includes('ifcwall');
-      applyMaterialDefinition(
-        refs.viewerRef,
-        target,
-        {
-          ...material,
-          surfaceScope: isWall ? surfaceScope : undefined,
-        }
-      );
-      count += 1;
-    });
-
-    setToastMessage(`${material.name} applied to ${count} selected element${count === 1 ? '' : 's'}.`);
+    const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
+    if (!targetObject?.id || !material) return;
+    applyMaterialDefinition(refs.viewerRef, targetObject, { ...material, surfaceScope: String(targetObject.type || '').toLowerCase().includes('ifcwall') ? surfaceScope : undefined });
+    setToastMessage(`${material.name} applied.`);
     setTimeout(() => setToastMessage(null), 1800);
-    return count;
   };
-
   const applyLibraryMaterialToAllWalls = (material = null, surfaceScope = wallSurfaceScope) => {
     if (!material) return;
     const count = applyMaterialDefinitionToAllWalls(refs.viewerRef, { ...material, surfaceScope });
     setToastMessage(count ? `${material.name} applied to ${count} walls.` : 'No native walls found in this scene.');
     setTimeout(() => setToastMessage(null), 2200);
-    return count;
   };
+
 
   const activeAsset = engineState.selectedAssetId && refs.viewerRef.current
     ? refs.viewerRef.current.scene.models[engineState.selectedAssetId]
@@ -325,24 +273,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     setWallSurfaceScope('both');
   }, [engineState.selectedObject?.id, engineState.selectedAssetId]);
 
-  const hideCursorTooltip = () => {
-    if (!tooltipRef.current) return;
-    tooltipRef.current.style.display = 'none';
-    tooltipRef.current.innerHTML = '';
-  };
-
   const updateCursorTooltip = (clientX, clientY, offsetX, offsetY) => {
     if (!tooltipRef.current || !engineActions.getCursorWorldPosition) return;
-    if (engineState.selectedObject && engineState.selectedObject.id !== '__multi_selection__') {
-      return;
-    }
-
     const canvasPos = [offsetX, offsetY];
     const worldPos = engineActions.getCursorWorldPosition(canvasPos);
     
     if (worldPos) {
       tooltipRef.current.style.display = 'flex';
-      tooltipRef.current.style.pointerEvents = 'none';
       tooltipRef.current.style.transform = `translate(${clientX + 15}px, ${clientY + 15}px)`;
       tooltipRef.current.innerHTML = `
         <div class="flex flex-col gap-0.5">
@@ -353,11 +290,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         </div>
       `;
     } else {
-      hideCursorTooltip();
+      tooltipRef.current.style.display = 'none';
     }
   };
-
-
 
   const handlePointerDown = (e) => {
     refs.canvasRef.current?.focus();
@@ -384,7 +319,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   };
   
   const handleDragOver = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY); };
-  const handlePointerLeave = () => { if (engineState.selectedObject) return; hideCursorTooltip(); };
+  const handlePointerLeave = () => { if (tooltipRef.current) tooltipRef.current.style.display = 'none'; };
   const handleDragEnter = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
 
   const handleDrop = async (e) => {
@@ -419,6 +354,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     setToastMessage(`Saved “${savedLayout.name}” to Layouts.`);
     setTimeout(() => setToastMessage(null), 2200);
     return savedLayout;
+  };
+
+  const handleUpdateSavedLayoutSnapshot = async (layoutId, renderResult, renderConfig) => {
+    const updatedLayout = await updateSavedLayoutSnapshot(layoutId, renderResult, renderConfig);
+    setToastMessage(`Updated “${updatedLayout.name}” in Layouts.`);
+    setTimeout(() => setToastMessage(null), 2200);
+    return updatedLayout;
   };
 
   const handleManualSave = async () => {
@@ -527,7 +469,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
 
       <div 
         ref={tooltipRef}
-        className="fixed z-[999] pointer-events-auto hidden px-3 py-2 bg-slate-900/95 backdrop-blur-xl border border-slate-700/50 rounded-xl shadow-2xl transition-opacity duration-75 text-xs font-mono"
+        className="fixed z-[999] pointer-events-none hidden px-3 py-2 bg-slate-900/95 backdrop-blur-xl border border-slate-700/50 rounded-xl shadow-2xl transition-opacity duration-75 text-xs font-mono"
         style={{ top: 0, left: 0, willChange: 'transform' }}
       />
       
@@ -550,13 +492,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           assetName={activeAsset?.name || engineState.selectedObject?.name || 'Selected element'}
           anchorX={lastClickPos.x}
           anchorY={lastClickPos.y}
-          isNative={!!engineState.selectedObject && !activeAsset && engineState.selectedElements?.length <= 1}
+          isNative={!!engineState.selectedObject && !activeAsset}
           isDarkMode={isDarkMode}
-          selectionCount={materialTargets.length}
-          selectedElements={materialTargets}
-          isMultiSelection={materialTargets.length > 1}
-          multiSelectMode={engineState.multiSelectMode}
-          onToggleMultiSelect={() => engineActions.toggleMultiSelectMode()}
           onIsolate={async () => {
             if (!engineState.selectedObject || activeAsset) return;
 
@@ -577,12 +514,17 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           materialLibrary={MATERIAL_LIBRARY}
           selectedMaterial={selectedMaterial}
           onMaterialSelect={applyLibraryMaterial}
-          canApplyToAllWalls={hasWallSelection}
+          canApplyToAllWalls={!!engineState.selectedObject && String(engineState.selectedObject.type || '').toLowerCase().includes('ifcwall')}
           wallSurfaceScope={wallSurfaceScope}
           onWallSurfaceScopeChange={setWallSurfaceScope}
           onApplyMaterialToAllWalls={applyLibraryMaterialToAllWalls}
           onColorChange={(hex, surfaceScope = wallSurfaceScope) => {
-            applyMaterialToSelection(hex, surfaceScope);
+            const r = parseInt(hex.substring(1, 3), 16) / 255;
+            const g = parseInt(hex.substring(3, 5), 16) / 255;
+            const b = parseInt(hex.substring(5, 7), 16) / 255;
+            const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
+            applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b], surfaceScope);
+            if (setCustomColor) setCustomColor(hex);
           }}
           currentColor={customColor}
           onDelete={() => {
@@ -719,10 +661,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             selectedObject={engineState.selectedObject}
             activeAsset={activeAsset}
             selectedAssetId={engineState.selectedAssetId}
-            selectedElements={engineState.selectedElements}
-            multiSelectMode={engineState.multiSelectMode}
-            onToggleMultiSelect={() => engineActions.toggleMultiSelectMode()}
-            onClearSelection={() => engineActions.clearSelection()}
             customColor={customColor}
             handleCustomColorChange={handleCustomColorChange}
             onApplyToAllWalls={handleApplyColorToAllWalls}
@@ -787,6 +725,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         setRenderResult={setRenderResult}
         setRenderError={setRenderError}
         onSaveAsLayout={handleSaveAsLayout}
+        onUpdateSavedLayoutSnapshot={handleUpdateSavedLayoutSnapshot}
+        currentSavedLayout={savedLayouts.find((layout) => layout.id === activeProject?.savedLayoutId) || null}
         activeFileName={fileName}
         existingSavedLayouts={savedLayouts}
       />
