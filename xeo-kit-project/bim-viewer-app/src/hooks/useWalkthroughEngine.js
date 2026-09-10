@@ -12,8 +12,8 @@ const MIN_HEIGHT_OFFSET_METERS = -0.45;
 const MAX_HEIGHT_OFFSET_METERS = 1.0;
 const DEFAULT_FOV_DEGREES = 115;
 const GUIDED_CAMERA_HEIGHT_METERS = 2.16;
-const GUIDED_PAN_AMPLITUDE_DEG = 13;
-const GUIDED_PAN_RATE_RAD_PER_SEC = 0.035;
+const GUIDED_PAN_AMPLITUDE_DEG = 16;
+const GUIDED_PAN_RATE_RAD_PER_SEC = 0.045;
 
 class WalkRuntime {
   constructor({ canvas, onState }) {
@@ -110,6 +110,10 @@ class WalkRuntime {
     this.guidedCompositionLookaheadMeters = 8;
     this.presentationHotspotIds = new Set();
     this.presentationHotspotScores = new Map();
+    // Phase 5: semantic destination roles inferred from local floor context.
+    // These roles are presentation hints; physical movement still uses the same
+    // navigation/runtime path system as earlier phases.
+    this.hotspotRoles = new Map();
     this.presentationMaxVisible = 4;
     this.presentationMaxDistanceMeters = 9;
     this.presentationMinSeparationDeg = 16;
@@ -372,6 +376,7 @@ class WalkRuntime {
     const safeRenderedHotspots = rawHotspots.filter((hotspot) => this._hasCameraClearance(hotspot.position));
     const augmentedHotspots = this._augmentHotspotsFromFloor(surfacePayload, safeRenderedHotspots, 18);
     this.hotspots = augmentedHotspots;
+    this._assignHotspotRoles();
     this.navigationPlan = this._buildNavigationPlan(surfacePayload, augmentedHotspots);
     if (safeRenderedHotspots.length !== rawHotspots.length) {
       console.info('[Walkthrough] Removed unsafe low-clearance hotspots', {
@@ -560,6 +565,72 @@ class WalkRuntime {
       if (base.length + selected.length >= targetCount) break;
     }
     return [...base, ...selected];
+  }
+
+  _assignHotspotRoles() {
+    this.hotspotRoles.clear();
+    if (!this.hotspots?.length) return;
+
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const radiusNear = 1.35 * unit;
+    const radiusCluster = 3.4 * unit;
+
+    // First pass: derive local spatial statistics. We deliberately avoid naming
+    // rooms unless the backend already supplied an areaId/label. The runtime can
+    // still distinguish a useful presentation role without pretending that a
+    // generic hotspot is a real architectural room.
+    for (const hotspot of this.hotspots) {
+      if (!hotspot?.id || !Array.isArray(hotspot.position)) continue;
+      const x = Number(hotspot.position[0]);
+      const z = Number(hotspot.position[2]);
+      if (!Number.isFinite(x) || !Number.isFinite(z)) continue;
+
+      const neighbors = [];
+      for (const other of this.hotspots) {
+        if (other === hotspot || !Array.isArray(other?.position)) continue;
+        const dx = Number(other.position[0]) - x;
+        const dz = Number(other.position[2]) - z;
+        const distance = Math.hypot(dx, dz);
+        if (distance <= radiusCluster) neighbors.push(distance);
+      }
+      neighbors.sort((a, b) => a - b);
+      const closeCount = neighbors.filter((distance) => distance <= radiusNear).length;
+      const openness = Number(hotspot.clearanceMeters ?? hotspot.score ?? 0) || 0;
+
+      let role = 'walkpoint';
+      if ((hotspot.areaId && String(hotspot.areaId).trim()) || /entr(y|ance)/i.test(String(hotspot.label || ''))) {
+        role = 'room-entrance';
+      } else if (closeCount <= 1 && openness >= 1.45) {
+        role = 'viewpoint';
+      } else if (closeCount >= 5) {
+        role = 'room-center';
+      } else if (closeCount >= 3 && openness < 1.0) {
+        role = 'transition';
+      }
+
+      this.hotspotRoles.set(hotspot.id, role);
+      hotspot.presentationRole = role;
+    }
+
+    // Guarantee at least one center/viewpoint candidate in the overall scene.
+    // Pick from open destinations rather than inventing new geometry.
+    const hasCenter = [...this.hotspotRoles.values()].some((role) => role === 'room-center');
+    if (!hasCenter) {
+      let best = null;
+      for (const hotspot of this.hotspots) {
+        const openness = Number(hotspot.clearanceMeters ?? hotspot.score ?? 0) || 0;
+        if (!best || openness > best.score) best = { hotspot, score: openness };
+      }
+      if (best?.hotspot?.id) {
+        this.hotspotRoles.set(best.hotspot.id, 'room-center');
+        best.hotspot.presentationRole = 'room-center';
+      }
+    }
+  }
+
+  _getHotspotRole(hotspot) {
+    if (!hotspot?.id) return 'walkpoint';
+    return this.hotspotRoles.get(hotspot.id) || hotspot.presentationRole || 'walkpoint';
   }
 
   _buildNavigationPlan(surfacePayload, hotspots) {
@@ -1060,8 +1131,15 @@ class WalkRuntime {
       .filter((hotspot) => Array.isArray(hotspot.position) && this._hasCameraClearance(hotspot.position));
 
     const candidates = (pool.length ? pool : this.hotspots)
-      .map((hotspot) => ({ hotspot, distance: Math.hypot(hotspot.position[0] - targetPoint[0], hotspot.position[2] - targetPoint[2]) }))
-      .sort((a, b) => a.distance - b.distance);
+      .map((hotspot) => ({
+        hotspot,
+        distance: Math.hypot(hotspot.position[0] - targetPoint[0], hotspot.position[2] - targetPoint[2]),
+        role: this._getHotspotRole(hotspot),
+      }))
+      .sort((a, b) => {
+        const priority = (role) => role === 'room-entrance' ? 0 : role === 'room-center' ? 1 : role === 'viewpoint' ? 2 : role === 'transition' ? 3 : 4;
+        return (priority(a.role) - priority(b.role)) || (a.distance - b.distance);
+      });
 
     for (const candidate of candidates) {
       const ok = await this.travelTo(candidate.hotspot.position, label);
@@ -1758,7 +1836,13 @@ if (name === 'top') {
       const proximity = THREE.MathUtils.clamp(1 - item.distance / (this.guidedCompositionLookaheadMeters * unit), 0, 1);
       const centered = 1 - THREE.MathUtils.clamp(item.angle / THREE.MathUtils.degToRad(75), 0, 1);
       const forwardBonus = incoming.lengthSq() > 1e-8 ? Math.max(0, incoming.dot(item.direction)) : 0;
-      score += 1.8 + proximity * 1.4 + centered * 1.2 + forwardBonus * 0.55;
+      const role = this._getHotspotRole(item.hotspot);
+      const roleBonus = role === 'room-center' ? 0.9
+        : role === 'viewpoint' ? 0.75
+        : role === 'room-entrance' ? 0.45
+        : role === 'transition' ? 0.25
+        : 0.1;
+      score += 1.8 + proximity * 1.4 + centered * 1.2 + forwardBonus * 0.55 + roleBonus;
     }
 
     // A clear forward ray is a useful tie-breaker because a good presentation
@@ -1864,7 +1948,13 @@ if (name === 'top') {
 
       const proximity = THREE.MathUtils.clamp(1 - distance / (this.presentationMaxDistanceMeters * unit), 0, 1);
       const centered = 1 - angle / THREE.MathUtils.degToRad(78);
-      const score = proximity * 2.2 + centered * 2.0 + (Number(hotspot.score) || 0) * 0.15;
+      const role = this._getHotspotRole(hotspot);
+      const roleBonus = role === 'room-center' ? 1.4
+        : role === 'viewpoint' ? 1.15
+        : role === 'room-entrance' ? 0.85
+        : role === 'transition' ? 0.55
+        : 0.2;
+      const score = proximity * 2.2 + centered * 2.0 + (Number(hotspot.score) || 0) * 0.15 + roleBonus;
       candidates.push({ hotspot, distance, angle, score });
     }
 
