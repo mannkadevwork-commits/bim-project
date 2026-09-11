@@ -73,6 +73,8 @@ class WalkRuntime {
     this.guidedApproachStartYaw = 0;
     this.guidedArrivalStartYaw = 0;
     this.guidedArrivalTargetYaw = 0;
+    this.guidedArrivalStartPitch = this.guidedPitch || -0.085;
+    this.guidedArrivalTargetPitch = this.guidedPitch || -0.085;
     this.guidedArrivalSettleStartedAt = 0;
     this.guidedArrivalSettleDurationMs = 1250;
     // Phase 9: transition-aware choreography. Different architectural transitions
@@ -115,6 +117,27 @@ class WalkRuntime {
     this.guidedPanPhase = 0;
     this.guidedAutoRotate = true;
     this.guidedTravelRotating = false;
+    // Phase 23: explicit stationary 360-degree presentation. This is a viewing
+    // state layered above navigation; it never adds or replaces NavMesh points.
+    this.immersive360Active = false;
+    this.immersive360AutoRotate = true;
+    this.immersive360ManualActive = false;
+    this.immersive360ManualUntil = 0;
+    this.immersive360PointerDown = null;
+    this.immersive360LastPointer = null;
+    this.immersive360PointerDragging = false;
+    this.immersive360YawVelocity = 0;
+    // Phase 24: curated 360 presentation state. This is a UI/presentation layer
+    // around the existing stationary 360 view; it does not create new navigation.
+    this.immersivePresentationActive = false;
+    this.immersivePresentationLabel = null;
+    this.immersivePresentationKind = null;
+    this.immersivePresentationStartedAt = 0;
+    // Phase 26: panorama-style scene navigation backed by existing curated destinations.
+    this._resetImmersiveSceneState();
+    this.immersive360OfferAvailable = false;
+    // Phase 25: Smart 720 is a session-local whole-home presentation journey.
+    this._resetSmart720TourState();
     // Guided-mode manual yaw is a temporary user override. It pauses the
     // cinematic pan while the user drags, then resumes from the new heading.
     this.guidedManualYawUntil = 0;
@@ -153,6 +176,14 @@ class WalkRuntime {
     this.guidedShotSubject = null;
     this.guidedShotSubjectId = null;
     this.guidedShotSubjectUntil = 0;
+    // Phase 15: deterministic shot language for Guided presentation. The shot type
+    // is derived from semantic role, transition context, and available visual
+    // subjects; it is never random and does not influence physical navigation.
+    this.guidedShotType = 'hero';
+    this.guidedShotHistory = [];
+    this.guidedFrameQuality = 0;
+    this.guidedFrameTargetOffsetX = 0;
+    this.guidedFrameTargetOffsetY = 0;
     // Phase 8B: guided architectural tour state. This layer chooses the next
     // semantic destination; the NavMesh remains responsible for physical travel.
     this.guidedTourArmed = false;
@@ -164,6 +195,9 @@ class WalkRuntime {
     this.guidedTourLastVisitedHotspotId = null;
     this.guidedTourLastRole = null;
     this.guidedTourAdvanceLock = false;
+    this.guidedHeroEndingActive = false;
+    this.guidedHeroEndingStartedAt = 0;
+    this.guidedHeroEndingUntil = 0;
     // Phase 5: semantic destination roles inferred from local floor context.
     // These roles are presentation hints; physical movement still uses the same
     // navigation/runtime path system as earlier phases.
@@ -229,6 +263,7 @@ class WalkRuntime {
         if (e.key === '-' || e.key === '_') { e.preventDefault(); this.zoom(-1); }
       }
       if (e.key === 'Escape') {
+        if (this.immersive360Active) this.setImmersive360(false);
         this.onState?.({ type: 'escape' });
       }
     };
@@ -242,12 +277,18 @@ class WalkRuntime {
       // A simple click remains a navigation action, so we defer the floor/hotspot
       // click until pointer-up and only treat it as a click when the pointer did
       // not move beyond a small drag threshold.
+      if (this.immersive360Active) {
+        this._beginImmersive360Pointer(e);
+        return;
+      }
+
       if (this.walkMode === 'guided') {
         // Manual interaction always wins over the cinematic director.
         // An explicit destination click will re-arm the tour in navigateToHotspot.
         this.guidedTourArmed = false;
         this.guidedTourNextAt = 0;
         this.guidedTourAdvanceLock = false;
+        this._resetGuidedHeroEnding?.();
         this.arrivalSettleUntil = 0;
         this.guidedShotSubject = null;
         this.guidedShotSubjectId = null;
@@ -272,6 +313,10 @@ class WalkRuntime {
       this.setLookLocked(!this.lookLocked, true);
     };
     this.onPointerUp = (e) => {
+      if (e.button === 0 && this.immersive360Active && this.viewMode === 'walk') {
+        this._endImmersive360Pointer(e);
+        return;
+      }
       if (e.button === 0 && this.walkMode === 'guided' && this.viewMode === 'walk') {
         const wasDragging = this.guidedPointerDragging;
         this.guidedPointerDown = null;
@@ -292,6 +337,11 @@ class WalkRuntime {
     this.onPointerMove = (e) => {
       if (this.viewMode !== 'walk') return;
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+
+      if (this.immersive360Active) {
+        this._moveImmersive360Pointer(e);
+        return;
+      }
 
       if (this.walkMode === 'guided') {
         if (!this.guidedPointerDown || !this.guidedLastPointer) return;
@@ -353,6 +403,10 @@ class WalkRuntime {
     window.addEventListener('keyup', this.onKeyUp);
     this.renderer.domElement.addEventListener('contextmenu', this.onContextMenu);
     this.onPointerCancel = (e) => {
+      if (this.immersive360Active) {
+        this._cancelImmersive360Pointer(e);
+        return;
+      }
       if (e.pointerId == null || this.walkMode !== 'guided') return;
       const wasDragging = this.guidedPointerDragging;
       this.guidedPointerDown = null;
@@ -470,8 +524,16 @@ class WalkRuntime {
       this.walkAreas = semanticAreas.filter((area) => activeAreaIds.has(area.id));
     }
     this._assignHotspotRoles();
+    this._buildDestinationPresentation(augmentedHotspots);
     this._buildSafeAnchorRegistry();
     this.navigationPlan = this._buildNavigationPlan(surfacePayload, augmentedHotspots);
+    this.navigationPlan.destinationPresentation = {
+      version: this.destinationPresentation?.version || 1,
+      primary: this.destinationPresentation?.primary || [],
+      optional: this.destinationPresentation?.optional || [],
+      internal: this.destinationPresentation?.internal || [],
+      presentationHotspots: this.destinationPresentation?.presentationHotspots || [],
+    };
     if (safeRenderedHotspots.length !== rawHotspots.length) {
       console.info('[Walkthrough] Removed unsafe low-clearance hotspots', {
         removed: rawHotspots.length - safeRenderedHotspots.length,
@@ -1239,6 +1301,9 @@ class WalkRuntime {
       group.userData.walkLabel = hotspot.label || 'Floor destination';
       group.userData.hotspotId = hotspot.id;
       group.userData.source = hotspot.source;
+      const presentation = this._getDestinationPresentation(hotspot);
+      group.userData.destinationKind = presentation?.destinationKind || 'internal';
+      group.userData.presentationLabel = presentation?.presentationLabel || hotspot.label || 'Navigation point';
       group.visible = false;
       this.scene.add(group);
       this.portalObjects.push(group);
@@ -1322,11 +1387,16 @@ class WalkRuntime {
     // never beds, sofas, walls, or other rendered geometry.
     const floorPoint = this._raycastNavigationSurface(event);
     if (!floorPoint) return;
+    this.cancelSmart720Tour?.('manual-floor');
     this.activeHotspotId = null;
+    this.guidedShotType = 'hero';
     this.travelTo([floorPoint.x, floorPoint.y, floorPoint.z], 'Floor destination');
   }
 
-  async navigateToHotspot(hotspot) {
+  async navigateToHotspot(hotspot, options = {}) {
+    if (!options.preserveImmersiveScene) this._clearImmersiveSceneSwitch?.('manual-navigation');
+    if (this.smart720Active && !this.smart720ProgrammaticTravel) this.cancelSmart720Tour?.('manual-navigation');
+    if (this.immersive360Active) this.setImmersive360(false);
     if (!hotspot || this.viewMode !== 'walk') return false;
     if (this.path || this.directTravel) return false;
 
@@ -1519,6 +1589,13 @@ class WalkRuntime {
     this.guidedTourArmed = true;
     this.guidedPresentationAreaId = hotspot.areaId || this.guidedTourLastAreaId || null;
     this._configureGuidedTransition(hotspot);
+    // Phase 16: lock the presentation language to this destination before travel
+    // starts so tempo, approach heading and arrival settle stay coherent.
+    const shotType = this._chooseGuidedShotType(this.position);
+    if (shotType) {
+      this.guidedShotType = shotType;
+      this._recordGuidedShotType(shotType);
+    }
     this.guidedTourNextAt = 0;
     this.guidedTourAdvanceLock = false;
     this.guidedTourVisitedHotspots.add(hotspot.id);
@@ -1573,6 +1650,10 @@ class WalkRuntime {
       if (hotspot.id === this.activeHotspotId || this.guidedTourVisitedHotspots.has(hotspot.id)) continue;
       const role = this._getHotspotRole(hotspot);
       if (role === 'walkpoint' || role === 'transition') continue;
+      // Phase 19: Guided tour stops are customer-facing destinations only.
+      // Entrances remain valid internal navigation anchors for room switching,
+      // but they should not appear as narrative presentation stops.
+      if (!this._isCustomerFacingDestination(hotspot)) continue;
       if (!this._hasCameraClearance(hotspot.position)) continue;
 
       const point = this._closestWalkPoint(hotspot.position, 0.45);
@@ -1622,6 +1703,7 @@ class WalkRuntime {
   }
 
   _advanceGuidedTour(now = performance.now()) {
+    if (this.smart720Active) return this._updateSmart720Tour(now);
     if (
       this.walkMode !== 'guided' ||
       !this.guidedTourArmed ||
@@ -1634,6 +1716,7 @@ class WalkRuntime {
 
     const next = this._chooseNextGuidedTourDestination();
     if (!next) {
+      if (this._startGuidedHeroEnding?.(this.position)) return true;
       this.guidedTourArmed = false;
       this.guidedTourNextAt = 0;
       this.guidedTourAdvanceLock = false;
@@ -1735,6 +1818,8 @@ class WalkRuntime {
 
   setWalkMode(mode) {
     const next = mode === 'explore' ? 'explore' : 'guided';
+    if (this.smart720Active) this.cancelSmart720Tour?.('mode-change');
+    if (this.immersive360Active) this.setImmersive360(false);
     if (next === this.walkMode) return;
     this.walkMode = next;
 
@@ -1749,7 +1834,13 @@ class WalkRuntime {
       this.guidedTourLastAreaId = null;
       this.guidedTourLastVisitedHotspotId = null;
       this.guidedTourLastRole = null;
+      this._resetGuidedHeroEnding?.();
       this.guidedPresentationAreaId = null;
+      this.guidedShotType = 'hero';
+      this.guidedShotHistory = [];
+    this.guidedFrameQuality = 0;
+    this.guidedFrameTargetOffsetX = 0;
+    this.guidedFrameTargetOffsetY = 0;
       this.arrivalSettleUntil = 0;
       this.guidedApproachActive = false;
       this.guidedArrivalSettleStartedAt = 0;
@@ -1774,6 +1865,8 @@ class WalkRuntime {
       this.lookLocked = false;
       this.onState?.({ type: 'look-lock', locked: false });
     }
+    this.immersive360OfferAvailable = false;
+    this.onState?.({ type: 'immersive-360-offer', available: false });
     this.onState?.({ type: 'walk-mode', mode: this.walkMode });
   }
 
@@ -1788,6 +1881,8 @@ class WalkRuntime {
 
   setViewMode(mode) {
     const next = mode === 'overview' ? 'overview' : 'walk';
+    if (this.smart720Active && next !== 'walk') this.cancelSmart720Tour?.('view-mode-change');
+    if (this.immersive360Active) this.setImmersive360(false);
     if (next === this.viewMode) return;
     this.viewMode = next;
     if (next === 'overview') {
@@ -1964,6 +2059,7 @@ if (name === 'top') {
     this.guidedTourArmed = false;
     this.guidedTourNextAt = 0;
     this.guidedTourAdvanceLock = false;
+    this._resetGuidedHeroEnding?.();
     this.arrivalSettleUntil = 0;
     this.guidedApproachActive = false;
     this.guidedRevealActive = false;
@@ -1989,6 +2085,7 @@ if (name === 'top') {
     const unit = Math.max(this.metersPerUnit, 1e-6);
     const remaining = Math.max(0, remainingDistance / unit);
     const total = Math.max(0, this.travelTotalDistance / unit);
+    const shot = this.guidedShotType;
 
     // Short hops should feel responsive; longer trips get a noticeable
     // acceleration phase, comfortable cruise, then a deliberate arrival brake.
@@ -2010,7 +2107,19 @@ if (name === 'top') {
       brake = THREE.MathUtils.lerp(0.28, 1, smooth01(remaining / brakeDistance));
     }
 
-    return THREE.MathUtils.clamp(Math.min(accel, brake), 0.18, 1);
+    let shotMultiplier = 1;
+    if (this.walkMode === 'guided') {
+      // Phase 16: shot language now affects movement tempo. The physical route is
+      // unchanged; only the presentation speed profile changes.
+      const finalApproach = remaining <= Math.max(1.55, this.guidedTransitionApproachDistanceMeters);
+      if (shot === 'hero') shotMultiplier = finalApproach ? 0.92 : 0.96;
+      else if (shot === 'reveal') shotMultiplier = finalApproach ? 0.76 : 0.88;
+      else if (shot === 'detail') shotMultiplier = finalApproach ? 0.58 : 0.78;
+      else if (shot === 'axis') shotMultiplier = finalApproach ? 0.86 : 0.93;
+      else if (shot === 'transition') shotMultiplier = 1.02;
+    }
+
+    return THREE.MathUtils.clamp(Math.min(accel, brake) * shotMultiplier, 0.16, 1);
   }
 
   _updateMovement(dt) {
@@ -2099,10 +2208,17 @@ if (name === 'top') {
 
       // Look farther ahead at higher speed so turns are anticipated rather than
       // followed like a chain of rigid waypoints. The path itself remains intact.
+      const shotLookAheadMultiplier = this.walkMode === 'guided'
+        ? (this.guidedShotType === 'detail' ? 0.72
+          : this.guidedShotType === 'reveal' ? 1.18
+            : this.guidedShotType === 'axis' ? 1.12
+              : this.guidedShotType === 'transition' ? 1.28
+                : 0.96)
+        : 1;
       const lookAhead = THREE.MathUtils.clamp(
-        (0.42 + this.pathVelocity.length() * 0.22) * this.metersPerUnit,
-        0.35 * this.metersPerUnit,
-        1.25 * this.metersPerUnit,
+        (0.42 + this.pathVelocity.length() * 0.22) * this.metersPerUnit * shotLookAheadMultiplier,
+        0.30 * this.metersPerUnit,
+        1.45 * this.metersPerUnit,
       );
       const steerTarget = this._pointAlongPath(this.pathIndex, Math.min(lookAhead, Math.max(0.01, remainingDistance)));
       const next = steerTarget || this.path[this.pathIndex];
@@ -2390,174 +2506,17 @@ if (name === 'top') {
     return null;
   }
 
-  _buildPresentationSubjectIndex() {
-    this.presentationSubjects = [];
-    // Phase 13: lock the Guided presentation onto one meaningful visual subject
-    // during the arrival shot so the camera behaves like a deliberate architectural
-    // composition instead of continually re-solving the frame.
-    this.guidedShotSubject = null;
-    this.guidedShotSubjectId = null;
-    this.guidedShotSubjectUntil = 0;
-    if (!this.model) return;
 
-    const classify = (name = '') => {
-      const lower = String(name).toLowerCase();
-      if (/(sofa|couch|chair|table|desk|bed|cabinet|wardrobe|shelf|shelving|counter|stool|bench|tv|television|coffee)/.test(lower)) return 'furniture';
-      if (/(sink|toilet|bathtub|bath|shower|basin|hob|oven|fridge|refrigerator|appliance)/.test(lower)) return 'fixture';
-      if (/(window|glazing|glass|door|sliding|opening)/.test(lower)) return 'opening';
-      if (/(light|lamp|ceiling|pendant|fan|chandelier)/.test(lower)) return 'lighting';
-      if (/(plant|decor|art|painting|mirror|rug|carpet|curtain)/.test(lower)) return 'decor';
-      if (/(wall|floor|slab|ceiling|roof|column|beam|structural)/.test(lower)) return null;
-      return 'object';
-    };
 
-    this.model.traverse((obj) => {
-      if (!obj.isMesh || !obj.visible) return;
-      const role = classify(obj.name || obj.parent?.name || '');
-      if (!role) return;
-      const box = new THREE.Box3().setFromObject(obj);
-      if (box.isEmpty()) return;
-      const size = box.getSize(new THREE.Vector3());
-      const maxDim = Math.max(size.x, size.y, size.z);
-      if (!Number.isFinite(maxDim) || maxDim < 0.08) return;
-      const center = box.getCenter(new THREE.Vector3());
-      this.presentationSubjects.push({
-        object: obj,
-        role,
-        center,
-        size,
-        radius: Math.max(maxDim * 0.5, 0.12 * Math.max(this.metersPerUnit, 1e-6)),
-      });
-    });
 
-    // Avoid letting a huge set of decorative meshes dominate the composition.
-    // Keep the most useful subjects by world-space size, with a generous cap.
-    this.presentationSubjects.sort((a, b) => {
-      const priority = { furniture: 5, fixture: 4.5, opening: 3.7, decor: 3.2, lighting: 2.8, object: 2.5 };
-      return (priority[b.role] || 0) * b.radius - (priority[a.role] || 0) * a.radius;
-    });
-    if (this.presentationSubjects.length > 80) this.presentationSubjects.length = 80;
-  }
 
-  _chooseGuidedShotSubject(referencePosition = this.position, candidateYaw = this.currentYaw) {
-    if (!this.presentationSubjects.length) return null;
-    const unit = Math.max(this.metersPerUnit, 0.000001);
-    const areaId = this._getGuidedPresentationAreaId();
-    const eye = new THREE.Vector3(
-      referencePosition.x,
-      referencePosition.y + this.eyeHeight * unit + this.heightOffset * unit,
-      referencePosition.z,
-    );
-    const forward = new THREE.Vector3(-Math.sin(candidateYaw), 0, -Math.cos(candidateYaw));
-    const maxDistance = 8.5 * unit;
-    const avoidId = this.guidedShotSubjectId;
-    const priority = { furniture: 5.0, fixture: 4.6, opening: 3.9, decor: 3.4, lighting: 2.7, object: 2.4 };
-    const candidates = [];
 
-    for (const subject of this.presentationSubjects) {
-      if (!subject?.object || !subject.object.visible) continue;
-      if (avoidId && subject.object.uuid === avoidId) continue;
-      const to = subject.center.clone().sub(referencePosition);
-      to.y = 0;
-      const distance = to.length();
-      if (!Number.isFinite(distance) || distance < 0.85 * unit || distance > maxDistance) continue;
 
-      const direction = to.normalize();
-      const angle = Math.acos(THREE.MathUtils.clamp(forward.dot(direction), -1, 1));
-      if (angle > THREE.MathUtils.degToRad(72)) continue;
 
-      // Subject must belong to the active semantic area when the current shot has one.
-      // This keeps the focus from leaking through a wall into another room.
-      if (areaId && subject.object.userData?.walkAreaId && subject.object.userData.walkAreaId !== areaId) continue;
 
-      const target = subject.center.clone();
-      target.y = THREE.MathUtils.clamp(
-        target.y,
-        referencePosition.y + 0.35 * unit,
-        referencePosition.y + 2.5 * unit,
-      );
-      const toTarget = target.clone().sub(eye);
-      const targetDistance = toTarget.length();
-      if (this.model && targetDistance > 1e-6) {
-        this.raycaster.set(eye, toTarget.normalize());
-        const hit = this.raycaster.intersectObject(this.model, true)[0];
-        if (hit && hit.object !== subject.object && hit.distance < targetDistance - 0.08 * unit) continue;
-      }
 
-      const angleQuality = 1 - angle / THREE.MathUtils.degToRad(72);
-      const distanceQuality = THREE.MathUtils.clamp(1 - distance / maxDistance, 0, 1);
-      const sizeQuality = THREE.MathUtils.clamp(Math.log1p(subject.radius / unit * 3) * 0.55, 0, 1.3);
-      const roleWeight = priority[subject.role] || 2.0;
-      const score = roleWeight * (0.65 + angleQuality * 1.75 + distanceQuality * 0.85 + sizeQuality * 0.55);
-      candidates.push({ subject, score, angle, distance, target });
-    }
 
-    candidates.sort((a, b) => b.score - a.score);
-    return candidates[0]?.subject || null;
-  }
 
-  _yawToGuidedSubject(referencePosition = this.position, subject = this.guidedShotSubject) {
-    if (!subject?.center) return null;
-    const dx = subject.center.x - referencePosition.x;
-    const dz = subject.center.z - referencePosition.z;
-    if (Math.hypot(dx, dz) < 0.15 * Math.max(this.metersPerUnit, 0.000001)) return null;
-    return Math.atan2(-dx, -dz);
-  }
-
-  _visualSubjectScore(referencePosition = this.position, candidateYaw = this.currentYaw) {
-    if (!this.presentationSubjects.length) return 0;
-    const unit = Math.max(this.metersPerUnit, 0.000001);
-    const origin = new THREE.Vector3(referencePosition.x, referencePosition.y, referencePosition.z);
-    const eye = new THREE.Vector3(
-      origin.x,
-      origin.y + this.eyeHeight * unit + this.heightOffset * unit,
-      origin.z,
-    );
-    const forward = new THREE.Vector3(-Math.sin(candidateYaw), 0, -Math.cos(candidateYaw));
-    const maxDistance = 8.5 * unit;
-    let score = 0;
-    let visibleSubjects = 0;
-
-    for (const subject of this.presentationSubjects) {
-      const to = subject.center.clone().sub(origin);
-      to.y = 0;
-      const distance = to.length();
-      if (!Number.isFinite(distance) || distance < 0.75 * unit || distance > maxDistance) continue;
-      const direction = to.normalize();
-      const angle = Math.acos(THREE.MathUtils.clamp(forward.dot(direction), -1, 1));
-      if (angle > THREE.MathUtils.degToRad(68)) continue;
-
-      const target = subject.center.clone();
-      target.y = THREE.MathUtils.clamp(
-        target.y,
-        origin.y + 0.35 * unit,
-        origin.y + 2.6 * unit,
-      );
-      const toTarget = target.clone().sub(eye);
-      const targetDistance = toTarget.length();
-      if (this.model && targetDistance > 1e-6) {
-        this.raycaster.set(eye, toTarget.normalize());
-        const hit = this.raycaster.intersectObject(this.model, true)[0];
-        if (hit && hit.object !== subject.object && hit.distance < targetDistance - 0.08 * unit) continue;
-      }
-
-      const angleQuality = 1 - angle / THREE.MathUtils.degToRad(68);
-      const distanceQuality = THREE.MathUtils.clamp(1 - distance / maxDistance, 0, 1);
-      const sizeQuality = THREE.MathUtils.clamp(Math.log1p(subject.radius / unit * 3) * 0.55, 0, 1.3);
-      const roleWeight = subject.role === 'furniture' ? 1.35
-        : subject.role === 'fixture' ? 1.2
-        : subject.role === 'opening' ? 0.95
-        : subject.role === 'decor' ? 0.82
-        : subject.role === 'lighting' ? 0.65
-        : 0.55;
-
-      score += roleWeight * (0.7 + angleQuality * 1.7 + distanceQuality * 0.8 + sizeQuality * 0.5);
-      visibleSubjects += 1;
-      if (visibleSubjects >= 8) break;
-    }
-
-    return score;
-  }
 
   _headingWallGuardScore(referencePosition = this.position, candidateYaw = this.currentYaw) {
     if (!this.model) return 0;
@@ -2786,15 +2745,32 @@ if (name === 'top') {
     const revealYaw = this._findGuidedRevealYaw(referencePosition, destination, incomingDirection);
     const isTransition = this.guidedTransitionKind === 'room-entry' || this.guidedTransitionKind === 'room-crossing';
 
-    // Phase 10: introduce a distinct reveal heading for architectural transitions.
-    // It stays subtle for same-space hops and more lateral for room crossings,
-    // creating a readable glimpse of the new space while the body keeps following
-    // the physical path.
+    // Phase 16: use the selected shot language to choreograph the approach.
+    // Reveal shots bias laterally, Detail shots delay the final focus, Axis shots
+    // preserve forward depth, and Hero shots stay broad and composed.
     this.guidedApproachStartYaw = this.currentYaw;
-    const revealBlend = isTransition ? 0.68 : 0.58;
-    const revealTarget = isTransition ? revealYaw : finalYaw;
+    let revealBlend = isTransition ? 0.68 : 0.58;
+    let revealTarget = isTransition ? revealYaw : finalYaw;
+    let revealFinalBlend = isTransition ? 0.34 : 0.18;
+    if (this.guidedShotType === 'reveal') {
+      revealBlend = Math.max(revealBlend, 0.78);
+      revealTarget = revealYaw;
+      revealFinalBlend = 0.48;
+    } else if (this.guidedShotType === 'detail') {
+      revealBlend = 0.34;
+      revealTarget = finalYaw;
+      revealFinalBlend = 0.08;
+    } else if (this.guidedShotType === 'axis') {
+      revealBlend = 0.52;
+      revealTarget = this._angleLerp(destinationYaw, finalYaw, 0.65);
+      revealFinalBlend = 0.26;
+    } else if (this.guidedShotType === 'hero') {
+      revealBlend = isTransition ? 0.62 : 0.48;
+      revealTarget = finalYaw;
+      revealFinalBlend = isTransition ? 0.28 : 0.22;
+    }
     this.guidedApproachTargetYaw = this._angleLerp(this.currentYaw, revealTarget, revealBlend);
-    this.guidedRevealTargetYaw = this._angleLerp(revealYaw, finalYaw, isTransition ? 0.34 : 0.18);
+    this.guidedRevealTargetYaw = this._angleLerp(revealYaw, finalYaw, revealFinalBlend);
     this.guidedApproachActive = true;
     this.guidedRevealActive = isTransition;
     this.guidedCompositionTargetYaw = this.guidedApproachTargetYaw;
@@ -2818,23 +2794,51 @@ if (name === 'top') {
         ? Math.atan2(-incomingDirection.x, -incomingDirection.z)
         : preferredYaw);
 
+    // Phase 15: choose a deterministic architectural shot language before selecting
+    // the subject. Shot variety is derived from destination/room context, not random.
+    // Phase 16 may already have selected it during final approach; preserve that
+    // decision so the travel and arrival choreography remain one coherent shot.
+    if (!this.guidedShotType || this.guidedShotType === 'transition' || !this.activeHotspotId) {
+      this.guidedShotType = this._chooseGuidedShotType(referencePosition);
+      this._recordGuidedShotType(this.guidedShotType);
+    }
+
     // Phase 13: choose one visible design subject for the shot and let the camera
     // settle toward it. If no trustworthy subject exists, keep the Phase 11/12
     // composition instead of forcing a synthetic focus.
     this.guidedShotSubject = this._chooseGuidedShotSubject(referencePosition, baseArrivalYaw);
     this.guidedShotSubjectId = this.guidedShotSubject?.object?.uuid || null;
-    const subjectYaw = this._yawToGuidedSubject(referencePosition, this.guidedShotSubject);
-    const arrivalYaw = Number.isFinite(subjectYaw)
-      ? this._angleLerp(baseArrivalYaw, subjectYaw, 0.62)
+    const frame = this._chooseGuidedFrame(referencePosition, this.guidedShotSubject, baseArrivalYaw);
+    const arrivalYaw = Number.isFinite(frame?.yaw)
+      ? this._angleLerp(baseArrivalYaw, frame.yaw, 0.76)
       : baseArrivalYaw;
+    const arrivalPitch = Number.isFinite(frame?.pitch) ? frame.pitch : this.guidedPitch;
+    this.guidedFrameQuality = frame?.quality || 0;
+    this.guidedFrameTargetOffsetX = frame?.targetOffsetX || 0;
+    this.guidedFrameTargetOffsetY = frame?.targetOffsetY || 0;
 
     // Phase 8: do not snap on arrival. Freeze the current heading, then settle
     // smoothly into the final architectural composition over ~1.25 seconds.
     const now = performance.now();
+    const baseSettle = this.guidedTransitionKind === 'room-entry'
+      ? 1450
+      : this.guidedTransitionKind === 'room-crossing'
+        ? 1500
+        : this.guidedTransitionKind === 'same-space'
+          ? 950
+          : 1250;
+    const shotSettleAdjustment = this.guidedShotType === 'hero' ? 180
+      : this.guidedShotType === 'reveal' ? 220
+        : this.guidedShotType === 'detail' ? 360
+          : this.guidedShotType === 'axis' ? 120
+            : 0;
+    this.guidedArrivalSettleDurationMs = THREE.MathUtils.clamp(baseSettle + shotSettleAdjustment, 850, 1850);
     this.guidedApproachActive = false;
     this.guidedRevealActive = false;
     this.guidedArrivalStartYaw = this.currentYaw;
     this.guidedArrivalTargetYaw = arrivalYaw;
+    this.guidedArrivalStartPitch = this.currentPitch;
+    this.guidedArrivalTargetPitch = arrivalPitch;
     this.guidedArrivalSettleStartedAt = now;
     this.arrivalSettleUntil = now + this.guidedArrivalSettleDurationMs;
     this.guidedShotSubjectUntil = now + this.guidedArrivalSettleDurationMs + this.guidedTourHoldMs;
@@ -2916,13 +2920,18 @@ if (name === 'top') {
   _syncCamera() {
     const smoothing = 1 - Math.exp(-this.lookSmoothing * (this._lastDt || 0.016));
     const dt = this._lastDt || 0.016;
+    const now = performance.now();
     const isTravelling = Boolean(this.path?.length || this.directTravel);
 
     // Guided mode is a presentation camera: it slowly pans continuously, not
     // only while travelling. Phase 8 adds two higher-priority cinematic states:
     // a final-approach reveal and a short arrival settle.
-    if (this.walkMode === 'guided' && this.guidedAutoRotate) {
-      const now = performance.now();
+    if (this.immersive360Active) {
+      this._updateImmersive360(now, dt);
+      this._updateSmart720Tour?.(now, dt);
+    } else if (this.smart720Active) {
+      this._updateSmart720Tour?.(now, dt);
+    } else if (this.walkMode === 'guided' && this.guidedAutoRotate) {
 
       if (!this.guidedManualActive && this.arrivalSettleUntil > now) {
         const totalMs = Math.max(1, this.guidedArrivalSettleDurationMs);
@@ -2933,7 +2942,8 @@ if (name === 'top') {
         this.guidedCompositionYaw = settleYaw;
         this.guidedCompositionTargetYaw = this.guidedArrivalTargetYaw;
         this.targetYaw = settleYaw;
-        this.targetPitch = this.guidedPitch;
+        const settlePitch = THREE.MathUtils.lerp(this.guidedArrivalStartPitch, this.guidedArrivalTargetPitch, eased);
+        this.targetPitch = settlePitch;
         this.guidedPanPhase = 0;
       } else if (!this.guidedManualActive && this.guidedApproachActive && isTravelling) {
         let approachYaw = this.guidedApproachTargetYaw;
@@ -2991,6 +3001,20 @@ if (name === 'top') {
           this._refreshPresentationDestinations(this.position, resumeYaw);
         }
       } else {
+        if (this._updateGuidedHeroEnding?.(now)) {
+          this.guidedCompositionYaw = this._angleLerp(
+            this.guidedCompositionYaw,
+            this.guidedCompositionTargetYaw,
+            1 - Math.exp(-1.15 * dt),
+          );
+          const heroSweep = Math.sin(this.guidedPanPhase)
+            * THREE.MathUtils.degToRad(this.guidedCompositionSweepDeg)
+            * 0.05;
+          this.guidedPanPhase += dt * this.guidedYawRate * 0.32;
+          this.targetYaw = this.guidedCompositionYaw + heroSweep;
+          this.targetPitch = this.guidedArrivalTargetPitch ?? this.guidedPitch;
+          this.guidedTravelRotating = true;
+        } else {
         // Phase 13: while the current architectural shot is still being presented,
         // preserve its chosen subject instead of letting periodic composition search
         // pull the camera toward another room/object.
@@ -3039,6 +3063,7 @@ if (name === 'top') {
         this.targetYaw = this.guidedCompositionYaw + microSweep;
         this.targetPitch = this.guidedPitch;
       }
+        }
       this.guidedTravelRotating = !this.guidedManualActive;
     } else if (!isTravelling) {
       this.guidedTravelRotating = false;
@@ -3074,6 +3099,10 @@ if (name === 'top') {
 
     const candidates = [];
     for (const portal of this.portalObjects) {
+      if (portal.userData?.destinationKind === 'internal') {
+        portal.visible = false;
+        continue;
+      }
       const to = portal.position.clone().sub(this.position);
       const dist = Math.hypot(to.x, to.z);
       if (dist < 0.35 * this.metersPerUnit || dist > maxDistance) {
@@ -3163,6 +3192,22 @@ if (name === 'top') {
     });
   }
 
+  _updateImmersive360Offer() {
+    const available = Boolean(
+      this.viewMode === 'walk' &&
+      this.walkMode === 'guided' &&
+      !this.immersive360Active &&
+      !this.path &&
+      !this.directTravel &&
+      this.guidedTourArmed &&
+      this.activeHotspotId &&
+      performance.now() >= this.arrivalSettleUntil
+    );
+    if (available === this.immersive360OfferAvailable) return;
+    this.immersive360OfferAvailable = available;
+    this.onState?.({ type: 'immersive-360-offer', available });
+  }
+
   _tick = () => {
     if (!this.running) return;
     const now = performance.now();
@@ -3177,6 +3222,9 @@ if (name === 'top') {
       this.orbitControls.autoRotate = this.autoRotate;
       this.orbitControls.update();
     }
+    this._updateImmersiveSceneSwitch?.(now);
+    this._updateImmersive360Offer();
+    this._updateSmart720Offer?.();
     this._updatePortals();
     this.renderer.render(this.scene, this.camera);
     this.animationFrame = requestAnimationFrame(this._tick);
@@ -3219,21 +3267,38 @@ if (name === 'top') {
   }
 }
 
+import { subjectDirectorMethods } from './walkthrough/subjectDirector.js';
+import { framingDirectorMethods } from './walkthrough/framingDirector.js';
+import { shotDirectorMethods } from './walkthrough/shotDirector.js';
+import { destinationDirectorMethods } from './walkthrough/destinationDirector.js';
+import { heroEndingDirectorMethods } from './walkthrough/heroEndingDirector.js';
+import { immersive360DirectorMethods } from './walkthrough/immersive360Director.js';
+import { immersivePresentationDirectorMethods } from './walkthrough/immersivePresentationDirector.js';
+import { smart720TourDirectorMethods } from './walkthrough/smart720TourDirector.js';
+import { immersiveSceneDirectorMethods } from './walkthrough/immersiveSceneDirector.js';
+
+Object.assign(WalkRuntime.prototype, subjectDirectorMethods, shotDirectorMethods, framingDirectorMethods, destinationDirectorMethods, heroEndingDirectorMethods, immersive360DirectorMethods, immersivePresentationDirectorMethods, smart720TourDirectorMethods, immersiveSceneDirectorMethods);
+
 export function useWalkthroughEngine({ containerRef, jobId }) {
   const runtimeRef = useRef(null);
-  const [state, setState] = useState({ status: 'idle', areas: [], navigationPlan: null, activeArea: null, activeHotspotId: null, message: '', lookLocked: true, walkMode: 'guided', cameraHeightMeters: DEFAULT_EYE_HEIGHT_METERS + DEFAULT_HEIGHT_OFFSET_METERS, heightOffsetMeters: DEFAULT_HEIGHT_OFFSET_METERS, cameraFov: DEFAULT_FOV_DEGREES, stuck: false, recoveryAvailable: false });
+  const [state, setState] = useState({ status: 'idle', areas: [], navigationPlan: null, destinationPresentation: null, activeArea: null, activeHotspotId: null, message: '', lookLocked: true, walkMode: 'guided', immersive360Active: false, immersive360AutoRotate: true, immersivePresentationActive: false, immersivePresentationLabel: null, immersivePresentationKind: null, immersiveSceneIndex: 0, immersiveSceneTotal: 0, immersiveSceneLabel: null, immersiveSceneCanPrev: false, immersiveSceneCanNext: false, immersiveSceneSwitching: false, immersive360OfferAvailable: false, smart720Active: false, smart720OfferAvailable: false, smart720Phase: 'idle', smart720StopIndex: 0, smart720TotalStops: 0, smart720CurrentLabel: null, cameraHeightMeters: DEFAULT_EYE_HEIGHT_METERS + DEFAULT_HEIGHT_OFFSET_METERS, heightOffsetMeters: DEFAULT_HEIGHT_OFFSET_METERS, cameraFov: DEFAULT_FOV_DEGREES, stuck: false, recoveryAvailable: false });
 
   useEffect(() => {
     if (!containerRef.current || !jobId) return undefined;
     const runtime = new WalkRuntime({
       canvas: containerRef.current,
       onState: (event) => {
-        if (event.type === 'loaded') setState({ status: 'ready', areas: event.areas || [], navigationPlan: runtimeRef.current?.navigationPlan || null, activeArea: null, activeHotspotId: null, message: '', lookLocked: runtimeRef.current?.lookLocked ?? false, walkMode: runtimeRef.current?.walkMode ?? 'guided', cameraHeightMeters: (runtimeRef.current?.eyeHeight || DEFAULT_EYE_HEIGHT_METERS) + (runtimeRef.current?.heightOffset || 0), heightOffsetMeters: runtimeRef.current?.heightOffset || 0, cameraFov: runtimeRef.current?.fov || DEFAULT_FOV_DEGREES, stuck: false, recoveryAvailable: false });
+        if (event.type === 'loaded') setState({ status: 'ready', areas: event.areas || [], navigationPlan: runtimeRef.current?.navigationPlan || null, destinationPresentation: runtimeRef.current?.destinationPresentation || null, activeArea: null, activeHotspotId: null, message: '', lookLocked: runtimeRef.current?.lookLocked ?? false, walkMode: runtimeRef.current?.walkMode ?? 'guided', immersive360Active: runtimeRef.current?.immersive360Active ?? false, immersive360AutoRotate: runtimeRef.current?.immersive360AutoRotate ?? true, immersivePresentationActive: runtimeRef.current?.immersivePresentationActive ?? false, immersivePresentationLabel: runtimeRef.current?.immersivePresentationLabel ?? null, immersivePresentationKind: runtimeRef.current?.immersivePresentationKind ?? null, immersiveSceneIndex: runtimeRef.current?.immersiveSceneIndex ?? 0, immersiveSceneTotal: runtimeRef.current?.immersiveSceneTotal ?? 0, immersiveSceneLabel: runtimeRef.current?.immersiveSceneLabel ?? null, immersiveSceneCanPrev: runtimeRef.current?.immersiveSceneCanPrev ?? false, immersiveSceneCanNext: runtimeRef.current?.immersiveSceneCanNext ?? false, immersiveSceneSwitching: runtimeRef.current?.immersiveSceneSwitching ?? false, immersive360OfferAvailable: runtimeRef.current?.immersive360OfferAvailable ?? false, smart720Active: runtimeRef.current?.smart720Active ?? false, smart720OfferAvailable: runtimeRef.current?.smart720OfferAvailable ?? false, smart720Phase: runtimeRef.current?.smart720Phase ?? 'idle', smart720StopIndex: runtimeRef.current?.smart720StopIndex ?? 0, smart720TotalStops: runtimeRef.current?.smart720TotalStops ?? 0, smart720CurrentLabel: runtimeRef.current?.smart720CurrentLabel ?? null, cameraHeightMeters: (runtimeRef.current?.eyeHeight || DEFAULT_EYE_HEIGHT_METERS) + (runtimeRef.current?.heightOffset || 0), heightOffsetMeters: runtimeRef.current?.heightOffset || 0, cameraFov: runtimeRef.current?.fov || DEFAULT_FOV_DEGREES, stuck: false, recoveryAvailable: false });
         if (event.type === 'loading') setState((prev) => ({ ...prev, status: 'loading' }));
         if (event.type === 'travel') setState((prev) => ({ ...prev, activeArea: event.label || null, activeHotspotId: event.hotspotId || prev.activeHotspotId || null, message: event.active ? `Walking to ${event.label}…` : '' }));
         if (event.type === 'error') setState((prev) => ({ ...prev, message: event.message || 'Navigation failed.' }));
         if (event.type === 'look-lock') setState((prev) => ({ ...prev, lookLocked: event.locked }));
-        if (event.type === 'walk-mode') setState((prev) => ({ ...prev, walkMode: event.mode }));
+        if (event.type === 'walk-mode') setState((prev) => ({ ...prev, walkMode: event.mode, immersive360OfferAvailable: false, smart720Active: false, smart720OfferAvailable: false, smart720Phase: 'idle', smart720StopIndex: 0, smart720TotalStops: 0, smart720CurrentLabel: null, immersive360Active: false, immersivePresentationActive: false, immersivePresentationLabel: null, immersivePresentationKind: null, immersiveSceneIndex: 0, immersiveSceneTotal: 0, immersiveSceneLabel: null, immersiveSceneCanPrev: false, immersiveSceneCanNext: false, immersiveSceneSwitching: false }));
+        if (event.type === 'immersive-360') setState((prev) => ({ ...prev, immersive360Active: Boolean(event.active), immersive360AutoRotate: event.autoRotate === undefined ? prev.immersive360AutoRotate : Boolean(event.autoRotate), ...(event.active ? {} : { immersivePresentationActive: false, immersivePresentationLabel: null, immersivePresentationKind: null }) }));
+        if (event.type === 'immersive-scene') setState((prev) => ({ ...prev, immersiveSceneIndex: event.index ?? prev.immersiveSceneIndex, immersiveSceneTotal: event.total ?? prev.immersiveSceneTotal, immersiveSceneLabel: event.label ?? prev.immersiveSceneLabel, immersiveSceneCanPrev: Boolean(event.canPrev), immersiveSceneCanNext: Boolean(event.canNext), immersiveSceneSwitching: Boolean(event.switching) }));
+        if (event.type === 'immersive-360-offer') setState((prev) => ({ ...prev, immersive360OfferAvailable: Boolean(event.available) }));
+        if (event.type === 'smart-720-offer') setState((prev) => ({ ...prev, smart720OfferAvailable: Boolean(event.available) }));
+        if (event.type === 'smart-720-tour') setState((prev) => ({ ...prev, smart720Active: Boolean(event.active), smart720Phase: event.active ? (event.phase || prev.smart720Phase) : (event.completed ? 'complete' : 'idle'), smart720StopIndex: event.stopIndex ?? prev.smart720StopIndex, smart720TotalStops: event.totalStops ?? prev.smart720TotalStops, smart720CurrentLabel: event.label ?? prev.smart720CurrentLabel, smart720OfferAvailable: false }));
         if (event.type === 'camera-settings') setState((prev) => ({ ...prev, cameraHeightMeters: event.cameraHeightMeters, heightOffsetMeters: event.heightOffsetMeters, cameraFov: event.fov }));
         if (event.type === 'unstuck') setState((prev) => ({ ...prev, message: 'Recovered walk position.', stuck: false, recoveryAvailable: false }));
         if (event.type === 'stuck') setState((prev) => ({ ...prev, stuck: Boolean(event.available), recoveryAvailable: Boolean(event.available) }));
@@ -3244,7 +3309,7 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
     const base = import.meta.env.VITE_API_URL || 'http://localhost:3000';
     runtime.load(jobId, base).catch((error) => {
       console.error('[Walkthrough] Failed to load job:', error);
-      setState({ status: 'error', areas: [], activeArea: null, message: error.message, lookLocked: true, walkMode: 'guided', stuck: false, recoveryAvailable: false });
+      setState({ status: 'error', areas: [], navigationPlan: null, destinationPresentation: null, activeArea: null, message: error.message, lookLocked: true, walkMode: 'guided', immersive360Active: false, immersive360AutoRotate: true, immersivePresentationActive: false, immersivePresentationLabel: null, immersivePresentationKind: null, immersiveSceneIndex: 0, immersiveSceneTotal: 0, immersiveSceneLabel: null, immersiveSceneCanPrev: false, immersiveSceneCanNext: false, immersiveSceneSwitching: false, immersive360OfferAvailable: false, smart720Active: false, smart720OfferAvailable: false, smart720Phase: 'idle', smart720StopIndex: 0, smart720TotalStops: 0, smart720CurrentLabel: null, stuck: false, recoveryAvailable: false });
     });
     return () => {
       runtime.dispose();
@@ -3263,9 +3328,17 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
   const setFov = useCallback((value) => runtimeRef.current?.setFov(value), []);
   const setViewMode = useCallback((value) => runtimeRef.current?.setViewMode(value), []);
   const setAutoRotate = useCallback((value) => runtimeRef.current?.setAutoRotate(value), []);
+  const setImmersive360 = useCallback((value, options) => runtimeRef.current?.setImmersive360(value, options), []);
+  const setImmersive360AutoRotate = useCallback((value) => runtimeRef.current?.setImmersive360AutoRotate(value), []);
+  const enterImmersivePresentation = useCallback((options) => runtimeRef.current?.enterImmersivePresentation(options), []);
+  const exitImmersivePresentation = useCallback(() => runtimeRef.current?.exitImmersivePresentation(), []);
+  const resetImmersivePresentationView = useCallback(() => runtimeRef.current?.resetImmersivePresentationView(), []);
+  const switchImmersiveScene = useCallback((direction) => runtimeRef.current?.switchImmersiveScene(direction), []);
+  const startSmart720Tour = useCallback(() => runtimeRef.current?.startSmart720Tour(), []);
+  const cancelSmart720Tour = useCallback((reason) => runtimeRef.current?.cancelSmart720Tour(reason), []);
   const setViewPreset = useCallback((value) => runtimeRef.current?.setViewPreset(value), []);
   const zoom = useCallback((value) => runtimeRef.current?.zoom(value), []);
   const fitView = useCallback(() => runtimeRef.current?.fitView(), []);
   const recoverToSafeSpot = useCallback(() => runtimeRef.current?.recoverToSafeSpot(), []);
-  return { ...state, travelTo, switchRoom, navigateToHotspot, stopTravel, recoverToSafeSpot, setHeightOffset, setSensitivity, setWalkMode, setLookLocked, setViewMode, setAutoRotate, setViewPreset, zoom, fitView, setFov };
+  return { ...state, travelTo, switchRoom, navigateToHotspot, stopTravel, recoverToSafeSpot, setHeightOffset, setSensitivity, setWalkMode, setLookLocked, setViewMode, setAutoRotate, setImmersive360, setImmersive360AutoRotate, enterImmersivePresentation, exitImmersivePresentation, resetImmersivePresentationView, switchImmersiveScene, startSmart720Tour, cancelSmart720Tour, setViewPreset, zoom, fitView, setFov };
 }

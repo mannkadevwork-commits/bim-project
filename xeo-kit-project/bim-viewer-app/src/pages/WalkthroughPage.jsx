@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
-  ArrowLeft, Camera, ChevronDown, ChevronUp, CircleHelp, Fullscreen, Gauge,
-  Minus, Map, Move3d, MousePointer2, Play, Plus, RotateCcw, RotateCw,
-  Settings2, Target, View, X,
+  ArrowLeft, Camera, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleHelp, Gauge,
+  Maximize2, Minimize2, Minus, Map, Move3d, MousePointer2, Play, Plus,
+  RotateCcw, RotateCw, Settings2, Target, View, X,
 } from 'lucide-react';
 import { useWalkthroughEngine } from '../hooks/useWalkthroughEngine';
 
@@ -15,7 +15,7 @@ function IconButton({ title, onClick, children, active = false, disabled = false
       aria-label={title}
       disabled={disabled}
       onClick={onClick}
-      className={`flex h-9 w-9 items-center justify-center rounded-xl border text-slate-200 transition ${active ? 'border-[#ff914d]/40 bg-[#ff914d]/15 text-[#ffb27a]' : 'border-transparent bg-white/[0.03] hover:border-white/10 hover:bg-white/[0.08] hover:text-white'} disabled:cursor-not-allowed disabled:opacity-40`}
+      className={`flex h-9 w-9 items-center justify-center rounded-xl border text-white transition ${active ? 'border-[#ff914d]/50 bg-[#ff914d]/18 text-[#ffd1b3] shadow-[0_0_22px_rgba(255,145,77,.14)]' : 'border-white/[0.07] bg-white/[0.06] hover:border-white/15 hover:bg-white/[0.11] hover:text-white'} disabled:cursor-not-allowed disabled:opacity-40`}
     >{children}</button>
   );
 }
@@ -40,6 +40,22 @@ export default function WalkthroughPage() {
   const [autoRotate, setAutoRotate] = useState(false);
   const [fov, setFov] = useState(120);
   const [walkMode, setWalkMode] = useState('guided');
+  const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
+
+  useEffect(() => {
+    const onFullscreenChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
+
+  const toggleFullscreen = async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen?.();
+      else await document.documentElement.requestFullscreen?.();
+    } catch {
+      // Fullscreen can be blocked by browser policy; leave the walkthrough unchanged.
+    }
+  };
 
   const walkthrough = useWalkthroughEngine({ containerRef: viewportRef, jobId });
   const navigationPlan = walkthrough.navigationPlan || null;
@@ -66,11 +82,20 @@ export default function WalkthroughPage() {
     if (walkthrough.stuck) return 'Navigation paused · choose a nearby floor marker or reposition safely';
     if (walkthrough.message) return walkthrough.message;
     if (viewMode === 'overview') return 'Preview · orbit and zoom · click Start Walkthrough';
-    if (effectiveWalkMode === 'guided') return 'Guided · click a floor destination to move · drag horizontally to look';
+    if (walkthrough.immersive360Active) {
+      if (walkthrough.smart720Active) return `Smart 720 · ${walkthrough.smart720CurrentLabel || 'room presentation'} · full-room presentation`;
+      return `${walkthrough.immersivePresentationLabel || '360° presentation'} · drag horizontally to look around${walkthrough.immersive360AutoRotate ? ' · auto-rotate on' : ' · auto-rotate off'}`;
+    }
+    if (effectiveWalkMode === 'guided') {
+      if (walkthrough.smart720Active) return `Smart 720 · ${walkthrough.smart720CurrentLabel || 'next room'}`;
+      if (walkthrough.smart720OfferAvailable && walkthrough.immersive360OfferAvailable) return 'Guided · choose a room-to-room Smart 720 tour or explore 360° here';
+      if (walkthrough.smart720OfferAvailable) return 'Guided · presentation ready · start a Smart 720 tour';
+      return walkthrough.immersive360OfferAvailable ? 'Guided · presentation ready · explore 360° from the current point' : 'Guided · click a floor destination to move · drag horizontally to look';
+    }
     return walkthrough.lookLocked
       ? 'Explore · view locked · double-click to unlock'
       : 'Explore · move with W/A/S/D · move mouse to look';
-  }, [walkthrough.status, walkthrough.message, viewMode, effectiveWalkMode, walkthrough.lookLocked]);
+  }, [walkthrough.status, walkthrough.message, viewMode, effectiveWalkMode, walkthrough.lookLocked, walkthrough.immersive360Active, walkthrough.immersive360OfferAvailable, walkthrough.smart720Active, walkthrough.smart720OfferAvailable, walkthrough.smart720CurrentLabel]);
 
   const applyFov = (value) => {
     const next = Number(value);
@@ -89,6 +114,19 @@ export default function WalkthroughPage() {
     setHeightOffset(next);
     walkthrough.setHeightOffset(next);
   };
+
+  const openImmersive360 = () => {
+    if (viewMode !== 'walk' || effectiveWalkMode !== 'guided' || !walkthrough.immersive360OfferAvailable) return;
+    walkthrough.enterImmersivePresentation({ autoRotate: true });
+  };
+
+  const startSmart720 = () => {
+    if (viewMode !== 'walk' || effectiveWalkMode !== 'guided' || !walkthrough.smart720OfferAvailable) return;
+    walkthrough.startSmart720Tour();
+  };
+
+  const reset360View = () => walkthrough.resetImmersivePresentationView();
+  const toggle360AutoRotate = () => walkthrough.setImmersive360AutoRotate(!walkthrough.immersive360AutoRotate);
 
   const switchWalkMode = (mode) => {
     setWalkMode(mode);
@@ -140,11 +178,31 @@ export default function WalkthroughPage() {
       <div className="relative h-screen w-screen overflow-hidden bg-slate-950 text-white">
       <div ref={viewportRef} className="absolute inset-0" />
 
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-30 flex justify-center p-4">
-        <div className="pointer-events-auto flex items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/72 px-4 py-2.5 shadow-2xl backdrop-blur-xl">
-          <Move3d className="h-4 w-4 text-[#ff914d]" />
-          <span className="text-sm font-semibold">{viewMode === 'walk' ? 'HCI Walkthrough' : 'HCI 3D Preview'}</span>
-          <span className="text-xs text-slate-400">{jobId}</span>
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-30 flex items-start justify-between p-4 md:p-5">
+        <div className="pointer-events-auto flex items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/78 px-3.5 py-2.5 shadow-[0_18px_60px_rgba(0,0,0,.24)] backdrop-blur-2xl">
+          <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-[#ff914d]/30 bg-[#ff914d]/14">
+            <Move3d className="h-4 w-4 text-[#ffad73]" />
+          </div>
+          <div>
+            <div className="text-sm font-semibold tracking-tight text-white">HCI Walkthrough</div>
+            <div className="text-[10px] uppercase tracking-[0.16em] text-slate-300">{viewMode === 'walk' ? 'Interactive presentation' : '3D preview'} · {jobId}</div>
+          </div>
+        </div>
+
+        <div className="pointer-events-auto flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/20 p-1 backdrop-blur-md">
+          <div className="hidden items-center gap-2 rounded-full border border-white/12 bg-slate-950/70 px-3 py-2 text-[11px] text-slate-200 shadow-xl backdrop-blur-xl sm:flex">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#ff914d] shadow-[0_0_10px_rgba(255,145,77,.8)]" />
+            {viewMode === 'walk'
+              ? (walkthrough.smart720Active ? 'Smart 720 tour' : (walkthrough.immersive360Active ? '360° presentation' : (effectiveWalkMode === 'guided' ? 'Guided presentation' : 'Explore mode')))
+              : 'Overview'}
+          </div>
+          <IconButton
+            title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+            onClick={toggleFullscreen}
+            active={isFullscreen}
+          >
+            {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+          </IconButton>
         </div>
       </div>
 
@@ -166,10 +224,10 @@ export default function WalkthroughPage() {
       )} */}
 
       {viewMode === 'walk' && (
-        <div className="absolute left-4 top-20 z-30 w-[320px] overflow-hidden rounded-3xl border border-white/10 bg-slate-950/62 shadow-[0_24px_80px_rgba(0,0,0,.35)] backdrop-blur-2xl">
+        <div className="absolute left-4 top-20 z-30 w-[300px] overflow-hidden rounded-[24px] border border-white/10 bg-slate-950/54 shadow-[0_28px_90px_rgba(0,0,0,.32)] backdrop-blur-2xl sm:w-[310px]">
           <button
             type="button"
-            className="flex w-full items-center justify-between px-4 py-3.5 text-left"
+            className="flex w-full items-center justify-between px-4 py-3 text-left"
             onClick={() => setRailOpen((v) => !v)}
           >
             <div className="flex items-center gap-3">
@@ -177,8 +235,8 @@ export default function WalkthroughPage() {
                 <Map className="h-4 w-4 text-[#ff914d]" />
               </div>
               <div>
-                <div className="text-sm font-semibold text-white">Floor map</div>
-                <div className="mt-0.5 text-[11px] text-slate-400">{navigationHotspots.length} validated destinations</div>
+                <div className="text-[13px] font-semibold tracking-tight text-white">Floor map</div>
+                <div className="mt-0.5 text-[10px] text-slate-300">{navigationHotspots.length} curated destinations</div>
               </div>
             </div>
             {railOpen ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
@@ -191,7 +249,7 @@ export default function WalkthroughPage() {
                   Building floor map…
                 </div>
               ) : (
-                <div className="relative aspect-[4/3] overflow-hidden rounded-2xl border border-white/10 bg-slate-900/65 shadow-inner">
+                <div className="relative aspect-[4/3] overflow-hidden rounded-[18px] border border-white/12 bg-slate-900/76 shadow-inner">
                   <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_45%,rgba(255,145,77,.07),transparent_58%)]" />
                   <svg
                     className="absolute inset-0 h-full w-full"
@@ -232,13 +290,13 @@ export default function WalkthroughPage() {
                       })}
                     </g>
                   </svg>
-                  <div className="pointer-events-none absolute bottom-2 left-2 rounded-lg border border-white/10 bg-slate-950/55 px-2 py-1 text-[10px] text-slate-400 backdrop-blur-md">
+                  <div className="pointer-events-none absolute bottom-2 left-2 rounded-full border border-white/10 bg-slate-950/52 px-2.5 py-1 text-[10px] font-medium text-slate-200 backdrop-blur-md">
                     Click a point to move
                   </div>
                 </div>
               )}
 
-              <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
+              <div className="mt-3 flex items-center justify-between text-[10px] font-medium text-slate-300">
                 <span>Orange = walkable destination</span>
                 <span>{effectiveWalkMode === 'guided' ? 'Guided' : 'Explore'}</span>
               </div>
@@ -275,7 +333,7 @@ export default function WalkthroughPage() {
           <div className="mb-4 flex items-center justify-between">
             <div>
               <div className="text-sm font-semibold">Walk Controls</div>
-              <div className="text-[11px] text-slate-400">Fine-tune how the camera feels.</div>
+              <div className="text-[11px] text-slate-300">Fine-tune how the camera feels.</div>
             </div>
             <IconButton title="Close controls" onClick={() => setSettingsOpen(false)}><X className="h-4 w-4" /></IconButton>
           </div>
@@ -295,7 +353,7 @@ export default function WalkthroughPage() {
               <input className="w-full accent-[#ff914d]" type="range" min="-0.15" max="0.35" step="0.01" value={heightOffset} onChange={(e) => applyHeight(e.target.value)} />
               <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Lower</span><span>Neutral</span><span>Higher</span></div>
             </label>
-            <button type="button" onClick={() => { applyHeight(0.35); applyFov(120); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-300 hover:bg-white/[0.06]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
+            <button type="button" onClick={() => { applyHeight(0.35); applyFov(120); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-200 hover:bg-white/[0.08]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
           </div>
         </div>
       )}
@@ -320,7 +378,6 @@ export default function WalkthroughPage() {
           <button type="button" onClick={() => { walkthrough.fitView(); setMoreOpen(false); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-sm text-slate-200 hover:bg-white/[0.06]"><Target className="h-4 w-4" /> Fit model</button>
           <button type="button" onClick={() => { setSettingsOpen(true); setMoreOpen(false); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-sm text-slate-200 hover:bg-white/[0.06]"><Gauge className="h-4 w-4" /> Walk sensitivity & height</button>
           <button type="button" onClick={() => { const next = !autoRotate; setAutoRotate(next); walkthrough.setAutoRotate(next); setMoreOpen(false); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-sm text-slate-200 hover:bg-white/[0.06]"><RotateCw className="h-4 w-4" /> Auto rotate</button>
-          <button type="button" onClick={() => { if (!document.fullscreenElement) document.documentElement.requestFullscreen?.(); else document.exitFullscreen?.(); setMoreOpen(false); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-sm text-slate-200 hover:bg-white/[0.06]"><Fullscreen className="h-4 w-4" /> Fullscreen</button>
         </div>
       )}
 
@@ -329,6 +386,8 @@ export default function WalkthroughPage() {
           <div className="mb-3 flex items-center justify-between"><span className="font-semibold text-white">Walkthrough help</span><IconButton title="Close help" onClick={() => setHelpOpen(false)}><X className="h-4 w-4" /></IconButton></div>
           <div className="space-y-2 text-xs leading-5 text-slate-400">
             <div><b className="text-slate-200">Guided:</b> click a circular floor destination to travel with a slow cinematic camera pan.</div>
+            <div><b className="text-slate-200">360°:</b> appears as a contextual presentation action after a Guided destination settles. Explore the full room; slow auto-rotation pauses while you interact and resumes after idle.</div>
+            <div><b className="text-slate-200">Smart 720:</b> presents the curated customer-facing rooms one by one, using real NavMesh travel between them and a full 360° presentation at each stop.</div>
             <div><b className="text-slate-200">Explore:</b> W/A/S/D moves · mouse looks freely · Shift runs. Mouse movement is smoothed.</div>
             <div><b className="text-slate-200">Overview:</b> W/A/S/D pan · Q/E zoom · mouse orbit · wheel zoom · +/- keys zoom.</div>
             <div><b className="text-slate-200">Floor map:</b> glass map shows every validated navigation destination; click a point to travel there.</div>
@@ -338,7 +397,36 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      <div className="absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-2xl border border-white/10 bg-slate-950/82 p-2 shadow-2xl backdrop-blur-2xl">
+      {viewMode === 'walk' && effectiveWalkMode === 'guided' && !walkthrough.immersive360Active && (walkthrough.smart720OfferAvailable || walkthrough.immersive360OfferAvailable) && (
+        <div className="absolute bottom-20 left-1/2 z-30 -translate-x-1/2">
+          <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/90 p-2 shadow-[0_18px_50px_rgba(0,0,0,.34)] backdrop-blur-2xl">
+            {walkthrough.smart720OfferAvailable && (
+              <button
+                type="button"
+                onClick={startSmart720}
+                className="group flex items-center gap-2 rounded-xl bg-[#ff914d] px-4 py-2.5 text-xs font-bold text-slate-950 shadow-[0_10px_28px_rgba(255,145,77,.18)] transition hover:bg-[#ff7a28]"
+                title="Start a room-to-room whole-home presentation tour"
+              >
+                <Play className="h-4 w-4" />
+                <span>Smart 720 Tour</span>
+              </button>
+            )}
+            {walkthrough.immersive360OfferAvailable && (
+              <button
+                type="button"
+                onClick={openImmersive360}
+                className="group flex items-center gap-2 rounded-xl border border-[#ff914d]/28 bg-white/[0.05] px-3.5 py-2.5 text-xs font-semibold text-white transition hover:border-[#ff914d]/48 hover:bg-white/[0.09]"
+                title="Explore a full 360° view from the current destination"
+              >
+                <RotateCw className="h-4 w-4 text-[#ff914d] transition group-hover:rotate-45" />
+                <span>Explore 360°</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1 rounded-[22px] border border-white/12 bg-slate-950/84 p-1.5 shadow-[0_24px_70px_rgba(0,0,0,.36)] backdrop-blur-2xl">
         <IconButton
           title={viewMode === 'walk' ? 'Exit first-person view' : 'Back to renderer'}
           onClick={() => {
@@ -366,10 +454,10 @@ export default function WalkthroughPage() {
           </button>
         ) : (
           <div className="flex items-center rounded-xl border border-white/10 bg-white/[0.03] p-0.5" aria-label="Walkthrough interaction mode">
-            <button type="button" onClick={() => switchWalkMode('guided')} title="Guided mode: click destinations, slow cinematic camera pan" className={`flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-semibold transition ${effectiveWalkMode === 'guided' ? 'bg-[#ff914d] text-slate-950 shadow-sm' : 'text-slate-300 hover:bg-white/[0.06]'}`}>
+            <button type="button" onClick={() => switchWalkMode('guided')} title="Guided mode: click destinations, slow cinematic camera pan" className={`flex h-8 items-center gap-1.5 rounded-[10px] px-2.5 text-[11px] font-semibold transition ${effectiveWalkMode === 'guided' ? 'bg-white text-slate-950 shadow-sm' : 'text-slate-200 hover:bg-white/[0.08]'}`}>
               <MousePointer2 className="h-3.5 w-3.5" /> Guided
             </button>
-            <button type="button" onClick={() => switchWalkMode('explore')} title="Explore mode: W/A/S/D movement and free mouse look" className={`flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-semibold transition ${effectiveWalkMode === 'explore' ? 'bg-[#ff914d] text-slate-950 shadow-sm' : 'text-slate-300 hover:bg-white/[0.06]'}`}>
+            <button type="button" onClick={() => switchWalkMode('explore')} title="Explore mode: W/A/S/D movement and free mouse look" className={`flex h-8 items-center gap-1.5 rounded-[10px] px-2.5 text-[11px] font-semibold transition ${effectiveWalkMode === 'explore' ? 'bg-white text-slate-950 shadow-sm' : 'text-slate-200 hover:bg-white/[0.08]'}`}>
               <Move3d className="h-3.5 w-3.5" /> Explore
             </button>
           </div>
@@ -392,9 +480,38 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      <div className="pointer-events-none absolute left-1/2 top-16 z-20 -translate-x-1/2 rounded-full border border-white/10 bg-slate-950/70 px-4 py-2 text-xs text-slate-300 shadow-xl backdrop-blur-xl">
+      <div className="pointer-events-none absolute left-1/2 top-16 z-20 -translate-x-1/2 rounded-full border border-white/10 bg-slate-950/82 px-4 py-2 text-xs font-medium text-slate-100 shadow-xl backdrop-blur-xl">
         {statusText}
       </div>
+
+      {walkthrough.immersivePresentationActive && (
+        <div className="absolute bottom-28 right-6 z-30 w-[270px] rounded-2xl border border-white/10 bg-slate-950/82 p-3 text-white shadow-2xl backdrop-blur-2xl">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-orange-200/80">{walkthrough.smart720Active ? 'Smart 720 Tour' : '360° Presentation'}</div>
+              <div className="mt-1 truncate text-sm font-semibold text-white">{walkthrough.smart720CurrentLabel || walkthrough.immersivePresentationLabel || 'Architectural view'}</div>
+              <div className="mt-1 text-[11px] leading-4 text-slate-300">{walkthrough.smart720Active ? `Room presentation ${walkthrough.smart720StopIndex || 1} of ${walkthrough.smart720TotalStops || 1}. The next room follows automatically.` : 'Stationary architectural view. Drag to explore the room.'}</div>
+            </div>
+          </div>
+          {!walkthrough.smart720Active && walkthrough.immersiveSceneTotal > 1 && (
+            <div className="mb-2 flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-2 py-1.5">
+              <button type="button" onClick={() => walkthrough.switchImmersiveScene(-1)} disabled={!walkthrough.immersiveSceneCanPrev || walkthrough.immersiveSceneSwitching} className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.04] text-slate-200 transition hover:bg-white/[0.1] disabled:cursor-not-allowed disabled:opacity-35" title="Previous presentation scene"><ChevronLeft className="h-4 w-4" /></button>
+              <div className="min-w-0 flex-1 text-center">
+                <div className="truncate text-[10px] font-semibold text-white">{walkthrough.immersiveSceneLabel || walkthrough.immersivePresentationLabel || 'Presentation scene'}</div>
+                <div className="mt-0.5 text-[9px] uppercase tracking-[0.16em] text-slate-400">Scene {Math.max(1, walkthrough.immersiveSceneIndex)} of {walkthrough.immersiveSceneTotal}</div>
+              </div>
+              <button type="button" onClick={() => walkthrough.switchImmersiveScene(1)} disabled={!walkthrough.immersiveSceneCanNext || walkthrough.immersiveSceneSwitching} className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.04] text-slate-200 transition hover:bg-white/[0.1] disabled:cursor-not-allowed disabled:opacity-35" title="Next presentation scene"><ChevronRight className="h-4 w-4" /></button>
+            </div>
+          )}
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            <button type="button" onClick={reset360View} className="flex h-8 items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] text-[10px] font-semibold text-slate-200 hover:bg-white/[0.11]"><RotateCcw className="h-3.5 w-3.5" /> Recenter</button>
+            {!walkthrough.smart720Active && (
+              <button type="button" onClick={toggle360AutoRotate} className={`flex h-8 items-center justify-center gap-1.5 rounded-lg border text-[10px] font-semibold ${walkthrough.immersive360AutoRotate ? 'border-[#ff914d]/40 bg-[#ff914d]/12 text-[#ffd1b3]' : 'border-white/10 bg-white/[0.06] text-slate-200 hover:bg-white/[0.11]'}`}><RotateCw className="h-3.5 w-3.5" /> {walkthrough.immersive360AutoRotate ? 'Auto on' : 'Auto off'}</button>
+            )}
+            <button type="button" onClick={() => walkthrough.exitImmersivePresentation()} className="flex h-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-[10px] font-semibold text-slate-200 hover:bg-white/[0.11]">{walkthrough.smart720Active ? 'Stop tour' : 'Exit'}</button>
+          </div>
+        </div>
+      )}
       </div>
     </>
   );
