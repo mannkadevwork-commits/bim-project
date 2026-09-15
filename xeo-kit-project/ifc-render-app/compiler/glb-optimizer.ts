@@ -1,9 +1,9 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { NodeIO } from "@gltf-transform/core";
 import { ALL_EXTENSIONS } from "@gltf-transform/extensions";
 import {
   dedup,
-  instance,
   prune,
   simplify,
   textureCompress,
@@ -16,8 +16,7 @@ import sharp from "sharp";
 export interface GlbOptimizationOptions {
   inputPath: string;
   outputPath: string;
-  rawBackupPath?: string;
-  minInputBytes?: number;
+  reportPath?: string;
   simplifyRatio?: number;
   simplifyError?: number;
   maxTextureSize?: number;
@@ -29,16 +28,32 @@ export interface GlbOptimizationStats {
   outputBytes: number;
   inputMb: number;
   outputMb: number;
-  reductionPercent: number;
+  fileReductionPercent: number;
+  trianglesBefore: number;
+  trianglesAfter: number;
+  verticesBefore: number;
+  verticesAfter: number;
+  meshesBefore: number;
+  meshesAfter: number;
+  primitivesBefore: number;
+  primitivesAfter: number;
+  materialsBefore: number;
+  materialsAfter: number;
+  texturesBefore: number;
+  texturesAfter: number;
+  generatedAt: string;
+}
+
+type GeometryStats = {
   triangles: number;
   vertices: number;
   meshes: number;
   primitives: number;
   materials: number;
   textures: number;
-}
+};
 
-function countStats(document: any): Pick<GlbOptimizationStats, "triangles" | "vertices" | "meshes" | "primitives" | "materials" | "textures"> {
+function countGeometryStats(document: any): GeometryStats {
   let triangles = 0;
   let vertices = 0;
   let primitives = 0;
@@ -46,11 +61,16 @@ function countStats(document: any): Pick<GlbOptimizationStats, "triangles" | "ve
   for (const mesh of document.getRoot().listMeshes()) {
     for (const primitive of mesh.listPrimitives()) {
       primitives += 1;
+
       const indices = primitive.getIndices();
-      if (indices?.getCount()) triangles += Math.floor(indices.getCount() / 3);
+      if (indices?.getCount()) {
+        triangles += Math.floor(indices.getCount() / 3);
+      }
 
       const position = primitive.getAttribute("POSITION");
-      if (position?.getCount()) vertices += position.getCount();
+      if (position?.getCount()) {
+        vertices += position.getCount();
+      }
     }
   }
 
@@ -64,49 +84,54 @@ function countStats(document: any): Pick<GlbOptimizationStats, "triangles" | "ve
   };
 }
 
+function reductionPercent(before: number, after: number): number {
+  return before > 0 ? ((before - after) / before) * 100 : 0;
+}
+
+function writeReport(
+  reportPath: string | undefined,
+  stats: GlbOptimizationStats,
+): void {
+  if (!reportPath) return;
+  fs.writeFileSync(reportPath, JSON.stringify(stats, null, 2), "utf8");
+}
+
+/**
+ * Converts the compiler's exact GLB into the production visual GLB used by
+ * the browser walkthrough.
+ *
+ * We intentionally do not arbitrarily join/instance scene nodes because HCI
+ * relies on authored transforms, semantic names, furniture placement and
+ * door isolation.
+ */
 export async function optimizeGlb(
   options: GlbOptimizationOptions,
-): Promise<GlbOptimizationStats | null> {
+): Promise<GlbOptimizationStats> {
   if (!fs.existsSync(options.inputPath)) {
     throw new Error(`GLB input does not exist: ${options.inputPath}`);
-  }
-
-  const inputBytes = fs.statSync(options.inputPath).size;
-  const minInputBytes = options.minInputBytes ?? 8 * 1024 * 1024;
-
-  // Preserve the raw compiler output for debugging/fallback.
-  if (options.rawBackupPath) {
-    fs.copyFileSync(options.inputPath, options.rawBackupPath);
   }
 
   const io = new NodeIO().registerExtensions(ALL_EXTENSIONS);
   await MeshoptEncoder.ready;
   await MeshoptSimplifier.ready;
 
+  const inputBytes = fs.statSync(options.inputPath).size;
   const document = await io.read(options.inputPath);
-  const before = countStats(document);
+  const before = countGeometryStats(document);
 
-  // For small scenes, don't spend compiler CPU just to squeeze a few bytes.
-  if (inputBytes < minInputBytes) {
-    fs.copyFileSync(options.inputPath, options.outputPath);
-    return {
-      inputBytes,
-      outputBytes: inputBytes,
-      inputMb: inputBytes / 1024 / 1024,
-      outputMb: inputBytes / 1024 / 1024,
-      reductionPercent: 0,
-      ...before,
-    };
-  }
-
-  const ratio = Math.min(1, Math.max(0.5, options.simplifyRatio ?? 0.70));
-  const error = options.simplifyError ?? 0.001;
+  const ratio = Math.min(
+    1,
+    Math.max(0.5, options.simplifyRatio ?? 0.70),
+  );
+  const error = Math.max(0, options.simplifyError ?? 0.001);
+  const maxTextureSize = Math.max(512, options.maxTextureSize ?? 2048);
+  const textureQuality = Math.min(
+    100,
+    Math.max(60, options.textureQuality ?? 86),
+  );
 
   await document.transform(
-    // Lossless graph cleanup and repeated-asset reuse.
     dedup(),
-    // Weld only before simplification. The simplifier itself also avoids
-    // unsupported primitive modes, so LINE/POINT primitives remain intact.
     weld({ tolerance: 0.0001 }),
     simplify({
       simplifier: MeshoptSimplifier,
@@ -114,66 +139,103 @@ export async function optimizeGlb(
       error,
       lockBorder: true,
     }),
-
-    // Keep runtime payloads small without touching material semantics.
-    ...(options.maxTextureSize
-      ? [
-          textureCompress({
-            encoder: sharp,
-            targetFormat: "webp",
-            resize: [options.maxTextureSize, options.maxTextureSize],
-            quality: options.textureQuality ?? 84,
-          }),
-        ]
-      : []),
-
+    textureCompress({
+      encoder: sharp,
+      targetFormat: "webp",
+      resize: [maxTextureSize, maxTextureSize],
+      quality: textureQuality,
+    }),
     prune(),
   );
 
-  // Meshopt is the final geometry-encoding pass. It both prepares the
-  // accessors for web delivery and writes EXT_meshopt_compression data.
+  const after = countGeometryStats(document);
+
   await document.transform(
-    meshopt({ encoder: MeshoptEncoder, level: "high" }),
+    meshopt({
+      encoder: MeshoptEncoder,
+      level: "high",
+    }),
   );
 
-  // NodeIO gets the encoder from the dependency registry on write.
-  const encodedIo = new NodeIO()
+  const outputIO = new NodeIO()
     .registerExtensions(ALL_EXTENSIONS)
     .registerDependencies({
       "meshopt.encoder": MeshoptEncoder,
     });
 
-  await encodedIo.write(options.outputPath, document);
+  const outputDir = path.dirname(options.outputPath);
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  await outputIO.write(options.outputPath, document);
 
   const outputBytes = fs.statSync(options.outputPath).size;
-  const after = countStats(document);
+  const generatedAt = new Date().toISOString();
 
   const stats: GlbOptimizationStats = {
     inputBytes,
     outputBytes,
     inputMb: inputBytes / 1024 / 1024,
     outputMb: outputBytes / 1024 / 1024,
-    reductionPercent: inputBytes > 0
-      ? ((inputBytes - outputBytes) / inputBytes) * 100
-      : 0,
-    ...after,
-  };
-
-  console.log("[compiler:glb-opt] complete", {
-    inputMb: stats.inputMb.toFixed(2),
-    outputMb: stats.outputMb.toFixed(2),
-    reductionPercent: stats.reductionPercent.toFixed(1),
+    fileReductionPercent: reductionPercent(inputBytes, outputBytes),
     trianglesBefore: before.triangles,
     trianglesAfter: after.triangles,
     verticesBefore: before.vertices,
     verticesAfter: after.vertices,
+    meshesBefore: before.meshes,
+    meshesAfter: after.meshes,
     primitivesBefore: before.primitives,
     primitivesAfter: after.primitives,
     materialsBefore: before.materials,
     materialsAfter: after.materials,
     texturesBefore: before.textures,
     texturesAfter: after.textures,
+    generatedAt,
+  };
+
+  writeReport(options.reportPath, stats);
+
+  console.log("[compiler:glb-opt] production GLB ready", {
+    inputMB: stats.inputMb.toFixed(2),
+    outputMB: stats.outputMb.toFixed(2),
+    fileReduction: `${stats.fileReductionPercent.toFixed(1)}%`,
+    triangleReduction: `${reductionPercent(
+      before.triangles,
+      after.triangles,
+    ).toFixed(1)}%`,
+    vertexReduction: `${reductionPercent(
+      before.vertices,
+      after.vertices,
+    ).toFixed(1)}%`,
+    primitiveReduction: `${reductionPercent(
+      before.primitives,
+      after.primitives,
+    ).toFixed(1)}%`,
   });
 
   return stats;
+}
+
+const isMainModule =
+  import.meta.url ===
+  new URL(`file://${process.argv[1]?.replace(/\\/g, "/")}`).href;
+
+if (isMainModule) {
+  const [inputPath, outputPath, reportPath] = process.argv.slice(2);
+
+  if (!inputPath || !outputPath) {
+    console.error(
+      "Usage: npx tsx glb-optimizer.ts <input.glb> <output.glb> [report.json]",
+    );
+    process.exit(1);
+  }
+
+  optimizeGlb({ inputPath, outputPath, reportPath })
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error(
+        "[compiler:glb-opt] failed:",
+        error instanceof Error ? error.message : error,
+      );
+      process.exit(1);
+    });
 }

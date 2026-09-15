@@ -1314,7 +1314,12 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
     const baseUrl = `${protocol}://${host}`;
 
     if (angle === "360") {
-        const compilerScriptPath = path.join(__dirname, "compiler", "compiler.ts");
+        // const compilerScriptPath = path.join(__dirname, "compiler", "compiler.ts");
+        const compilerScriptPath = path.join(
+  __dirname,
+  "compiler",
+  "production-compile.ts"
+);
         const outputGlbPath = path.join(jobDir, "output.glb");
 
         try {

@@ -1,13 +1,19 @@
 import * as fs from "fs";
 import * as path from "path";
 import { IfcAPI } from "web-ifc";
-import { Document, NodeIO, Node as GltfNode, Primitive, Texture } from "@gltf-transform/core";
+import {
+  Document,
+  NodeIO,
+  Node as GltfNode,
+  Texture,
+} from "@gltf-transform/core";
 
 import { extractGeometry } from "./geometry";
 import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
 import { fileURLToPath, pathToFileURL } from "url";
 import { WalkNavigationPipeline } from "./navigation/WalkNavigationPipeline";
 import { RoomDetector } from "./navigation/RoomDetector";
+import { optimizeGlb } from "./glb-optimizer";
 
 enum AssetType {
   STRUCTURAL_REPLACEMENT = "structural_replacement",
@@ -21,15 +27,10 @@ interface AssetTypeBehavior {
 
 const ASSET_TYPE_BEHAVIOR: Record<AssetType, AssetTypeBehavior> = {
   [AssetType.STRUCTURAL_REPLACEMENT]: {
-    // Structural replacements are authored in the current IFC/world frame.
-    // Their geometry carries its native frame, so the wrapper must preserve it
-    // rather than applying the furniture bottom-center placement convention.
     preservePlacement: true,
     applyMaterialOverrides: true,
   },
   [AssetType.FURNITURE]: {
-    // Furniture positions/scales are already persisted in the CURRENT scene
-    // frame by the frontend. Do not multiply them by scene_calibration again.
     preservePlacement: false,
     applyMaterialOverrides: false,
   },
@@ -44,19 +45,16 @@ interface FurnitureItem {
   rotation: [number, number, number];
   scale: [number, number, number];
   type?: AssetType;
-  assetFormat?: 'glb' | 'ifc';
+  assetFormat?: "glb" | "ifc";
   fileType?: string;
   nativeSourceId?: string;
   isNativeIsolation?: boolean;
-  /** Optional future authoritative world matrix, column-major glTF order. */
   matrix?: [
     number, number, number, number,
     number, number, number, number,
     number, number, number, number,
     number, number, number, number
   ];
-  /** Set when a GLB door was placed via insert-door. Position is the exact
-   * Python-computed void center; no AABB pivot correction must be applied. */
   doorHostWallId?: string;
 }
 
@@ -67,20 +65,29 @@ interface StructuralEditEntry {
 }
 
 interface MaterialEntry {
-  kind?: 'color' | 'fabric' | 'texture';
+  kind?: "color" | "fabric" | "texture";
   color: string;
   rgb: [number, number, number];
-  texture?: { id?: string; name?: string; src?: string; repeat?: [number, number] };
+  texture?: {
+    id?: string;
+    name?: string;
+    src?: string;
+    repeat?: [number, number];
+  };
   roughness?: number;
   metallic?: number;
 }
 
 interface ProjectState {
-  structural_edits: Record<string, StructuralEditEntry>;
-  materials: Record<string, MaterialEntry>;
+  structural_edits?: Record<string, StructuralEditEntry>;
+  materials?: Record<string, MaterialEntry>;
   furniture: FurnitureItem[];
   scene_calibration?: {
-    scaleFactor?: { x: number; y: number; z: number };
+    scaleFactor?: {
+      x: number;
+      y: number;
+      z: number;
+    };
     migratedToFrameScale?: boolean;
   };
 }
@@ -92,8 +99,6 @@ export interface CompileSceneOptions {
 
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-const DEG_TO_RAD = Math.PI / 180;
-
 function readFileAsUint8Array(filePath: string): Uint8Array {
   const raw = fs.readFileSync(filePath);
   return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
@@ -101,12 +106,8 @@ function readFileAsUint8Array(filePath: string): Uint8Array {
 
 function classifyAsset(
   item: FurnitureItem,
-  structuralEdits: Record<string, StructuralEditEntry>
+  structuralEdits: Record<string, StructuralEditEntry>,
 ): AssetType {
-  // Native-isolated entries are structural replacements even when an older
-  // project_state.json does not carry an explicit `type` or structural-edits
-  // record. Their source geometry lives in the IFC/world frame and must not
-  // use the catalog-furniture placement convention.
   if (item.isNativeIsolation || item.nativeSourceId) {
     return AssetType.STRUCTURAL_REPLACEMENT;
   }
@@ -125,15 +126,9 @@ function classifyAsset(
   return AssetType.FURNITURE;
 }
 
-function getIfcLineValue(line: any, key: string, fallback = ""): string {
-  const v = line?.[key];
-  if (v && typeof v === "object" && "value" in v) return String(v.value);
-  if (typeof v === "string") return v;
-  return fallback;
-}
-
 const DEBUG_COMPILER =
-  process.env.HCI_COMPILER_DEBUG === "1" || process.env.HCI_COMPILER_DEBUG === "true";
+  process.env.HCI_COMPILER_DEBUG === "1" ||
+  process.env.HCI_COMPILER_DEBUG === "true";
 
 function debugLog(...args: unknown[]): void {
   if (DEBUG_COMPILER) console.log(...args);
@@ -145,91 +140,138 @@ function isFiniteMatrix16(value: unknown): value is [
   number, number, number, number,
   number, number, number, number
 ] {
-  return Array.isArray(value)
-    && value.length === 16
-    && value.every((v) => typeof v === "number" && Number.isFinite(v)) as boolean;
+  return (
+    Array.isArray(value) &&
+    value.length === 16 &&
+    value.every(
+      (v) => typeof v === "number" && Number.isFinite(v),
+    )
+  );
 }
 
 function resolveItemMaterial(
   item: FurnitureItem,
-  materials: Record<string, MaterialEntry>
+  materials: Record<string, MaterialEntry>,
 ): MaterialEntry | undefined {
-  // Current frontend state stores placed-asset material overrides by instanceId.
-  // Keep id as a compatibility fallback for older states.
   return materials[item.instanceId] ?? materials[item.id];
 }
 
-function resolveMaterialTexturePath(src: string | undefined, assetsDirectory: string): string | null {
+function resolveMaterialTexturePath(
+  src: string | undefined,
+  assetsDirectory: string,
+): string | null {
   if (!src) return null;
-  const clean = String(src).split('?')[0].split('#')[0];
-  const compilerMaterials = path.join(ROOT_DIR, 'materials');
-  if (clean.startsWith('/materials/')) {
-    const candidate = path.resolve(compilerMaterials, clean.slice('/materials/'.length));
+
+  const clean = String(src).split("?")[0].split("#")[0];
+  const compilerMaterials = path.join(ROOT_DIR, "materials");
+
+  if (clean.startsWith("/materials/")) {
+    const candidate = path.resolve(
+      compilerMaterials,
+      clean.slice("/materials/".length),
+    );
     if (fs.existsSync(candidate)) return candidate;
   }
-  if (clean.startsWith('/assets/')) {
-    const candidate = path.resolve(assetsDirectory, clean.slice('/assets/'.length));
+
+  if (clean.startsWith("/assets/")) {
+    const candidate = path.resolve(
+      assetsDirectory,
+      clean.slice("/assets/".length),
+    );
     if (fs.existsSync(candidate)) return candidate;
   }
+
   return fs.existsSync(clean) ? clean : null;
 }
 
 function mimeForTexture(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
-  if (ext === '.webp') return 'image/webp';
-  return 'image/png';
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  return "image/png";
 }
 
 function applyMaterialToSubtree(
   root: GltfNode,
   materialOverride: MaterialEntry | undefined,
   doc: Document,
-  assetsDirectory: string
+  assetsDirectory: string,
 ): void {
   if (!materialOverride) return;
+
   const [r, g, b] = materialOverride.rgb;
   let sharedTexture: Texture | null = null;
-  if ((materialOverride.kind === 'fabric' || materialOverride.kind === 'texture') && materialOverride.texture?.src) {
-    const texturePath = resolveMaterialTexturePath(materialOverride.texture.src, assetsDirectory);
+
+  if (
+    (materialOverride.kind === "fabric" ||
+      materialOverride.kind === "texture") &&
+    materialOverride.texture?.src
+  ) {
+    const texturePath = resolveMaterialTexturePath(
+      materialOverride.texture.src,
+      assetsDirectory,
+    );
+
     if (texturePath) {
-      sharedTexture = doc.createTexture(`Tex_${materialOverride.texture.id || 'material'}`)
+      sharedTexture = doc
+        .createTexture(
+          `Tex_${materialOverride.texture.id || "material"}`,
+        )
         .setMimeType(mimeForTexture(texturePath))
         .setImage(fs.readFileSync(texturePath));
     }
   }
+
   const visit = (node: GltfNode): void => {
     const mesh = node.getMesh();
+
     if (mesh) {
       for (const primitive of mesh.listPrimitives()) {
         const source = primitive.getMaterial();
+
         let material = doc
-          .createMaterial(`${source?.getName() ?? node.getName()}_override`)
-          .setBaseColorFactor([r, g, b, source ? source.getBaseColorFactor()[3] : 1])
-          .setRoughnessFactor(materialOverride.roughness ?? source?.getRoughnessFactor() ?? 0.8)
-          .setMetallicFactor(materialOverride.metallic ?? source?.getMetallicFactor() ?? 0.1)
+          .createMaterial(
+            `${source?.getName() ?? node.getName()}_override`,
+          )
+          .setBaseColorFactor([
+            r,
+            g,
+            b,
+            source ? source.getBaseColorFactor()[3] : 1,
+          ])
+          .setRoughnessFactor(
+            materialOverride.roughness ??
+              source?.getRoughnessFactor() ??
+              0.8,
+          )
+          .setMetallicFactor(
+            materialOverride.metallic ??
+              source?.getMetallicFactor() ??
+              0.1,
+          )
           .setDoubleSided(source?.getDoubleSided() ?? true);
-        if (sharedTexture) material = material.setBaseColorTexture(sharedTexture);
+
+        if (sharedTexture) {
+          material = material.setBaseColorTexture(sharedTexture);
+        }
+
         primitive.setMaterial(material);
       }
     }
-    for (const child of node.listChildren()) visit(child);
+
+    for (const child of node.listChildren()) {
+      visit(child);
+    }
   };
+
   visit(root);
 }
 
 function computeScaledFurniturePivotTranslation(
   pivot: [number, number, number],
   targetPosition: [number, number, number],
-  scale: [number, number, number]
+  scale: [number, number, number],
 ): [number, number, number] {
-  // Match the frontend asset restore contract exactly:
-  // 1) apply persisted scale to the asset model,
-  // 2) read the scaled AABB,
-  // 3) place the model so the stored placement target is at the
-  //    scaled bottom-center pivot.
-  // Rotation is applied AFTER this translation in the frontend, so it is
-  // intentionally not included in this pivot calculation.
   return [
     targetPosition[0] - pivot[0] * scale[0],
     targetPosition[1] - pivot[1] * scale[1],
@@ -240,26 +282,19 @@ function computeScaledFurniturePivotTranslation(
 function applyPersistedGlbTransform(
   wrapper: GltfNode,
   item: FurnitureItem,
-  preserveNativeFrame: boolean
+  preserveNativeFrame: boolean,
 ): boolean {
-  // For catalog GLBs, project_state.matrix is the runtime/root transform
-  // that corresponds to the user's semantic placement. In the verified
-  // project states, item.position is the visual placement target while the
-  // matrix translation is that target minus the GLB's local visual pivot.
-  // Reusing item.position as the root translation causes a small but visible
-  // placement drift in output.glb.
-  //
-  // Hosted GLB doors keep the existing direct-position contract because their
-  // position is computed by the backend from the wall/void placement logic.
   if (preserveNativeFrame || !isFiniteMatrix16(item.matrix)) {
     return false;
   }
 
   try {
-    wrapper.setMatrix(item.matrix!);
-  } catch (err) {
+    wrapper.setMatrix(item.matrix);
+  } catch (error) {
     console.warn(
-      `[compiler:glb-transform] ${item.instanceId}: failed to apply persisted matrix; falling back to TRS - ${(err as Error).message}`
+      `[compiler:glb-transform] ${item.instanceId}: failed to apply persisted matrix; falling back to TRS - ${
+        (error as Error).message
+      }`,
     );
     return false;
   }
@@ -277,21 +312,14 @@ function applyAuthoredTransform(
   wrapper: GltfNode,
   item: FurnitureItem,
   pivot: [number, number, number] | null,
-  preserveNativeFrame: boolean
+  preserveNativeFrame: boolean,
 ): void {
-  // IFC/native-isolated assets continue to use the existing TRS contract.
-  // GLB catalog assets are handled separately below so that their persisted
-  // runtime matrix can be reproduced exactly when one is available.
   const rotation = eulerToQuaternion(item.rotation);
   const scale: [number, number, number] = Array.isArray(item.scale)
     ? item.scale
     : [1, 1, 1];
 
   if (preserveNativeFrame) {
-    // Native isolated IFCs are already authored in the IFC/world frame. The
-    // frontend restores them with their persisted TRS directly. Applying a
-    // furniture-style AABB/pivot correction here changes the frame and causes
-    // calibrated native edits to drift or appear as detached "ghost" geometry.
     wrapper.setTranslation(item.position);
     wrapper.setRotation(rotation);
     wrapper.setScale(scale);
@@ -302,6 +330,7 @@ function applyAuthoredTransform(
       rotation: item.rotation,
       scale,
     });
+
     return;
   }
 
@@ -312,15 +341,10 @@ function applyAuthoredTransform(
     return;
   }
 
-  // Catalog/placed IFC furniture uses the same bottom-center placement
-  // contract as the frontend. Do NOT rotate the pivot here: the frontend
-  // computes placement after scale and then applies rotation around the node
-  // origin. Reproducing that order is what keeps GLB output aligned with the
-  // editor for rotated doors/sofas and non-uniformly resized assets.
   const translation = computeScaledFurniturePivotTranslation(
     pivot,
     item.position,
-    scale
+    scale,
   );
 
   wrapper.setScale(scale);
@@ -338,121 +362,165 @@ function applyAuthoredTransform(
 }
 
 export async function compileScene(
-  options: CompileSceneOptions
+  options: CompileSceneOptions,
 ): Promise<void> {
-
   const { jobDirectory, assetsDirectory } = options;
 
   const INPUT_IFC_PATH = path.join(jobDirectory, "input.ifc");
   const PROJECT_STATE_PATH = path.join(jobDirectory, "project_state.json");
+
+  // Build artifact. This file is never exposed to the browser and is removed
+  // after navigation + optimization complete.
+  const RAW_GLB_PATH = path.join(jobDirectory, "output.raw.glb");
+
+  // Browser-facing production artifact.
   const OUTPUT_GLB_PATH = path.join(jobDirectory, "output.glb");
 
-    function resolveGlbPath(src: string): string {
-      // src is a full URL like http://localhost:3000/uploads/catalog/models/xxx.glb
-      // or a relative path like /uploads/catalog/models/xxx.glb
-      let pathname: string;
-      try {
-        pathname = new URL(src).pathname;
-      } catch {
-        pathname = src;
-      }
-      // Map /uploads/... to the uploads folder sitting next to the compiler's server root
-      if (pathname.startsWith("/uploads/")) {
-        return path.join(ROOT_DIR, "..", pathname);
-      }
-      // Fallback: treat as absolute path
-      return pathname;
-    }
+  const OPTIMIZATION_REPORT_PATH = path.join(
+    jobDirectory,
+    "optimization_report.json",
+  );
 
-    function resolveIfcPath(src: string): string {
-    // Normalise: accept both full URLs (http://host/...) and bare paths (/assets/...)
+  function resolveGlbPath(src: string): string {
     let pathname: string;
+
     try {
       pathname = new URL(src).pathname;
     } catch {
-      // src is already a bare path like /assets/wall_standard.ifc
-      pathname = src.startsWith("/") ? src : `/${src}`;
+      pathname = src;
     }
 
-    // Strip query-string / fragment that may survive URL parsing
-    pathname = pathname.split("?")[0].split("#")[0];
-
-    // /assets/<file>  →  assetsDirectory/<file>
-    if (pathname.startsWith("/assets/")) {
-      return path.join(assetsDirectory, path.basename(pathname));
-    }
-
-    // /uploads/<rest>  →  <serverRoot>/uploads/<rest>  (catalog-uploaded IFCs)
     if (pathname.startsWith("/uploads/")) {
       return path.join(ROOT_DIR, "..", pathname);
     }
 
-    // /jobs/<jobId>/<relativePath>  →  job directory lookup
+    return pathname;
+  }
+
+  function resolveIfcPath(src: string): string {
+    let pathname: string;
+
+    try {
+      pathname = new URL(src).pathname;
+    } catch {
+      pathname = src.startsWith("/") ? src : `/${src}`;
+    }
+
+    pathname = pathname.split("?")[0].split("#")[0];
+
+    if (pathname.startsWith("/assets/")) {
+      return path.join(
+        assetsDirectory,
+        path.basename(pathname),
+      );
+    }
+
+    if (pathname.startsWith("/uploads/")) {
+      return path.join(ROOT_DIR, "..", pathname);
+    }
+
     if (pathname.startsWith("/jobs/")) {
-      const match = pathname.match(/^\/jobs\/([^\/]+)\/(.+)$/);
-      if (!match) throw new Error(`Invalid /jobs/ src: ${src}`);
+      const match = pathname.match(/^\/jobs\/([^/]+)\/(.+)$/);
+
+      if (!match) {
+        throw new Error(`Invalid /jobs/ src: ${src}`);
+      }
 
       const originalJobId = match[1];
-      const relativePath  = match[2];
+      const relativePath = match[2];
 
-      const currentPath = path.join(jobDirectory, relativePath);
-      if (fs.existsSync(currentPath)) return currentPath;
+      const currentPath = path.join(
+        jobDirectory,
+        relativePath,
+      );
 
-      const originalJobPath = path.join(path.dirname(jobDirectory), originalJobId, relativePath);
+      if (fs.existsSync(currentPath)) {
+        return currentPath;
+      }
+
+      const originalJobPath = path.join(
+        path.dirname(jobDirectory),
+        originalJobId,
+        relativePath,
+      );
+
       if (fs.existsSync(originalJobPath)) {
-        console.warn(`[compiler] Using edited IFC from original job: ${originalJobPath}`);
+        console.warn(
+          `[compiler] Using edited IFC from original job: ${originalJobPath}`,
+        );
         return originalJobPath;
       }
 
-      throw new Error(`Edited IFC not found.\nCurrent: ${currentPath}\nOriginal: ${originalJobPath}`);
+      throw new Error(
+        `Edited IFC not found.\nCurrent: ${currentPath}\nOriginal: ${originalJobPath}`,
+      );
     }
 
     throw new Error(`Unsupported src: ${src}`);
   }
-  
+
   if (!fs.existsSync(INPUT_IFC_PATH)) {
-    throw new Error(`Fatal: structural IFC not found at ${INPUT_IFC_PATH}`);
-  }
-  if (!fs.existsSync(PROJECT_STATE_PATH)) {
     throw new Error(
-      `Fatal: project_state.json not found at ${PROJECT_STATE_PATH}`
+      `Fatal: structural IFC not found at ${INPUT_IFC_PATH}`,
     );
   }
 
-  const structuralIfcBytes = readFileAsUint8Array(INPUT_IFC_PATH);
+  if (!fs.existsSync(PROJECT_STATE_PATH)) {
+    throw new Error(
+      `Fatal: project_state.json not found at ${PROJECT_STATE_PATH}`,
+    );
+  }
+
+  const structuralIfcBytes = readFileAsUint8Array(
+    INPUT_IFC_PATH,
+  );
 
   let projectState: ProjectState;
+
   try {
-    const raw = fs.readFileSync(PROJECT_STATE_PATH, "utf-8");
-    projectState = JSON.parse(raw) as ProjectState;
-  } catch (err) {
+    projectState = JSON.parse(
+      fs.readFileSync(PROJECT_STATE_PATH, "utf-8"),
+    ) as ProjectState;
+  } catch (error) {
     throw new Error(
-      `Fatal: could not parse project_state.json - ${(err as Error).message}`
+      `Fatal: could not parse project_state.json - ${
+        (error as Error).message
+      }`,
     );
   }
 
   if (!Array.isArray(projectState.furniture)) {
     throw new Error(
-      "Fatal: project_state.json is malformed - 'furniture' must be an array."
+      "Fatal: project_state.json is malformed - 'furniture' must be an array.",
     );
   }
 
-  const structuralEdits = projectState.structural_edits ?? {};
+  const structuralEdits =
+    projectState.structural_edits ?? {};
   const materials = projectState.materials ?? {};
 
-  // Phase 6A: semantic room detection is read-only and must never block scene compilation.
-  // It operates from the current input.ifc + project_state structural replacements and
-  // writes rooms_debug.json for validation before editor integration.
-  try {
-    await RoomDetector.run({ jobDirectory });
-  } catch (err) {
-    console.warn(`[compiler:rooms] Room detection failed; continuing GLB compilation - ${(err as Error).message}`);
+  // Room detection is a diagnostics/editor aid. Do not run it during
+  // production 360 renders unless explicitly enabled.
+  if (process.env.HCI_ENABLE_LEGACY_ROOM_DETECTOR === "1") {
+    try {
+      await RoomDetector.run({ jobDirectory });
+    } catch (error) {
+      console.warn(
+        `[compiler:rooms] Room detection failed; continuing GLB compilation - ${
+          (error as Error).message
+        }`,
+      );
+    }
   }
 
-  // Persisted furniture position/scale are already in the CURRENT calibrated
-  // scene frame. Do not apply scene_calibration a second time to asset TRS.
-  if (projectState.scene_calibration?.scaleFactor && DEBUG_COMPILER) {
-    debugLog("[compiler:calibration] metadata only", projectState.scene_calibration);
+  if (
+    projectState.scene_calibration?.scaleFactor &&
+    DEBUG_COMPILER
+  ) {
+    debugLog(
+      "[compiler:calibration] metadata only",
+      projectState.scene_calibration,
+    );
   }
 
   const ifcApi = new IfcAPI();
@@ -466,20 +534,25 @@ export async function compileScene(
 
   try {
     let structuralModelId: number;
+
     try {
-      structuralModelId = ifcApi.OpenModel(structuralIfcBytes, {
-        COORDINATE_TO_ORIGIN: false,
-      });
+      structuralModelId = ifcApi.OpenModel(
+        structuralIfcBytes,
+        {
+          COORDINATE_TO_ORIGIN: false,
+        },
+      );
       openModelIds.push(structuralModelId);
-    } catch (err) {
+    } catch (error) {
       throw new Error(
         `Fatal: failed to parse structural input.ifc via web-ifc - ${
-          (err as Error).message
-        }`
+          (error as Error).message
+        }`,
       );
     }
 
     let structureNode: GltfNode;
+
     try {
       structureNode = extractGeometry(
         ifcApi,
@@ -491,44 +564,57 @@ export async function compileScene(
           structuralEdits,
           materialOverrides: materials,
           assetsDirectory,
-        }
+        },
       );
-    } catch (err) {
+    } catch (error) {
       throw new Error(
         `Fatal: extractGeometry failed on structural model - ${
-          (err as Error).message
-        }`
+          (error as Error).message
+        }`,
       );
     }
 
-    // The persisted calibration factor represents the scene frame produced by
-    // the backend /rescale operation. That operation rewrites the project IFC
-    // coordinates by the factor about the IFC/world origin; the frontend then
-    // transforms every persisted asset position and scale by the same factor.
-    // The current GLB compiler is reading the structural IFC in its raw frame,
-    // so we must reproduce that same structural frame transform exactly once.
-    // Do NOT pivot the structure around its visual center here: the frontend's
-    // persisted asset positions are already in the origin-scaled frame
-    // (newCenter = oldCenter * ratio for this calibration path).
-    const persistedCalibration = projectState.scene_calibration?.scaleFactor;
-    const calibrationScale: [number, number, number] =
+    const persistedCalibration =
+      projectState.scene_calibration?.scaleFactor;
+
+    const calibrationScale: [
+      number,
+      number,
+      number
+    ] =
       persistedCalibration &&
       Number.isFinite(persistedCalibration.x) &&
       Number.isFinite(persistedCalibration.y) &&
       Number.isFinite(persistedCalibration.z) &&
-      persistedCalibration.x > 0 && persistedCalibration.y > 0 && persistedCalibration.z > 0
-        ? [persistedCalibration.x, persistedCalibration.y, persistedCalibration.z]
+      persistedCalibration.x > 0 &&
+      persistedCalibration.y > 0 &&
+      persistedCalibration.z > 0
+        ? [
+            persistedCalibration.x,
+            persistedCalibration.y,
+            persistedCalibration.z,
+          ]
         : [1, 1, 1];
 
-    if (calibrationScale.some((v) => Math.abs(v - 1) > 1e-9)) {
-      const structureFrame = doc.createNode("IFC_Structure_Frame").addChild(structureNode);
+    if (
+      calibrationScale.some(
+        (value) => Math.abs(value - 1) > 1e-9,
+      )
+    ) {
+      const structureFrame = doc
+        .createNode("IFC_Structure_Frame")
+        .addChild(structureNode);
+
       structureFrame.setScale(calibrationScale);
       scene.addChild(structureFrame);
 
-      debugLog("[compiler:calibration] applied structural scene-frame scale", {
-        calibrationScale,
-        pivot: "world-origin",
-      });
+      debugLog(
+        "[compiler:calibration] applied structural scene-frame scale",
+        {
+          calibrationScale,
+          pivot: "world-origin",
+        },
+      );
     } else {
       scene.addChild(structureNode);
     }
@@ -537,102 +623,160 @@ export async function compileScene(
 
     for (const item of projectState.furniture) {
       const isGlb =
-        item.assetFormat === 'glb' ||
-        item.fileType === 'glb' ||
-        item.src.toLowerCase().endsWith('.glb');
+        item.assetFormat === "glb" ||
+        item.fileType === "glb" ||
+        item.src.toLowerCase().endsWith(".glb");
 
       try {
         if (isGlb) {
-          // ── GLB branch ──────────────────────────────────────────────
           const assetPath = resolveGlbPath(item.src);
-          console.log(`[compiler] Loading GLB: ${item.name} -> ${assetPath}`);
+
+          console.log(
+            `[compiler] Loading GLB: ${item.name} -> ${assetPath}`,
+          );
 
           if (!fs.existsSync(assetPath)) {
-            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): GLB not found at ${assetPath}`);
+            console.warn(
+              `[compiler] Skipping "${item.instanceId}" (${item.name}): GLB not found at ${assetPath}`,
+            );
             continue;
           }
 
           let glbDoc: Document;
+
           try {
             const glbBytes = fs.readFileSync(assetPath);
-            glbDoc = await io.readBinary(new Uint8Array(glbBytes.buffer, glbBytes.byteOffset, glbBytes.byteLength));
-          } catch (err) {
-            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): failed to read GLB - ${(err as Error).message}`);
+
+            glbDoc = await io.readBinary(
+              new Uint8Array(
+                glbBytes.buffer,
+                glbBytes.byteOffset,
+                glbBytes.byteLength,
+              ),
+            );
+          } catch (error) {
+            console.warn(
+              `[compiler] Skipping "${item.instanceId}" (${item.name}): failed to read GLB - ${
+                (error as Error).message
+              }`,
+            );
             continue;
           }
 
-          const clonedRoot = doc.createNode(`${item.instanceId}_geometry`);
+          const clonedRoot = doc.createNode(
+            `${item.instanceId}_geometry`,
+          );
 
-          function cloneNode(srcNode: GltfNode, parentDst: GltfNode): void {
-            const dstNode = doc.createNode(srcNode.getName());
+          function cloneNode(
+            srcNode: GltfNode,
+            parentDst: GltfNode,
+          ): void {
+            const dstNode = doc.createNode(
+              srcNode.getName(),
+            );
 
-            // Preserve the source node's authored matrix when present. Some
-            // catalog GLBs rely on matrix-based parent transforms; rebuilding
-            // those nodes from TRS can introduce small placement differences.
             let copiedSourceMatrix = false;
+
             try {
               const sourceMatrix = srcNode.getMatrix();
-              if (sourceMatrix && sourceMatrix.length === 16) {
+
+              if (
+                sourceMatrix &&
+                sourceMatrix.length === 16
+              ) {
                 dstNode.setMatrix(sourceMatrix);
                 copiedSourceMatrix = true;
               }
-            } catch (_) {
+            } catch {
               copiedSourceMatrix = false;
             }
 
             if (!copiedSourceMatrix) {
-              dstNode.setTranslation(srcNode.getTranslation());
-              dstNode.setRotation(srcNode.getRotation());
+              dstNode.setTranslation(
+                srcNode.getTranslation(),
+              );
+              dstNode.setRotation(
+                srcNode.getRotation(),
+              );
               dstNode.setScale(srcNode.getScale());
             }
 
             const srcMesh = srcNode.getMesh();
+
             if (srcMesh) {
-              const dstMesh = doc.createMesh(srcMesh.getName());
+              const dstMesh = doc.createMesh(
+                srcMesh.getName(),
+              );
+
               for (const srcPrim of srcMesh.listPrimitives()) {
                 const dstPrim = doc.createPrimitive();
+
                 dstPrim.setMode(srcPrim.getMode());
 
                 const srcIdx = srcPrim.getIndices();
+
                 if (srcIdx) {
                   const srcArr = srcIdx.getArray();
+
                   if (srcArr) {
                     dstPrim.setIndices(
-                      doc.createAccessor()
+                      doc
+                        .createAccessor()
                         .setType(srcIdx.getType())
                         .setArray(srcArr.slice())
-                        .setBuffer(buffer)
+                        .setBuffer(buffer),
                     );
                   }
                 }
 
                 for (const semantic of srcPrim.listSemantics()) {
-                  const srcAttr = srcPrim.getAttribute(semantic)!;
+                  const srcAttr =
+                    srcPrim.getAttribute(semantic)!;
                   const srcArr = srcAttr.getArray();
+
                   if (srcArr) {
                     dstPrim.setAttribute(
                       semantic,
-                      doc.createAccessor()
+                      doc
+                        .createAccessor()
                         .setType(srcAttr.getType())
                         .setArray(srcArr.slice())
-                        .setBuffer(buffer)
+                        .setBuffer(buffer),
                     );
                   }
                 }
 
-                const srcMat = srcPrim.getMaterial();
+                const srcMat =
+                  srcPrim.getMaterial();
+
                 if (srcMat) {
-                  const [r, g, b, a] = srcMat.getBaseColorFactor();
-                  const dstMat = doc.createMaterial(srcMat.getName())
-                    .setBaseColorFactor([r, g, b, a])
-                    .setRoughnessFactor(srcMat.getRoughnessFactor())
-                    .setMetallicFactor(srcMat.getMetallicFactor())
-                    .setDoubleSided(srcMat.getDoubleSided());
+                  const [r, g, b, a] =
+                    srcMat.getBaseColorFactor();
+
+                  const dstMat = doc
+                    .createMaterial(srcMat.getName())
+                    .setBaseColorFactor([
+                      r,
+                      g,
+                      b,
+                      a,
+                    ])
+                    .setRoughnessFactor(
+                      srcMat.getRoughnessFactor(),
+                    )
+                    .setMetallicFactor(
+                      srcMat.getMetallicFactor(),
+                    )
+                    .setDoubleSided(
+                      srcMat.getDoubleSided(),
+                    );
+
                   dstPrim.setMaterial(dstMat);
                 }
 
                 dstMesh.addPrimitive(dstPrim);
               }
+
               dstNode.setMesh(dstMesh);
             }
 
@@ -643,73 +787,115 @@ export async function compileScene(
             }
           }
 
-          const glbScenes = glbDoc.getRoot().listScenes();
-          for (const glbScene of glbScenes) {
+          for (const glbScene of glbDoc
+            .getRoot()
+            .listScenes()) {
             for (const rootNode of glbScene.listChildren()) {
               cloneNode(rootNode, clonedRoot);
             }
           }
 
-          const instanceWrapper = doc.createNode(item.instanceId).addChild(clonedRoot);
+          const instanceWrapper = doc
+            .createNode(item.instanceId)
+            .addChild(clonedRoot);
 
-          const itemMaterial = resolveItemMaterial(item, materials);
-          applyMaterialToSubtree(clonedRoot, itemMaterial, doc, assetsDirectory);
-
-          // GLB doors placed via insert-door have doorHostWallId set. Their
-          // position is the exact Python-computed void center — use it directly
-          // without any AABB pivot correction (same contract as native-isolated IFCs).
-          const isHostedDoor = !!item.doorHostWallId;
-          const appliedPersistedMatrix = applyPersistedGlbTransform(
-            instanceWrapper,
-            item,
-            isHostedDoor
+          applyMaterialToSubtree(
+            clonedRoot,
+            resolveItemMaterial(item, materials),
+            doc,
+            assetsDirectory,
           );
 
+          const isHostedDoor =
+            !!item.doorHostWallId;
+
+          const appliedPersistedMatrix =
+            applyPersistedGlbTransform(
+              instanceWrapper,
+              item,
+              isHostedDoor,
+            );
+
           if (!appliedPersistedMatrix) {
-            applyAuthoredTransform(instanceWrapper, item, null, isHostedDoor);
+            applyAuthoredTransform(
+              instanceWrapper,
+              item,
+              null,
+              isHostedDoor,
+            );
           }
 
           scene.addChild(instanceWrapper);
-          debugLog(`[compiler] Mounted GLB "${item.instanceId}" (${item.name})`, {
-            assetFrame: "catalog-glb",
-            position: item.position,
-            rotation: item.rotation,
-            scale: item.scale,
-            matrix: isFiniteMatrix16(item.matrix) ? item.matrix : null,
-            matrixApplied: appliedPersistedMatrix,
-          });
 
+          debugLog(
+            `[compiler] Mounted GLB "${item.instanceId}" (${item.name})`,
+            {
+              assetFrame: "catalog-glb",
+              position: item.position,
+              rotation: item.rotation,
+              scale: item.scale,
+              matrix: isFiniteMatrix16(item.matrix)
+                ? item.matrix
+                : null,
+              matrixApplied: appliedPersistedMatrix,
+            },
+          );
         } else {
-          // ── IFC branch ───────────────────────────────────────────────
-          const assetType = classifyAsset(item, structuralEdits);
-          const behavior = ASSET_TYPE_BEHAVIOR[assetType];
+          const assetType = classifyAsset(
+            item,
+            structuralEdits,
+          );
+          const behavior =
+            ASSET_TYPE_BEHAVIOR[assetType];
 
           const assetPath = resolveIfcPath(item.src);
-          console.log(`[compiler] Loading IFC: ${item.name} -> ${assetPath}`);
+
+          console.log(
+            `[compiler] Loading IFC: ${item.name} -> ${assetPath}`,
+          );
 
           if (!fs.existsSync(assetPath)) {
-            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): asset not found at ${assetPath}`);
+            console.warn(
+              `[compiler] Skipping "${item.instanceId}" (${item.name}): asset not found at ${assetPath}`,
+            );
             continue;
           }
 
           let assetBytes: Uint8Array;
+
           try {
-            assetBytes = readFileAsUint8Array(assetPath);
-          } catch (err) {
-            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): failed to read asset - ${(err as Error).message}`);
+            assetBytes =
+              readFileAsUint8Array(assetPath);
+          } catch (error) {
+            console.warn(
+              `[compiler] Skipping "${item.instanceId}" (${item.name}): failed to read asset - ${
+                (error as Error).message
+              }`,
+            );
             continue;
           }
 
           let assetModelId: number;
+
           try {
-            assetModelId = ifcApi.OpenModel(assetBytes, { COORDINATE_TO_ORIGIN: false });
+            assetModelId = ifcApi.OpenModel(
+              assetBytes,
+              {
+                COORDINATE_TO_ORIGIN: false,
+              },
+            );
             openModelIds.push(assetModelId);
-          } catch (err) {
-            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): web-ifc failed - ${(err as Error).message}`);
+          } catch (error) {
+            console.warn(
+              `[compiler] Skipping "${item.instanceId}" (${item.name}): web-ifc failed - ${
+                (error as Error).message
+              }`,
+            );
             continue;
           }
 
           let tempSubtree: GltfNode;
+
           try {
             tempSubtree = extractGeometry(
               ifcApi,
@@ -717,33 +903,53 @@ export async function compileScene(
               doc,
               buffer,
               `${item.instanceId}_geometry`,
-              behavior.applyMaterialOverrides ? { materialOverrides: materials, assetsDirectory } : {}
+              behavior.applyMaterialOverrides
+                ? {
+                    materialOverrides:
+                      materials,
+                    assetsDirectory,
+                  }
+                : {},
             );
-          } catch (err) {
-            console.warn(`[compiler] Skipping "${item.instanceId}" (${item.name}): extractGeometry failed - ${(err as Error).message}`);
+          } catch (error) {
+            console.warn(
+              `[compiler] Skipping "${item.instanceId}" (${item.name}): extractGeometry failed - ${
+                (error as Error).message
+              }`,
+            );
             continue;
           }
 
-          // Furniture material overrides are keyed by the placed instance in
-          // current frontend state, not by the source IFC GlobalId.
           if (assetType === AssetType.FURNITURE) {
-            applyMaterialToSubtree(tempSubtree, resolveItemMaterial(item, materials), doc, assetsDirectory);
+            applyMaterialToSubtree(
+              tempSubtree,
+              resolveItemMaterial(
+                item,
+                materials,
+              ),
+              doc,
+              assetsDirectory,
+            );
           }
 
-          const instanceWrapper = doc.createNode(item.instanceId).addChild(tempSubtree);
+          const instanceWrapper = doc
+            .createNode(item.instanceId)
+            .addChild(tempSubtree);
 
-          // Critical compositor rule:
-          // - Furniture geometry is in the asset's local frame. Its saved
-          //   position is the desired pivot position in the CURRENT scene frame.
-          // - Native isolated IFC geometry already carries its IFC/world frame.
-          //   Scale/rotation must therefore pivot around that geometry instead
-          //   of the global origin (otherwise calibrated edits fly apart).
-          let pivot: [number, number, number] | null = null;
+          let pivot:
+            | [number, number, number]
+            | null = null;
+
           try {
-            pivot = computeAssetPivotOffset(tempSubtree);
-          } catch (err) {
+            pivot =
+              computeAssetPivotOffset(
+                tempSubtree,
+              );
+          } catch (error) {
             console.warn(
-              `[compiler] Pivot computation failed for "${item.instanceId}": ${(err as Error).message}; falling back to raw TRS.`
+              `[compiler] Pivot computation failed for "${item.instanceId}": ${
+                (error as Error).message
+              }; falling back to raw TRS.`,
             );
           }
 
@@ -751,70 +957,168 @@ export async function compileScene(
             instanceWrapper,
             item,
             pivot,
-            assetType === AssetType.STRUCTURAL_REPLACEMENT
+            assetType ===
+              AssetType.STRUCTURAL_REPLACEMENT,
           );
 
           scene.addChild(instanceWrapper);
-          debugLog(`[compiler] Mounted IFC "${item.instanceId}" (${item.name}) [${assetType}]`, {
-            assetFrame: assetType === AssetType.STRUCTURAL_REPLACEMENT ? "native-isolation" : "catalog-furniture",
-            position: item.position,
-            rotation: item.rotation,
-            scale: item.scale,
-            pivot,
-            matrix: isFiniteMatrix16(item.matrix) ? item.matrix : null,
-          });
+
+          debugLog(
+            `[compiler] Mounted IFC "${item.instanceId}" (${item.name}) [${assetType}]`,
+            {
+              assetFrame:
+                assetType ===
+                AssetType.STRUCTURAL_REPLACEMENT
+                  ? "native-isolation"
+                  : "catalog-furniture",
+              position: item.position,
+              rotation: item.rotation,
+              scale: item.scale,
+              pivot,
+              matrix: isFiniteMatrix16(item.matrix)
+                ? item.matrix
+                : null,
+            },
+          );
         }
-      } catch (err) {
-        console.warn(`[compiler] Unexpected error processing "${item.instanceId ?? 'unknown'}": ${(err as Error).message}. Skipping.`);
+      } catch (error) {
+        console.warn(
+          `[compiler] Unexpected error processing "${
+            item.instanceId ?? "unknown"
+          }": ${(error as Error).message}. Skipping.`,
+        );
         continue;
       }
     }
 
-    const glbBuffer = await io.writeBinary(doc);
-    fs.writeFileSync(OUTPUT_GLB_PATH, Buffer.from(glbBuffer));
+    // -----------------------------------------------------------
+    // BUILD RAW GLB
+    // -----------------------------------------------------------
 
-    console.log(`[compiler] Wrote ${OUTPUT_GLB_PATH} (${glbBuffer.byteLength} bytes)`);
+    const glbBuffer = await io.writeBinary(doc);
+
+    fs.writeFileSync(
+      RAW_GLB_PATH,
+      Buffer.from(glbBuffer),
+    );
+
+    console.log(
+      `[compiler] Wrote raw build GLB ${RAW_GLB_PATH} (${glbBuffer.byteLength} bytes)`,
+    );
+
+    // -----------------------------------------------------------
+    // NAVIGATION FROM EXACT COMPILED GEOMETRY
+    // -----------------------------------------------------------
 
     try {
-      await WalkNavigationPipeline.run(OUTPUT_GLB_PATH, jobDirectory);
-    } catch (err) {
-      console.error(
-        `[compiler] Recast navigation generation failed - ${(err as Error).message}. Continuing with output.glb.`
+      await WalkNavigationPipeline.run(
+        RAW_GLB_PATH,
+        jobDirectory,
+      );
+    } catch (error) {
+      throw new Error(
+        `Recast navigation generation failed - ${
+          (error as Error).message
+        }`,
       );
     }
+
+    // -----------------------------------------------------------
+    // PRODUCTION VISUAL GLB
+    // -----------------------------------------------------------
+
+    try {
+      await optimizeGlb({
+        inputPath: RAW_GLB_PATH,
+        outputPath: OUTPUT_GLB_PATH,
+        reportPath: OPTIMIZATION_REPORT_PATH,
+        simplifyRatio:
+          Number(
+            process.env.HCI_GLB_SIMPLIFY_RATIO,
+          ) || 0.70,
+        simplifyError:
+          Number(
+            process.env.HCI_GLB_SIMPLIFY_ERROR,
+          ) || 0.001,
+        maxTextureSize:
+          Number(
+            process.env.HCI_GLB_MAX_TEXTURE_SIZE,
+          ) || 2048,
+        textureQuality:
+          Number(
+            process.env.HCI_GLB_TEXTURE_QUALITY,
+          ) || 86,
+      });
+    } finally {
+      // Never leave the massive raw build artifact in a production job.
+      try {
+        if (fs.existsSync(RAW_GLB_PATH)) {
+          fs.rmSync(RAW_GLB_PATH, {
+            force: true,
+          });
+        }
+      } catch (cleanupError) {
+        console.warn(
+          `[compiler] Failed to remove temporary raw GLB: ${
+            (cleanupError as Error).message
+          }`,
+        );
+      }
+    }
+
+    if (!fs.existsSync(OUTPUT_GLB_PATH)) {
+      throw new Error(
+        `Production optimization completed without output.glb: ${OUTPUT_GLB_PATH}`,
+      );
+    }
+
+    console.log(
+      `[compiler] Production visual GLB ready at ${OUTPUT_GLB_PATH}`,
+    );
   } finally {
     for (const modelId of openModelIds) {
       try {
         ifcApi.CloseModel(modelId);
-      } catch (err) {
+      } catch (error) {
         console.warn(
           `[compiler] Warning: failed to close model ${modelId} - ${
-            (err as Error).message
-          }`
+            (error as Error).message
+          }`,
         );
       }
     }
   }
 }
 
-const isMainModule = import.meta.url === pathToFileURL(process.argv[1] ?? '').href;
+const isMainModule =
+  import.meta.url ===
+  pathToFileURL(process.argv[1] ?? "").href;
 
 if (isMainModule) {
-  const [jobDirectory, assetsDirectory] = process.argv.slice(2);
+  const [jobDirectory, assetsDirectory] =
+    process.argv.slice(2);
 
   if (!jobDirectory || !assetsDirectory) {
     console.error(
-      "Usage: npx tsx compiler.ts <jobDirectory> <assetsDirectory>"
+      "Usage: npx tsx compiler.ts <jobDirectory> <assetsDirectory>",
     );
     process.exit(1);
   }
 
-  compileScene({ jobDirectory, assetsDirectory })
+  compileScene({
+    jobDirectory,
+    assetsDirectory,
+  })
     .then(() => {
       process.exit(0);
     })
-    .catch((err) => {
-      console.error("[compiler] Fatal error:", err instanceof Error ? err.message : err);
+    .catch((error) => {
+      console.error(
+        "[compiler] Fatal error:",
+        error instanceof Error
+          ? error.message
+          : error,
+      );
       process.exit(1);
     });
 }
