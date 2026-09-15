@@ -3,35 +3,76 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { compileScene } from "./compiler";
 
-const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ROOT_DIR = path.dirname(
+  fileURLToPath(import.meta.url),
+);
 
 export interface ProductionCompileOptions {
   jobDirectory: string;
   assetsDirectory: string;
 }
 
+const PRODUCTION_ONLY_ARTIFACTS = [
+  "output.raw.glb",
+  "walk_nav_input_debug.obj",
+  "rooms_debug.json",
+  "360_viewer.html",
+];
+
+function cleanupProductionOnlyArtifacts(
+  jobDirectory: string,
+): void {
+  for (const fileName of PRODUCTION_ONLY_ARTIFACTS) {
+    const filePath = path.join(
+      jobDirectory,
+      fileName,
+    );
+
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.rmSync(filePath, {
+          force: true,
+        });
+
+        console.log(
+          `[production-compile] removed build/debug artifact: ${fileName}`,
+        );
+      }
+    } catch (error) {
+      // Cleanup must never turn a successful render into a 500.
+      console.warn(
+        `[production-compile] cleanup failed for ${fileName}:`,
+        error instanceof Error
+          ? error.message
+          : error,
+      );
+    }
+  }
+}
+
 /**
- * Production render entry point.
+ * Production 360 render entry point.
  *
- * IMPORTANT:
- * compileScene() already performs the full production visual pipeline:
- *   1. exact scene compilation
- *   2. navigation generation from the raw compiled geometry
- *   3. GLB optimization
- *   4. removal of the temporary raw GLB
+ * There is exactly ONE GLB optimization pass:
  *
- * The server calls this production entry point, so optimization must NOT be
- * repeated here. Re-optimizing output.glb would attempt to read a GLB that
- * already contains EXT_meshopt_compression and would require a MeshoptDecoder.
+ *   production-compile
+ *       -> compileScene
+ *           -> output.raw.glb
+ *           -> navigation from exact compiled geometry
+ *           -> optimizeGlb
+ *           -> output.glb
  *
- * Keep this wrapper deliberately thin so there is one authoritative compiler
- * pipeline and one browser-facing output.glb.
+ * compileScene is the authoritative owner of the visual GLB pipeline.
+ * This wrapper intentionally DOES NOT call optimizeGlb again.
  */
 export async function compileProductionScene({
   jobDirectory,
   assetsDirectory,
 }: ProductionCompileOptions): Promise<void> {
-  const outputGlbPath = path.join(jobDirectory, "output.glb");
+  const outputGlbPath = path.join(
+    jobDirectory,
+    "output.glb",
+  );
 
   await compileScene({
     jobDirectory,
@@ -52,6 +93,11 @@ export async function compileProductionScene({
     );
   }
 
+  // Do not keep huge raw/debug artifacts in customer jobs.
+  cleanupProductionOnlyArtifacts(
+    jobDirectory,
+  );
+
   console.log(
     `[production-compile] optimized walkthrough ready: ${outputGlbPath} (${stat.size} bytes)`,
   );
@@ -59,10 +105,15 @@ export async function compileProductionScene({
 
 const isMainModule =
   import.meta.url ===
-  new URL(`file://${process.argv[1]?.replace(/\\/g, "/")}`).href;
+  new URL(
+    `file://${process.argv[1]?.replace(/\\/g, "/")}`,
+  ).href;
 
 if (isMainModule) {
-  const [jobDirectory, assetsDirectory] = process.argv.slice(2);
+  const [
+    jobDirectory,
+    assetsDirectory,
+  ] = process.argv.slice(2);
 
   if (!jobDirectory || !assetsDirectory) {
     console.error(
@@ -79,7 +130,9 @@ if (isMainModule) {
     .catch((error) => {
       console.error(
         "[production-compile] Fatal:",
-        error instanceof Error ? error.message : error,
+        error instanceof Error
+          ? error.message
+          : error,
       );
       process.exit(1);
     });
