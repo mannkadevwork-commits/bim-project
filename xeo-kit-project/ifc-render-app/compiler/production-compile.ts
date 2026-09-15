@@ -2,7 +2,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { compileScene } from "./compiler";
-import { optimizeGlb } from "./glb-optimizer";
 
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -14,21 +13,25 @@ export interface ProductionCompileOptions {
 /**
  * Production render entry point.
  *
- * Existing compileScene() remains responsible for the exact scene assembly
- * and navigation generation. Once it has finished, output.glb is still the
- * exact compiler artifact; navigation has already been generated from it.
- * We then replace only the visual output.glb with the optimized asset.
+ * IMPORTANT:
+ * compileScene() already performs the full production visual pipeline:
+ *   1. exact scene compilation
+ *   2. navigation generation from the raw compiled geometry
+ *   3. GLB optimization
+ *   4. removal of the temporary raw GLB
  *
- * This keeps the existing navigation/collision behavior intact while making
- * the browser-facing artifact production-optimized automatically.
+ * The server calls this production entry point, so optimization must NOT be
+ * repeated here. Re-optimizing output.glb would attempt to read a GLB that
+ * already contains EXT_meshopt_compression and would require a MeshoptDecoder.
+ *
+ * Keep this wrapper deliberately thin so there is one authoritative compiler
+ * pipeline and one browser-facing output.glb.
  */
 export async function compileProductionScene({
   jobDirectory,
   assetsDirectory,
 }: ProductionCompileOptions): Promise<void> {
   const outputGlbPath = path.join(jobDirectory, "output.glb");
-  const optimizedPath = path.join(jobDirectory, "output.optimized.tmp.glb");
-  const reportPath = path.join(jobDirectory, "optimization_report.json");
 
   await compileScene({
     jobDirectory,
@@ -41,29 +44,17 @@ export async function compileProductionScene({
     );
   }
 
-  try {
-    await optimizeGlb({
-      inputPath: outputGlbPath,
-      outputPath: optimizedPath,
-      reportPath,
-      simplifyRatio: Number(process.env.HCI_GLB_SIMPLIFY_RATIO) || 0.70,
-      simplifyError: Number(process.env.HCI_GLB_SIMPLIFY_ERROR) || 0.001,
-      maxTextureSize: Number(process.env.HCI_GLB_MAX_TEXTURE_SIZE) || 2048,
-      textureQuality: Number(process.env.HCI_GLB_TEXTURE_QUALITY) || 86,
-    });
+  const stat = fs.statSync(outputGlbPath);
 
-    // Replace the browser-facing artifact only after the optimized file has
-    // been completely written. Existing output.glb therefore stays intact if
-    // optimization fails midway.
-    fs.rmSync(outputGlbPath, { force: true });
-    fs.renameSync(optimizedPath, outputGlbPath);
-  } finally {
-    if (fs.existsSync(optimizedPath)) {
-      fs.rmSync(optimizedPath, { force: true });
-    }
+  if (!stat.isFile() || stat.size <= 0) {
+    throw new Error(
+      `Production compile created an invalid output.glb: ${outputGlbPath}`,
+    );
   }
 
-  console.log(`[production-compile] optimized walkthrough ready: ${outputGlbPath}`);
+  console.log(
+    `[production-compile] optimized walkthrough ready: ${outputGlbPath} (${stat.size} bytes)`,
+  );
 }
 
 const isMainModule =
@@ -80,7 +71,10 @@ if (isMainModule) {
     process.exit(1);
   }
 
-  compileProductionScene({ jobDirectory, assetsDirectory })
+  compileProductionScene({
+    jobDirectory,
+    assetsDirectory,
+  })
     .then(() => process.exit(0))
     .catch((error) => {
       console.error(
