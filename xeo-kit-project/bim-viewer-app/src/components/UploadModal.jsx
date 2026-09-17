@@ -189,10 +189,10 @@ const UploadModal = ({ isOpen, onClose, onProjectCreated }) => {
               </button>
               
               <div className="text-xs text-slate-400 dark:text-slate-500 text-center relative z-10 space-y-1">
-                <p>Images (<span className="text-cyan-600 dark:text-cyan-400">.jpg, .png</span>) | 3D (<span className="text-[#ff914d]">.ifc, .xkt</span>)</p>
+                <p>Images (<span className="text-cyan-600 dark:text-cyan-400">.jpg, .png, .webp</span>) | 3D (<span className="text-[#ff914d]">.ifc, .xkt</span>)</p>
               </div>
               
-              <input type="file" className="hidden" ref={fileInputRef} onChange={handleFileChange} accept="image/jpeg, image/png, .xkt, .ifc" />
+              <input type="file" className="hidden" ref={fileInputRef} onChange={handleFileChange} accept="image/jpeg, image/png, image/webp, .xkt, .ifc" />
             </div>
 
             {/* Divider */}

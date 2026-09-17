@@ -7,6 +7,7 @@ import math
 import re
 import faulthandler
 import importlib.util
+from datetime import datetime, timezone
 import ifcopenshell
 import ifcopenshell.guid
 import ifcopenshell.util.element
@@ -957,19 +958,37 @@ def _build_extraction_prompt(image_path: str, repair_summary: dict = None, expec
 # =====================================================================
 # 2. API LOGIC (Centerline & Detail Extraction)
 # =====================================================================
+def _build_gemini_client():
+    """Create the Gemini client from the backend-owned GOOGLE_API_KEY."""
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        sys.exit("[!] Error: GOOGLE_API_KEY is not set on the backend.")
+
+    # Keep the key explicit so this subprocess cannot accidentally select a
+    # different credential if both GOOGLE_API_KEY and GEMINI_API_KEY exist.
+    return genai.Client(api_key=api_key)
+
+
+def _gemini_model_name() -> str:
+    # Configurable from the backend environment; current default is aligned
+    # with Google's current Gemini Python examples.
+    return os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+
+
 def analyze_floor_plan_detailed(image_path: str, allow_low_detail: bool = False) -> BuildingAnalysis:
-    if not os.environ.get("GEMINI_API_KEY"):
-        sys.exit("[!] Error: GEMINI_API_KEY is not set.")
-    client = genai.Client()
+    client = _build_gemini_client()
+    model_name = _gemini_model_name()
 
     ext = os.path.splitext(image_path)[1].lower()
     mime_map = {
         '.jpg': 'image/jpeg',
         '.jpeg': 'image/jpeg',
         '.png': 'image/png',
-        '.svg': 'image/jpeg'
+        '.webp': 'image/webp',
     }
-    mime_type = mime_map.get(ext, 'application/octet-stream')
+    mime_type = mime_map.get(ext)
+    if not mime_type:
+        sys.exit(f"[!] Error: Unsupported floor-plan image type: {ext or 'unknown'}")
     
     with open(image_path, 'rb') as f:
         image_bytes = f.read()
@@ -978,7 +997,7 @@ def analyze_floor_plan_detailed(image_path: str, allow_low_detail: bool = False)
     def run_extraction(prompt: str, label: str) -> BuildingAnalysis:
         print(f"[API] Running Detailed Visual Extraction{label}...")
         response = client.models.generate_content(
-            model='gemini-3-flash-preview',
+            model=model_name,
             contents=[image_part, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -987,7 +1006,17 @@ def analyze_floor_plan_detailed(image_path: str, allow_low_detail: bool = False)
                 max_output_tokens=65535,
             ),
         )
-        return response.parsed
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, BuildingAnalysis):
+            return parsed
+        if parsed is not None:
+            return BuildingAnalysis.model_validate(parsed)
+
+        response_text = getattr(response, "text", None)
+        if response_text:
+            return BuildingAnalysis.model_validate_json(response_text)
+
+        raise RuntimeError("Gemini returned no structured floor-plan data.")
 
     try:
         data = run_extraction(_build_extraction_prompt(image_path), "")
@@ -1596,6 +1625,7 @@ if __name__ == "__main__":
     parser.add_argument("--image", default="1 BHK HOUSE .jpg")
     parser.add_argument("--output", default="1_BHK_Detailed.ifc")
     parser.add_argument("--cache", default="1_BHK_Detailed_Cache.json")
+    parser.add_argument("--analysis-output", default=None, help="Write a job-facing Gemini analysis JSON beside the IFC output")
     parser.add_argument("--assets", default=None, help="Path to the custom assets directory provided by backend")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--debug", action="store_true", help="Print debug logs for IFC property attachments")
@@ -1608,12 +1638,32 @@ if __name__ == "__main__":
         print(f"[Info] Using image-specific cache: {args.cache}")
 
     if os.path.exists(args.cache) and not args.force:
-        with open(args.cache, 'r') as f:
+        with open(args.cache, 'r', encoding='utf-8') as f:
             data = BuildingAnalysis(**json.load(f))
+        print(f"[Cache] Using existing extraction cache: {args.cache}")
     else:
         data = analyze_floor_plan_detailed(args.image, allow_low_detail=args.allow_low_detail)
-        with open(args.cache, 'w') as f:
+        with open(args.cache, 'w', encoding='utf-8') as f:
             json.dump(data.model_dump(), f, indent=4)
+
+    if args.analysis_output:
+        analysis_payload = {
+            "version": 1,
+            "provider": "google-gemini",
+            "model": _gemini_model_name(),
+            "analyzedAt": datetime.now(timezone.utc).isoformat(),
+            "sourceImage": os.path.basename(args.image),
+            "summary": _extraction_summary(data),
+            "analysis": data.model_dump(),
+        }
+        analysis_dir = os.path.dirname(os.path.abspath(args.analysis_output))
+        if analysis_dir:
+            os.makedirs(analysis_dir, exist_ok=True)
+        temp_analysis = f"{args.analysis_output}.tmp"
+        with open(temp_analysis, 'w', encoding='utf-8') as f:
+            json.dump(analysis_payload, f, indent=2)
+        os.replace(temp_analysis, args.analysis_output)
+        print(f"[Success] Gemini analysis written: {args.analysis_output}")
 
     prop_paths = find_ifc_properties_files()
     print(f"[Info] Found {len(prop_paths)} ifc_properties.py file(s): {prop_paths}")

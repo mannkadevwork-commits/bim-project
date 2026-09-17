@@ -1,0 +1,5 @@
+# Dependencies used by automated_bim_v4_connected.py
+# Python 3.9+ is required by the current Google GenAI SDK.
+google-genai
+pydantic>=2,<3
+ifcopenshell

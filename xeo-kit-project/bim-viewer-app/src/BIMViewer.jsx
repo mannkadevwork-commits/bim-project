@@ -493,6 +493,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           anchorX={lastClickPos.x}
           anchorY={lastClickPos.y}
           isNative={!!engineState.selectedObject && !activeAsset}
+          selectedElements={engineState.selectedElements}
+          selectionCount={engineState.selectedElements?.length || 1}
+          isMultiSelection={(engineState.selectedElements?.length || 0) > 1}
+          multiSelectMode={engineState.multiSelectMode}
+          onToggleMultiSelect={engineActions.toggleMultiSelectMode}
           isDarkMode={isDarkMode}
           onIsolate={async () => {
             if (!engineState.selectedObject || activeAsset) return;
@@ -642,8 +647,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             placementMode={engineState.placementMode}
             setPlacementMode={engineActions.setPlacementMode}
             resetSelection={() => {
-              engineActions.setSelectedObject(null);
-              engineActions.setSelectedAssetId(null);
+              engineActions.clearSelection();
             }}
             fileName={fileName}
             projectState={projectState} 
@@ -659,6 +663,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             rightTab={rightTab}
             setRightTab={setRightTab}
             selectedObject={engineState.selectedObject}
+            selectedElements={engineState.selectedElements}
+            multiSelectMode={engineState.multiSelectMode}
+            onToggleMultiSelect={engineActions.toggleMultiSelectMode}
+            onClearSelection={engineActions.clearSelection}
             activeAsset={activeAsset}
             selectedAssetId={engineState.selectedAssetId}
             customColor={customColor}
