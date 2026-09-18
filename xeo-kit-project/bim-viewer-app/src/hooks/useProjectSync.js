@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { applyMaterialDefinitionToSceneTarget as applySceneMaterial, applyMaterialDefinitionToObjects as applySceneMaterials, normalizeMaterialDefinition } from '../utils/materialScene';
 import { generateGlbThumbnail } from '../utils/glbThumbnail';
+import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -40,6 +41,7 @@ export const useProjectSync = (activeProject) => {
   const { file, jobId } = activeProject || {};
   const [projectState, setProjectState] = useState({ materials: {}, furniture: [], structural_edits: {} });
   const projectStateRef = useRef(projectState);
+  const projectStateLoadCommitPerfRef = useRef(null);
   
   const [availableAssets, setAvailableAssets] = useState([]);
   const [availableLayouts, setAvailableLayouts] = useState([]);
@@ -60,18 +62,46 @@ export const useProjectSync = (activeProject) => {
 
   useEffect(() => { projectStateRef.current = projectState; }, [projectState]);
 
+  useEffect(() => {
+    if (projectStateLoadCommitPerfRef.current == null || !jobId) return;
+    const startedAt = projectStateLoadCommitPerfRef.current;
+    projectStateLoadCommitPerfRef.current = null;
+    perfLog('PROJECT_SYNC', 'PROJECT_STATE_REACT_COMMITTED', {
+      jobId,
+      durationMs: Number((performance.now() - startedAt).toFixed(1)),
+      materials: Object.keys(projectState.materials || {}).length,
+      furniture: Array.isArray(projectState.furniture) ? projectState.furniture.length : 0,
+    });
+  }, [projectState, jobId]);
+
   // 1. LOAD: Fetch initial project state & asset catalog on startup
   useEffect(() => {
+    const syncEnd = perfTimer('PROJECT_SYNC', 'schedule project/layout data loads', {
+      jobId: jobId || null,
+      fileName: file?.name || null,
+    });
     if (file && jobId) {
       setProjectState({ materials: {}, furniture: [], structural_edits: {}, scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } } });
 
-      fetch(`${API_BASE_URL}/api/projects/${jobId}/load`)
+      const loadStateStartedAt = performance.now();
+      perfLog('PROJECT_SYNC', 'START project state load', { jobId });
+      perfFetch('PROJECT_SYNC', 'project state', `${API_BASE_URL}/api/projects/${jobId}/load`)
         .then(res => {
           if (!res.ok) throw new Error('Failed to load from server');
-          return res.json();
+          const status = res.status;
+          return res.json().then(data => ({ status, data }));
         })
-        .then(data => {
+        .then(({ status, data }) => {
+          perfLog('PROJECT_SYNC', 'END project state load', {
+            jobId,
+            status,
+            durationMs: Number((performance.now() - loadStateStartedAt).toFixed(1)),
+            materials: Object.keys(data?.materials || {}).length,
+            furniture: Array.isArray(data?.furniture) ? data.furniture.length : 0,
+            structuralEdits: Object.keys(data?.structural_edits || {}).length,
+          });
           if (data) {
+            projectStateLoadCommitPerfRef.current = performance.now();
             setProjectState({
               materials: data.materials || {},
               furniture: data.furniture || [],
@@ -100,19 +130,26 @@ export const useProjectSync = (activeProject) => {
       setProjectState({ materials: {}, furniture: [], structural_edits: {}, scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } } });
     }
 
-    fetch(`${API_BASE_URL}/api/assets`)
+    perfFetch('PROJECT_SYNC', 'asset catalog', `${API_BASE_URL}/api/assets`)
       .then(res => res.json())
-      .then(data => setAvailableAssets(data))
+      .then(data => {
+        perfLog('PROJECT_SYNC', 'asset catalog populated', { count: Array.isArray(data) ? data.length : 0 });
+        setAvailableAssets(data);
+      })
       .catch(err => console.error('[ProjectSync] Failed to load asset catalog:', err));
 
     setLayoutsLoading(true);
     setLayoutsError(null);
-    fetch(`${API_BASE_URL}/api/layouts`)
+    perfFetch('PROJECT_SYNC', 'predefined layouts', `${API_BASE_URL}/api/layouts`)
       .then(res => {
         if (!res.ok) throw new Error(`Failed to load layouts (${res.status})`);
         return res.json();
       })
-      .then(data => setAvailableLayouts(Array.isArray(data?.layouts) ? data.layouts : []))
+      .then(data => {
+        const layouts = Array.isArray(data?.layouts) ? data.layouts : [];
+        perfLog('PROJECT_SYNC', 'predefined layouts populated', { count: layouts.length });
+        setAvailableLayouts(layouts);
+      })
       .catch(err => {
         console.error('[ProjectSync] Failed to load predefined layouts:', err);
         setLayoutsError(err.message);
@@ -123,12 +160,16 @@ export const useProjectSync = (activeProject) => {
     if (jobId) {
       setSavedLayoutsLoading(true);
       setSavedLayoutsError(null);
-      fetch(`${API_BASE_URL}/api/saved-layouts`, { cache: 'no-store' })
+      perfFetch('PROJECT_SYNC', 'saved layouts list', `${API_BASE_URL}/api/saved-layouts`, { cache: 'no-store' })
         .then(res => {
           if (!res.ok) throw new Error(`Failed to load saved layouts (${res.status})`);
           return res.json();
         })
-        .then(data => setSavedLayouts(Array.isArray(data?.layouts) ? data.layouts.map(normalizeSavedLayout) : []))
+        .then(data => {
+          const layouts = Array.isArray(data?.layouts) ? data.layouts.map(normalizeSavedLayout) : [];
+          perfLog('PROJECT_SYNC', 'saved layouts populated', { count: layouts.length });
+          setSavedLayouts(layouts);
+        })
         .catch(err => {
           console.error('[ProjectSync] Failed to load saved layouts:', err);
           setSavedLayoutsError(err.message);
@@ -139,6 +180,7 @@ export const useProjectSync = (activeProject) => {
       setSavedLayoutsLoading(false);
       setSavedLayoutsError(null);
     }
+    syncEnd({ completed: true });
   }, [file, jobId]);
 
   // 2. AUTO-SAVE: Safe sequential queue

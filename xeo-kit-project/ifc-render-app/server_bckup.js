@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -13,21 +13,7 @@ const adminRoutes = require('./admin-routes');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
-
-const PERF_LOGS_ENABLED = String(process.env.HCI_PERF_LOGS ?? 'true').toLowerCase() !== 'false';
-const serverPerfNowMs = () => Number(process.hrtime.bigint()) / 1e6;
-
-if (PERF_LOGS_ENABLED) {
-  app.use((req, res, next) => {
-    const startedAt = serverPerfNowMs();
-    res.on('finish', () => {
-      const durationMs = Number((serverPerfNowMs() - startedAt).toFixed(1));
-      console.info(`[PERF][HTTP] ${req.method} ${req.originalUrl} -> ${res.statusCode} ${durationMs}ms`);
-    });
-    next();
-  });
-}
+app.use(express.json()); 
 
 const { generate360ViewerFromGLB } = require('./aps-pipeline');
 
@@ -243,11 +229,8 @@ app.get('/api/assets', (req, res) => {
 // Its private render job contains the exact GLB + navigation artifacts used by
 // the React walkthrough, so reopening a saved layout does not mutate the active project.
 app.get('/api/saved-layouts', (req, res) => {
-  const startedAt = serverPerfNowMs();
   try {
-    const layouts = readAllSavedLayouts().map(decorateSavedLayout);
-    if (PERF_LOGS_ENABLED) console.info(`[PERF][API] GET /api/saved-layouts count=${layouts.length} durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)}`);
-    res.json({ layouts });
+    res.json({ layouts: readAllSavedLayouts().map(decorateSavedLayout) });
   } catch (error) {
     console.error('[SavedLayouts] Global List Error:', error);
     res.status(500).json({ error: 'Failed to list saved layouts.' });
@@ -586,10 +569,8 @@ app.delete('/api/saved-layouts/:layoutId', (req, res) => {
 // The saved layout itself remains untouched; the user gets a fresh project
 // containing the exact IFC + project state captured when the layout was saved.
 app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
-  const startedAt = serverPerfNowMs();
   try {
     const { jobId, layoutId } = req.params;
-    if (PERF_LOGS_ENABLED) console.info(`[PERF][RESTORE] START layoutId=${layoutId} activeJobId=${jobId}`);
     if (!requireActiveProject(jobId, res)) return;
 
     const layouts = readAllSavedLayouts();
@@ -618,19 +599,12 @@ app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
 
     // The restored workspace must start from the exact IFC captured by the
     // saved layout, not the currently active project's IFC.
-    const copyStartedAt = serverPerfNowMs();
     fs.copyFileSync(inputIfcPath, path.join(newJobDir, 'input.ifc'));
     fs.copyFileSync(
       fs.existsSync(originalIfcPath) ? originalIfcPath : inputIfcPath,
       path.join(newJobDir, 'original.ifc')
     );
     fs.copyFileSync(statePath, path.join(newJobDir, 'project_state.json'));
-    if (PERF_LOGS_ENABLED) {
-      const copiedBytes = ['input.ifc', 'original.ifc', 'project_state.json']
-        .map(name => { try { return fs.statSync(path.join(newJobDir, name)).size; } catch { return 0; } })
-        .reduce((sum, n) => sum + n, 0);
-      console.info(`[PERF][RESTORE] snapshot copies bytes=${copiedBytes} durationMs=${(serverPerfNowMs()-copyStartedAt).toFixed(1)}`);
-    }
 
     const now = new Date().toISOString();
     const sourceManifest = readManifest(sourceJobDir);
@@ -651,7 +625,6 @@ app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.headers.host;
 
-    if (PERF_LOGS_ENABLED) console.info(`[PERF][RESTORE] END layoutId=${layout.id} newJobId=${newJobId} durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)}`);
     return res.json({
       success: true,
       sourceJobId,
@@ -666,7 +639,6 @@ app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
       savedLayoutName: layout.name,
     });
   } catch (error) {
-    if (PERF_LOGS_ENABLED) console.info(`[PERF][RESTORE] ERROR durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)} error=${JSON.stringify(error?.message || String(error))}`);
     console.error('[SavedLayouts] Restore Error:', error);
     res.status(500).json({ error: 'Failed to restore saved layout.' });
   }
@@ -858,18 +830,14 @@ app.post('/api/projects/:jobId/save', (req, res) => {
 });
 
 app.get('/api/projects/:jobId/load', (req, res) => {
-    const startedAt = serverPerfNowMs();
     try {
         const jobId = req.params.jobId;
         const statePath = path.join(jobsDir, jobId, 'project_state.json');
         
         if (fs.existsSync(statePath)) {
-            const raw = fs.readFileSync(statePath, 'utf-8');
-            const state = JSON.parse(raw);
-            if (PERF_LOGS_ENABLED) console.info(`[PERF][API] GET /api/projects/${jobId}/load bytes=${Buffer.byteLength(raw)} furniture=${Array.isArray(state?.furniture) ? state.furniture.length : 0} durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)}`);
+            const state = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
             res.json(state);
         } else {
-            if (PERF_LOGS_ENABLED) console.info(`[PERF][API] GET /api/projects/${jobId}/load empty-state durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)}`);
             res.json({ materials: {}, furniture: [] });
         }
     } catch (error) {
@@ -919,26 +887,175 @@ const floorplanStorage = multer.diskStorage({
     cb(null, `input_image${ext}`); 
   }
 });
-const uploadFloorplan = multer({ storage: floorplanStorage });
+const uploadFloorplan = multer({
+  storage: floorplanStorage,
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = new Set(['image/jpeg', 'image/png', 'image/webp']);
+    if (!allowed.has(file.mimetype)) {
+      return cb(new Error('Unsupported floor-plan image type. Use JPG, PNG, or WebP.'));
+    }
+    cb(null, true);
+  },
+});
 
-function runGeminiPipeline({ jobId, jobDir, imagePath, ifcFileName, ifcOutputPath }) {
-  return new Promise((resolve, reject) => {
-    const scriptPath = path.join(__dirname, 'latest_interior_v2', 'automated_bim_v4_connected.py');
-    const cachePath = path.join(jobDir, `${jobId}_cache.json`);
+function resolvePythonBin() {
+  const configured = String(process.env.PYTHON_BIN || '').trim();
+  if (configured) return configured;
 
-    const pythonProcess = spawn('python', [
-      scriptPath, '--image', imagePath, '--output', ifcOutputPath, '--cache', cachePath, '--assets', assetsDir,
-    ]);
+  const venvPython = process.platform === 'win32'
+    ? path.join(__dirname, 'latest_interior_v2', '.venv', 'Scripts', 'python.exe')
+    : path.join(__dirname, 'latest_interior_v2', '.venv', 'bin', 'python');
 
-    let pythonLogs = '';
-    pythonProcess.stdout.on('data', (data) => { pythonLogs += data.toString(); });
-    pythonProcess.stderr.on('data', (data) => { pythonLogs += data.toString(); });
+  if (fs.existsSync(venvPython)) return venvPython;
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
+const pythonEnvironmentCache = new Map();
+
+function validatePythonAiEnvironment(pythonBin) {
+  const cacheKey = String(pythonBin);
+  if (pythonEnvironmentCache.has(cacheKey)) return pythonEnvironmentCache.get(cacheKey);
+
+  const checkCode = [
+    'import google.genai',
+    'import pydantic',
+    'import ifcopenshell',
+    'print(\"HCI_GEMINI_ENV_OK\")',
+  ].join('; ');
+
+  try {
+    const output = execFileSync(pythonBin, ['-c', checkCode], {
+      encoding: 'utf8',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const ok = output.includes('HCI_GEMINI_ENV_OK');
+    if (ok) pythonEnvironmentCache.set(cacheKey, true);
+    return ok;
+  } catch (error) {
+    // Do not cache failures: an administrator may install the missing
+    // dependency while Node remains running. The next upload should retry.
+    return false;
+  }
+}
+
+async function runGeminiPipeline({ jobId, jobDir, imagePath, ifcFileName, ifcOutputPath }) {
+  const scriptPath = path.join(__dirname, 'latest_interior_v2', 'automated_bim_v4_connected.py');
+  const cachePath = path.join(jobDir, `${jobId}_cache.json`);
+  const analysisPath = path.join(jobDir, `${jobId}_gemini_analysis.json`);
+  const pythonBin = resolvePythonBin();
+
+  if (!fs.existsSync(scriptPath)) {
+    throw {
+      status: 500,
+      body: {
+        error: 'AI floor-plan generator is missing on the backend.',
+        expectedPath: scriptPath,
+      },
+    };
+  }
+
+  if (!process.env.GOOGLE_API_KEY) {
+    throw {
+      status: 500,
+      body: {
+        error: 'GOOGLE_API_KEY is not configured on the backend.',
+      },
+    };
+  }
+
+  if (!validatePythonAiEnvironment(pythonBin)) {
+    const installCommand = process.platform === 'win32'
+      ? `\"${pythonBin}\" -m pip install -r \"${path.join(__dirname, 'latest_interior_v2', 'requirements-gemini.txt')}\"`
+      : `\"${pythonBin}\" -m pip install -r ${path.join(__dirname, 'latest_interior_v2', 'requirements-gemini.txt')}`;
+
+    throw {
+      status: 503,
+      body: {
+        error: 'Python AI environment is missing required Gemini/IFC dependencies.',
+        python: pythonBin,
+        generator: scriptPath,
+        installCommand,
+        required: ['google-genai', 'pydantic>=2', 'ifcopenshell'],
+      },
+    };
+  }
+
+  console.log(`[AI] Starting Gemini floor-plan pipeline for ${jobId}`);
+  console.log(`[AI] Python: ${pythonBin}`);
+  console.log(`[AI] Generator: ${scriptPath}`);
+  console.log('[AI] Model: gemini-3-flash-preview (basic-scene pass)');
+
+  return await new Promise((resolve, reject) => {
+    const pythonProcess = spawn(pythonBin, [
+      scriptPath,
+      '--image', imagePath,
+      '--output', ifcOutputPath,
+      '--cache', cachePath,
+      '--analysis-output', analysisPath,
+      '--assets', assetsDir,
+    ], {
+      cwd: path.dirname(scriptPath),
+      env: {
+        ...process.env,
+        // The Python process explicitly consumes GOOGLE_API_KEY.
+        GOOGLE_API_KEY: process.env.GOOGLE_API_KEY,
+      },
+      windowsHide: true,
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    pythonProcess.stdout.on('data', (data) => {
+      const chunk = data.toString();
+      stdout += chunk;
+      console.log(`[AI:${jobId}] ${chunk.trimEnd()}`);
+    });
+
+    pythonProcess.stderr.on('data', (data) => {
+      const chunk = data.toString();
+      stderr += chunk;
+      console.error(`[AI:${jobId}:stderr] ${chunk.trimEnd()}`);
+    });
+
+    pythonProcess.on('error', (error) => {
+      reject({
+        status: 500,
+        body: {
+          error: `Failed to start Python AI generator: ${error.message}`,
+          generator: scriptPath,
+          logs: `${stdout}\n${stderr}`.trim(),
+        },
+      });
+    });
 
     pythonProcess.on('close', (code) => {
-      if (code !== 0 || !fs.existsSync(ifcOutputPath)) {
-        return reject({ status: 500, body: { error: 'IFC file was not generated by the AI.', logs: pythonLogs } });
+      const logs = `${stdout}\n${stderr}`.trim();
+      const hasIfc = fs.existsSync(ifcOutputPath);
+      const hasAnalysis = fs.existsSync(analysisPath);
+
+      if (code !== 0 || !hasIfc) {
+        return reject({
+          status: 500,
+          body: {
+            error: 'IFC file was not generated by the Gemini floor-plan pipeline.',
+            exitCode: code,
+            logs,
+            analysisFile: hasAnalysis ? `/jobs/${jobId}/${path.basename(analysisPath)}` : null,
+          },
+        });
       }
-      resolve({ ifcFileName });
+
+      if (!hasAnalysis) {
+        console.warn(`[AI] IFC was generated but Gemini analysis JSON is missing for ${jobId}.`);
+      }
+
+      resolve({
+        ifcFileName,
+        analysisFileName: hasAnalysis ? path.basename(analysisPath) : null,
+      });
     });
   });
 }
@@ -989,7 +1106,13 @@ async function runMlModulePipeline({ jobId, jobDir, imagePath, req }) {
   return jobPromise;
 }
 
-app.post('/api/convert-floorplan', uploadFloorplan.single('image'), async (req, res) => {
+app.post('/api/convert-floorplan', (req, res, next) => {
+  uploadFloorplan.single('image')(req, res, (err) => {
+    if (!err) return next();
+    const status = err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+    return res.status(status).json({ error: err.message || 'Invalid floor-plan upload.' });
+  });
+}, async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No image file uploaded' });
 
   const jobDir = req.file.destination;
@@ -1010,7 +1133,7 @@ app.post('/api/convert-floorplan', uploadFloorplan.single('image'), async (req, 
     const host = req.headers.host;
     const fileUrl = `${protocol}://${host}/jobs/${jobId}/${result.ifcFileName}`;
 
-    res.json({ success: true, message: 'Conversion successful', fileUrl: fileUrl, jobId: jobId });
+    res.json({ success: true, message: 'Conversion successful', fileUrl: fileUrl, jobId: jobId, analysisFileUrl: result.analysisFileName ? `${protocol}://${host}/jobs/${jobId}/${result.analysisFileName}` : null });
   } catch (err) {
     const status = (err && err.status) || 500;
     const body = (err && err.body) || { error: 'Failed to convert floorplan.' };

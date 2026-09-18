@@ -20,7 +20,6 @@ import argparse
 import json
 import math
 import os
-import random
 import re
 import sys
 import time
@@ -1258,129 +1257,11 @@ Return ONLY structured JSON matching DetailsAnalysis.
 ARCHITECTURE REFERENCE:
 """ + json.dumps(arch_payload, separators=(",", ":"))
 
-def _split_env_list(value: str) -> List[str]:
-    if not value:
-        return []
-    parts = re.split(r"[,;\n]+", value)
-    return [part.strip() for part in parts if part and part.strip()]
-
-
-def _load_gemini_api_keys() -> List[str]:
-    """Load a de-duplicated Gemini key pool without logging key material.
-
-    Supported environment variables (first match order):
-      GOOGLE_API_KEYS / GEMINI_API_KEYS = comma/semicolon/newline separated
-      GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, ...
-      GEMINI_API_KEY_1, GEMINI_API_KEY_2, ...
-      GOOGLE_API_KEY / GEMINI_API_KEY
-    """
-    keys: List[str] = []
-    for env_name in ("GOOGLE_API_KEYS", "GEMINI_API_KEYS"):
-        keys.extend(_split_env_list(os.environ.get(env_name, "")))
-
-    for prefix in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
-        numbered = []
-        for env_name, value in os.environ.items():
-            m = re.fullmatch(rf"{re.escape(prefix)}_(\d+)", env_name)
-            if m and value and value.strip():
-                numbered.append((int(m.group(1)), value.strip()))
-        for _, value in sorted(numbered):
-            keys.append(value)
-
-    for env_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
-        value = os.environ.get(env_name, "")
-        if value and value.strip():
-            keys.append(value.strip())
-
-    deduped: List[str] = []
-    seen = set()
-    for key in keys:
-        if key not in seen:
-            seen.add(key)
-            deduped.append(key)
-    if not deduped:
-        sys.exit("[!] No Gemini API key configured. Set GOOGLE_API_KEY or a key pool such as GOOGLE_API_KEYS.")
-    return deduped
-
-
-def _gemini_model_candidates() -> List[str]:
-    primary = os.environ.get("GEMINI_MODEL", MODEL_NAME).strip()
-    fallback_env = os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash")
-    models = [primary] + _split_env_list(fallback_env)
-    result: List[str] = []
-    seen = set()
-    for model in models:
-        model = model.strip()
-        if model and model not in seen:
-            seen.add(model)
-            result.append(model)
-    return result
-
-
-def _http_retry_policy() -> object:
-    """Disable nested SDK retries so our explicit key/model failover stays bounded."""
-    try:
-        return types.HttpOptions(
-            retry_options=types.HttpRetryOptions(attempts=1)
-        )
-    except Exception:
-        return None
-
-
-def build_gemini_client(api_key: str):
-    kwargs = {"api_key": api_key}
-    http_options = _http_retry_policy()
-    if http_options is not None:
-        kwargs["http_options"] = http_options
-    return genai.Client(**kwargs)
-
-
-def _error_code(exc: Exception) -> Optional[int]:
-    code = getattr(exc, "code", None)
-    if isinstance(code, int):
-        return code
-    match = re.search(r"\b([45]\d{2})\b", str(exc))
-    return int(match.group(1)) if match else None
-
-
-def _error_kind(exc: Exception) -> str:
-    code = _error_code(exc)
-    text = str(exc).lower()
-    if code in {401, 403} or "unauthenticated" in text or "access_token_type_unsupported" in text or "permission" in text:
-        return "credential"
-    if code == 404 or "model not found" in text or "not_found" in text:
-        return "model"
-    if code == 429 or "resource_exhausted" in text or "rate limit" in text or "quota" in text:
-        return "rate_limit"
-    if code in {408, 500, 502, 503, 504} or "unavailable" in text or "temporarily" in text or any(token in exc.__class__.__name__.lower() for token in ("timeout", "connect", "readerror", "transport", "protocol")):
-        return "transient"
-    return "fatal"
-
-
-def _retry_after_seconds(exc: Exception) -> Optional[float]:
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None) if response is not None else None
-    if headers:
-        try:
-            value = headers.get("retry-after") or headers.get("Retry-After")
-            if value is not None:
-                return max(0.0, min(float(value), 30.0))
-        except Exception:
-            pass
-    return None
-
-
-def _bounded_sleep(round_index: int, exc: Exception) -> None:
-    retry_after = _retry_after_seconds(exc)
-    if retry_after is not None:
-        delay = retry_after
-    else:
-        base = float(os.environ.get("GEMINI_RETRY_BASE_SECONDS", "2"))
-        maximum = float(os.environ.get("GEMINI_RETRY_MAX_SECONDS", "20"))
-        delay = min(maximum, base * (2 ** max(0, round_index - 1)))
-        delay += random.uniform(0.0, min(1.0, delay * 0.25))
-    print(f"[AI-RETRY] Waiting {delay:.1f}s before the next Gemini failover round.")
-    time.sleep(delay)
+def build_gemini_client():
+    key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not key:
+        sys.exit("[!] GOOGLE_API_KEY (or GEMINI_API_KEY) is not set.")
+    return genai.Client(api_key=key)
 
 
 class ArchitectureAnalysis(BaseModel):
@@ -1395,94 +1276,21 @@ class DetailsAnalysis(BaseModel):
     interiors: List[InteriorComponent] = Field(default_factory=list)
 
 
-def _generate_structured_resilient(image_part, prompt: str, schema):
-    """Generate structured output with bounded key + model failover.
-
-    Preferred model is always attempted first. Credential-specific failures rotate
-    to the next key. Transient failures (429/5xx) are retried with bounded backoff.
-    Model-unavailable failures move to the configured fallback model(s).
-    """
-    keys = _load_gemini_api_keys()
-    models = _gemini_model_candidates()
-    max_rounds = max(1, int(os.environ.get("GEMINI_FAILOVER_ROUNDS", "2")))
-    last_error: Optional[Exception] = None
-    last_kind = "fatal"
-
-    for round_index in range(1, max_rounds + 1):
-        round_had_transient = False
-        for model_index, model_name in enumerate(models, start=1):
-            model_had_transient = False
-            model_had_credential_error = False
-            for key_index, key in enumerate(keys, start=1):
-                print(f"[AI-TRY] model={model_name} model#{model_index}/{len(models)} key#{key_index}/{len(keys)} round={round_index}/{max_rounds}")
-                client = build_gemini_client(key)
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[image_part, prompt],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=schema,
-                            temperature=0.0,
-                            max_output_tokens=65535,
-                            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                        ),
-                    )
-                    parsed = getattr(response, "parsed", None)
-                    if parsed is None:
-                        response_text = getattr(response, "text", None)
-                        if response_text:
-                            return schema.model_validate_json(response_text)
-                        raise RuntimeError("Gemini returned no structured parsed response.")
-                    return parsed if isinstance(parsed, schema) else schema.model_validate(parsed)
-                except (APIError, ServerError, ClientError) as exc:
-                    kind = _error_kind(exc)
-                    last_error = exc
-                    last_kind = kind
-                    code = _error_code(exc)
-                    print(f"[AI-FAILOVER] model={model_name} key#{key_index}/{len(keys)} code={code} kind={kind}")
-                    if kind == "credential":
-                        model_had_credential_error = True
-                        continue
-                    if kind == "model":
-                        # No need to keep burning keys on a missing model.
-                        break
-                    if kind in {"rate_limit", "transient"}:
-                        model_had_transient = True
-                        round_had_transient = True
-                        continue
-                    raise
-                except Exception as exc:
-                    kind = _error_kind(exc)
-                    last_error = exc
-                    last_kind = kind
-                    print(f"[AI-FAILOVER] unexpected error model={model_name} key#{key_index}/{len(keys)} kind={kind}")
-                    if kind in {"rate_limit", "transient", "credential", "model"}:
-                        if kind == "transient":
-                            model_had_transient = True
-                            round_had_transient = True
-                        elif kind == "credential":
-                            model_had_credential_error = True
-                        continue
-                    raise
-
-            # If every configured key failed authentication, changing the model
-            # cannot repair the credential itself; stop and report the last error.
-            if model_had_credential_error and not model_had_transient:
-                break
-
-            # A model-level outage should immediately allow the fallback model.
-            if model_had_transient or last_kind == "model":
-                continue
-
-        if round_had_transient and round_index < max_rounds:
-            _bounded_sleep(round_index, last_error or RuntimeError("Gemini transient failure"))
-            continue
-        break
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("Gemini failover exhausted without a response.")
+def _generate_structured(client, image_part, prompt: str, schema):
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[image_part, prompt],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+            temperature=0.0,
+            max_output_tokens=65535,
+        ),
+    )
+    parsed = response.parsed
+    if parsed is None:
+        raise RuntimeError("Gemini returned no structured parsed response.")
+    return parsed
 
 
 def _merge_ai_passes(architecture: ArchitectureAnalysis, details: DetailsAnalysis) -> BuildingAnalysis:
@@ -1498,13 +1306,12 @@ def _merge_ai_passes(architecture: ArchitectureAnalysis, details: DetailsAnalysi
 
 
 def analyze_floor_plan(image_path: str) -> BuildingAnalysis:
+    client = build_gemini_client()
     image_part = _image_part(image_path)
-    model_candidates = _gemini_model_candidates()
-    keys = _load_gemini_api_keys()
-    print(f"[AI] Model priority: {model_candidates[0]}")
-    print(f"[AI] Failover pool: {len(keys)} API key(s), {len(model_candidates)} model(s)")
+
+    print(f"[AI] Model: {MODEL_NAME}")
     print("[AI] Pass 1/2: architectural graph (walls + openings + rooms + slab)")
-    architecture_raw = _generate_structured_resilient(image_part, build_architecture_prompt(), ArchitectureAnalysis)
+    architecture_raw = _generate_structured(client, image_part, build_architecture_prompt(), ArchitectureAnalysis)
     architecture = normalize_analysis(BuildingAnalysis(
         building_name=architecture_raw.building_name,
         walls=architecture_raw.walls,
@@ -1518,7 +1325,7 @@ def analyze_floor_plan(image_path: str) -> BuildingAnalysis:
     print(f"[AI] Architecture pass: walls={len(architecture.walls)} openings={len(architecture.openings)} rooms={len(architecture.rooms)} slabs={len(architecture.slabs)}")
 
     print("[AI] Pass 2/2: room-by-room detail inventory")
-    details_raw = _generate_structured_resilient(image_part, build_details_prompt(architecture), DetailsAnalysis)
+    details_raw = _generate_structured(client, image_part, build_details_prompt(architecture), DetailsAnalysis)
     data = _merge_ai_passes(
         ArchitectureAnalysis(
             building_name=architecture.building_name,

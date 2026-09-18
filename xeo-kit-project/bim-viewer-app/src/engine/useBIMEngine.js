@@ -21,6 +21,7 @@ import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, up
 import { calculateGrabPoint } from './stretch/TranslationController';
 import { CameraManager } from './CameraManager';
 import { applyMaterialDefinitionToSceneTarget, configureNativeIFCMaterialController, disposeNativeIFCMaterialController } from '../utils/materialScene';
+import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
 
 const getNavCubeTheme = (isDarkMode) => ({
   color: isDarkMode ? '#1a2435' : '#eef2f7',
@@ -239,6 +240,14 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     const state = stateOverride || projectStateRef.current;
     if (!state) return Promise.resolve([]);
 
+    const restoreEnd = perfTimer('BIM_ENGINE', 'restore persisted project state', {
+      jobId,
+      mainModelId: currentModelRef.current?.id || null,
+      materials: Object.keys(state.materials || {}).length,
+      furniture: Array.isArray(state.furniture) ? state.furniture.length : 0,
+      structuralEdits: Object.keys(state.structural_edits || {}).length,
+    });
+
     // Hydrate the cumulative scene calibration from persisted project state.
     // This is display/scene metadata only; furniture.scale is already stored in
     // the current scene frame and must NOT be multiplied by this value on restore.
@@ -402,6 +411,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         const hasPersistedMatrix = Array.isArray(item.matrix) && item.matrix.length === 16;
         const targetPosition = (isNativeIsolation || hasPersistedMatrix) ? null : (item.position || [0, 0, 0]);
 
+        const assetRestoreEnd = perfTimer('BIM_ENGINE', `restore asset ${item.instanceId}`, {
+          jobId,
+          instanceId: item.instanceId,
+          src: item.src,
+          fileType: item.fileType || item.file_type || null,
+        });
         const restorePromise = loadIFCAssetIntoScene(
           loadersRef,
           globalScaleFactorRef,
@@ -424,9 +439,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         ).then((model) => {
           loadingModelsRef.current.delete(item.instanceId);
           if (!model) throw new Error('Asset restore returned no model.');
+          assetRestoreEnd({ loaded: true, modelId: model.id });
           return model;
         }).catch(error => {
           loadingModelsRef.current.delete(item.instanceId);
+          assetRestoreEnd({ loaded: false, error: error?.message || String(error) });
           console.error('[BIM Engine] Failed to restore asset:', item.instanceId, error);
           throw error;
         });
@@ -435,7 +452,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       });
     }
 
-    return Promise.all(restorePromises);
+    return Promise.all(restorePromises)
+      .then((models) => {
+        restoreEnd({
+          restoredModels: models.length,
+          sceneModels: Object.keys(viewerRef.current?.scene?.models || {}).length,
+        });
+        return models;
+      })
+      .catch((error) => {
+        restoreEnd({
+          failed: true,
+          error: error?.message || String(error),
+          sceneModels: Object.keys(viewerRef.current?.scene?.models || {}).length,
+        });
+        throw error;
+      });
   };
 
   // Strictly controlled effect: Never process the state until the scene finishes loading completely.
@@ -443,6 +475,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   // geometry finishes being instantiated into `viewerRef.current.scene.objects`.
   useEffect(() => {
     if (isModelLoadedRef.current) {
+      perfLog('BIM_ENGINE', 'projectState changed after model load; restoring scene', {
+        jobId,
+        furniture: Array.isArray(projectState?.furniture) ? projectState.furniture.length : 0,
+        materials: Object.keys(projectState?.materials || {}).length,
+      });
       restoreProjectStateToScene(projectState).catch(error => {
         console.error('[BIM Engine] Failed to restore persisted project state:', error);
       });
@@ -1583,6 +1620,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       : fileName.split('.').pop().toLowerCase();
 
     setIsLoading(true);
+    const mainLoadEnd = perfTimer('BIM_ENGINE', 'main model load lifecycle', {
+      jobId,
+      fileName,
+      fileExtension,
+      fileSizeBytes: file?.size || null,
+    });
 
     const waitForLoader = async (key) => {
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -1609,13 +1652,17 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             ? 'gltf'
             : null;
 
+      const loaderWaitEnd = perfTimer('BIM_ENGINE', 'wait for main model loader', { jobId, requiredLoader });
       if (requiredLoader && !(await waitForLoader(requiredLoader))) {
+        loaderWaitEnd({ loaded: false });
         if (isCurrentLoad()) {
           console.error(`[BIM Engine] Timed out waiting for ${requiredLoader} loader.`);
+          mainLoadEnd({ completed: false, phase: 'loader-timeout' });
           setIsLoading(false);
         }
         return;
       }
+      loaderWaitEnd({ loaded: true });
 
       if (!isCurrentLoad()) return;
 
@@ -1629,13 +1676,17 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           return;
         }
         try {
+          const ifcLoadCallEnd = perfTimer('BIM_ENGINE', 'IFC loader.load call', { jobId, bytes: ifcData.byteLength });
           currentModelRef.current = loadersRef.current.ifc.load({
             id: 'main_structure',
             ifc: ifcData,
             edges: true,
             globalizeCoordinates: false,
           });
+          ifcLoadCallEnd({ modelId: currentModelRef.current?.id || null });
+          const materialControllerEnd = perfTimer('BIM_ENGINE', 'configure native IFC material controller', { jobId });
           configureNativeIFCMaterialController(loadViewer, ifcAPIRef.current, ifcData, 'main_structure');
+          materialControllerEnd({ completed: true });
         } catch (error) {
           console.error('[BIM Engine] IFC load failed:', error);
           currentModelRef.current = null;
@@ -1675,6 +1726,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       }
 
       currentModelRef.current.on('loaded', async () => {
+        perfLog('BIM_ENGINE', 'MAIN_MODEL_LOADED', {
+          jobId,
+          modelId: currentModelRef.current?.id || null,
+          objectCount: Object.keys(loadViewer.scene.objects || {}).length,
+          modelCount: Object.keys(loadViewer.scene.models || {}).length,
+        });
         if (!isCurrentLoad()) {
           try { currentModelRef.current?.destroy(); } catch (e) {}
           return;
@@ -1689,19 +1746,44 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         isModelLoadedRef.current = true;
         
         // Only safely trigger state logic exactly when model becomes ready
-        restoreProjectStateToScene(projectStateRef.current);
+        try {
+          await restoreProjectStateToScene(projectStateRef.current);
+          mainLoadEnd({
+            completed: true,
+            finalModelId: currentModelRef.current?.id || null,
+            sceneModels: Object.keys(loadViewer.scene.models || {}).length,
+            sceneObjects: Object.keys(loadViewer.scene.objects || {}).length,
+          });
+          perfLog('BIM_ENGINE', 'LAYOUT_READY', {
+            jobId,
+            mainModelId: currentModelRef.current?.id || null,
+            sceneModels: Object.keys(loadViewer.scene.models || {}).length,
+            sceneObjects: Object.keys(loadViewer.scene.objects || {}).length,
+          });
+        } catch (error) {
+          mainLoadEnd({ completed: false, error: error?.message || String(error) });
+          console.error('[BIM Engine] Failed while restoring layout state:', error);
+        }
       });
     };
 
     const reader = new FileReader();
+    const readerEnd = perfTimer('BIM_ENGINE', 'read main model File into ArrayBuffer', {
+      jobId,
+      fileName,
+      fileSizeBytes: file?.size || null,
+    });
     activeReader = reader;
     reader.onload = (e) => {
       if (!isCurrentLoad()) return;
+      readerEnd({ completed: true, bufferBytes: e?.target?.result?.byteLength || null });
       loadMainModel(e.target.result);
     };
     reader.onerror = () => {
+      readerEnd({ completed: false, error: 'FileReader error' });
       if (isCurrentLoad()) {
         setIsLoading(false);
+        mainLoadEnd({ completed: false, error: 'FileReader error' });
         console.error('[BIM Engine] Failed to read IFC/model file.');
       }
     };

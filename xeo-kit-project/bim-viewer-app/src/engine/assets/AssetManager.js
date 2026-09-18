@@ -1,4 +1,5 @@
 import { API_BASE_URL } from '../utils/constants';
+import { perfFetch, perfLog, perfTimer } from '../../utils/perfLogger';
 
 const nativeIsolationInFlight = new Set();
 
@@ -36,6 +37,7 @@ export const loadIFCAssetIntoScene = async (
     }
 
     try {
+      const assetLoadEnd = perfTimer('ASSET', `load GLB ${instanceId}`, { instanceId, srcUrl });
       // GLTFLoaderPlugin loads GLB/GLTF from src directly. Do not send a GLB
       // through WebIFCLoaderPlugin - that is what caused the xeokit
       // "reading 'arguments'" failure for GLB catalog doors.
@@ -88,6 +90,9 @@ export const loadIFCAssetIntoScene = async (
           options.onLoaded(assetModel);
         }
 
+        assetLoadEnd({ loaded: true, format: 'glb', modelId: assetModel.id });
+        perfLog('ASSET', 'GLB model loaded', { instanceId, modelId: assetModel.id, srcUrl });
+
         if (typeof options.onPlaced === 'function') {
           const persistedTarget = Array.isArray(targetPosition) && targetPosition.length === 3
             ? [...targetPosition]
@@ -98,6 +103,7 @@ export const loadIFCAssetIntoScene = async (
 
       assetModel.on('loaded', applyLoadedTransform);
       assetModel.on('error', (error) => {
+        assetLoadEnd({ loaded: false, format: 'glb', error: error?.message || String(error) });
         console.error('[BIM Engine] GLB asset load failure:', {
           instanceId,
           srcUrl,
@@ -118,11 +124,14 @@ export const loadIFCAssetIntoScene = async (
 
   if (!loadersRef.current.ifc) return null;
 
+  const assetLoadEnd = perfTimer('ASSET', `load IFC ${instanceId}`, { instanceId, srcUrl });
   try {
-    const response = await fetch(srcUrl);
+    const response = await perfFetch('ASSET', `IFC ${instanceId}`, srcUrl);
     if (!response.ok) throw new Error(`Asset fetch failed (${response.status})`);
 
+    const bufferTimer = perfTimer('ASSET', `decode IFC response ${instanceId}`);
     const buffer = await response.arrayBuffer();
+    bufferTimer({ bytes: buffer.byteLength });
     const assetModel = loadersRef.current.ifc.load({
       id: instanceId,
       ifc: new Uint8Array(buffer),
@@ -173,6 +182,9 @@ export const loadIFCAssetIntoScene = async (
         options.onLoaded(assetModel);
       }
 
+      assetLoadEnd({ loaded: true, format: 'ifc', modelId: assetModel.id, bytes: buffer.byteLength });
+      perfLog('ASSET', 'IFC model loaded', { instanceId, modelId: assetModel.id, srcUrl, bytes: buffer.byteLength });
+
       if (typeof options.onPlaced === 'function') {
         const persistedTarget = Array.isArray(targetPosition) && targetPosition.length === 3
           ? [...targetPosition]
@@ -183,6 +195,7 @@ export const loadIFCAssetIntoScene = async (
 
     return assetModel;
   } catch (error) {
+    assetLoadEnd({ loaded: false, format: 'ifc', error: error?.message || String(error) });
     console.error('[BIM Engine] Placement failure:', error);
     throw error;
   }

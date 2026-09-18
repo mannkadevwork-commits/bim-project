@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import BIMViewer from './BIMViewer';
 import AdminPanel from './pages/AdminPanel';
@@ -8,6 +8,7 @@ import UploadModal from './components/UploadModal';
 import ContactForm from './components/ContactForm';
 import { AlertTriangle } from 'lucide-react';
 import ProjectStartModal from './components/ProjectStartModal';
+import { perfFetch, perfLog, perfTimer } from './utils/perfLogger';
 import WalkthroughPage from './pages/WalkthroughPage';
 
 const ensureIfcFileName = (value, fallback = 'model.ifc') => {
@@ -30,6 +31,8 @@ function ViewerApp() {
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [isResettingProject, setIsResettingProject] = useState(false);
   const [isSwitchingLayout, setIsSwitchingLayout] = useState(false);
+  const activeProjectCommitPerfRef = useRef(null);
+
 
   // Validate the last project on startup, but DO NOT automatically open it.
   // The user explicitly decides whether to continue or start a new project.
@@ -114,6 +117,19 @@ function ViewerApp() {
   }, []);
 
   useEffect(() => {
+    if (!activeProject?.jobId || activeProjectCommitPerfRef.current == null) return;
+    const startedAt = activeProjectCommitPerfRef.current;
+    activeProjectCommitPerfRef.current = null;
+    const durationMs = Number((performance.now() - startedAt).toFixed(1));
+    perfLog('APP', 'ACTIVE_PROJECT_COMMITTED', {
+      jobId: activeProject.jobId,
+      fileName: activeProject.fileName,
+      durationMs,
+      savedLayoutId: activeProject.savedLayoutId || null,
+    });
+  }, [activeProject?.jobId]);
+
+  useEffect(() => {
     const handlePageShow = (event) => {
       if (!event.persisted) return;
       const mode = localStorage.getItem('hci_startup_mode');
@@ -138,9 +154,14 @@ function ViewerApp() {
     const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
     setIsContinuingProject(true);
 
+    const totalEnd = perfTimer('APP', 'continue previous project', {
+      jobId: previousProject.jobId,
+      savedLayoutId: previousProject.savedLayoutId || null,
+    });
+
     try {
       const previousFilePath = previousProject.savedLayoutId ? 'input.ifc' : 'original.ifc';
-      const response = await fetch(
+      const response = await perfFetch('APP', `continue IFC ${previousFilePath}`,
         `${API_BASE_URL}/jobs/${previousProject.jobId}/${previousFilePath}`,
         { cache: 'no-store' }
       );
@@ -149,7 +170,9 @@ function ViewerApp() {
         throw new Error(`Previous project IFC could not be loaded (${response.status}).`);
       }
 
+      const blobTimer = perfTimer('APP', 'decode previous project IFC response');
       const blob = await response.blob();
+      blobTimer({ sizeBytes: blob.size, type: blob.type });
       const resolvedFileName = previousProject.savedLayoutId
         ? ensureIfcFileName(previousProject.fileName, 'Saved Layout.ifc')
         : previousProject.fileName;
@@ -157,6 +180,7 @@ function ViewerApp() {
         type: 'application/octet-stream',
       });
 
+      activeProjectCommitPerfRef.current = performance.now();
       setActiveProject({
         jobId: previousProject.jobId,
         file,
@@ -168,6 +192,7 @@ function ViewerApp() {
       setShowStartChoice(false);
       setIsUploadOpen(false);
     } catch (error) {
+      perfLog('APP', 'continue previous project ERROR', { jobId: previousProject?.jobId, error: error?.message });
       console.error('[App] Failed to continue previous project:', error);
       localStorage.removeItem('hci_active_project');
       setPreviousProject(null);
@@ -175,6 +200,7 @@ function ViewerApp() {
       setIsUploadOpen(true);
       alert(`Previous project could not be opened: ${error.message}`);
     } finally {
+      totalEnd({ completed: true });
       setIsContinuingProject(false);
     }
   };
@@ -252,26 +278,36 @@ function ViewerApp() {
 
     const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
     setIsSwitchingLayout(true);
+    const totalEnd = perfTimer('APP', 'open saved layout', {
+      activeJobId: activeProject.jobId,
+      layoutId: layout.id,
+      renderJobId: layout.renderJobId,
+      layoutName: layout.name,
+    });
 
     try {
       // Create a fresh working project from the saved snapshot. This is the
       // important distinction from the 360 preview: the editor receives the
       // snapshot IFC + project_state and restores it through the normal xeokit
       // project-loading path.
-      const response = await fetch(
+      const response = await perfFetch('APP', 'saved-layout restore POST',
         `${API_BASE_URL}/api/projects/${encodeURIComponent(activeProject.jobId)}/saved-layouts/${encodeURIComponent(layout.id)}/restore`,
         { method: 'POST' }
       );
+      const jsonTimer = perfTimer('APP', 'parse saved-layout restore response');
       const data = await response.json().catch(() => ({}));
+      jsonTimer({ newJobId: data?.newJobId || null });
       if (!response.ok || !data.success || !data.newJobId) {
         throw new Error(data.error || `Saved layout restore failed (${response.status})`);
       }
 
       const fileUrl = data.fileUrl || `${API_BASE_URL}/jobs/${encodeURIComponent(data.newJobId)}/input.ifc`;
-      const responseIfc = await fetch(fileUrl, { cache: 'no-store' });
+      const responseIfc = await perfFetch('APP', 'saved layout IFC download', fileUrl, { cache: 'no-store' });
       if (!responseIfc.ok) throw new Error(`Saved layout IFC could not be loaded (${responseIfc.status}).`);
 
+      const blobTimer = perfTimer('APP', 'decode saved layout IFC response', { fileUrl });
       const blob = await responseIfc.blob();
+      blobTimer({ sizeBytes: blob.size, type: blob.type });
       const fileName = ensureIfcFileName(
         data.fileName,
         `Saved Layout - ${layout.name}.ifc`
@@ -297,13 +333,17 @@ function ViewerApp() {
         savedLayoutName: nextProject.savedLayoutName,
       }));
 
+      activeProjectCommitPerfRef.current = performance.now();
+      perfLog('APP', 'ACTIVE_PROJECT_SET_FOR_SAVED_LAYOUT', { jobId: nextProject.jobId, savedLayoutId: nextProject.savedLayoutId });
       setActiveProject(nextProject);
       setIsUploadOpen(false);
       setShowStartChoice(false);
     } catch (error) {
+      perfLog('APP', 'open saved layout ERROR', { layoutId: layout?.id, error: error?.message });
       console.error('[App] Failed to restore saved layout:', error);
       alert(`Failed to load ${layout.name}: ${error.message}`);
     } finally {
+      totalEnd({ completed: true });
       setIsSwitchingLayout(false);
     }
   };
