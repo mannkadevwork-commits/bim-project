@@ -985,7 +985,7 @@ async function runGeminiPipeline({ jobId, jobDir, imagePath, ifcFileName, ifcOut
   console.log(`[AI] Starting Gemini floor-plan pipeline for ${jobId}`);
   console.log(`[AI] Python: ${pythonBin}`);
   console.log(`[AI] Generator: ${scriptPath}`);
-  console.log(`[AI] Model: ${process.env.GEMINI_MODEL || 'gemini-3.8-flash'}`);
+  console.log('[AI] Model: gemini-3-flash-preview (basic-scene pass)');
 
   return await new Promise((resolve, reject) => {
     const pythonProcess = spawn(pythonBin, [
