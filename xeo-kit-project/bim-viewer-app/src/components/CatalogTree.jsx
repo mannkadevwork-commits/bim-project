@@ -1,345 +1,257 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, GripVertical, Search, Box, DoorOpen, Layers3, X } from 'lucide-react';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import * as THREE from 'three';
+import { useState, useMemo } from 'react';
+import { ChevronRight, ChevronDown, Search, Box, FileBox } from 'lucide-react';
 
-// Thumbnail generation is deliberately tiny and on-demand. Sidecar images win;
-// GLB previews are generated only for visible cards and cached for this session.
-const thumbnailCache = new Map();
-const thumbnailQueue = [];
-let activeThumbnailJobs = 0;
-const MAX_THUMBNAIL_JOBS = 2;
+const API = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+const assetUrl = (url) => (url && url.startsWith('/') ? `${API}${url}` : url);
 
-const enqueueThumbnail = (url, task) => new Promise((resolve, reject) => {
-  thumbnailQueue.push({ url, task, resolve, reject });
-  pumpThumbnailQueue();
-});
-
-const pumpThumbnailQueue = () => {
-  while (activeThumbnailJobs < MAX_THUMBNAIL_JOBS && thumbnailQueue.length) {
-    const job = thumbnailQueue.shift();
-    activeThumbnailJobs += 1;
-    Promise.resolve()
-      .then(job.task)
-      .then(value => job.resolve(value), error => job.reject(error))
-      .finally(() => {
-        activeThumbnailJobs -= 1;
-        pumpThumbnailQueue();
-      });
-  }
-};
-
-const disposeObject = (root) => {
-  root.traverse((object) => {
-    if (!object.isMesh) return;
-    object.geometry?.dispose?.();
-    const materials = Array.isArray(object.material) ? object.material : [object.material];
-    materials.forEach(material => {
-      if (!material) return;
-      for (const key of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap']) {
-        material[key]?.dispose?.();
-      }
-      material.dispose?.();
-    });
-  });
-};
-
-const renderGlbThumbnail = (url) => {
-  if (thumbnailCache.has(url)) return Promise.resolve(thumbnailCache.get(url));
-
-  return enqueueThumbnail(url, () => new Promise((resolve, reject) => {
-    const width = 144;
-    const height = 96;
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xf8fafc);
-
-    const camera = new THREE.PerspectiveCamera(28, width / height, 0.01, 1000);
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: false });
-    renderer.setSize(width, height, false);
-    renderer.setPixelRatio(1);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.05;
-
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x94a3b8, 2.1));
-    const key = new THREE.DirectionalLight(0xffffff, 2.8);
-    key.position.set(3, 5, 4);
-    scene.add(key);
-
-    const mount = document.createElement('div');
-    mount.style.position = 'absolute';
-    mount.style.width = '1px';
-    mount.style.height = '1px';
-    mount.style.overflow = 'hidden';
-    mount.style.opacity = '0';
-    mount.appendChild(renderer.domElement);
-    document.body.appendChild(mount);
-
-    new GLTFLoader().load(
-      url,
-      (gltf) => {
-        const root = gltf.scene;
-        scene.add(root);
-        root.updateMatrixWorld(true);
-
-        const box = new THREE.Box3().setFromObject(root);
-        const size = box.getSize(new THREE.Vector3());
-        const center = box.getCenter(new THREE.Vector3());
-        const maxDim = Math.max(size.x, size.y, size.z, 0.1);
-        const distance = maxDim / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5))) * 1.22;
-
-        camera.position.set(
-          center.x + distance * 0.82,
-          center.y + distance * 0.62,
-          center.z + distance * 0.82
-        );
-        camera.lookAt(center);
-        camera.near = Math.max(0.001, maxDim / 1000);
-        camera.far = Math.max(10, distance * 6);
-        camera.updateProjectionMatrix();
-
-        renderer.render(scene, camera);
-        const dataUrl = renderer.domElement.toDataURL('image/jpeg', 0.82);
-        thumbnailCache.set(url, dataUrl);
-        disposeObject(root);
-        renderer.dispose();
-        mount.remove();
-        resolve(dataUrl);
-      },
-      undefined,
-      (error) => {
-        renderer.dispose();
-        mount.remove();
-        reject(error);
-      }
-    );
-  }));
-};
-
-const GlbThumbnail = ({ url, sidecarUrl, alt }) => {
-  const hostRef = useRef(null);
-  const [src, setSrc] = useState(sidecarUrl || null);
-  const [visible, setVisible] = useState(Boolean(sidecarUrl));
-
-  useEffect(() => {
-    if (sidecarUrl) {
-      setSrc(sidecarUrl);
-      return undefined;
-    }
-    const host = hostRef.current;
-    if (!host || !url || !/\.(glb|gltf)(\?|$)/i.test(url)) return undefined;
-
-    const observer = new IntersectionObserver(([entry]) => {
-      if (entry.isIntersecting) {
-        setVisible(true);
-        observer.disconnect();
-      }
-    }, { rootMargin: '160px' });
-    observer.observe(host);
-    return () => observer.disconnect();
-  }, [url, sidecarUrl]);
-
-  useEffect(() => {
-    if (!visible || sidecarUrl || src || !url) return;
-    let cancelled = false;
-    renderGlbThumbnail(url)
-      .then(value => { if (!cancelled) setSrc(value); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [visible, sidecarUrl, src, url]);
-
+function ColorDot({ rgb }) {
+  if (!rgb || !Array.isArray(rgb)) return null;
+  const [r, g, b] = rgb;
   return (
-    <div ref={hostRef} className="h-20 w-24 shrink-0 overflow-hidden rounded-lg border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900/50">
-      {src ? (
-        <img src={src} alt={alt} loading="lazy" className="h-full w-full object-contain" />
-      ) : (
-        <div className="flex h-full items-center justify-center text-slate-400">
-          <Box className="h-7 w-7" />
-        </div>
-      )}
+    <span
+      className="w-3 h-3 rounded-full border border-slate-300 dark:border-slate-600 shrink-0"
+      style={{ backgroundColor: `rgb(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)})` }}
+    />
+  );
+}
+
+function FileTypeBadge({ fileType }) {
+  const isGlb = fileType === 'glb';
+  return (
+    <div className="w-full h-full flex flex-col items-center justify-center gap-1">
+      <div className={`flex items-center justify-center w-8 h-8 rounded-lg ${
+        isGlb ? 'bg-indigo-100 dark:bg-indigo-900/40' : 'bg-amber-100 dark:bg-amber-900/40'
+      }`}>
+        {isGlb
+          ? <FileBox className="w-4 h-4 text-indigo-500" />
+          : <Box className="w-4 h-4 text-amber-500" />}
+      </div>
+      <span className={`text-[9px] font-bold tracking-widest uppercase ${
+        isGlb ? 'text-indigo-500' : 'text-amber-500'
+      }`}>
+        {isGlb ? 'GLB' : 'IFC'}
+      </span>
     </div>
   );
-};
+}
 
-const matchesSearch = (item, query) => {
-  const q = query.trim().toLowerCase();
-  if (!q) return true;
-  return [item?.name, item?.original_name, item?.category, item?.subCategory, item?.sub_category, item?.categoryPath, item?.category_path]
-    .some(value => String(value || '').toLowerCase().includes(q));
-};
-
-const filterNode = (node, query) => {
-  const filteredItems = (node.items || []).filter(item => matchesSearch(item, query));
-  const filteredChildren = (node.children || [])
-    .map(child => filterNode(child, query))
-    .filter(Boolean);
-  if (!query.trim() || filteredItems.length || filteredChildren.length || String(node.name || '').toLowerCase().includes(query.trim().toLowerCase())) {
-    return { ...node, items: filteredItems, children: filteredChildren };
+function ItemThumb({ url, name, fileType }) {
+  const [failed, setFailed] = useState(false);
+  if (url && !failed) {
+    return (
+      <img
+        src={url}
+        alt={name}
+        onError={() => setFailed(true)}
+        className="w-full h-full object-cover"
+      />
+    );
   }
-  return null;
-};
+  return <FileTypeBadge fileType={fileType} />;
+}
 
-const nodeItemCount = node => (node.items || []).length + (node.children || []).reduce((sum, child) => sum + nodeItemCount(child), 0);
+function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection }) {
+  const placementId = `cat_${item.id}`;
+  const isActive = placementMode?.id === placementId;
+  const modelUrl = assetUrl(item.model_url || item.url);
 
-const ItemCard = ({ item, placementMode, setPlacementMode, resetSelection }) => {
-  const asset = {
+  const catalogId = String(item.id ?? '').trim();
+  const itemType = String(item.type || '').trim().toLowerCase();
+  const itemCategory = String(item.category || '').trim().toLowerCase();
+  const itemName = String(item.name || '').trim().toLowerCase();
+  const inferredDoor =
+    itemType === 'door' ||
+    /^door[_-]/i.test(catalogId) ||
+    (itemCategory === 'structural' && itemName.includes('door')) ||
+    itemName.includes('sliding door') ||
+    itemName.includes('flush door') ||
+    itemName.includes('swing door') ||
+    itemName.includes('fire-rated door') ||
+    itemName.includes('revolving door');
+
+  const buildPlacementAsset = () => ({
     ...item,
-    catalogId: item.catalogId ?? item.id,
-    src: item.url ?? item.src,
-    fileType: item.fileType ?? item.file_type,
-    file_type: item.file_type ?? item.fileType,
-  };
+    id: placementId,
+    catalogId: item.id,
+    url: modelUrl,
+    type: inferredDoor ? 'door' : (itemType || 'furniture'),
+    file_type: item.file_type || item.fileType || 'ifc',
+    source: 'catalog',
+  });
 
-  const activate = () => {
-    resetSelection?.();
-    setPlacementMode?.(asset);
+  const handleDragStart = (e) => {
+    e.dataTransfer.setData('application/json', JSON.stringify(buildPlacementAsset()));
+    e.dataTransfer.effectAllowed = 'copy';
   };
-
-  const onDragStart = (event) => {
-    event.dataTransfer.effectAllowed = 'copy';
-    event.dataTransfer.setData('application/json', JSON.stringify(asset));
-  };
-
-  const active = placementMode?.catalogId === asset.catalogId || placementMode?.id === asset.id;
-  const TypeIcon = asset.type === 'door' ? DoorOpen : asset.type === 'structural' ? Layers3 : Box;
 
   return (
     <div
       draggable
-      onDragStart={onDragStart}
-      onDoubleClick={activate}
-      onClick={activate}
-      className={`group flex cursor-grab items-center gap-3 rounded-xl border p-2.5 transition active:cursor-grabbing ${active
-        ? 'border-indigo-400 bg-indigo-50/80 dark:border-indigo-500 dark:bg-indigo-950/30'
-        : 'border-slate-200 bg-white hover:-translate-y-0.5 hover:border-indigo-300 hover:shadow-sm dark:border-slate-700 dark:bg-slate-900/40 dark:hover:border-indigo-700'
-      }`}
-      title="Drag into the 3D view or click to place"
+      onDragStart={handleDragStart}
+      onClick={() => { setPlacementMode(buildPlacementAsset()); resetSelection(); }}
+      className={`flex flex-col rounded-xl border transition-all cursor-grab active:cursor-grabbing overflow-hidden
+        ${isActive
+          ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-900/30 shadow-sm'
+          : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 hover:border-indigo-300 dark:hover:border-indigo-700 hover:bg-white dark:hover:bg-slate-800'
+        }`}
     >
-      <GlbThumbnail url={asset.url} sidecarUrl={asset.thumbnail_url || asset.thumbnailUrl} alt={asset.name} />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5">
-          <TypeIcon className="h-3.5 w-3.5 shrink-0 text-indigo-500" />
-          <p className="truncate text-xs font-bold text-slate-800 dark:text-slate-100">{asset.name}</p>
-        </div>
-        <p className="mt-1 truncate text-[10px] text-slate-400">{asset.subCategory || asset.category}</p>
-        <div className="mt-1 flex items-center gap-1.5 text-[9px] uppercase tracking-wider text-slate-400">
-          <GripVertical className="h-3 w-3" />
-          <span>{String(asset.file_type || 'model').toUpperCase()}</span>
-        </div>
+      <div className="w-full h-20 bg-slate-100 dark:bg-slate-700/50 overflow-hidden">
+        <ItemThumb url={assetUrl(item.thumbnail_url)} name={item.name} fileType={item.file_type} />
       </div>
-    </div>
-  );
-};
-
-const TreeNode = ({ node, depth = 0, searchActive, placementMode, setPlacementMode, resetSelection }) => {
-  const [expanded, setExpanded] = useState(depth === 0 || searchActive);
-  const hasContent = (node.children?.length || 0) > 0 || (node.items?.length || 0) > 0;
-  if (!hasContent) return null;
-
-  const count = nodeItemCount(node);
-  return (
-    <div className={depth ? 'ml-3 border-l border-slate-200 pl-2 dark:border-slate-800' : ''}>
-      <button
-        type="button"
-        onClick={() => setExpanded(value => !value)}
-        className="mb-1 flex w-full items-center justify-between rounded-lg px-2 py-2 text-left hover:bg-slate-100 dark:hover:bg-slate-800/60"
-      >
-        <span className="flex min-w-0 items-center gap-1.5">
-          {expanded ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />}
-          <span className="truncate text-[11px] font-bold text-slate-700 dark:text-slate-200">{node.name}</span>
+      <div className="flex items-center gap-1.5 px-2 py-1.5">
+        <ColorDot rgb={item.color_rgb} />
+        <span className="text-[10px] font-semibold text-slate-700 dark:text-slate-300 truncate leading-tight">
+          {item.name}
         </span>
-        <span className="ml-2 shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold text-slate-400 dark:bg-slate-800 dark:text-slate-500">{count}</span>
-      </button>
-
-      {expanded && (
-        <div className="space-y-1.5 pb-1">
-          {(node.items || []).map(item => (
-            <ItemCard
-              key={item.id}
-              item={item}
-              placementMode={placementMode}
-              setPlacementMode={setPlacementMode}
-              resetSelection={resetSelection}
-            />
-          ))}
-          {(node.children || []).map(child => (
-            <TreeNode
-              key={child.id}
-              node={child}
-              depth={depth + 1}
-              searchActive={searchActive}
-              placementMode={placementMode}
-              setPlacementMode={setPlacementMode}
-              resetSelection={resetSelection}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-};
-
-export const CatalogTree = ({ tree = [], loading = false, error = null, placementMode, setPlacementMode, resetSelection }) => {
-  const [query, setQuery] = useState('');
-  const filteredTree = useMemo(() => {
-    const q = query.trim();
-    if (!q) return tree;
-    return tree.map(node => filterNode(node, q)).filter(Boolean);
-  }, [tree, query]);
-
-  const resultCount = useMemo(() => filteredTree.reduce((sum, node) => sum + nodeItemCount(node), 0), [filteredTree]);
-
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="border-b border-slate-200 p-3 dark:border-slate-800">
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-          <input
-            value={query}
-            onChange={event => setQuery(event.target.value)}
-            placeholder="Search furniture, category, sub-category…"
-            className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 pl-9 pr-9 text-xs outline-none transition focus:border-indigo-400 focus:bg-white dark:border-slate-700 dark:bg-slate-900/60 dark:text-white dark:focus:border-indigo-500 dark:focus:bg-slate-900"
-          />
-          {query && (
-            <button type="button" onClick={() => setQuery('')} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-600 dark:hover:bg-slate-800">
-              <X className="h-3.5 w-3.5" />
-            </button>
-          )}
-        </div>
-        <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
-          <span>{query ? `${resultCount} result${resultCount === 1 ? '' : 's'}` : 'Drag an asset into the 3D view'}</span>
-          {query && <span>name + category + sub-category</span>}
-        </div>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        {loading ? (
-          <div className="flex h-40 items-center justify-center text-xs text-slate-400">Loading catalog…</div>
-        ) : error ? (
-          <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-600 dark:border-rose-900/50 dark:bg-rose-950/20 dark:text-rose-300">{error}</div>
-        ) : filteredTree.length ? (
-          <div className="space-y-1">
-            {filteredTree.map(node => (
-              <TreeNode
-                key={node.id}
-                node={node}
-                searchActive={Boolean(query)}
-                placementMode={placementMode}
-                setPlacementMode={setPlacementMode}
-                resetSelection={resetSelection}
-              />
-            ))}
-          </div>
-        ) : (
-          <div className="rounded-xl border border-dashed border-slate-300 p-6 text-center dark:border-slate-700">
-            <Search className="mx-auto mb-2 h-6 w-6 text-slate-400" />
-            <p className="text-xs font-semibold text-slate-600 dark:text-slate-300">No catalog items found</p>
-            <p className="mt-1 text-[10px] text-slate-400">Try a model name or folder/sub-category.</p>
-          </div>
+        {item.file_type === 'glb' && (
+          <span className="ml-auto text-[8px] font-bold text-indigo-500 uppercase shrink-0">GLB</span>
         )}
       </div>
     </div>
   );
-};
+}
 
-export default CatalogTree;
+function CategoryNode({ node, depth, placementMode, setPlacementMode, resetSelection, searchQuery }) {
+  const [isOpen, setIsOpen] = useState(depth === 0);
+
+  const hasChildren = node.children?.length > 0;
+  const hasItems = node.items?.length > 0;
+  const hasContent = hasChildren || hasItems;
+
+  const matchesSearch = useMemo(() => {
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    const itemMatch = (items) => items?.some(i => i.name.toLowerCase().includes(q));
+    const childMatch = (children) => children?.some(c => itemMatch(c.items) || childMatch(c.children));
+    return itemMatch(node.items) || childMatch(node.children);
+  }, [searchQuery, node]);
+
+  if (searchQuery && !matchesSearch) return null;
+
+  const filteredItems = searchQuery
+    ? node.items?.filter(i => i.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    : node.items;
+
+  const indentPx = depth * 12;
+
+  return (
+    <div>
+      <button
+        onClick={() => hasContent && setIsOpen(o => !o)}
+        className={`w-full flex items-center gap-2 py-2 text-left transition-colors
+          ${hasContent ? 'hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer' : 'cursor-default'}
+          ${depth === 0 ? 'border-b border-slate-100 dark:border-slate-800' : ''}`}
+        style={{ paddingLeft: `${12 + indentPx}px`, paddingRight: '12px' }}
+      >
+        <span className="w-3 h-3 shrink-0 text-slate-400">
+          {hasContent
+            ? (isOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />)
+            : <span className="w-3 h-3 block" />}
+        </span>
+        {node.image_url ? (
+          <img src={assetUrl(node.image_url)} alt={node.name} className="w-5 h-5 rounded object-cover shrink-0" />
+        ) : (
+          <span className={`w-2 h-2 rounded-full shrink-0 ${depth === 0 ? 'bg-indigo-400' : 'bg-slate-300 dark:bg-slate-600'}`} />
+        )}
+        <span className={`truncate ${depth === 0
+          ? 'text-xs font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wide'
+          : 'text-xs font-semibold text-slate-600 dark:text-slate-400'}`}>
+          {node.name}
+        </span>
+        {hasItems && (
+          <span className="ml-auto text-[9px] text-slate-400 shrink-0">{node.items.length}</span>
+        )}
+      </button>
+
+      {(isOpen || searchQuery) && (
+        <div>
+          {node.children?.map(child => (
+            <CategoryNode
+              key={child.id}
+              node={child}
+              depth={depth + 1}
+              placementMode={placementMode}
+              setPlacementMode={setPlacementMode}
+              resetSelection={resetSelection}
+              searchQuery={searchQuery}
+            />
+          ))}
+          {filteredItems?.length > 0 && (
+            <div
+              className="grid grid-cols-2 gap-2 py-2 pr-3"
+              style={{ paddingLeft: `${12 + indentPx + 12}px` }}
+            >
+              {filteredItems.map(item => (
+                <CatalogItemCard
+                  key={item.id}
+                  item={item}
+                  placementMode={placementMode}
+                  setPlacementMode={setPlacementMode}
+                  resetSelection={resetSelection}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function CatalogTree({ tree, loading, error, placementMode, setPlacementMode, resetSelection }) {
+  const [searchQuery, setSearchQuery] = useState('');
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-32 text-slate-400 text-sm gap-2">
+        <span className="animate-spin w-4 h-4 border-2 border-indigo-400 border-t-transparent rounded-full" />
+        Loading catalog...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="p-4 text-center text-rose-500 text-xs">
+        Failed to load catalog.<br />
+        <span className="text-slate-400">{error}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800 shrink-0">
+        <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 rounded-lg px-2 py-1.5">
+          <Search className="w-3 h-3 text-slate-400 shrink-0" />
+          <input
+            type="text"
+            placeholder="Search catalog..."
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            className="flex-1 bg-transparent text-xs text-slate-700 dark:text-slate-300 placeholder-slate-400 outline-none"
+          />
+          {searchQuery && (
+            <button onClick={() => setSearchQuery('')} className="text-slate-400 hover:text-slate-600 text-xs cursor-pointer">✕</button>
+          )}
+        </div>
+      </div>
+      <p className="text-[10px] text-slate-400 dark:text-slate-500 px-3 py-1.5 shrink-0">
+        Drag an item onto the 3D view to place it.
+      </p>
+      <div className="flex-1 overflow-y-auto">
+        {tree.map(rootNode => (
+          <CategoryNode
+            key={rootNode.id}
+            node={rootNode}
+            depth={0}
+            placementMode={placementMode}
+            setPlacementMode={setPlacementMode}
+            resetSelection={resetSelection}
+            searchQuery={searchQuery}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
