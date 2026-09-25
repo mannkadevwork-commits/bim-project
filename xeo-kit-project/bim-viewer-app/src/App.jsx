@@ -348,6 +348,31 @@ function ViewerApp() {
     }
   };
 
+  const handleSavedLayoutCreated = (layout) => {
+    if (!layout?.id) return;
+
+    setActiveProject((previous) => {
+      if (!previous) return previous;
+
+      const nextProject = {
+        ...previous,
+        savedLayoutsSourceJobId: previous.jobId,
+        savedLayoutId: layout.id,
+        savedLayoutName: layout.name || null,
+      };
+
+      localStorage.setItem('hci_active_project', JSON.stringify({
+        jobId: nextProject.jobId,
+        fileName: nextProject.fileName,
+        savedLayoutsSourceJobId: nextProject.savedLayoutsSourceJobId,
+        savedLayoutId: nextProject.savedLayoutId,
+        savedLayoutName: nextProject.savedLayoutName,
+      }));
+
+      return nextProject;
+    });
+  };
+
   const handleLayoutReplace = async (layout) => {
     if (!activeProject?.jobId || !layout?.id) return;
 
@@ -432,6 +457,7 @@ function ViewerApp() {
             onAdd={() => setIsUploadOpen(true)}
             onReplaceProject={handleLayoutReplace}
             onOpenSavedLayout={handleOpenSavedLayout}
+            onSavedLayoutCreated={handleSavedLayoutCreated}
           />
         ) : null}
       </div>

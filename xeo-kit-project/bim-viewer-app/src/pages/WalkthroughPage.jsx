@@ -21,6 +21,7 @@ function IconButton({ title, onClick, children, active = false, disabled = false
 }
 
 const LOCK_TOAST_CSS = `@keyframes walkLockFade { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }`;
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
 export default function WalkthroughPage() {
   const { jobId } = useParams();
@@ -41,12 +42,77 @@ export default function WalkthroughPage() {
   const [fov, setFov] = useState(120);
   const [walkMode, setWalkMode] = useState('guided');
   const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
+  const [displayName, setDisplayName] = useState('');
+
 
   useEffect(() => {
     const onFullscreenChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const resolveDisplayName = async () => {
+      if (!jobId) {
+        setDisplayName('HCI Walkthrough');
+        return;
+      }
+
+      // Saved layouts use their immutable renderJobId in the walkthrough URL.
+      // Prefer the human-readable hierarchy stored on the saved-layout record.
+      try {
+        const layoutsResponse = await fetch(`${API_BASE_URL}/api/saved-layouts`, { cache: 'no-store' });
+        if (layoutsResponse.ok) {
+          const payload = await layoutsResponse.json().catch(() => ({}));
+          const savedLayout = Array.isArray(payload?.layouts)
+            ? payload.layouts.find((layout) => layout?.id === jobId || layout?.renderJobId === jobId)
+            : null;
+
+          if (savedLayout) {
+            const hierarchy = [
+              savedLayout.categoryName,
+              savedLayout.subCategory,
+              savedLayout.name,
+            ]
+              .map((value) => String(value || '').trim())
+              .filter(Boolean)
+              .join(' → ');
+
+            if (!cancelled && hierarchy) {
+              setDisplayName(hierarchy);
+              return;
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('[WalkthroughPage] Saved-layout metadata lookup failed:', error);
+      }
+
+      // Normal renders/projects don't have saved-layout metadata, so use the
+      // original IFC filename from the project manifest instead of exposing the
+      // internal job id.
+      try {
+        const projectResponse = await fetch(`${API_BASE_URL}/api/projects/${encodeURIComponent(jobId)}/validate`, { cache: 'no-store' });
+        if (projectResponse.ok) {
+          const payload = await projectResponse.json().catch(() => ({}));
+          const fileName = String(payload?.fileName || '').trim();
+          if (!cancelled && fileName) {
+            setDisplayName(fileName);
+            return;
+          }
+        }
+      } catch (error) {
+        console.warn('[WalkthroughPage] Project filename lookup failed:', error);
+      }
+
+      if (!cancelled) setDisplayName('HCI Walkthrough');
+    };
+
+    resolveDisplayName();
+    return () => { cancelled = true; };
+  }, [jobId]);
 
   const toggleFullscreen = async () => {
     try {
@@ -185,7 +251,12 @@ export default function WalkthroughPage() {
           </div>
           <div>
             <div className="text-sm font-semibold tracking-tight text-white">HCI Walkthrough</div>
-            <div className="text-[10px] uppercase tracking-[0.16em] text-slate-300">{viewMode === 'walk' ? 'Interactive presentation' : '3D preview'} · {jobId}</div>
+            <div
+              className="max-w-[min(72vw,620px)] truncate text-[10px] uppercase tracking-[0.16em] text-slate-300"
+              title={displayName || undefined}
+            >
+              {viewMode === 'walk' ? 'Interactive presentation' : '3D preview'} · {displayName || 'Loading…'}
+            </div>
           </div>
         </div>
 

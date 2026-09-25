@@ -5,6 +5,44 @@ import { NativeIFCMaterialController } from '../engine/NativeIFCMaterialControll
 const nativeControllers = new WeakMap();
 const rgbFallback = [1, 1, 1];
 
+// Material applications can be asynchronous (especially native IFC wall
+// overlays). Keep a per-viewer/per-target generation so an older operation
+// can never repaint the scene after a newer undo/redo restore has started.
+const materialGenerations = new WeakMap();
+
+const getGenerationMap = (viewer) => {
+  let map = materialGenerations.get(viewer);
+  if (!map) {
+    map = new Map();
+    materialGenerations.set(viewer, map);
+  }
+  return map;
+};
+
+const beginMaterialMutation = (viewer, targetId) => {
+  const map = getGenerationMap(viewer);
+  const next = (map.get(targetId) || 0) + 1;
+  map.set(targetId, next);
+  return next;
+};
+
+const isMaterialMutationCurrent = (viewer, targetId, generation) => {
+  return getGenerationMap(viewer).get(targetId) === generation;
+};
+
+export const invalidateMaterialMutations = (viewer, targetIds = null) => {
+  if (!viewer) return;
+  const map = getGenerationMap(viewer);
+  if (Array.isArray(targetIds) && targetIds.length) {
+    targetIds.forEach((targetId) => beginMaterialMutation(viewer, targetId));
+    return;
+  }
+
+  // Bump every target currently known to the material layer. This is used by
+  // full project reconciliation before undo/redo restores the authored state.
+  [...map.keys()].forEach((targetId) => beginMaterialMutation(viewer, targetId));
+};
+
 export const configureNativeIFCMaterialController = (viewer, ifcAPI, ifcData, modelId = 'main_structure') => {
   if (!viewer) return null;
   let controller = nativeControllers.get(viewer);
@@ -72,20 +110,25 @@ const loadImage = (src) => new Promise((resolve, reject) => {
   image.src = src;
 });
 
-export const applyMaterialDefinitionToSceneTarget = async (viewer, targetId, definition) => {
+export const applyMaterialDefinitionToSceneTarget = async (viewer, targetId, definition, options = {}) => {
   if (!viewer || !targetId || !definition) return false;
   const materialDef = normalizeMaterialDefinition(definition);
+  const generation = beginMaterialMutation(viewer, targetId);
+  const callerIsCurrent = typeof options?.isCurrent === 'function' ? options.isCurrent : () => true;
+  const isCurrent = () => callerIsCurrent() && isMaterialMutationCurrent(viewer, targetId, generation);
 
   const nativeController = nativeControllers.get(viewer);
   if (nativeController) {
-    const nativeResult = await nativeController.apply(targetId, materialDef);
+    const nativeResult = await nativeController.apply(targetId, materialDef, { ...options, isCurrent });
     if (nativeResult.handled) {
       if (nativeResult.applied) return true;
+      if (!isCurrent()) return false;
       // Color on native IFC falls through to the existing proven colorize path.
       if (materialDef.kind !== 'color') return false;
     }
   }
 
+  if (!isCurrent()) return false;
   const targets = resolveTargets(viewer, targetId);
   if (!targets.length) return false;
 
@@ -93,6 +136,7 @@ export const applyMaterialDefinitionToSceneTarget = async (viewer, targetId, def
     let diffuseMap = null;
     if (materialDef.textureSrc) {
       const image = await loadImage(materialDef.textureSrc);
+      if (!isCurrent()) return false;
       diffuseMap = new Texture(viewer.scene, { image });
     }
 
@@ -103,6 +147,12 @@ export const applyMaterialDefinitionToSceneTarget = async (viewer, targetId, def
       ...(diffuseMap ? { diffuseMap } : {}),
     });
     material._hciOwned = true;
+
+    if (!isCurrent()) {
+      try { material.destroy(); } catch (_) {}
+      try { diffuseMap?.destroy(); } catch (_) {}
+      return false;
+    }
 
     targets.forEach(object => {
       try {
@@ -130,4 +180,38 @@ export const applyMaterialDefinitionToObjects = async (viewer, targetIds, defini
     if (await applyMaterialDefinitionToSceneTarget(viewer, id, definition)) changed += 1;
   }
   return changed;
+};
+
+export const clearNativeIFCMaterialOverride = (viewer, targetId) => {
+  if (!viewer || !targetId) return;
+
+  // Invalidate any in-flight native material operation for this target first.
+  // This prevents a late async color/texture job from recreating the overlay
+  // immediately after the user deletes the wall.
+  invalidateMaterialMutations(viewer, [targetId]);
+
+  const controller = nativeControllers.get(viewer);
+  if (!controller) return;
+
+  try {
+    controller.destroyOverlay(targetId);
+  } catch (error) {
+    console.warn('[Material] Failed to clear native IFC material overlay:', targetId, error);
+  }
+};
+
+export const clearNativeIFCMaterialOverrides = (viewer) => {
+  if (!viewer) return;
+  // Cancel outstanding async native/generic material work before the scene
+  // baseline is restored. Without this, a late texture/geometry promise can
+  // repaint a wall immediately after Ctrl+Z.
+  invalidateMaterialMutations(viewer);
+
+  const controller = nativeControllers.get(viewer);
+  if (!controller) return;
+  try {
+    controller.clearAll();
+  } catch (error) {
+    console.warn('[Material] Failed to clear native IFC material overrides.', error);
+  }
 };

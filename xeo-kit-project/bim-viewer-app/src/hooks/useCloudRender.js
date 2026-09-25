@@ -10,19 +10,26 @@ export const useCloudRender = (activeProject, projectStateRef) => {
   const [renderError, setRenderError] = useState(null);
   const [renderConfig, setRenderConfig] = useState({ type: '360', quality: 'high', lighting: 'daylight' });
 
-  const executeRender = async () => {
-    if (!file || !jobId) return;
+  const executeRender = async ({ silent = false, typeOverride = null } = {}) => {
+    if (!file || !jobId) {
+      if (silent) throw new Error('No active project is available for rendering.');
+      return null;
+    }
 
-    setIsRendering(true);
-    setRenderError(null);
-    setRenderResult(null);
     const startTime = Date.now();
+
+    if (!silent) {
+      setIsRendering(true);
+      setRenderError(null);
+      setRenderResult(null);
+    }
 
     const formData = new FormData();
     formData.append('ifcFile', file);
     formData.append('jobId', jobId);
 
-    const actualAngle = renderConfig.type === 'static' ? 'top-front-right' : renderConfig.type;
+    const effectiveRenderType = typeOverride || renderConfig.type;
+    const actualAngle = effectiveRenderType === 'static' ? 'top-front-right' : effectiveRenderType;
     formData.append('angle', actualAngle);
     formData.append('lighting', renderConfig.lighting);
     formData.append('quality', renderConfig.quality);
@@ -31,30 +38,46 @@ export const useCloudRender = (activeProject, projectStateRef) => {
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/render`, { method: 'POST', body: formData });
-      if (!response.ok) throw new Error('Render failed. Server returned ' + response.status);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || `Render failed. Server returned ${response.status}`);
+      }
 
-      const data = await response.json();
-      setRenderResult({
+      const result = {
         ...data,
         jobId,
         modelUrl: `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`,
         walkthroughUrl: `${window.location.origin}/walkthrough/${encodeURIComponent(jobId)}`,
         projectState: renderedProjectState,
-        renderConfig: { ...renderConfig },
-      });
-      setRenderTime(((Date.now() - startTime) / 1000).toFixed(1));
+        renderConfig: { ...renderConfig, type: effectiveRenderType },
+      };
+
+      if (!silent) {
+        setRenderResult(result);
+        setRenderTime(((Date.now() - startTime) / 1000).toFixed(1));
+      }
+
+      return result;
     } catch (error) {
-      setRenderError(error.message || 'An error occurred during rendering.');
+      if (!silent) {
+        setRenderError(error.message || 'An error occurred during rendering.');
+      }
+      throw error;
     } finally {
-      setIsRendering(false);
+      if (!silent) {
+        setIsRendering(false);
+      }
     }
   };
+
+  const renderCurrentProject = () => executeRender({ silent: true, typeOverride: '360' });
 
   return {
     state: { isRendering, renderResult, renderTime, renderError },
     config: renderConfig,
     setRenderConfig,
     executeRender,
+    renderCurrentProject,
     setRenderResult,
     setRenderError,
   };

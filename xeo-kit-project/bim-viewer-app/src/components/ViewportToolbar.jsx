@@ -14,6 +14,8 @@ import {
   Trash2,
   X,
   RotateCcw,
+  Undo2,
+  Redo2,
   Footprints,
 } from 'lucide-react';
 
@@ -45,6 +47,10 @@ export const ViewportToolbar = ({
   onRestoreView,
   onDeleteView,
   onResetCamera,
+  canUndo = false,
+  canRedo = false,
+  onUndo,
+  onRedo,
 }) => {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [showSavedViews, setShowSavedViews] = useState(false);
@@ -195,6 +201,31 @@ export const ViewportToolbar = ({
           )}
         </div>
 
+
+        <div className="mx-0.5 h-8 w-px bg-slate-700/80" />
+
+        <button
+          type="button"
+          className={`${item(false)} ${canUndo ? '' : 'cursor-not-allowed opacity-30 hover:bg-transparent hover:text-slate-400'}`}
+          onClick={onUndo}
+          disabled={!canUndo}
+          title="Undo · Ctrl+Z"
+          aria-label="Undo"
+          aria-keyshortcuts="Control+Z Meta+Z"
+        >
+          <Undo2 className="h-4.5 w-4.5" />
+        </button>
+        <button
+          type="button"
+          className={`${item(false)} ${canRedo ? '' : 'cursor-not-allowed opacity-30 hover:bg-transparent hover:text-slate-400'}`}
+          onClick={onRedo}
+          disabled={!canRedo}
+          title="Redo · Ctrl+Y / Ctrl+Shift+Z"
+          aria-label="Redo"
+          aria-keyshortcuts="Control+Y Control+Shift+Z Meta+Y Meta+Shift+Z"
+        >
+          <Redo2 className="h-4.5 w-4.5" />
+        </button>
 
         <button
           type="button"

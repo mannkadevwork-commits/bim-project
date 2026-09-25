@@ -2,6 +2,14 @@ import { useState, useEffect, useRef } from 'react';
 import { applyMaterialDefinitionToSceneTarget as applySceneMaterial, applyMaterialDefinitionToObjects as applySceneMaterials, normalizeMaterialDefinition } from '../utils/materialScene';
 import { generateGlbThumbnail } from '../utils/glbThumbnail';
 import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
+import {
+  HISTORY_COALESCE_MS,
+  HISTORY_LIMIT,
+  cloneProjectState,
+  createInitialProjectState,
+  projectStatesEqual,
+} from './projectHistory';
+import { applyGLBPlacementTransform, getGLBPlacementTarget, isGLBModel } from '../engine/assets/GLBAssetTransform';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -39,9 +47,19 @@ const MOCK_ROOM_TEMPLATES = [
 
 export const useProjectSync = (activeProject) => {
   const { file, jobId } = activeProject || {};
-  const [projectState, setProjectState] = useState({ materials: {}, furniture: [], structural_edits: {} });
+  const [projectState, setProjectState] = useState(createInitialProjectState);
+
+  // Bounded in-memory editor history. The current project state is still persisted
+  // through the existing save pipeline; history is only the undo/redo command stack.
+  const historyPastRef = useRef([]);
+  const historyFutureRef = useRef([]);
+  const historyTransactionRef = useRef(null);
+  const lastHistoryMutationRef = useRef(null);
+  const historyApplyingRef = useRef(false);
+  const [historyRevision, setHistoryRevision] = useState(0);
   const projectStateRef = useRef(projectState);
   const projectStateLoadCommitPerfRef = useRef(null);
+  const projectStateHydratedRef = useRef(false);
   
   const [availableAssets, setAvailableAssets] = useState([]);
   const [availableLayouts, setAvailableLayouts] = useState([]);
@@ -62,6 +80,170 @@ export const useProjectSync = (activeProject) => {
 
   useEffect(() => { projectStateRef.current = projectState; }, [projectState]);
 
+
+  const bumpHistoryRevision = () => setHistoryRevision(value => value + 1);
+
+  const resetHistory = () => {
+    historyPastRef.current = [];
+    historyFutureRef.current = [];
+    historyTransactionRef.current = null;
+    lastHistoryMutationRef.current = null;
+    bumpHistoryRevision();
+  };
+
+  const commitHistoryState = (previousState, coalesceKey = null) => {
+    if (projectStatesEqual(previousState, projectStateRef.current)) return;
+
+    const now = performance.now();
+    const last = lastHistoryMutationRef.current;
+    const shouldCoalesce = Boolean(
+      coalesceKey &&
+      last?.key === coalesceKey &&
+      now - last.at <= HISTORY_COALESCE_MS &&
+      historyPastRef.current.length > 0
+    );
+
+    if (!shouldCoalesce) {
+      historyPastRef.current.push(cloneProjectState(previousState));
+      if (historyPastRef.current.length > HISTORY_LIMIT) {
+        historyPastRef.current.splice(0, historyPastRef.current.length - HISTORY_LIMIT);
+      }
+    }
+
+    historyFutureRef.current = [];
+    lastHistoryMutationRef.current = { key: coalesceKey, at: now };
+    bumpHistoryRevision();
+  };
+
+  const setProjectStateTracked = (nextOrUpdater, options = {}) => {
+    const { history = true, coalesceKey = null } = options;
+    const previousState = projectStateRef.current;
+    const nextState = typeof nextOrUpdater === 'function'
+      ? nextOrUpdater(previousState)
+      : nextOrUpdater;
+
+    if (nextState === undefined || projectStatesEqual(previousState, nextState)) {
+      return false;
+    }
+
+    projectStateRef.current = nextState;
+    setProjectState(nextState);
+
+    if (!history) {
+      lastHistoryMutationRef.current = null;
+      return true;
+    }
+
+    if (history && !historyApplyingRef.current) {
+      if (historyTransactionRef.current) {
+        historyTransactionRef.current.changed = true;
+        lastHistoryMutationRef.current = null;
+      } else {
+        commitHistoryState(previousState, coalesceKey);
+      }
+    }
+
+    return true;
+  };
+
+  const beginHistoryTransaction = (label = 'edit') => {
+    const active = historyTransactionRef.current;
+    if (active) {
+      active.depth += 1;
+      return;
+    }
+
+    historyTransactionRef.current = {
+      label,
+      depth: 1,
+      changed: false,
+      before: cloneProjectState(projectStateRef.current),
+    };
+    lastHistoryMutationRef.current = null;
+  };
+
+  const endHistoryTransaction = () => {
+    const active = historyTransactionRef.current;
+    if (!active) return false;
+
+    active.depth -= 1;
+    if (active.depth > 0) return active.changed;
+
+    historyTransactionRef.current = null;
+    if (!active.changed || projectStatesEqual(active.before, projectStateRef.current)) {
+      return false;
+    }
+
+    historyPastRef.current.push(cloneProjectState(active.before));
+    if (historyPastRef.current.length > HISTORY_LIMIT) {
+      historyPastRef.current.splice(0, historyPastRef.current.length - HISTORY_LIMIT);
+    }
+    historyFutureRef.current = [];
+    lastHistoryMutationRef.current = null;
+    bumpHistoryRevision();
+    return true;
+  };
+
+  // Abort an in-flight composite action without polluting the undo stack.
+  // This is used by asynchronous operations such as Door Insert/Unlock, where
+  // several scene/state mutations may happen before the backend operation finishes.
+  const cancelHistoryTransaction = () => {
+    const active = historyTransactionRef.current;
+    if (!active) return false;
+
+    const shouldRestore = !projectStatesEqual(active.before, projectStateRef.current);
+    historyApplyingRef.current = true;
+    historyTransactionRef.current = null;
+    lastHistoryMutationRef.current = null;
+    if (shouldRestore) {
+      const restoredState = cloneProjectState(active.before);
+      projectStateRef.current = restoredState;
+      setProjectState(restoredState);
+    }
+    historyApplyingRef.current = false;
+    bumpHistoryRevision();
+    return shouldRestore;
+  };
+
+  const undo = () => {
+    if (historyApplyingRef.current || historyTransactionRef.current || !historyPastRef.current.length) {
+      return false;
+    }
+
+    const previousState = historyPastRef.current.pop();
+    const currentState = cloneProjectState(projectStateRef.current);
+    historyFutureRef.current.push(currentState);
+    historyApplyingRef.current = true;
+    historyTransactionRef.current = null;
+    lastHistoryMutationRef.current = null;
+    projectStateRef.current = previousState;
+    setProjectState(previousState);
+    historyApplyingRef.current = false;
+    bumpHistoryRevision();
+    return true;
+  };
+
+  const redo = () => {
+    if (historyApplyingRef.current || historyTransactionRef.current || !historyFutureRef.current.length) {
+      return false;
+    }
+
+    const nextState = historyFutureRef.current.pop();
+    const currentState = cloneProjectState(projectStateRef.current);
+    historyPastRef.current.push(currentState);
+    if (historyPastRef.current.length > HISTORY_LIMIT) {
+      historyPastRef.current.splice(0, historyPastRef.current.length - HISTORY_LIMIT);
+    }
+    historyApplyingRef.current = true;
+    historyTransactionRef.current = null;
+    lastHistoryMutationRef.current = null;
+    projectStateRef.current = nextState;
+    setProjectState(nextState);
+    historyApplyingRef.current = false;
+    bumpHistoryRevision();
+    return true;
+  };
+
   useEffect(() => {
     if (projectStateLoadCommitPerfRef.current == null || !jobId) return;
     const startedAt = projectStateLoadCommitPerfRef.current;
@@ -80,8 +262,10 @@ export const useProjectSync = (activeProject) => {
       jobId: jobId || null,
       fileName: file?.name || null,
     });
+    resetHistory();
+    projectStateHydratedRef.current = false;
     if (file && jobId) {
-      setProjectState({ materials: {}, furniture: [], structural_edits: {}, scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } } });
+      setProjectStateTracked(createInitialProjectState(), { history: false });
 
       const loadStateStartedAt = performance.now();
       perfLog('PROJECT_SYNC', 'START project state load', { jobId });
@@ -102,12 +286,14 @@ export const useProjectSync = (activeProject) => {
           });
           if (data) {
             projectStateLoadCommitPerfRef.current = performance.now();
-            setProjectState({
+            setProjectStateTracked({
               materials: data.materials || {},
               furniture: data.furniture || [],
               structural_edits: data.structural_edits || {},
               scene_calibration: data.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
-            });
+            }, { history: false });
+            resetHistory();
+            projectStateHydratedRef.current = true;
           }
         })
         .catch(() => {
@@ -115,19 +301,25 @@ export const useProjectSync = (activeProject) => {
           if (localState) {
             try {
               const parsed = JSON.parse(localState);
-              setProjectState({
+              setProjectStateTracked({
                 materials: parsed.materials || {},
                 furniture: parsed.furniture || [],
                 structural_edits: parsed.structural_edits || {},
                 scene_calibration: parsed.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
-              });
+              }, { history: false });
+              resetHistory();
+              projectStateHydratedRef.current = true;
             } catch (e) {
               console.warn('[ProjectSync] Failed to parse local state, starting fresh.');
+              projectStateHydratedRef.current = true;
             }
+          } else {
+            projectStateHydratedRef.current = true;
           }
         });
     } else {
-      setProjectState({ materials: {}, furniture: [], structural_edits: {}, scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } } });
+      setProjectStateTracked(createInitialProjectState(), { history: false });
+      projectStateHydratedRef.current = false;
     }
 
     perfFetch('PROJECT_SYNC', 'asset catalog', `${API_BASE_URL}/api/assets`)
@@ -213,13 +405,7 @@ export const useProjectSync = (activeProject) => {
   };
 
   useEffect(() => {
-    if (
-      Object.keys(projectState.materials || {}).length === 0 &&
-      (projectState.furniture || []).length === 0 &&
-      Object.keys(projectState.structural_edits || {}).length === 0
-    ) return;
-
-    if (!jobId) return;
+    if (!jobId || !projectStateHydratedRef.current) return;
 
     setSaveStatus('unsaved');
     pendingSaveRef.current = { state: projectState, targetJobId: jobId };
@@ -477,7 +663,7 @@ export const useProjectSync = (activeProject) => {
     void applySceneMaterial(viewerRef.current, selectedObject.id, sceneDefinition);
     if (normalized.color) setCustomColor(normalized.color);
 
-    setProjectState(prev => {
+    setProjectStateTracked(prev => {
       const nextMaterials = { ...(prev.materials || {}) };
       nextMaterials[selectedObject.id] = nextWallState || normalized;
       return { ...prev, materials: nextMaterials };
@@ -521,7 +707,7 @@ export const useProjectSync = (activeProject) => {
     });
 
     setCustomColor(normalized.color);
-    setProjectState(prev => {
+    setProjectStateTracked(prev => {
       const nextMaterials = { ...(prev.materials || {}) };
       wallIds.forEach(id => {
         const previous = nextMaterials[id];
@@ -555,6 +741,9 @@ export const useProjectSync = (activeProject) => {
     const numValue = parseFloat(value);
     if (!Number.isFinite(numValue)) return;
 
+    const isGLB = isGLBModel(assetModel);
+    const currentGLBTarget = isGLB ? getGLBPlacementTarget(assetModel) : null;
+
     let updatedPos;
     let updatedRot;
     let updatedScale;
@@ -562,23 +751,55 @@ export const useProjectSync = (activeProject) => {
     if (isScale) {
       updatedScale = [...(assetModel.scale || [1, 1, 1])];
       updatedScale[axis] = Math.max(0.001, numValue);
-      assetModel.scale = updatedScale;
+      if (isGLB) {
+        applyGLBPlacementTransform(
+          assetModel,
+          currentGLBTarget,
+          assetModel.rotation || [0, 0, 0],
+          updatedScale
+        );
+      } else {
+        assetModel.scale = updatedScale;
+      }
     } else if (isRotation) {
       updatedRot = [...(assetModel.rotation || [0, 0, 0])];
       updatedRot[axis] = numValue;
-      assetModel.rotation = updatedRot;
+      if (isGLB) {
+        applyGLBPlacementTransform(
+          assetModel,
+          currentGLBTarget,
+          updatedRot,
+          assetModel.scale || [1, 1, 1]
+        );
+      } else {
+        assetModel.rotation = updatedRot;
+      }
     } else {
-      updatedPos = [...(assetModel.position || [0, 0, 0])];
-      updatedPos[axis] = numValue;
-      assetModel.position = updatedPos;
+      if (isGLB) {
+        updatedPos = [...currentGLBTarget];
+        updatedPos[axis] = numValue;
+        applyGLBPlacementTransform(
+          assetModel,
+          updatedPos,
+          assetModel.rotation || [0, 0, 0],
+          assetModel.scale || [1, 1, 1]
+        );
+      } else {
+        updatedPos = [...(assetModel.position || [0, 0, 0])];
+        updatedPos[axis] = numValue;
+        assetModel.position = updatedPos;
+      }
     }
 
-    const persistedPosition = isRotation || isScale
-      ? null
-      : assetModelToTargetPosition(assetModel);
+    const persistedPosition = isGLB
+      ? (updatedPos || currentGLBTarget)
+      : (isRotation || isScale ? null : assetModelToTargetPosition(assetModel));
     const persistedMatrix = normalizeMatrix(assetModel.matrix);
+    const glbNormalization = isGLB
+      ? assetModel?._assetMeta?.glbNormalization
+      : null;
 
-    setProjectState(prev => ({
+    setProjectStateTracked(prev => ({
       ...prev,
       furniture: (prev.furniture || []).map(f =>
         f.instanceId === selectedAssetId
@@ -588,10 +809,11 @@ export const useProjectSync = (activeProject) => {
               rotation: updatedRot || f.rotation || [0, 0, 0],
               scale: updatedScale || f.scale || [1, 1, 1],
               ...(persistedMatrix ? { matrix: persistedMatrix } : {}),
+              ...(glbNormalization ? { glbNormalization } : {}),
             }
           : f
       ),
-    }));
+    }), { coalesceKey: `asset-transform:${selectedAssetId}:${isScale ? 'scale' : isRotation ? 'rotation' : 'position'}` });
   };
 
   const deleteAsset = (viewerRef, selectedAssetId) => {
@@ -605,7 +827,7 @@ export const useProjectSync = (activeProject) => {
     // Persistence is authoritative. Even if the live xeokit model is already
     // gone (for example after a reload/race), the saved furniture entry must
     // always be removed so a later calibration/reload cannot resurrect it.
-    setProjectState(prev => ({
+    setProjectStateTracked(prev => ({
       ...prev,
       furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
     }));
@@ -628,21 +850,49 @@ export const useProjectSync = (activeProject) => {
       // already persisted in the current scene frame and are not rescaled on restore.
       const effectiveScale = baseScale.map((v, i) => v * sceneScale[i]);
 
-      loadIFCAssetIntoScene(uniqueId, fullAssetUrl, item.position, item.rotation, { fileType: inferFileType(item.url, item.file_type), scale: effectiveScale });
+      const templateFileType = inferFileType(item.url, item.file_type);
+      const onPlaced = (instanceId, finalPosition, model) => {
+        if (!isGLBModel(model)) return;
+        const matrix = normalizeMatrix(model?.matrix);
+        const normalizedGLB = model?._assetMeta?.glbNormalization;
+        const semanticPosition = getGLBPlacementTarget(model);
+        setProjectState(prev => ({
+          ...prev,
+          furniture: (prev.furniture || []).map(existingItem =>
+            existingItem.instanceId === instanceId
+              ? {
+                  ...existingItem,
+                  position: semanticPosition,
+                  ...(matrix ? { matrix } : {}),
+                  ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
+                }
+              : existingItem
+          ),
+        }));
+      };
+
+      loadIFCAssetIntoScene(
+        uniqueId,
+        fullAssetUrl,
+        item.position,
+        item.rotation,
+        { fileType: templateFileType, scale: effectiveScale, onPlaced }
+      );
       
       return {
         id: item.id,
         instanceId: uniqueId,
         name: item.name,
         src: fullAssetUrl,
-        fileType: inferFileType(item.url, item.file_type),
+        fileType: templateFileType,
         position: item.position || [0, 0, 0],
         rotation: item.rotation || [0, 0, 0],
         scale: effectiveScale,
+        ...(item.glbNormalization ? { glbNormalization: item.glbNormalization } : {}),
       };
     });
 
-    setProjectState(prev => ({
+    setProjectStateTracked(prev => ({
       ...prev,
       furniture: [...(prev.furniture || []), ...newFurnitureItems],
     }));
@@ -699,50 +949,62 @@ export const useProjectSync = (activeProject) => {
       ...(doorHostWallId ? { doorHostWallId } : {}),
     };
 
-    setProjectState(prev => ({
+    setProjectStateTracked(prev => ({
       ...prev,
       furniture: [...(prev.furniture || []), furnitureItem],
     }));
 
     const onPlaced = (instanceId, finalPosition, model) => {
       const matrix = normalizeMatrix(model?.matrix);
-      setProjectState(prev => ({
+      const normalizedGLB = isGLBModel(model)
+        ? model?._assetMeta?.glbNormalization
+        : null;
+      const semanticPosition = isGLBModel(model)
+        ? getGLBPlacementTarget(model)
+        : (Array.isArray(finalPosition) ? [...finalPosition] : null);
+
+      setProjectStateTracked(prev => ({
         ...prev,
         furniture: (prev.furniture || []).map(item =>
           item.instanceId === instanceId
             ? {
                 ...item,
-                position: Array.isArray(finalPosition) ? [...finalPosition] : item.position,
+                position: semanticPosition || item.position,
                 ...(matrix ? { matrix } : {}),
+                ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
               }
             : item
         ),
-      }));
+      }), { history: false });
     };
 
-    loadIFCAssetIntoScene(
-      uniqueId,
-      fullAssetUrl,
-      position,
-      safeRotation,
-      { fileType, scale: effectiveScale, onPlaced }
-    ).catch(error => {
-      console.error('[ProjectSync] Failed to load placed asset:', error);
-      setProjectState(prev => ({
-        ...prev,
-        furniture: (prev.furniture || []).filter(item => item.instanceId !== uniqueId),
-      }));
-    });
+    const placementPromise = Promise.resolve()
+      .then(() => loadIFCAssetIntoScene(
+        uniqueId,
+        fullAssetUrl,
+        position,
+        safeRotation,
+        { fileType, scale: effectiveScale, onPlaced }
+      ))
+      .catch(error => {
+        console.error('[ProjectSync] Failed to load placed asset:', error);
+        setProjectStateTracked(prev => ({
+          ...prev,
+          furniture: (prev.furniture || []).filter(item => item.instanceId !== uniqueId),
+        }), { history: false });
+        throw error;
+      });
 
     setToastMessage(`${furnitureItem.name} placed!`);
     setTimeout(() => setToastMessage(null), 3000);
+    return placementPromise;
   };
 
   const updateStructuralEdit = (entityId, transformType, axis, value) => {
     if (!entityId) return;
     if (transformType !== 'scale' && transformType !== 'offset' && transformType !== 'visible') return;
 
-    setProjectState(prev => {
+    setProjectStateTracked(prev => {
       const structuralEdits = prev.structural_edits || {};
       const existingEdit = structuralEdits[entityId] || {};
 
@@ -773,7 +1035,7 @@ export const useProjectSync = (activeProject) => {
           },
         },
       };
-    });
+    }, { coalesceKey: `structural:${entityId}:${transformType}` });
   };
 
   const adoptIsolatedAsset = (
@@ -786,7 +1048,7 @@ export const useProjectSync = (activeProject) => {
     scale = [1, 1, 1],
     metadata = {}
   ) => {
-    setProjectState(prev => {
+    setProjectStateTracked(prev => {
       const furniture = prev.furniture || [];
       if (furniture.some(item => item.instanceId === newInstanceId)) return prev;
 
@@ -923,8 +1185,8 @@ export const useProjectSync = (activeProject) => {
       },
     };
 
-    projectStateRef.current = nextState;
-    setProjectState(nextState);
+    setProjectStateTracked(nextState, { history: false });
+    resetHistory();
     await persistProjectStateForCalibration(nextState);
     return nextState;
   };
@@ -977,8 +1239,8 @@ export const useProjectSync = (activeProject) => {
       },
     };
 
-    projectStateRef.current = nextState;
-    setProjectState(nextState);
+    setProjectStateTracked(nextState, { history: false });
+    resetHistory();
     await persistProjectStateForCalibration(nextState);
     return nextState;
   };
@@ -1013,6 +1275,14 @@ export const useProjectSync = (activeProject) => {
     repairLegacyCalibrationState,
     setToastMessage,
     setCustomColor,
+    undo,
+    redo,
+    beginHistoryTransaction,
+    endHistoryTransaction,
+    resetHistory,
+    cancelHistoryTransaction,
+    canUndo: historyPastRef.current.length > 0,
+    canRedo: historyFutureRef.current.length > 0,
     saveNow,
     refreshSavedLayouts,
     saveRenderedLayout,

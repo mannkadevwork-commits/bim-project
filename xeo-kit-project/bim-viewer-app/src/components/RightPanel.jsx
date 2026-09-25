@@ -2,8 +2,9 @@ import { useState, useEffect, useRef } from 'react';
 import { 
   PanelRightClose, Component, Settings2, Eye, EyeOff, Scissors, 
   Footprints, Orbit, Info, Palette, Maximize2, Move, Ruler,
-  Sun, Moon, Trash2, CloudCog, Loader2, Clock  
+  Sun, Moon, Trash2, CloudCog, Loader2, Clock, Layers3, X  
 } from 'lucide-react';
+import { LayoutMetadataForm } from './LayoutMetadataForm';
 
 const POSITION_RADIUS = 8;   
 const ELEVATION_RANGE = [-2, 6]; 
@@ -19,16 +20,18 @@ const PREDEFINED_COLORS = {
 
 export const RightPanel = ({
   isOpen, onClose, rightTab, setRightTab,
-  selectedObject, selectedElements = [], multiSelectMode = false, onToggleMultiSelect, onClearSelection, activeAsset, selectedAssetId,
+  selectedObject, selectedElements = [], multiSelectMode = false, onToggleMultiSelect, onClearSelection, onDeleteSelected, activeAsset, selectedAssetId,
   customColor, handleCustomColorChange,
   updateSelectedAsset, deleteSelectedAsset, projectState,
   engineState, engineActions, adoptIsolatedAsset, updateStructuralEdit,
-  onDeleteProject, isDarkMode, toggleTheme, handleManualSave, isManualSaving, saveStatus, onApplyToAllWalls,
+  onDeleteProject, isDarkMode, toggleTheme, activeSavedLayout = null, onSaveLayout, isLayoutSaving = false,
+  fileNameForLayoutMetadata = '', existingSavedLayouts = [], saveStatus, onApplyToAllWalls,
   materialLibrary = [], selectedMaterial = null, onApplyMaterial, onApplyMaterialToAllWalls
 }) => {
   const [propertySubTab, setPropertySubTab] = useState('details');
   const [materialMode, setMaterialMode] = useState('color');
   const [wallSurfaceScope, setWallSurfaceScope] = useState('both');
+  const [showSaveLayoutForm, setShowSaveLayoutForm] = useState(false);
   const isMultiSelection = selectedElements.length > 1;
   const selectedWallCount = selectedElements.filter(item => item?.isWall).length;
   const selectedAssetCount = selectedElements.length - selectedWallCount;
@@ -132,7 +135,7 @@ export const RightPanel = ({
   };
 
   return (
-    <div className={`flex flex-col h-full bg-white dark:bg-slate-900 border-l border-slate-200 dark:border-slate-800 transition-all duration-300 z-20 ${isOpen ? 'w-[340px]' : 'w-0 overflow-hidden border-none'}`}>
+    <div className={`relative flex flex-col h-full bg-white dark:bg-slate-900 border-l border-slate-200 dark:border-slate-800 transition-all duration-300 z-20 ${isOpen ? 'w-[340px]' : 'w-0 overflow-hidden border-none'}`}>
       
       {/* ── Global Controls Header ── */}
       <div className="flex flex-col gap-3 px-4 py-3 border-b border-slate-200 dark:border-slate-800 shrink-0 bg-slate-50 dark:bg-slate-900/50">
@@ -144,12 +147,17 @@ export const RightPanel = ({
               <PanelRightClose className="w-4 h-4"/>
             </button>
             <button 
-              onClick={handleManualSave}
-              disabled={isManualSaving}
-              className="flex items-center gap-2 bg-[#ff914d] hover:bg-[#ff7a28] disabled:opacity-75 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-[10px] font-bold tracking-wide transition-colors shadow-sm"
+              onClick={() => {
+                if (isLayoutSaving) return;
+                if (activeSavedLayout?.id) onSaveLayout?.();
+                else setShowSaveLayoutForm(true);
+              }}
+              disabled={isLayoutSaving}
+              className="flex items-center gap-2 bg-[#ff914d] hover:bg-[#ff7a28] disabled:opacity-75 disabled:cursor-wait text-white px-3 py-1.5 rounded-md text-[10px] font-bold tracking-wide transition-colors shadow-sm"
+              title={activeSavedLayout?.id ? `Save changes to ${activeSavedLayout.name}` : 'Save the current design as a reusable layout'}
             >
-              {isManualSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <CloudCog className="w-3.5 h-3.5"/>}
-              {isManualSaving ? 'Saving...' : 'Save Project'}
+              {isLayoutSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Layers3 className="w-3.5 h-3.5"/>}
+              {isLayoutSaving ? 'Saving...' : 'Save Layout'}
             </button>
           </div>
 
@@ -192,6 +200,34 @@ export const RightPanel = ({
             </div>
         </div>
       </div>
+
+      {showSaveLayoutForm && !activeSavedLayout?.id && (
+        <div className="absolute inset-0 z-[80] overflow-y-auto bg-slate-950/60 p-3 backdrop-blur-sm">
+          <div className="min-h-full rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-indigo-500">Save Layout</p>
+                <h3 className="mt-1 text-base font-bold text-slate-900 dark:text-white">Save current design</h3>
+                <p className="mt-1 text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">The current design will be compiled in the background and saved with its latest thumbnail.</p>
+              </div>
+              <button type="button" onClick={() => setShowSaveLayoutForm(false)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-white/5 dark:hover:text-white" aria-label="Close save layout form">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <LayoutMetadataForm
+              mode="create"
+              fileName={fileNameForLayoutMetadata}
+              existingLayouts={existingSavedLayouts}
+              submitting={isLayoutSaving}
+              onSubmit={async (metadata) => {
+                const saved = await onSaveLayout?.(metadata);
+                if (saved) setShowSaveLayoutForm(false);
+              }}
+              onCancel={() => setShowSaveLayoutForm(false)}
+            />
+          </div>
+        </div>
+      )}
 
       {/* ── Properties Tab ── */}
       {rightTab === 'properties' && (
@@ -495,8 +531,22 @@ export const RightPanel = ({
 
                                 {isMultiSelection ? (
                                     <div className="mt-4 rounded-xl border border-cyan-400/15 bg-cyan-500/5 p-3 text-[10px] text-slate-400 leading-relaxed">
-                                        <Info className="w-3 h-3 inline mb-0.5 mr-1 text-cyan-300"/>
-                                        Multi-select is active. Choose a finish above and it will be applied to all selected elements. Wall-side scope affects walls; other elements receive the finish normally.
+                                        <div className="flex items-center justify-between gap-3">
+                                            <div>
+                                                <Info className="w-3 h-3 inline mb-0.5 mr-1 text-cyan-300"/>
+                                                Multi-select is active. Choose a finish above and it will be applied to all selected elements.
+                                            </div>
+                                            {onDeleteSelected && (
+                                                <button
+                                                    type="button"
+                                                    onClick={onDeleteSelected}
+                                                    className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-rose-400/20 bg-rose-500/8 px-2.5 py-1.5 text-[9px] font-bold text-rose-400 hover:bg-rose-500/15 hover:text-rose-300 transition-colors"
+                                                >
+                                                    <Trash2 className="w-3 h-3"/> Delete {selectedElements.length}
+                                                </button>
+                                            )}
+                                        </div>
+                                        <div className="mt-2 text-[9px] text-slate-500">Wall-side scope affects walls; other selected elements receive the finish normally.</div>
                                     </div>
                                 ) : selectedObject && !activeAsset && (
                                     <div className="mt-4 p-3 bg-slate-50 dark:bg-slate-800 rounded text-[10px] text-slate-500 leading-relaxed border border-slate-100 dark:border-slate-700">

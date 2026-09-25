@@ -1,5 +1,16 @@
 import { API_BASE_URL } from '../utils/constants';
 import { perfFetch, perfLog, perfTimer } from '../../utils/perfLogger';
+import {
+  applyGLBPlacementTransform,
+  buildGLBNormalization,
+  GLB_TRANSFORM_VERSION,
+  getGLBPlacementTarget,
+  isValidMatrix16,
+  migrateLegacyGLBTransform,
+  sanitizeRotation,
+  sanitizeScale,
+} from './GLBAssetTransform';
+import { inspectGLBSource } from './GLBAssetDescriptor';
 
 const nativeIsolationInFlight = new Set();
 
@@ -47,8 +58,24 @@ export const loadIFCAssetIntoScene = async (
         edges: true,
       });
 
-      // Keep the same asset marker and transform/persistence contract used by
-      // IFC catalog assets. Existing callers can continue to use this function.
+      // Inspect the authored GLB scene graph in parallel with xeokit's loader.
+      // This descriptor resolves the pivot from the source node hierarchy,
+      // including root/unit/axis conversion matrices, instead of guessing from
+      // a post-transform world AABB. Cache by URL so repeated instances pay the
+      // inspection cost only once.
+      const descriptorPromise = inspectGLBSource(srcUrl).catch((error) => {
+        console.warn('[BIM Engine] GLB source inspection unavailable; using runtime fallback:', {
+          instanceId,
+          srcUrl,
+          error: error?.message || String(error),
+        });
+        return null;
+      });
+
+      // GLBs get their own transform contract. We never modify the source mesh;
+      // instead we normalize the root's pivot once and keep authored placement
+      // anchored to that pivot. This is intentionally separate from the existing
+      // IFC/native AABB logic below.
       assetModel._assetMeta = {
         instanceId,
         fileType: 'glb',
@@ -56,47 +83,88 @@ export const loadIFCAssetIntoScene = async (
         srcUrl,
       };
 
-      const applyLoadedTransform = () => {
-        const userScale = Array.isArray(options.scale) && options.scale.length === 3
-          ? options.scale
-          : [1, 1, 1];
+      const applyLoadedTransform = async () => {
+        try {
+          // Read the authored source scene before applying user placement.
+          // Unlike model.aabb, this descriptor is in the GLB's own scene space
+          // and includes every node/root transform emitted by the DCC converter.
+          const sourceDescriptor = await descriptorPromise;
+          const existingNormalization = options.glbNormalization;
+          const normalization = existingNormalization?.version === GLB_TRANSFORM_VERSION
+            ? {
+                ...existingNormalization,
+                version: GLB_TRANSFORM_VERSION,
+                pivotLocal: Array.isArray(existingNormalization.pivotLocal)
+                  ? [...existingNormalization.pivotLocal]
+                  : buildGLBNormalization(assetModel).pivotLocal,
+              }
+            : buildGLBNormalization(assetModel, {
+                pivotMode: options.pivotMode,
+                pivotLocal: options.pivotLocal,
+                unitScale: options.unitScale,
+                descriptor: sourceDescriptor,
+              });
 
-        const safeRotation = Array.isArray(rotation) && rotation.length === 3
-          ? rotation
-          : [0, 0, 0];
+          assetModel._assetMeta.glbNormalization = normalization;
+          assetModel._assetMeta.glbNormalized = true;
+          assetModel._assetMeta.assetDimensions = [...normalization.dimensions];
 
-        // Match the existing IFC asset contract exactly: scale + rotation first,
-        // then use the post-transform AABB to honor the persisted target position.
-        assetModel.scale = [...userScale];
-        assetModel.rotation = [...safeRotation];
+          // Legacy GLB records may still have the old persisted matrix. Preserve
+          // the visible pivot from that matrix during migration, then immediately
+          // switch to the normalized root contract. New records use semantic
+          // position directly.
+          const legacyMatrix = isValidMatrix16(options.persistedMatrix)
+            ? options.persistedMatrix
+            : null;
 
-        if (Array.isArray(targetPosition) && targetPosition.length === 3) {
-          const aabb = assetModel.aabb;
-          if (aabb && aabb.length >= 6) {
-            const centerX = (aabb[0] + aabb[3]) / 2;
-            const centerZ = (aabb[2] + aabb[5]) / 2;
-            const bottomY = aabb[1];
-            assetModel.position = [
-              targetPosition[0] - centerX,
-              targetPosition[1] - bottomY,
-              targetPosition[2] - centerZ,
-            ];
-          } else {
-            assetModel.position = [...targetPosition];
+          const userScale = sanitizeScale(options.scale || [1, 1, 1]);
+          const safeRotation = sanitizeRotation(rotation);
+          let semanticTarget = Array.isArray(targetPosition) && targetPosition.length === 3
+            ? [...targetPosition]
+            : null;
+
+          if (!semanticTarget && legacyMatrix) {
+            semanticTarget = migrateLegacyGLBTransform(
+              assetModel,
+              legacyMatrix,
+              safeRotation,
+              userScale
+            );
           }
-        }
 
-        if (typeof options.onLoaded === 'function') {
-          options.onLoaded(assetModel);
+          // If we did not have a target or legacy matrix, treat the current raw
+          // pivot as the target at its current world position.
+          if (!semanticTarget) {
+            semanticTarget = getGLBPlacementTarget(assetModel);
+          }
+
+          applyGLBPlacementTransform(
+            assetModel,
+            semanticTarget,
+            safeRotation,
+            userScale
+          );
+
+          if (typeof options.onLoaded === 'function') {
+            options.onLoaded(assetModel);
+          }
+        } catch (error) {
+          assetLoadEnd({ loaded: false, format: 'glb', error: error?.message || String(error) });
+          console.error('[BIM Engine] GLB normalization/placement failure:', {
+            instanceId,
+            srcUrl,
+            error,
+          });
+          throw error;
         }
 
         assetLoadEnd({ loaded: true, format: 'glb', modelId: assetModel.id });
         perfLog('ASSET', 'GLB model loaded', { instanceId, modelId: assetModel.id, srcUrl });
 
         if (typeof options.onPlaced === 'function') {
-          const persistedTarget = Array.isArray(targetPosition) && targetPosition.length === 3
-            ? [...targetPosition]
-            : [...assetModel.position];
+          // Persist the semantic normalized pivot location, not the internal
+          // xeokit root translation. This is what keeps Move/Rotate/Scale stable.
+          const persistedTarget = getGLBPlacementTarget(assetModel);
           options.onPlaced(instanceId, persistedTarget, assetModel);
         }
       };

@@ -1,6 +1,7 @@
 import { axesKey } from '../utils/helpers';
 import { AXIS_HANDLE_COLORS, STRETCH_HANDLE_FACE_OPACITY } from '../utils/constants';
 import { animateHandleTo } from './StretchHandles';
+import { applyGLBPlacementTransform, getGLBPlacementTarget, isGLBModel } from '../assets/GLBAssetTransform';
 
 export const applyScale = (viewerRef, targetId, isAsset, scaleVec) => {
   const viewer = viewerRef.current;
@@ -8,6 +9,20 @@ export const applyScale = (viewerRef, targetId, isAsset, scaleVec) => {
   if (isAsset) {
     const model = viewer.scene.models[targetId];
     if (!model) return;
+
+    if (isGLBModel(model)) {
+      // GLB normalization owns the placement pivot. Scaling must not replace
+      // the full matrix and accidentally erase rotation/pivot information.
+      applyGLBPlacementTransform(
+        model,
+        getGLBPlacementTarget(model),
+        model.rotation || [0, 0, 0],
+        [sx, sy, sz]
+      );
+      return;
+    }
+
+    // Existing non-GLB asset/IFC behavior remains unchanged.
     const p = model.position || [0, 0, 0];
     model.matrix = [
       sx, 0,  0,  0,

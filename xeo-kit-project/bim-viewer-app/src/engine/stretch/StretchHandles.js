@@ -4,6 +4,7 @@ import { buildBoxGeometry } from '@xeokit/xeokit-sdk/src/viewer/scene/geometry/b
 import { PhongMaterial } from '@xeokit/xeokit-sdk/src/viewer/scene/materials/PhongMaterial';
 import { buildSelectionCage, destroySelectionCage } from '../viewer/SelectionController';
 import { axesKey, axisDirKey } from '../utils/helpers';
+import { getGLBPlacementTarget, isGLBModel } from '../assets/GLBAssetTransform';
 import {
   AXIS_HANDLE_COLORS,
   STRETCH_HANDLE_FACE_OPACITY,
@@ -145,6 +146,7 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
     (yMax - yMin) / 2,
     (zMax - zMin) / 2,
   ];
+  const maxDim = Math.max(xMax - xMin, yMax - yMin, zMax - zMin, 0.5);
 
   const { rotationY, axes: localAxes } = getLocalAxes(viewer, entityId, isAsset);
   
@@ -163,7 +165,6 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
   // Keep handles readable across different asset sizes without turning
   // them into oversized boxes. Use the object's local dimensions as the
   // scale reference.
-  const maxDim = Math.max(worldHalf[0] * 2, worldHalf[1] * 2, worldHalf[2] * 2, 0.5);
   const grip = Math.max(0.055, Math.min(0.18, maxDim * 0.045));
   const FACE_SIZE = {
      0: [grip * 0.45, grip * 2.2, grip * 2.2],
@@ -258,9 +259,12 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
   // the object, so the arc + arrow visibly follow the furniture rotation.
   const ROTATION_COLOR = [0.48, 0.30, 0.95];
   const ROTATION_HOVER = [1.0, 0.42, 0.12];
-  const radiusX = (xMax - xMin) / 2;
-  const radiusZ = (zMax - zMin) / 2;
-  const radius = Math.max(radiusX, radiusZ) + Math.max(0.38, maxDim * 0.16);
+  const rotationCenter = isAsset && isGLBModel(viewer.scene.models[entityId])
+    ? getGLBPlacementTarget(viewer.scene.models[entityId])
+    : center;
+  const horizontalHalfX = Math.max(Math.abs(xMin - rotationCenter[0]), Math.abs(xMax - rotationCenter[0]));
+  const horizontalHalfZ = Math.max(Math.abs(zMin - rotationCenter[2]), Math.abs(zMax - rotationCenter[2]));
+  const radius = Math.max(horizontalHalfX, horizontalHalfZ) + Math.max(0.38, maxDim * 0.16);
   const ringYOffset = Math.max(0.03, maxDim * 0.012);
   // Use real triangle geometry for the arc instead of WebGL line width.
   // Line width is implementation-dependent and was rendering too thin in the
@@ -317,7 +321,7 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
         emissive: ROTATION_COLOR,
         opacity: 0.94,
       }),
-      position: center,
+      position: rotationCenter,
       rotation: [0, rotationY, 0],
       pickable: true,
       collidable: false,
@@ -368,7 +372,7 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
         emissive: ROTATION_COLOR,
         opacity: 0.012,
       }),
-      position: center,
+      position: rotationCenter,
       rotation: [0, rotationY, 0],
       pickable: true,
       collidable: false,
@@ -412,7 +416,7 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
         emissive: ROTATION_COLOR,
         opacity: 1.0,
       }),
-      position: center,
+      position: rotationCenter,
       rotation: [0, rotationY, 0],
       pickable: true,
       collidable: false,
@@ -439,7 +443,7 @@ export const buildStretchHandles = (ctx, entityId, isAsset) => {
       restOpacity: mesh === rotationArcMesh ? 0.94 : (mesh === rotationArrowMesh ? 1.0 : 0.012),
       rotationGroup: rotationVisualGroup,
       rotationPickProxy: mesh === rotationPickArcMesh,
-      rotationCenter: center,
+      rotationCenter,
     };
     stretchHandlesRef.current.push(mesh);
   });

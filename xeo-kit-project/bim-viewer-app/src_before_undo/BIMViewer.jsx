@@ -13,9 +13,10 @@ import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
 import { ViewportToolbar } from './components/ViewportToolbar';
 import { TransformModesHelp } from './components/TransformModesHelp';
 import { AssetContextMenu } from './components/AssetContextMenu';
+import { MATERIAL_LIBRARY, COLOR_LIBRARY, FABRIC_LIBRARY, TEXTURE_LIBRARY } from './utils/materialCatalog';
 import { useCatalog } from './hooks/useCatalog';
 
-const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
+const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSavedLayout }) => {
   const { file, jobId, fileName } = activeProject || {};
   const containerRef = useRef(null);
   const tooltipRef = useRef(null);
@@ -27,6 +28,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [isManualSaving, setIsManualSaving] = useState(false);
   const [lastClickPos, setLastClickPos] = useState({ x: 0, y: 0 });
+  const [cameraProjection, setCameraProjection] = useState('perspective');
+  const [savedCameraViews, setSavedCameraViews] = useState([]);
+  const [wallSurfaceScope, setWallSurfaceScope] = useState('both');
 
   // Add the useCatalog hook call[cite: 1]
   const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
@@ -45,7 +49,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
   const {
     projectState, projectStateRef, saveStatus, lastSavedTime,
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
-    toastMessage, customColor, applyMaterial, updateAsset,
+    savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout, updateSavedLayout, updateSavedLayoutSnapshot, deleteSavedLayout,
+    toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, applyMaterialDefinition, applyMaterialDefinitionToAllWalls, updateAsset,
     deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage, saveNow
   } = useProjectSync(activeProject);
@@ -149,13 +154,56 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     setIsRightPanelOpen,
     setRightTab,
     transformFurnitureForCalibration,
-    repairLegacyCalibrationState
+    repairLegacyCalibrationState,
+    isDarkMode
   );
 
   const {
     state: renderState, config: renderConfig, setRenderConfig, executeRender,
     setRenderResult, setRenderError,
   } = useCloudRender(activeProject, projectStateRef);
+
+  useEffect(() => {
+    if (!jobId) {
+      setSavedCameraViews([]);
+      return;
+    }
+    try {
+      const raw = window.localStorage.getItem(`hci-camera-views:${jobId}`);
+      setSavedCameraViews(raw ? JSON.parse(raw) : []);
+    } catch (error) {
+      console.warn('[BIMViewer] Unable to restore saved camera views.', error);
+      setSavedCameraViews([]);
+    }
+  }, [jobId]);
+
+  const persistSavedCameraViews = (views) => {
+    setSavedCameraViews(views);
+    if (!jobId) return;
+    try {
+      window.localStorage.setItem(`hci-camera-views:${jobId}`, JSON.stringify(views));
+    } catch (error) {
+      console.warn('[BIMViewer] Unable to persist saved camera views.', error);
+    }
+  };
+
+  const saveCameraView = (name) => {
+    const snapshot = engineActions.camera.snapshot();
+    if (!snapshot) return;
+    const view = { id: `view_${Date.now()}`, name, snapshot };
+    persistSavedCameraViews([...savedCameraViews, view].slice(-12));
+  };
+
+  const restoreCameraView = (id) => {
+    const view = savedCameraViews.find((item) => item.id === id);
+    if (!view) return;
+    engineActions.camera.restore(view.snapshot);
+    setCameraProjection(view.snapshot.projection || 'perspective');
+  };
+
+  const deleteCameraView = (id) => {
+    persistSavedCameraViews(savedCameraViews.filter((item) => item.id !== id));
+  };
 
   useEffect(() => {
     const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
@@ -175,19 +223,55 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     setIsRightPanelOpen(!nextState);
   };
 
-  const handleCustomColorChange = (e) => {
+  const handleCustomColorChange = (e, surfaceScope = wallSurfaceScope) => {
     const hex = e.target.value;
     const r = parseInt(hex.substring(1, 3), 16) / 255;
     const g = parseInt(hex.substring(3, 5), 16) / 255;
     const b = parseInt(hex.substring(5, 7), 16) / 255;
     const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
-    applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b]);
+    applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b], surfaceScope);
     if (setCustomColor) setCustomColor(hex);
   };
+
+  const handleApplyColorToAllWalls = (hexColor = customColor, surfaceScope = wallSurfaceScope) => {
+    if (!hexColor || !/^#[0-9a-fA-F]{6}$/.test(hexColor)) return;
+    const r = parseInt(hexColor.substring(1, 3), 16) / 255;
+    const g = parseInt(hexColor.substring(3, 5), 16) / 255;
+    const b = parseInt(hexColor.substring(5, 7), 16) / 255;
+    const count = applyMaterialToAllWalls(refs.viewerRef, hexColor, [r, g, b], surfaceScope);
+    if (count > 0) {
+      setToastMessage(`Applied color to ${count} wall${count === 1 ? '' : 's'}.`);
+      setTimeout(() => setToastMessage(null), 2200);
+    } else {
+      setToastMessage('No native walls found in this scene.');
+      setTimeout(() => setToastMessage(null), 2200);
+    }
+    return count;
+  };
+
+  const selectedMaterial = projectState.materials?.[engineState.selectedObject?.id || engineState.selectedAssetId] || null;
+  const applyLibraryMaterial = (material, surfaceScope = wallSurfaceScope) => {
+    const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
+    if (!targetObject?.id || !material) return;
+    applyMaterialDefinition(refs.viewerRef, targetObject, { ...material, surfaceScope: String(targetObject.type || '').toLowerCase().includes('ifcwall') ? surfaceScope : undefined });
+    setToastMessage(`${material.name} applied.`);
+    setTimeout(() => setToastMessage(null), 1800);
+  };
+  const applyLibraryMaterialToAllWalls = (material = null, surfaceScope = wallSurfaceScope) => {
+    if (!material) return;
+    const count = applyMaterialDefinitionToAllWalls(refs.viewerRef, { ...material, surfaceScope });
+    setToastMessage(count ? `${material.name} applied to ${count} walls.` : 'No native walls found in this scene.');
+    setTimeout(() => setToastMessage(null), 2200);
+  };
+
 
   const activeAsset = engineState.selectedAssetId && refs.viewerRef.current
     ? refs.viewerRef.current.scene.models[engineState.selectedAssetId]
     : null;
+
+  useEffect(() => {
+    setWallSurfaceScope('both');
+  }, [engineState.selectedObject?.id, engineState.selectedAssetId]);
 
   const updateCursorTooltip = (clientX, clientY, offsetX, offsetY) => {
     if (!tooltipRef.current || !engineActions.getCursorWorldPosition) return;
@@ -265,6 +349,20 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     }
   };
 
+  const handleSaveAsLayout = async (metadata, renderResult, renderConfig) => {
+    const savedLayout = await saveRenderedLayout(metadata, renderResult, renderConfig);
+    setToastMessage(`Saved “${savedLayout.name}” to Layouts.`);
+    setTimeout(() => setToastMessage(null), 2200);
+    return savedLayout;
+  };
+
+  const handleUpdateSavedLayoutSnapshot = async (layoutId, renderResult, renderConfig) => {
+    const updatedLayout = await updateSavedLayoutSnapshot(layoutId, renderResult, renderConfig);
+    setToastMessage(`Updated “${updatedLayout.name}” in Layouts.`);
+    setTimeout(() => setToastMessage(null), 2200);
+    return updatedLayout;
+  };
+
   const handleManualSave = async () => {
     if (!file || !jobId) return;
     setIsManualSaving(true);
@@ -309,6 +407,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
     });
   }, [engineActions, updateAsset]);
 
+
+  const handleOpenSaveLayout = () => {
+    setRenderConfig((previous) => ({ ...previous, type: '360' }));
+    setShowRenderStudio(true);
+  };
+
   return (
     <div
       ref={containerRef}
@@ -337,17 +441,28 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             engineActions.setTransformMode('select');
           }}
           onNavMode={(next) => engineActions.setNavMode(next)}
+          transformMode={engineState.transformMode}
           onMeasure={() => engineActions.toggleMeasurementMode()}
           onClip={() => engineActions.toggleClipping()}
           onMaxView={toggleMaxView}
           onFullscreen={toggleBrowserFullscreen}
-          onFit={() => {
-            const viewer = refs.viewerRef.current;
-            if (viewer) {
-              const mainModel = viewer.scene.models?.main_structure;
-              if (mainModel) viewer.cameraFlight.flyTo(mainModel);
-            }
+          projection={cameraProjection}
+          onFocus={() => engineActions.camera.focusSelected()}
+          onCameraPreset={(preset) => {
+            engineActions.camera.preset(preset);
+            setCameraProjection(preset === 'top' ? 'ortho' : 'perspective');
           }}
+          onProjection={(projection) => {
+            engineActions.camera.setProjection(projection);
+            setCameraProjection(projection);
+          }}
+          onFit={() => engineActions.camera.fitScene()}
+          savedViews={savedCameraViews}
+          onSaveView={saveCameraView}
+          onRestoreView={restoreCameraView}
+          onDeleteView={deleteCameraView}
+          onResetCamera={() => engineActions.camera.reset()}
+          onSaveLayout={handleOpenSaveLayout}
           />
         </>
       )}
@@ -359,7 +474,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
       />
       
       {/* TOOLTIP OVERLAY FOR STRETCHING */}
-      {engineState.activeStretchData && (
+      {!showRenderStudio && engineState.activeStretchData && (
         <StretchTooltipOverlay 
           visible={true}
           x={engineState.activeStretchData.x}
@@ -368,7 +483,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
         />
       )}
       {/* TOOLTIP OVERLAY FOR EDITING */}
-      {(engineState.selectedAssetId || engineState.selectedObject) && !engineState.isStretching && (
+      {!showRenderStudio && (engineState.selectedAssetId || engineState.selectedObject) && !engineState.isStretching && (
         <TransformModeTooltip
           mode={engineState.transformMode}
           onModeChange={engineActions.setTransformMode}
@@ -378,6 +493,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
           anchorX={lastClickPos.x}
           anchorY={lastClickPos.y}
           isNative={!!engineState.selectedObject && !activeAsset}
+          selectedElements={engineState.selectedElements}
+          selectionCount={engineState.selectedElements?.length || 1}
+          isMultiSelection={(engineState.selectedElements?.length || 0) > 1}
+          multiSelectMode={engineState.multiSelectMode}
+          onToggleMultiSelect={engineActions.toggleMultiSelectMode}
           isDarkMode={isDarkMode}
           onIsolate={async () => {
             if (!engineState.selectedObject || activeAsset) return;
@@ -396,14 +516,22 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
               setTimeout(() => setToastMessage(null), 3500);
             }
           }}
-          onColorChange={(hex) => {
+          materialLibrary={MATERIAL_LIBRARY}
+          selectedMaterial={selectedMaterial}
+          onMaterialSelect={applyLibraryMaterial}
+          canApplyToAllWalls={!!engineState.selectedObject && String(engineState.selectedObject.type || '').toLowerCase().includes('ifcwall')}
+          wallSurfaceScope={wallSurfaceScope}
+          onWallSurfaceScopeChange={setWallSurfaceScope}
+          onApplyMaterialToAllWalls={applyLibraryMaterialToAllWalls}
+          onColorChange={(hex, surfaceScope = wallSurfaceScope) => {
             const r = parseInt(hex.substring(1, 3), 16) / 255;
             const g = parseInt(hex.substring(3, 5), 16) / 255;
             const b = parseInt(hex.substring(5, 7), 16) / 255;
             const targetObject = engineState.selectedObject || { id: engineState.selectedAssetId };
-            applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b]);
+            applyMaterial(refs.viewerRef, targetObject, hex, [r, g, b], surfaceScope);
             if (setCustomColor) setCustomColor(hex);
           }}
+          currentColor={customColor}
           onDelete={() => {
             if (engineState.selectedAssetId) {
               deleteAsset(refs.viewerRef, engineState.selectedAssetId);
@@ -507,13 +635,19 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             availableLayouts={availableLayouts}
             layoutsLoading={layoutsLoading}
             layoutsError={layoutsError}
+            savedLayouts={savedLayouts}
+            savedLayoutsLoading={savedLayoutsLoading}
+            savedLayoutsError={savedLayoutsError}
+            onOpenSavedLayout={onOpenSavedLayout}
+            onEditSavedLayout={updateSavedLayout}
+            onDeleteSavedLayout={deleteSavedLayout}
+            fileNameForLayoutMetadata={fileName}
             onSelectLayout={onReplaceProject}
             onApplyTemplate={(templateId) => applyTemplate(templateId, engineActions.loadIFCAssetIntoScene)}
             placementMode={engineState.placementMode}
             setPlacementMode={engineActions.setPlacementMode}
             resetSelection={() => {
-              engineActions.setSelectedObject(null);
-              engineActions.setSelectedAssetId(null);
+              engineActions.clearSelection();
             }}
             fileName={fileName}
             projectState={projectState} 
@@ -529,10 +663,19 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
             rightTab={rightTab}
             setRightTab={setRightTab}
             selectedObject={engineState.selectedObject}
+            selectedElements={engineState.selectedElements}
+            multiSelectMode={engineState.multiSelectMode}
+            onToggleMultiSelect={engineActions.toggleMultiSelectMode}
+            onClearSelection={engineActions.clearSelection}
             activeAsset={activeAsset}
             selectedAssetId={engineState.selectedAssetId}
             customColor={customColor}
             handleCustomColorChange={handleCustomColorChange}
+            onApplyToAllWalls={handleApplyColorToAllWalls}
+            materialLibrary={MATERIAL_LIBRARY}
+            selectedMaterial={selectedMaterial}
+            onApplyMaterial={applyLibraryMaterial}
+            onApplyMaterialToAllWalls={applyLibraryMaterialToAllWalls}
             updateSelectedAsset={(axis, val, rot) =>
               updateAsset(refs.viewerRef, engineState.selectedAssetId, axis, val, rot)
             }
@@ -589,6 +732,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject }) => {
         {...renderState}
         setRenderResult={setRenderResult}
         setRenderError={setRenderError}
+        onSaveAsLayout={handleSaveAsLayout}
+        onUpdateSavedLayoutSnapshot={handleUpdateSavedLayoutSnapshot}
+        currentSavedLayout={savedLayouts.find((layout) => layout.id === activeProject?.savedLayoutId) || null}
+        activeFileName={fileName}
+        existingSavedLayouts={savedLayouts}
       />
       
       {engineState.isLoading && (

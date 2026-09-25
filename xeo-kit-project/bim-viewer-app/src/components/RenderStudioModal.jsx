@@ -33,6 +33,17 @@ export const RenderStudioModal = ({
   const walkthroughUrl = renderResult?.walkthroughUrl || (jobId ? `${window.location.origin}/walkthrough/${encodeURIComponent(jobId)}` : null);
   const modelUrl = renderResult?.modelUrl || (jobId ? `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb` : null);
 
+  // Saved layouts have durable presentation metadata, so the render header should
+  // identify the design humans selected instead of exposing an internal render job id.
+  // For a normal project/render, fall back to its IFC filename.
+  const savedLayoutTitle = currentSavedLayout
+    ? [currentSavedLayout.categoryName, currentSavedLayout.subCategory, currentSavedLayout.name]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+        .join(' → ')
+    : '';
+  const renderDisplayName = savedLayoutTitle || String(activeFileName || '').trim() || jobId || 'HCI model';
+
   const handleSaveAsLayout = async (metadata) => {
     if (!onSaveAsLayout || isSavingLayout) return;
     setIsSavingLayout(true);
@@ -110,7 +121,12 @@ export const RenderStudioModal = ({
           <div className="flex items-center gap-3">
             <div>
               <h3 className="font-bold text-lg text-slate-800 dark:text-white">Interactive 360° Render</h3>
-              <p className="text-xs text-slate-400 mt-0.5">{jobId}</p>
+              <p
+                className="mt-0.5 max-w-[760px] break-words text-xs font-medium leading-5 text-slate-400"
+                title={renderDisplayName}
+              >
+                {renderDisplayName}
+              </p>
             </div>
             <span className="text-sm text-emerald-600 dark:text-emerald-400 flex items-center gap-1 bg-emerald-50 dark:bg-emerald-500/10 px-3 py-1 rounded-full"><Clock className="w-4 h-4"/> {renderTime}s</span>
           </div>

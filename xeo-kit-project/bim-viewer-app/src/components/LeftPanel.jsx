@@ -18,7 +18,7 @@ export const LeftPanel = ({
   placementMode, setPlacementMode, resetSelection,
   homeTemplates, onApplyTemplate, availableLayouts, layoutsLoading, layoutsError, onSelectLayout, fileName,
   savedLayouts = [], savedLayoutsLoading = false, savedLayoutsError = null, onOpenSavedLayout,
-  onEditSavedLayout, onDeleteSavedLayout, fileNameForLayoutMetadata,
+  onEditSavedLayout, onDeleteSavedLayout, fileNameForLayoutMetadata, activeSavedLayout = null,
 }) => {
   const [leftTab, setLeftTab] = useState('explorer');
   const [layoutPath, setLayoutPath] = useState({ level: 'root', type: null, category: null, subCategory: null });
@@ -119,13 +119,25 @@ export const LeftPanel = ({
 
   return (
     <div className={`flex h-full flex-col border-r border-slate-200 bg-white transition-all duration-300 dark:border-slate-800 dark:bg-slate-900 ${isOpen ? 'w-80' : 'w-0 overflow-hidden border-none'}`}>
-      <div className="flex shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 px-5 py-4 dark:border-slate-800 dark:bg-slate-900/50">
+      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 dark:border-slate-800 dark:bg-slate-900/50">
         <div className="flex min-w-0 items-center gap-3">
           <img src="/hci-logo.svg" alt="High Creation Interiors" className="hci-logo-badge hci-logo-badge--compact" />
-          <div className="h-4 w-px bg-slate-300 dark:bg-slate-700" />
-          <span className="truncate text-xs font-bold tracking-wide text-slate-700 dark:text-slate-300">{fileName || 'Untitled Project'}</span>
+          <div className="h-7 w-px bg-slate-300 dark:bg-slate-700" />
+          {activeSavedLayout ? (
+            <div
+              className="min-w-0"
+              title={`${activeSavedLayout.categoryName || 'Project'} → ${activeSavedLayout.subCategory || 'Sub-Category'} → ${activeSavedLayout.name || 'Layout'}`}
+            >
+              <p className="text-[9px] font-bold uppercase tracking-[0.16em] text-indigo-500 dark:text-indigo-300">Active Layout</p>
+              <p className="mt-0.5 break-words text-[11px] font-bold leading-4 text-slate-700 dark:text-slate-200">
+                {activeSavedLayout.categoryName || 'Project'} → {activeSavedLayout.subCategory || 'Sub-Category'} → {activeSavedLayout.name || 'Layout'}
+              </p>
+            </div>
+          ) : (
+            <span className="min-w-0 break-words text-xs font-bold leading-4 tracking-wide text-slate-700 dark:text-slate-300">{fileName || 'Untitled Project'}</span>
+          )}
         </div>
-        <button onClick={onClose} className="rounded p-1.5 text-slate-400 transition-colors hover:text-indigo-600 dark:hover:text-indigo-400" title="Close Panel"><PanelLeftClose className="h-4 w-4" /></button>
+        <button onClick={onClose} className="shrink-0 rounded p-1.5 text-slate-400 transition-colors hover:text-indigo-600 dark:hover:text-indigo-400" title="Close Panel"><PanelLeftClose className="h-4 w-4" /></button>
       </div>
 
       <div className="flex shrink-0 border-b border-slate-200 dark:border-slate-800">

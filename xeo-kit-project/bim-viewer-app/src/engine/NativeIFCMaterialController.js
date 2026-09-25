@@ -378,7 +378,16 @@ export class NativeIFCMaterialController {
     return { mesh, material, texture, url: loadedUrl };
   }
 
-  async apply(targetId, definition) {
+  async apply(targetId, definition, options = {}) {
+    const isCurrent = typeof options?.isCurrent === 'function' ? options.isCurrent : () => true;
+    const destroyEntry = (entry) => {
+      try { entry?.mesh?.destroy(); } catch (_) {}
+      try { entry?.material?.destroy(); } catch (_) {}
+      try { entry?.texture?.destroy(); } catch (_) {}
+      if (entry?.url) { try { URL.revokeObjectURL(entry.url); } catch (_) {} }
+    };
+
+    if (!isCurrent()) return { handled: true, applied: false };
     if (!this.isNativeTarget(targetId)) return { handled: false, applied: false };
 
     if (!this.ifcAPI || this.ifcModelID == null) {
@@ -401,10 +410,19 @@ export class NativeIFCMaterialController {
       const entries = [];
       try {
         for (const surface of requested) {
+          if (!isCurrent()) {
+            entries.forEach(destroyEntry);
+            return { handled: true, applied: false };
+          }
           const surfaceDefinition = isScopedState
             ? { ...definition.surfaces[surface], surfaceScope: null }
             : { ...definition, surfaceScope: null };
           const entry = await this._createOverlay(targetId, surfaceDefinition, surface);
+          if (!isCurrent()) {
+            if (entry) destroyEntry(entry);
+            entries.forEach(destroyEntry);
+            return { handled: true, applied: false };
+          }
           if (entry) entries.push(entry);
         }
       } catch (error) {
@@ -418,6 +436,10 @@ export class NativeIFCMaterialController {
         return { handled: true, applied: false };
       }
 
+      if (!isCurrent()) {
+        entries.forEach(destroyEntry);
+        return { handled: true, applied: false };
+      }
       if (!entries.length) return { handled: true, applied: false };
       this.overlays.set(targetId, entries);
       return { handled: true, applied: true };
@@ -431,6 +453,10 @@ export class NativeIFCMaterialController {
 
     const entry = await this._createOverlay(targetId, definition, null);
     if (!entry) return { handled: true, applied: false };
+    if (!isCurrent()) {
+      destroyEntry(entry);
+      return { handled: true, applied: false };
+    }
     this.destroyOverlay(targetId);
     this.overlays.set(targetId, [entry]);
     return { handled: true, applied: true };

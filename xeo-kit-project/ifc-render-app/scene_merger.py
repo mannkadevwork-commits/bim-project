@@ -783,7 +783,16 @@ def main():
             # 1. Delta-Based structural edit (resize/move), applied to the
             #    pristine per-element mesh BEFORE it joins the scene.
             #    input.ifc itself is never touched.
-            edit_def = structural_edits.get(global_id)
+            edit_def = structural_edits.get(global_id) or {}
+
+            # Visibility is an authored editor state. A deleted/hidden native
+            # element must not enter the static-render scene at all; keeping it
+            # in the OBJ and hiding it only in the editor would make the static
+            # render disagree with the user's canvas.
+            if edit_def.get("visible") is False:
+                log(f"[scene_merger] Skipping hidden structural element {global_id}.")
+                continue
+
             if edit_def:
                 apply_structural_edit(mesh, edit_def, warnings, global_id)
                 structural_edits_applied += 1
@@ -876,9 +885,28 @@ def main():
                     for piece in pieces:
                         piece.apply_transform(z_up_to_y_up_matrix())
 
-                transform = build_transform(
-                    item.get("position"), item.get("rotation"), item.get("scale"),
-                )
+                # The live Xeokit model.matrix is the authoritative transform
+                # after drag/resize operations. It is stored column-major (the
+                # same convention used by Xeokit/gl-matrix), while trimesh
+                # expects a conventional row-major NumPy matrix. Prefer the
+                # persisted matrix when valid so the static render reproduces
+                # the exact editor transform, including stretch operations;
+                # fall back to the semantic TRS fields for legacy states.
+                persisted_matrix = item.get("matrix")
+                transform = None
+                if (isinstance(persisted_matrix, (list, tuple)) and
+                    len(persisted_matrix) == 16):
+                    try:
+                        matrix_values = [float(value) for value in persisted_matrix]
+                        if all(np.isfinite(value) for value in matrix_values):
+                            transform = np.array(matrix_values, dtype=float).reshape((4, 4)).T
+                    except (TypeError, ValueError):
+                        transform = None
+
+                if transform is None:
+                    transform = build_transform(
+                        item.get("position"), item.get("rotation"), item.get("scale"),
+                    )
 
                 item_id = item.get("instanceId") or item.get("globalId") or item.get("id") or f"furniture_{i}"
                 # This is the EXACT key apply_material_override looks up below,

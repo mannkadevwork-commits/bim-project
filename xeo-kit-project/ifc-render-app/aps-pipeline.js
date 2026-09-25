@@ -13,6 +13,8 @@ const BUCKET_KEY = (process.env.APS_CLIENT_ID + "_render_storage").toLowerCase()
 
 const CAMERA_ANGLE = process.argv[2] || "top-front-right";
 const JOB_DIR = process.argv[3] || ".";
+const LIGHTING = process.argv[4] || "daylight";
+const QUALITY = process.argv[5] || "high";
 const JOB_ID = path.basename(JOB_DIR) || "default";
 
 const LOCAL_IFC_PATH = path.join(JOB_DIR, "input.ifc");
@@ -22,7 +24,7 @@ const LOCAL_MTL_PATH = path.join(JOB_DIR, "input.mtl");
 const CAMERA_JSON_PATH = path.join(JOB_DIR, "camera.json");
 const RESULT_PNG_PATH = path.join(JOB_DIR, "result.png");
 const HTML_OUT_PATH = path.join(JOB_DIR, "360_viewer.html");
-const LOCAL_BUNDLE_PATH = "./IFCRenderBundle.zip";
+const LOCAL_BUNDLE_PATH = path.join(__dirname, "IFCRenderBundle.zip");
 
 const CLOUD_OBJ_KEY = `${JOB_ID}_input.obj`;
 const CLOUD_MTL_KEY = `${JOB_ID}_input.mtl`;
@@ -1755,10 +1757,15 @@ async function runPipeline() {
             console.log("ℹ️  No input.mtl produced by scene_merger.py — scene has no material overrides, skipping.");
         }
 
-        const renderCfg = JSON.parse(fs.readFileSync('./render-config.json', 'utf-8'));
+        const renderConfigPath = path.join(__dirname, 'render-config.json');
+        const renderCfg = JSON.parse(fs.readFileSync(renderConfigPath, 'utf-8'));
         renderCfg.angle = CAMERA_ANGLE;
+        renderCfg.lighting = LIGHTING === 'night' ? 'night' : 'daylight';
+        renderCfg.quality = ['low', 'medium', 'high'].includes(QUALITY) ? QUALITY : 'high';
         renderCfg.interiorCenter = BBOX_CENTER;
         renderCfg.interiorSize = BBOX_SIZE;
+        renderCfg.fov = Number.isFinite(Number(renderCfg.camera?.fov)) ? Number(renderCfg.camera.fov) : 45;
+        renderCfg.staticResolution = { width: 3840, height: 2160 };
         fs.writeFileSync(CAMERA_JSON_PATH, JSON.stringify(renderCfg));
         await uploadFileToOSS(token, BUCKET_KEY, CLOUD_CAM_KEY, CAMERA_JSON_PATH);
 
@@ -1820,6 +1827,9 @@ async function runPipeline() {
         const fileRes = await axios.get(dlRes.data.url, { responseType: 'arraybuffer' });
 
         fs.writeFileSync(RESULT_PNG_PATH, Buffer.from(fileRes.data));
+        if (!fs.existsSync(RESULT_PNG_PATH) || fs.statSync(RESULT_PNG_PATH).size < 1024) {
+            throw new Error(`Autodesk completed but result.png is missing or unexpectedly small.`);
+        }
 
         console.log(`\n=================================================`);
         console.log(`PIPELINE SUCCESSFUL!`);

@@ -20,6 +20,7 @@ import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './plac
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
 import { calculateGrabPoint } from './stretch/TranslationController';
 import { CameraManager } from './CameraManager';
+import { applyGLBPlacementTransform, getGLBPlacementTarget, isGLBModel, GLB_TRANSFORM_VERSION } from './assets/GLBAssetTransform';
 import { applyMaterialDefinitionToSceneTarget, configureNativeIFCMaterialController, disposeNativeIFCMaterialController } from '../utils/materialScene';
 import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
 
@@ -300,6 +301,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const applyPersistedModelMatrix = (model, item) => {
     if (!model || !item) return;
 
+    // GLB assets are restored by the normalized pivot-aware loader contract.
+    // Applying the legacy raw matrix afterward would undo normalization.
+    if (isGLBModel(model) || item.fileType === 'glb' || item.file_type === 'glb') return;
+
     if (Array.isArray(item.matrix) && item.matrix.length === 16 && item.matrix.every(Number.isFinite)) {
       model.matrix = Array.from(item.matrix);
       return;
@@ -402,14 +407,20 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         loadingModelsRef.current.add(item.instanceId);
 
         const isNativeIsolation = !!item.isNativeIsolation;
+        const isGLBAsset = ['glb', 'gltf'].includes(String(item.fileType || item.file_type || '').toLowerCase());
+        const hasGLBNormalization = item?.glbNormalization?.version === GLB_TRANSFORM_VERSION &&
+          Array.isArray(item?.glbNormalization?.pivotLocal) &&
+          item.glbNormalization.pivotLocal.length === 3;
 
-        // Native-isolated IFCs already contain the element in its original
-        // IFC/world coordinate space. Passing item.position as targetPosition
-        // would run the generic AABB-to-floor placement correction and move the
-        // isolated wall. Load these at model origin, then restore their model
-        // transform exactly as persisted.
+        // GLB assets use the semantic normalized pivot target. Legacy GLBs with
+        // a persisted matrix are migrated from that exact matrix by AssetManager.
+        // Native-isolated IFCs retain the existing matrix/position restoration path.
         const hasPersistedMatrix = Array.isArray(item.matrix) && item.matrix.length === 16;
-        const targetPosition = (isNativeIsolation || hasPersistedMatrix) ? null : (item.position || [0, 0, 0]);
+        const targetPosition = isGLBAsset
+          ? (hasGLBNormalization || !hasPersistedMatrix
+            ? (Array.isArray(item.position) ? [...item.position] : [0, 0, 0])
+            : null)
+          : ((isNativeIsolation || hasPersistedMatrix) ? null : (item.position || [0, 0, 0]));
 
         const assetRestoreEnd = perfTimer('BIM_ENGINE', `restore asset ${item.instanceId}`, {
           jobId,
@@ -429,6 +440,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             scale: item.scale || [1, 1, 1],
             nativeSourceId: item.nativeSourceId || item.id || null,
             isNativeIsolation,
+            persistedMatrix: isGLBAsset ? item.matrix : null,
+            glbNormalization: isGLBAsset ? item.glbNormalization : null,
             onLoaded: (model) => {
               // Matrix is the authoritative authored transform once present.
               // Legacy records fall back to the proven target-position + TRS path.
@@ -1137,9 +1150,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       if (!targetObj) return;
 
       if (mode === 'move' && type === 'move') {
-        const startPosition = isAsset
-          ? [...(targetObj.position || [0, 0, 0])]
-          : [...(targetObj.offset || [0, 0, 0])];
+        const startPosition = isAsset && isGLBModel(targetObj)
+          ? getGLBPlacementTarget(targetObj)
+          : (isAsset
+            ? [...(targetObj.position || [0, 0, 0])]
+            : [...(targetObj.offset || [0, 0, 0])]);
         const startGrab = calculateGrabPoint(viewerRef, canvas, canvasPos, startPosition[1]);
         if (!startGrab) {
           viewer.cameraControl.active = true;
@@ -1160,9 +1175,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       }
 
       if (mode === 'rotate' && type === 'rotate') {
-        const center = targetObj.aabb
-          ? [(targetObj.aabb[0] + targetObj.aabb[3]) / 2, (targetObj.aabb[1] + targetObj.aabb[4]) / 2, (targetObj.aabb[2] + targetObj.aabb[5]) / 2]
-          : [...(targetObj.position || [0, 0, 0])];
+        const center = isAsset && isGLBModel(targetObj)
+          ? getGLBPlacementTarget(targetObj)
+          : (targetObj.aabb
+            ? [(targetObj.aabb[0] + targetObj.aabb[3]) / 2, (targetObj.aabb[1] + targetObj.aabb[4]) / 2, (targetObj.aabb[2] + targetObj.aabb[5]) / 2]
+            : [...(targetObj.position || [0, 0, 0])]);
         
         const startGrab = calculateGrabPoint(viewerRef, canvas, canvasPos, center[1]);
         if (!startGrab) {
@@ -1221,7 +1238,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         };
 
         const startScale = getScale(targetObj);
-        const startPosition = targetObj.position ? [...targetObj.position] : (targetObj.offset ? [...targetObj.offset] : [0, 0, 0]);
+        const startPosition = isAsset && isGLBModel(targetObj)
+          ? getGLBPlacementTarget(targetObj)
+          : (targetObj.position ? [...targetObj.position] : (targetObj.offset ? [...targetObj.offset] : [0, 0, 0]));
           
         stretchDragRef.current = {
           type: 'scale',
@@ -1268,8 +1287,18 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           dragData.startPosition[2] + currentGrab[2] - dragData.startGrab[2],
         ];
 
-        if (dragData.isAsset) targetObj.position = next;
-        else targetObj.offset = next;
+        if (dragData.isAsset && isGLBModel(targetObj)) {
+          applyGLBPlacementTransform(
+            targetObj,
+            next,
+            targetObj.rotation || [0, 0, 0],
+            targetObj.scale || [1, 1, 1]
+          );
+        } else if (dragData.isAsset) {
+          targetObj.position = next;
+        } else {
+          targetObj.offset = next;
+        }
 
         setActiveStretchData({ label: 'Move', x: e.clientX, y: e.clientY });
         return;
@@ -1296,27 +1325,15 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         while (nextRotation < 0) nextRotation += 360;
         nextRotation = nextRotation % 360;
 
-        const pivot = targetObj._transformPivot?.local;
-        if (pivot && dragData.isAsset && targetObj.position) {
-          const scale = targetObj.scale || [1, 1, 1];
-          const scaledLocal = [
-            pivot[0] * (scale[0] || 1),
-            pivot[1] * (scale[1] || 1),
-            pivot[2] * (scale[2] || 1),
-          ];
-          const oldRot = targetObj.rotation?.[1] || 0;
-          const currentPivot = [
-            targetObj.position[0] + scaledLocal[0] * Math.cos(oldRot * Math.PI / 180) - scaledLocal[2] * Math.sin(oldRot * Math.PI / 180),
-            targetObj.position[1] + scaledLocal[1],
-            targetObj.position[2] + scaledLocal[0] * Math.sin(oldRot * Math.PI / 180) + scaledLocal[2] * Math.cos(oldRot * Math.PI / 180),
-          ];
-          const nr = nextRotation * Math.PI / 180;
-          targetObj.rotation = [targetObj.rotation?.[0] || 0, nextRotation, targetObj.rotation?.[2] || 0];
-          targetObj.position = [
-            currentPivot[0] - (scaledLocal[0] * Math.cos(nr) - scaledLocal[2] * Math.sin(nr)),
-            currentPivot[1] - scaledLocal[1],
-            currentPivot[2] - (scaledLocal[0] * Math.sin(nr) + scaledLocal[2] * Math.cos(nr)),
-          ];
+        if (dragData.isAsset && isGLBModel(targetObj)) {
+          const currentTarget = getGLBPlacementTarget(targetObj);
+          const currentRotation = targetObj.rotation ? [...targetObj.rotation] : [0, 0, 0];
+          applyGLBPlacementTransform(
+            targetObj,
+            currentTarget,
+            [currentRotation[0], nextRotation, currentRotation[2]],
+            targetObj.scale || [1, 1, 1]
+          );
         } else {
           const currentRotation = targetObj.rotation ? [...targetObj.rotation] : [0, 0, 0];
           targetObj.rotation = [currentRotation[0], nextRotation, currentRotation[2]];
@@ -1354,19 +1371,23 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         
         s[axis] = Math.max(0.05, dragData.startScale[axis] + effectiveDelta * 0.005);
         
-        const startHalf = dragData.startHalf[axis];
-        const scaleRatio = s[axis] / (dragData.startScale[axis] || 1);
-        const halfDelta = startHalf * (scaleRatio - 1);
-        
-        nextPosition[0] += v[0] * halfDelta * dir;
-        nextPosition[1] += v[1] * halfDelta * dir;
-        nextPosition[2] += v[2] * halfDelta * dir;
+        // For normalized GLBs, the semantic pivot is the placement anchor.
+        // Do not shift it based on the runtime AABB while resizing.
+        if (!(dragData.isAsset && isGLBModel(targetObj))) {
+          const startHalf = dragData.startHalf[axis];
+          const scaleRatio = s[axis] / (dragData.startScale[axis] || 1);
+          const halfDelta = startHalf * (scaleRatio - 1);
+          
+          nextPosition[0] += v[0] * halfDelta * dir;
+          nextPosition[1] += v[1] * halfDelta * dir;
+          nextPosition[2] += v[2] * halfDelta * dir;
+        }
       });
       
       applyScale(viewerRef, dragData.targetId, dragData.isAsset, s);
       
-      if (dragData.isAsset) targetObj.position = nextPosition;
-      else targetObj.offset = nextPosition;
+      if (dragData.isAsset && !isGLBModel(targetObj)) targetObj.position = nextPosition;
+      else if (!dragData.isAsset) targetObj.offset = nextPosition;
       
       const names = dragData.axesList.map(({ axis }) => axis === 0 ? 'Width' : axis === 1 ? 'Height' : 'Depth');
       setActiveStretchData({
@@ -1383,7 +1404,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       
       if (targetObj && stretchPersistCallbackRef.current) {
         if (dragData.type === 'move') {
-          const position = dragData.isAsset ? (targetObj.position || [0, 0, 0]) : (targetObj.offset || [0, 0, 0]);
+          const position = dragData.isAsset && isGLBModel(targetObj)
+            ? getGLBPlacementTarget(targetObj)
+            : (dragData.isAsset ? (targetObj.position || [0, 0, 0]) : (targetObj.offset || [0, 0, 0]));
           position.forEach((value, axis) => {
             stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value);
           });

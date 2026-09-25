@@ -416,7 +416,10 @@ export const TransformModeTooltip = ({
             {(onColorChange || onMaterialSelect) && (
               <div>
                 <div className="flex items-center justify-between mb-2">
-                  <div><div className="text-[9px] font-bold text-slate-300 uppercase tracking-[0.15em]">Surface finish</div><div className="text-[8px] text-slate-600 mt-0.5">Color, fabric and texture are separate tools</div></div>
+                  <div>
+                    <div className="text-[9px] font-bold text-slate-300 uppercase tracking-[0.15em]">Surface finish</div>
+                    <div className="text-[8px] text-slate-600 mt-0.5">{isMultiSelection ? `Apply to ${selectionCount} selected elements` : 'Color, fabric and texture are separate tools'}</div>
+                  </div>
                   <span className="w-6 h-6 rounded-lg border border-slate-600 shadow-inner bg-cover bg-center" style={{ backgroundColor: selectedMaterial?.color || currentColor, backgroundImage: selectedMaterial?.texture?.src ? `url(${selectedMaterial.texture.src})` : 'none' }} />
                 </div>
                 {canApplyToAllWalls && (
@@ -458,13 +461,17 @@ export const TransformModeTooltip = ({
               </div>
             )}
             {onColorChange && onDelete && <div className="w-full h-px bg-slate-800 my-3" />}
-            {onDelete && !isMultiSelection && (
+            {onDelete && (
               <button
                 type="button"
                 onClick={(e) => { e.stopPropagation(); onDelete(); setShowMore(false); }}
-                className="w-full flex items-center gap-2 px-2 py-2 rounded-lg text-xs font-semibold text-rose-400 hover:bg-rose-500/10 hover:text-rose-300"
+                className="w-full flex items-center justify-between gap-2 px-2 py-2 rounded-lg text-xs font-semibold text-rose-400 hover:bg-rose-500/10 hover:text-rose-300"
               >
-                <Trash2 className="w-3.5 h-3.5" /> Delete Element
+                <span className="flex items-center gap-2">
+                  <Trash2 className="w-3.5 h-3.5" />
+                  {isMultiSelection ? `Delete ${selectionCount} elements` : 'Delete Element'}
+                </span>
+                {isMultiSelection && <span className="text-[8px] font-bold uppercase tracking-wider text-rose-500/70">Batch</span>}
               </button>
             )}
           </div>
