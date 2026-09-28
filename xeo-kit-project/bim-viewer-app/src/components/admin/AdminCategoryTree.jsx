@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Plus, Pencil, Trash2, FolderOpen, Folder, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, Plus, Pencil, Trash2, FolderOpen, Folder, Loader2, Power } from 'lucide-react';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -8,6 +8,7 @@ function CategoryForm({ initial, categories, onSave, onCancel }) {
   const [slug, setSlug] = useState(initial?.slug || '');
   const [description, setDescription] = useState(initial?.description || '');
   const [parentId, setParentId] = useState(initial?.parent_id || '');
+  const [isActive, setIsActive] = useState(initial?.is_active !== false);
   const [thumbnail, setThumbnail] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -27,6 +28,7 @@ function CategoryForm({ initial, categories, onSave, onCancel }) {
     fd.append('slug', slug.trim());
     fd.append('description', description.trim());
     if (parentId) fd.append('parent_id', parentId);
+    fd.append('is_active', isActive);
     if (thumbnail) fd.append('thumbnail', thumbnail);
     try {
       const url = initial ? `${API}/api/admin/categories/${initial.id}` : `${API}/api/admin/categories`;
@@ -60,6 +62,11 @@ function CategoryForm({ initial, categories, onSave, onCancel }) {
           <option value="">— No parent (root category) —</option>
           {parentOptions.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
         </select>
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <input type="checkbox" checked={isActive} onChange={e => setIsActive(e.target.checked)}
+            className="w-3.5 h-3.5 rounded accent-indigo-600" />
+          <span className="text-xs text-slate-600 dark:text-slate-400">Active (visible in catalog)</span>
+        </label>
         <div>
           <label className="text-[10px] text-slate-500 dark:text-slate-400 block mb-1">Thumbnail image (optional)</label>
           <input type="file" accept="image/*" onChange={e => setThumbnail(e.target.files[0])}
@@ -84,7 +91,7 @@ function CategoryForm({ initial, categories, onSave, onCancel }) {
   );
 }
 
-function CategoryRow({ cat, depth, categories, selectedCategoryId, onSelect, onEdit, onDelete, children }) {
+function CategoryRow({ cat, depth, categories, selectedCategoryId, onSelect, onEdit, onDelete, onToggle, children }) {
   const [open, setOpen] = useState(depth === 0);
   const childArray = Array.isArray(children) ? children.filter(Boolean) : (children ? [children] : []);
   const hasChildren = childArray.length > 0;
@@ -101,10 +108,28 @@ function CategoryRow({ cat, depth, categories, selectedCategoryId, onSelect, onE
           {hasChildren ? (open ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />) : <span className="w-3.5 h-3.5 block" />}
         </button>
         {open ? <FolderOpen className="w-3.5 h-3.5 text-indigo-400 shrink-0" /> : <Folder className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
-        <span className={`flex-1 text-xs truncate ${selectedCategoryId === cat.id ? 'font-bold text-indigo-700 dark:text-indigo-300' : 'text-slate-700 dark:text-slate-300'}`}>
+        <span className={`flex-1 text-xs truncate ${
+          selectedCategoryId === cat.id
+            ? 'font-bold text-indigo-700 dark:text-indigo-300'
+            : cat.is_active
+              ? 'text-slate-700 dark:text-slate-300'
+              : 'text-slate-400 dark:text-slate-600 line-through'
+        }`}>
           {cat.name}
+          {!cat.is_active && (
+            <span className="ml-1.5 text-[9px] font-bold text-amber-500 uppercase tracking-wide" style={{ textDecoration: 'none' }}>inactive</span>
+          )}
         </span>
         <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button onClick={e => { e.stopPropagation(); onToggle(cat); }}
+            className={`p-1 rounded transition-colors ${
+              cat.is_active
+                ? 'hover:bg-amber-100 dark:hover:bg-amber-900/40 text-slate-400 hover:text-amber-600'
+                : 'bg-amber-100 dark:bg-amber-900/40 text-amber-600'
+            }`}
+            title={cat.is_active ? 'Deactivate' : 'Activate'}>
+            <Power className="w-3 h-3" />
+          </button>
           <button onClick={e => { e.stopPropagation(); onEdit(cat); }} className="p-1 rounded hover:bg-indigo-100 dark:hover:bg-indigo-900/40 text-slate-400 hover:text-indigo-600 transition-colors" title="Edit">
             <Pencil className="w-3 h-3" />
           </button>
@@ -123,6 +148,15 @@ export function AdminCategoryTree({ categories, loading, selectedCategoryId, onS
   const [editingCategory, setEditingCategory] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleting, setDeleting] = useState(false);
+
+  const handleToggle = async (cat) => {
+    try {
+      await fetch(`${API}/api/admin/categories/${cat.id}/toggle`, { method: 'PATCH' });
+      onRefresh();
+    } catch (err) {
+      console.error('[Admin] Toggle category failed:', err);
+    }
+  };
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
@@ -148,7 +182,8 @@ export function AdminCategoryTree({ categories, loading, selectedCategoryId, onS
       <CategoryRow key={node.id} cat={node} depth={depth} categories={categories}
         selectedCategoryId={selectedCategoryId} onSelect={onSelect}
         onEdit={cat => { setEditingCategory(cat); setShowForm(true); }}
-        onDelete={setDeleteTarget}>
+        onDelete={setDeleteTarget}
+        onToggle={handleToggle}>
         {renderTree(node.children, depth + 1)}
       </CategoryRow>
     ));

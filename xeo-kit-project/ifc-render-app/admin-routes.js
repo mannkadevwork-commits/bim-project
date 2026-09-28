@@ -42,12 +42,13 @@ router.get('/categories', async (req, res) => {
 // POST /api/admin/categories
 router.post('/categories', upload.single('thumbnail'), async (req, res) => {
   try {
-    const { name, slug, description, parent_id, sort_order } = req.body;
+    const { name, slug, description, parent_id, sort_order, is_active } = req.body;
     const image_url = req.file ? `/uploads/catalog/thumbnails/${req.file.filename}` : null;
+    const active = is_active !== undefined ? is_active === 'true' || is_active === true : true;
     const { rows } = await db.query(
-      `INSERT INTO categories (name, slug, description, parent_id, image_url, sort_order)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [name, slug, description || null, parent_id || null, image_url, sort_order || 0]
+      `INSERT INTO categories (name, slug, description, parent_id, image_url, sort_order, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [name, slug, description || null, parent_id || null, image_url, sort_order || 0, active]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -59,8 +60,9 @@ router.post('/categories', upload.single('thumbnail'), async (req, res) => {
 // PUT /api/admin/categories/:id
 router.put('/categories/:id', upload.single('thumbnail'), async (req, res) => {
   try {
-    const { name, slug, description, parent_id, sort_order } = req.body;
+    const { name, slug, description, parent_id, sort_order, is_active } = req.body;
     const updates = { name, slug, description, parent_id, sort_order };
+    if (is_active !== undefined) updates.is_active = is_active === 'true' || is_active === true;
     if (req.file) updates.image_url = `/uploads/catalog/thumbnails/${req.file.filename}`;
 
     const fields = Object.keys(updates).filter(k => updates[k] !== undefined);
@@ -70,6 +72,20 @@ router.put('/categories/:id', upload.single('thumbnail'), async (req, res) => {
     const { rows } = await db.query(
       `UPDATE categories SET ${setClause} WHERE id = $${fields.length + 1} RETURNING *`,
       [...values, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Category not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/admin/categories/:id/toggle
+router.patch('/categories/:id/toggle', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `UPDATE categories SET is_active = NOT is_active WHERE id = $1 RETURNING *`,
+      [req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Category not found' });
     res.json(rows[0]);
@@ -101,7 +117,7 @@ router.post('/items', upload.fields([
   { name: 'model', maxCount: 1 },
 ]), async (req, res) => {
   try {
-    const { category_id, name, slug, description, color_rgb, attributes, sort_order } = req.body;
+    const { category_id, name, slug, description, color_rgb, attributes, sort_order, is_active } = req.body;
 
     if (!req.files?.model?.[0]) {
       return res.status(400).json({ error: 'model file (.ifc or .glb) is required' });
@@ -114,17 +130,18 @@ router.post('/items', upload.fields([
     const thumbnail_url = req.files?.thumbnail?.[0]
       ? `/uploads/catalog/thumbnails/${req.files.thumbnail[0].filename}`
       : null;
+    const active = is_active !== undefined ? is_active === 'true' || is_active === true : true;
 
     const { rows } = await db.query(
       `INSERT INTO catalog_items
-         (category_id, name, slug, description, color_rgb, thumbnail_url, model_url, file_type, attributes, sort_order)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+         (category_id, name, slug, description, color_rgb, thumbnail_url, model_url, file_type, attributes, sort_order, is_active)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [
         category_id, name, slug, description || null,
         color_rgb ? JSON.stringify(JSON.parse(color_rgb)) : JSON.stringify([0.8, 0.8, 0.8]),
         thumbnail_url, model_url, file_type,
         attributes ? JSON.stringify(JSON.parse(attributes)) : JSON.stringify({}),
-        sort_order || 0,
+        sort_order || 0, active,
       ]
     );
     res.status(201).json(rows[0]);
@@ -140,8 +157,9 @@ router.put('/items/:id', upload.fields([
   { name: 'model', maxCount: 1 },
 ]), async (req, res) => {
   try {
-    const { name, slug, description, color_rgb, attributes, sort_order, category_id } = req.body;
+    const { name, slug, description, color_rgb, attributes, sort_order, category_id, is_active } = req.body;
     const updates = { name, slug, description, sort_order, category_id };
+    if (is_active !== undefined) updates.is_active = is_active === 'true' || is_active === true;
 
     if (color_rgb) updates.color_rgb = JSON.stringify(JSON.parse(color_rgb));
     if (attributes) updates.attributes = JSON.stringify(JSON.parse(attributes));
@@ -162,6 +180,20 @@ router.put('/items/:id', upload.fields([
     const { rows } = await db.query(
       `UPDATE catalog_items SET ${setClause} WHERE id = $${fields.length + 1} RETURNING *`,
       [...values, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/admin/items/:id/toggle
+router.patch('/items/:id/toggle', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `UPDATE catalog_items SET is_active = NOT is_active WHERE id = $1 RETURNING *`,
+      [req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Item not found' });
     res.json(rows[0]);

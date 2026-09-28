@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Plus, Pencil, Trash2, Loader2, Box, FileBox, X, Sparkles } from 'lucide-react';
+import { Plus, Pencil, Trash2, Loader2, Box, FileBox, X, Sparkles, Power } from 'lucide-react';
 import { generateGlbThumbnail } from '../../utils/glbThumbnail';
+import { generateIfcThumbnail } from '../../utils/ifcThumbnail';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 const assetUrl = (url) => (url && url.startsWith('/') ? `${API}${url}` : url);
@@ -32,19 +33,22 @@ function ItemForm({ initial, categories, categoryId, onSave, onCancel }) {
   const [error, setError] = useState('');
   const [uploadProgress, setUploadProgress] = useState('');
   const [generatingThumb, setGeneratingThumb] = useState(false);
+  const [isActive, setIsActive] = useState(initial?.is_active !== false);
 
   const handleModelChange = async (file) => {
     setModelFile(file);
-    if (!file || !file.name.toLowerCase().endsWith('.glb')) return;
-    if (thumbnail) return; // don't overwrite a manually chosen thumbnail
+    const name = file?.name.toLowerCase() ?? '';
+    if (!file || thumbnail || (!name.endsWith('.glb') && !name.endsWith('.ifc'))) return;
     setGeneratingThumb(true);
     try {
-      const blob = await generateGlbThumbnail(file);
+      const blob = name.endsWith('.glb')
+        ? await generateGlbThumbnail(file)
+        : await generateIfcThumbnail(file);
       const previewUrl = URL.createObjectURL(blob);
       setThumbnailPreview(previewUrl);
       setThumbnail(new File([blob], 'thumbnail.jpg', { type: 'image/jpeg' }));
     } catch (e) {
-      console.warn('GLB thumbnail generation failed:', e);
+      console.warn('Thumbnail generation failed:', e);
     } finally {
       setGeneratingThumb(false);
     }
@@ -76,6 +80,7 @@ function ItemForm({ initial, categories, categoryId, onSave, onCancel }) {
     fd.append('category_id', catId);
     fd.append('color_rgb', JSON.stringify(hexToRgb(colorHex)));
     fd.append('attributes', attributes);
+    fd.append('is_active', isActive);
     if (thumbnail) fd.append('thumbnail', thumbnail);
     if (modelFile) fd.append('model', modelFile);
 
@@ -141,6 +146,11 @@ function ItemForm({ initial, categories, categoryId, onSave, onCancel }) {
           <textarea value={attributes} onChange={e => setAttributes(e.target.value)} rows={3}
             className="w-full text-xs px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-200 outline-none focus:border-indigo-400 resize-none font-mono" />
         </div>
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <input type="checkbox" checked={isActive} onChange={e => setIsActive(e.target.checked)}
+            className="w-3.5 h-3.5 rounded accent-indigo-600" />
+          <span className="text-xs text-slate-600 dark:text-slate-400">Active (visible in catalog)</span>
+        </label>
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="text-[10px] text-slate-500 dark:text-slate-400 block mb-1">
@@ -150,7 +160,7 @@ function ItemForm({ initial, categories, categoryId, onSave, onCancel }) {
               className="w-full text-xs text-slate-600 dark:text-slate-400 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-xs file:bg-indigo-50 file:text-indigo-700 cursor-pointer" />
             {generatingThumb && (
               <div className="mt-1 flex items-center gap-1 text-[10px] text-indigo-500">
-                <Loader2 className="w-3 h-3 animate-spin" /> Generating from GLB...
+                <Loader2 className="w-3 h-3 animate-spin" /> Generating preview...
               </div>
             )}
             {thumbnailPreview && !generatingThumb && (
@@ -190,7 +200,7 @@ function ItemForm({ initial, categories, categoryId, onSave, onCancel }) {
   );
 }
 
-function ItemCard({ item, onEdit, onDelete }) {
+function ItemCard({ item, onEdit, onDelete, onToggle }) {
   const [imgFailed, setImgFailed] = useState(false);
   const rgb = item.color_rgb;
   const colorStyle = Array.isArray(rgb)
@@ -198,7 +208,7 @@ function ItemCard({ item, onEdit, onDelete }) {
     : {};
 
   return (
-    <div className="border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden bg-white dark:bg-slate-900 group">
+    <div className={`border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden bg-white dark:bg-slate-900 group transition-opacity ${item.is_active ? 'opacity-100' : 'opacity-50'}`}>
       <div className="w-full h-28 bg-slate-100 dark:bg-slate-800 relative overflow-hidden">
         {item.thumbnail_url && !imgFailed ? (
           <img src={assetUrl(item.thumbnail_url)} alt={item.name} onError={() => setImgFailed(true)} className="w-full h-full object-cover" />
@@ -207,10 +217,20 @@ function ItemCard({ item, onEdit, onDelete }) {
             {item.file_type === 'glb' ? <FileBox className="w-8 h-8" /> : <Box className="w-8 h-8" />}
           </div>
         )}
+        {!item.is_active && (
+          <span className="absolute top-2 left-2 text-[9px] font-bold px-1.5 py-0.5 rounded uppercase bg-amber-500 text-white">inactive</span>
+        )}
         <span className={`absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded uppercase ${item.file_type === 'glb' ? 'bg-violet-600 text-white' : 'bg-indigo-600 text-white'}`}>
           {item.file_type}
         </span>
         <div className="absolute inset-0 bg-slate-900/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
+          <button onClick={() => onToggle(item)} className={`p-2 rounded-lg transition-colors ${
+            item.is_active
+              ? 'bg-white/90 hover:bg-amber-50 text-amber-600'
+              : 'bg-amber-500/90 hover:bg-amber-600 text-white'
+          }`} title={item.is_active ? 'Deactivate' : 'Activate'}>
+            <Power className="w-3.5 h-3.5" />
+          </button>
           <button onClick={() => onEdit(item)} className="p-2 bg-white/90 hover:bg-white rounded-lg text-slate-700 transition-colors" title="Edit">
             <Pencil className="w-3.5 h-3.5" />
           </button>
@@ -271,6 +291,15 @@ export function AdminItemsPanel({ categoryId, categories, onRefresh }) {
     }
   };
 
+  const handleToggle = async (item) => {
+    try {
+      await fetch(`${API}/api/admin/items/${item.id}/toggle`, { method: 'PATCH' });
+      fetchItems();
+    } catch (err) {
+      console.error('[Admin] Toggle item failed:', err);
+    }
+  };
+
   const handleSaved = () => { setShowForm(false); setEditingItem(null); fetchItems(); };
   const selectedCategoryName = categories.find(c => c.id === categoryId)?.name;
 
@@ -308,7 +337,9 @@ export function AdminItemsPanel({ categoryId, categories, onRefresh }) {
           {items.map(item => (
             <ItemCard key={item.id} item={item}
               onEdit={item => { setEditingItem(item); setShowForm(false); }}
-              onDelete={setDeleteTarget} />
+              onDelete={setDeleteTarget}
+              onToggle={handleToggle}
+            />
           ))}
         </div>
       )}

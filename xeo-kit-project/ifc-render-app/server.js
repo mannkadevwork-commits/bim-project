@@ -10,24 +10,11 @@ const crypto = require('crypto');
 const db = require('./db');
 const catalogRoutes = require('./catalog-routes');
 const adminRoutes = require('./admin-routes');
+const ifcEditorRoutes = require('./ifc-editor-routes');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
-
-const PERF_LOGS_ENABLED = String(process.env.HCI_PERF_LOGS ?? 'true').toLowerCase() !== 'false';
-const serverPerfNowMs = () => Number(process.hrtime.bigint()) / 1e6;
-
-if (PERF_LOGS_ENABLED) {
-  app.use((req, res, next) => {
-    const startedAt = serverPerfNowMs();
-    res.on('finish', () => {
-      const durationMs = Number((serverPerfNowMs() - startedAt).toFixed(1));
-      console.info(`[PERF][HTTP] ${req.method} ${req.originalUrl} -> ${res.statusCode} ${durationMs}ms`);
-    });
-    next();
-  });
-}
+app.use(express.json()); 
 
 const { generate360ViewerFromGLB } = require('./aps-pipeline');
 
@@ -209,6 +196,7 @@ app.use('/uploads', express.static(uploadsDir));
 // Mount catalog and admin API routes
 app.use('/api/catalog', catalogRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/ifc-editor', ifcEditorRoutes);
 
 const renderUpload = multer({ storage: multer.memoryStorage() });
 const projectCreateUpload = multer({ storage: multer.memoryStorage() });
@@ -243,11 +231,8 @@ app.get('/api/assets', (req, res) => {
 // Its private render job contains the exact GLB + navigation artifacts used by
 // the React walkthrough, so reopening a saved layout does not mutate the active project.
 app.get('/api/saved-layouts', (req, res) => {
-  const startedAt = serverPerfNowMs();
   try {
-    const layouts = readAllSavedLayouts().map(decorateSavedLayout);
-    if (PERF_LOGS_ENABLED) console.info(`[PERF][API] GET /api/saved-layouts count=${layouts.length} durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)}`);
-    res.json({ layouts });
+    res.json({ layouts: readAllSavedLayouts().map(decorateSavedLayout) });
   } catch (error) {
     console.error('[SavedLayouts] Global List Error:', error);
     res.status(500).json({ error: 'Failed to list saved layouts.' });
@@ -313,7 +298,7 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     [
       'output.glb',
       'navigation_surface.json',
-      'walk_hotspots.json',
+      'walk_areas.json',
       'navigation_navmesh.bin',
       'input.ifc',
       'original.ifc',
@@ -396,7 +381,7 @@ app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'
     const requiredFiles = [
       'output.glb',
       'navigation_surface.json',
-      'walk_hotspots.json',
+      'walk_areas.json',
       'navigation_navmesh.bin',
       'input.ifc',
       'original.ifc',
@@ -586,10 +571,8 @@ app.delete('/api/saved-layouts/:layoutId', (req, res) => {
 // The saved layout itself remains untouched; the user gets a fresh project
 // containing the exact IFC + project state captured when the layout was saved.
 app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
-  const startedAt = serverPerfNowMs();
   try {
     const { jobId, layoutId } = req.params;
-    if (PERF_LOGS_ENABLED) console.info(`[PERF][RESTORE] START layoutId=${layoutId} activeJobId=${jobId}`);
     if (!requireActiveProject(jobId, res)) return;
 
     const layouts = readAllSavedLayouts();
@@ -618,19 +601,12 @@ app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
 
     // The restored workspace must start from the exact IFC captured by the
     // saved layout, not the currently active project's IFC.
-    const copyStartedAt = serverPerfNowMs();
     fs.copyFileSync(inputIfcPath, path.join(newJobDir, 'input.ifc'));
     fs.copyFileSync(
       fs.existsSync(originalIfcPath) ? originalIfcPath : inputIfcPath,
       path.join(newJobDir, 'original.ifc')
     );
     fs.copyFileSync(statePath, path.join(newJobDir, 'project_state.json'));
-    if (PERF_LOGS_ENABLED) {
-      const copiedBytes = ['input.ifc', 'original.ifc', 'project_state.json']
-        .map(name => { try { return fs.statSync(path.join(newJobDir, name)).size; } catch { return 0; } })
-        .reduce((sum, n) => sum + n, 0);
-      console.info(`[PERF][RESTORE] snapshot copies bytes=${copiedBytes} durationMs=${(serverPerfNowMs()-copyStartedAt).toFixed(1)}`);
-    }
 
     const now = new Date().toISOString();
     const sourceManifest = readManifest(sourceJobDir);
@@ -651,7 +627,6 @@ app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.headers.host;
 
-    if (PERF_LOGS_ENABLED) console.info(`[PERF][RESTORE] END layoutId=${layout.id} newJobId=${newJobId} durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)}`);
     return res.json({
       success: true,
       sourceJobId,
@@ -666,7 +641,6 @@ app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
       savedLayoutName: layout.name,
     });
   } catch (error) {
-    if (PERF_LOGS_ENABLED) console.info(`[PERF][RESTORE] ERROR durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)} error=${JSON.stringify(error?.message || String(error))}`);
     console.error('[SavedLayouts] Restore Error:', error);
     res.status(500).json({ error: 'Failed to restore saved layout.' });
   }
@@ -858,18 +832,14 @@ app.post('/api/projects/:jobId/save', (req, res) => {
 });
 
 app.get('/api/projects/:jobId/load', (req, res) => {
-    const startedAt = serverPerfNowMs();
     try {
         const jobId = req.params.jobId;
         const statePath = path.join(jobsDir, jobId, 'project_state.json');
         
         if (fs.existsSync(statePath)) {
-            const raw = fs.readFileSync(statePath, 'utf-8');
-            const state = JSON.parse(raw);
-            if (PERF_LOGS_ENABLED) console.info(`[PERF][API] GET /api/projects/${jobId}/load bytes=${Buffer.byteLength(raw)} furniture=${Array.isArray(state?.furniture) ? state.furniture.length : 0} durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)}`);
+            const state = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
             res.json(state);
         } else {
-            if (PERF_LOGS_ENABLED) console.info(`[PERF][API] GET /api/projects/${jobId}/load empty-state durationMs=${(serverPerfNowMs()-startedAt).toFixed(1)}`);
             res.json({ materials: {}, furniture: [] });
         }
     } catch (error) {
@@ -921,77 +891,22 @@ const floorplanStorage = multer.diskStorage({
 });
 const uploadFloorplan = multer({ storage: floorplanStorage });
 
-function resolveGeminiPython() {
-  const venvPython = path.join(
-    __dirname,
-    'latest_interior_v2',
-    '.venv',
-    'Scripts',
-    'python.exe'
-  );
-
-  if (process.platform === 'win32' && fs.existsSync(venvPython)) {
-    console.info(`[AI] Python runtime: ${venvPython}`);
-    return { command: venvPython, prefixArgs: [] };
-  }
-
-  const fallback = process.platform === 'win32' ? 'py' : 'python';
-  const prefixArgs = process.platform === 'win32' ? ['-3'] : [];
-  console.warn(
-    `[AI-WARN] Dedicated Gemini venv not found at ${venvPython}; ` +
-    `falling back to ${fallback}. Gemini dependencies may be unavailable.`
-  );
-  return { command: fallback, prefixArgs };
-}
-
 function runGeminiPipeline({ jobId, jobDir, imagePath, ifcFileName, ifcOutputPath }) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(__dirname, 'latest_interior_v2', 'automated_bim_v4_connected.py');
     const cachePath = path.join(jobDir, `${jobId}_cache.json`);
-    const python = resolveGeminiPython();
 
-    const args = [
-      ...python.prefixArgs,
-      scriptPath,
-      '--image', imagePath,
-      '--output', ifcOutputPath,
-      '--cache', cachePath,
-      '--assets', assetsDir,
-    ];
-
-    console.info(`[AI:${jobId}] Generator: ${scriptPath}`);
-    console.info(`[AI:${jobId}] Python command: ${python.command}`);
-
-    const pythonProcess = spawn(python.command, args, {
-      cwd: path.dirname(scriptPath),
-      env: { ...process.env },
-    });
+    const pythonProcess = spawn('python', [
+      scriptPath, '--image', imagePath, '--output', ifcOutputPath, '--cache', cachePath, '--assets', assetsDir,
+    ]);
 
     let pythonLogs = '';
-    pythonProcess.stdout.on('data', (data) => {
-      const chunk = data.toString();
-      pythonLogs += chunk;
-      process.stdout.write(`[AI:${jobId}] ${chunk}`);
-    });
-    pythonProcess.stderr.on('data', (data) => {
-      const chunk = data.toString();
-      pythonLogs += chunk;
-      process.stderr.write(`[AI:${jobId}:stderr] ${chunk}`);
-    });
-
-    pythonProcess.on('error', (err) => {
-      const message = `[AI:${jobId}] Failed to launch Gemini Python process: ${err.message}`;
-      console.error(message);
-      reject({ status: 500, body: { error: 'Failed to start the AI pipeline.', logs: `${pythonLogs}\n${message}` } });
-    });
+    pythonProcess.stdout.on('data', (data) => { pythonLogs += data.toString(); });
+    pythonProcess.stderr.on('data', (data) => { pythonLogs += data.toString(); });
 
     pythonProcess.on('close', (code) => {
-      console.info(`[AI:${jobId}] Gemini Python exited with code ${code}`);
       if (code !== 0 || !fs.existsSync(ifcOutputPath)) {
-        return reject({
-          status: 500,
-          body: { error: 'IFC file was not generated by the AI.', logs: pythonLogs },
-        });
+        return reject({ status: 500, body: { error: 'IFC file was not generated by the AI.', logs: pythonLogs } });
       }
       resolve({ ifcFileName });
     });
@@ -1362,7 +1277,6 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
   try {
     const angle = req.body.angle || '360'; 
     const lighting = req.body.lighting || 'daylight';
-    const quality = req.body.quality || 'high';
     const jobId = req.body.jobId;
 
     if (!jobId) {
@@ -1431,7 +1345,7 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
     }
 
     try {
-      execSync(`node aps-pipeline.js ${angle} "${jobDir}" ${lighting} ${quality}`, { stdio: 'inherit', cwd: __dirname, env: { ...process.env, ASSET_DIR: assetsDir } });
+      execSync(`node aps-pipeline.js ${angle} "${jobDir}" ${lighting}`, { stdio: 'inherit', env: { ...process.env, ASSET_DIR: assetsDir } });
     } catch (pipelineError) {
       return res.status(500).json({ error: 'Failed to execute Autodesk pipeline.' });
     }
