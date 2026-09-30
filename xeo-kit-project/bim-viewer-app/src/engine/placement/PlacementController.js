@@ -94,7 +94,11 @@ export const getDropPosition = (viewerRef, projectStateRef, canvasPos, assetType
     z = floorPick.worldPos[2];
   }
 
-  return resolveCollisionFreePosition([x, y, z], projectStateRef);
+  // Manual catalog placement must honor the exact floor point under the cursor.
+  // Automatic collision nudging makes the asset appear to "jump" after drop,
+  // which is especially confusing for GLB furniture. Collision avoidance can be
+  // handled as a separate optional UX step; it must not silently rewrite a drop.
+  return [x, y, z];
 };
 
 export const getCursorWorldPosition = (viewerRef, canvasPos) => {

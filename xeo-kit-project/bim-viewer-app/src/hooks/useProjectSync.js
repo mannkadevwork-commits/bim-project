@@ -9,7 +9,7 @@ import {
   createInitialProjectState,
   projectStatesEqual,
 } from './projectHistory';
-import { applyGLBPlacementTransform, getGLBPlacementTarget, isGLBModel } from '../engine/assets/GLBAssetTransform';
+import { applyGLBPlacementTransform, getGLBPlacementTarget, getGLBRotation, getGLBScale, isGLBModel } from '../engine/assets/GLBAssetTransform';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -19,6 +19,14 @@ const inferFileType = (url, explicitType) => {
   const ext = clean.split('.').pop()?.toLowerCase();
   return ['ifc', 'glb', 'gltf', 'xkt'].includes(ext) ? ext : 'ifc';
 };
+
+const sanitizePersistedFurniture = (items) => (Array.isArray(items) ? items : []).map((item) => {
+  if (!item || typeof item !== 'object') return item;
+  const type = inferFileType(item.src || item.url, item.fileType || item.file_type);
+  if (type === 'glb' || type === 'gltf') return item;
+  const { matrix: _legacyMatrix, ...semanticItem } = item;
+  return semanticItem;
+});
 
 
 
@@ -288,7 +296,7 @@ export const useProjectSync = (activeProject) => {
             projectStateLoadCommitPerfRef.current = performance.now();
             setProjectStateTracked({
               materials: data.materials || {},
-              furniture: data.furniture || [],
+              furniture: sanitizePersistedFurniture(data.furniture || []),
               structural_edits: data.structural_edits || {},
               scene_calibration: data.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
             }, { history: false });
@@ -303,7 +311,7 @@ export const useProjectSync = (activeProject) => {
               const parsed = JSON.parse(localState);
               setProjectStateTracked({
                 materials: parsed.materials || {},
-                furniture: parsed.furniture || [],
+                furniture: sanitizePersistedFurniture(parsed.furniture || []),
                 structural_edits: parsed.structural_edits || {},
                 scene_calibration: parsed.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
               }, { history: false });
@@ -743,33 +751,39 @@ export const useProjectSync = (activeProject) => {
 
     const isGLB = isGLBModel(assetModel);
     const currentGLBTarget = isGLB ? getGLBPlacementTarget(assetModel) : null;
+    const currentGLBRotation = isGLB ? getGLBRotation(assetModel) : null;
+    const currentGLBScale = isGLB ? getGLBScale(assetModel) : null;
 
     let updatedPos;
     let updatedRot;
     let updatedScale;
 
     if (isScale) {
-      updatedScale = [...(assetModel.scale || [1, 1, 1])];
+      updatedScale = isGLB
+        ? [...currentGLBScale]
+        : [...(assetModel.scale || [1, 1, 1])];
       updatedScale[axis] = Math.max(0.001, numValue);
       if (isGLB) {
         applyGLBPlacementTransform(
           assetModel,
           currentGLBTarget,
-          assetModel.rotation || [0, 0, 0],
+          currentGLBRotation,
           updatedScale
         );
       } else {
         assetModel.scale = updatedScale;
       }
     } else if (isRotation) {
-      updatedRot = [...(assetModel.rotation || [0, 0, 0])];
+      updatedRot = isGLB
+        ? [...currentGLBRotation]
+        : [...(assetModel.rotation || [0, 0, 0])];
       updatedRot[axis] = numValue;
       if (isGLB) {
         applyGLBPlacementTransform(
           assetModel,
           currentGLBTarget,
           updatedRot,
-          assetModel.scale || [1, 1, 1]
+          currentGLBScale
         );
       } else {
         assetModel.rotation = updatedRot;
@@ -781,8 +795,8 @@ export const useProjectSync = (activeProject) => {
         applyGLBPlacementTransform(
           assetModel,
           updatedPos,
-          assetModel.rotation || [0, 0, 0],
-          assetModel.scale || [1, 1, 1]
+          currentGLBRotation,
+          currentGLBScale
         );
       } else {
         updatedPos = [...(assetModel.position || [0, 0, 0])];
@@ -794,7 +808,8 @@ export const useProjectSync = (activeProject) => {
     const persistedPosition = isGLB
       ? (updatedPos || currentGLBTarget)
       : (isRotation || isScale ? null : assetModelToTargetPosition(assetModel));
-    const persistedMatrix = normalizeMatrix(assetModel.matrix);
+    // Persist semantic transforms only. GLBs additionally persist normalization;
+    // IFC raw matrices are intentionally excluded from project state.
     const glbNormalization = isGLB
       ? assetModel?._assetMeta?.glbNormalization
       : null;
@@ -808,7 +823,6 @@ export const useProjectSync = (activeProject) => {
               position: persistedPosition || f.position || [0, 0, 0],
               rotation: updatedRot || f.rotation || [0, 0, 0],
               scale: updatedScale || f.scale || [1, 1, 1],
-              ...(persistedMatrix ? { matrix: persistedMatrix } : {}),
               ...(glbNormalization ? { glbNormalization } : {}),
             }
           : f
@@ -853,7 +867,8 @@ export const useProjectSync = (activeProject) => {
       const templateFileType = inferFileType(item.url, item.file_type);
       const onPlaced = (instanceId, finalPosition, model) => {
         if (!isGLBModel(model)) return;
-        const matrix = normalizeMatrix(model?.matrix);
+        // GLBs persist their semantic pivot transform; the runtime matrix is not
+        // part of the persistence contract.
         const normalizedGLB = model?._assetMeta?.glbNormalization;
         const semanticPosition = getGLBPlacementTarget(model);
         setProjectState(prev => ({
@@ -863,7 +878,6 @@ export const useProjectSync = (activeProject) => {
               ? {
                   ...existingItem,
                   position: semanticPosition,
-                  ...(matrix ? { matrix } : {}),
                   ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
                 }
               : existingItem
@@ -955,14 +969,15 @@ export const useProjectSync = (activeProject) => {
     }));
 
     const onPlaced = (instanceId, finalPosition, model) => {
-      const matrix = normalizeMatrix(model?.matrix);
-      const normalizedGLB = isGLBModel(model)
+      const isGLB = isGLBModel(model);
+      const normalizedGLB = isGLB
         ? model?._assetMeta?.glbNormalization
         : null;
-      const semanticPosition = isGLBModel(model)
+      const semanticPosition = isGLB
         ? getGLBPlacementTarget(model)
         : (Array.isArray(finalPosition) ? [...finalPosition] : null);
-
+      // Persist semantic transforms only; runtime IFC matrices are not part of
+      // the durable state contract.
       setProjectStateTracked(prev => ({
         ...prev,
         furniture: (prev.furniture || []).map(item =>
@@ -970,7 +985,6 @@ export const useProjectSync = (activeProject) => {
             ? {
                 ...item,
                 position: semanticPosition || item.position,
-                ...(matrix ? { matrix } : {}),
                 ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
               }
             : item
@@ -1065,7 +1079,6 @@ export const useProjectSync = (activeProject) => {
             position: Array.isArray(position) ? [...position] : [0, 0, 0],
             rotation: Array.isArray(rotation) ? [...rotation] : [0, 0, 0],
             scale: Array.isArray(scale) ? [...scale] : [1, 1, 1],
-            ...(Array.isArray(metadata?.matrix) && metadata.matrix.length === 16 ? { matrix: [...metadata.matrix] } : {}),
             nativeSourceId: metadata?.nativeSourceId || entityId,
             isNativeIsolation: metadata?.isNativeIsolation !== false,
           },

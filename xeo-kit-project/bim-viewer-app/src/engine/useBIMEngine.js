@@ -20,7 +20,7 @@ import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './plac
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
 import { calculateGrabPoint } from './stretch/TranslationController';
 import { CameraManager } from './CameraManager';
-import { applyGLBPlacementTransform, getGLBPlacementTarget, isGLBModel, GLB_TRANSFORM_VERSION } from './assets/GLBAssetTransform';
+import { applyGLBPlacementTransform, getGLBPlacementTarget, getGLBRotation, getGLBScale, isGLBModel, GLB_TRANSFORM_VERSION } from './assets/GLBAssetTransform';
 import { applyMaterialDefinitionToSceneTarget, configureNativeIFCMaterialController, disposeNativeIFCMaterialController } from '../utils/materialScene';
 import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
 
@@ -305,16 +305,13 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     // Applying the legacy raw matrix afterward would undo normalization.
     if (isGLBModel(model) || item.fileType === 'glb' || item.file_type === 'glb') return;
 
-    if (Array.isArray(item.matrix) && item.matrix.length === 16 && item.matrix.every(Number.isFinite)) {
-      model.matrix = Array.from(item.matrix);
-      return;
-    }
+    // IFC assets are restored from semantic position/rotation/scale. Ignore
+    // legacy raw matrices created by the failed IFC transform experiments.
+    if (!item.isNativeIsolation) return;
 
-    const position = item.isNativeIsolation
-      ? (Array.isArray(item.position) ? [...item.position] : [0, 0, 0])
-      : (Array.isArray(model.position) && model.position.length === 3
-        ? [...model.position]
-        : (Array.isArray(item.position) ? [...item.position] : [0, 0, 0]));
+    const position = Array.isArray(item.position) && item.position.length === 3
+      ? [...item.position]
+      : [0, 0, 0];
     const rotation = Array.isArray(item.rotation) && item.rotation.length === 3
       ? item.rotation
       : [0, 0, 0];
@@ -420,7 +417,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           ? (hasGLBNormalization || !hasPersistedMatrix
             ? (Array.isArray(item.position) ? [...item.position] : [0, 0, 0])
             : null)
-          : ((isNativeIsolation || hasPersistedMatrix) ? null : (item.position || [0, 0, 0]));
+          : (isNativeIsolation ? null : (Array.isArray(item.position) ? [...item.position] : [0, 0, 0]));
 
         const assetRestoreEnd = perfTimer('BIM_ENGINE', `restore asset ${item.instanceId}`, {
           jobId,
@@ -1193,7 +1190,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           isAsset,
           center,
           startGrab: [...startGrab],
-          startRotationY: targetObj.rotation?.[1] || 0,
+          startRotationY: isGLBModel(targetObj) ? getGLBRotation(targetObj)[1] : (targetObj.rotation?.[1] || 0),
           rotationGizmoMeshes: stretchHandlesRef.current.filter(mesh => (
             mesh?._stretchMeta?.type === 'rotate' &&
             mesh?._stretchMeta?.targetId === targetId &&
@@ -1209,7 +1206,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       }
 
       if (mode === 'stretch' && (type === 'face' || type === 'edge' || type === 'corner')) {
-        const rotationY = ((targetObj.rotation?.[1] || 0) * Math.PI) / 180;
+        const rotationY = (((isGLBModel(targetObj) ? getGLBRotation(targetObj)[1] : (targetObj.rotation?.[1] || 0))) * Math.PI) / 180;
         const c = Math.cos(rotationY);
         const sn = Math.sin(rotationY);
         const localAxes = [
@@ -1237,7 +1234,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           return [sx || 1, sy || 1, sz || 1];
         };
 
-        const startScale = getScale(targetObj);
+        const startScale = isGLBModel(targetObj)
+          ? getGLBScale(targetObj)
+          : getScale(targetObj);
         const startPosition = isAsset && isGLBModel(targetObj)
           ? getGLBPlacementTarget(targetObj)
           : (targetObj.position ? [...targetObj.position] : (targetObj.offset ? [...targetObj.offset] : [0, 0, 0]));
@@ -1291,8 +1290,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           applyGLBPlacementTransform(
             targetObj,
             next,
-            targetObj.rotation || [0, 0, 0],
-            targetObj.scale || [1, 1, 1]
+            getGLBRotation(targetObj),
+            getGLBScale(targetObj)
           );
         } else if (dragData.isAsset) {
           targetObj.position = next;
@@ -1327,12 +1326,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
         if (dragData.isAsset && isGLBModel(targetObj)) {
           const currentTarget = getGLBPlacementTarget(targetObj);
-          const currentRotation = targetObj.rotation ? [...targetObj.rotation] : [0, 0, 0];
+          const currentRotation = getGLBRotation(targetObj);
           applyGLBPlacementTransform(
             targetObj,
             currentTarget,
             [currentRotation[0], nextRotation, currentRotation[2]],
-            targetObj.scale || [1, 1, 1]
+            getGLBScale(targetObj)
           );
         } else {
           const currentRotation = targetObj.rotation ? [...targetObj.rotation] : [0, 0, 0];
@@ -1371,23 +1370,30 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         
         s[axis] = Math.max(0.05, dragData.startScale[axis] + effectiveDelta * 0.005);
         
-        // For normalized GLBs, the semantic pivot is the placement anchor.
-        // Do not shift it based on the runtime AABB while resizing.
-        if (!(dragData.isAsset && isGLBModel(targetObj))) {
-          const startHalf = dragData.startHalf[axis];
-          const scaleRatio = s[axis] / (dragData.startScale[axis] || 1);
-          const halfDelta = startHalf * (scaleRatio - 1);
-          
-          nextPosition[0] += v[0] * halfDelta * dir;
-          nextPosition[1] += v[1] * halfDelta * dir;
-          nextPosition[2] += v[2] * halfDelta * dir;
-        }
+        // Keep the same anchored-face behaviour as the safe-point resize
+        // implementation. The semantic GLB target is allowed to move here: it
+        // is the equivalent of the old model.position update and keeps the
+        // face opposite the dragged handle visually anchored.
+        const startHalf = dragData.startHalf[axis];
+        const scaleRatio = s[axis] / (dragData.startScale[axis] || 1);
+        const halfDelta = startHalf * (scaleRatio - 1);
+        
+        nextPosition[0] += v[0] * halfDelta * dir;
+        nextPosition[1] += v[1] * halfDelta * dir;
+        nextPosition[2] += v[2] * halfDelta * dir;
       });
       
-      applyScale(viewerRef, dragData.targetId, dragData.isAsset, s);
+      applyScale(viewerRef, dragData.targetId, dragData.isAsset, s, nextPosition);
+      dragData.currentScale = [...s];
       
-      if (dragData.isAsset && !isGLBModel(targetObj)) targetObj.position = nextPosition;
-      else if (!dragData.isAsset) targetObj.offset = nextPosition;
+      // IFC safe-point behavior: raw scale matrix first, then update model.position
+      // to keep the opposite handle anchored. GLBs stay entirely on their normalized
+      // transform path, so this setter is intentionally skipped for GLBs.
+      if (dragData.isAsset && !isGLBModel(targetObj)) {
+        targetObj.position = nextPosition;
+      } else if (!dragData.isAsset) {
+        targetObj.offset = nextPosition;
+      }
       
       const names = dragData.axesList.map(({ axis }) => axis === 0 ? 'Width' : axis === 1 ? 'Height' : 'Depth');
       setActiveStretchData({
@@ -1411,24 +1417,43 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value);
           });
         } else if (dragData.type === 'rotate') {
-          stretchPersistCallbackRef.current(dragData.targetId, 'rotation', 1, targetObj.rotation?.[1] || 0);
+          const rotationY = dragData.isAsset && isGLBModel(targetObj)
+            ? getGLBRotation(targetObj)[1]
+            : (targetObj.rotation?.[1] || 0);
+          stretchPersistCallbackRef.current(dragData.targetId, 'rotation', 1, rotationY);
         } else {
-          // Resize writes the live transform through model.matrix. Xeokit does
-          // not necessarily reflect that matrix back into model.scale, so
-          // reading targetObj.scale here can persist [1, 1, 1] even though the
-          // rendered model was visibly resized. Persist the same scale encoded
-          // in the matrix that the resize operation just applied.
-          const matrix = targetObj.matrix;
-          const matrixScale = matrix && matrix.length >= 11
-            ? [
-                Math.sqrt(matrix[0] * matrix[0] + matrix[1] * matrix[1] + matrix[2] * matrix[2]) || 1,
-                Math.sqrt(matrix[4] * matrix[4] + matrix[5] * matrix[5] + matrix[6] * matrix[6]) || 1,
-                Math.sqrt(matrix[8] * matrix[8] + matrix[9] * matrix[9] + matrix[10] * matrix[10]) || 1,
-              ]
-            : (targetObj.scale || [1, 1, 1]);
+          // GLBs are persisted through their normalized semantic scale. Do not
+          // read it back from a raw matrix because that would reintroduce the
+          // old matrix-vs-TRS conflict. Non-GLB assets keep the legacy matrix path.
+          const currentScale = dragData.isAsset && isGLBModel(targetObj)
+            ? (dragData.currentScale || getGLBScale(targetObj))
+            : (() => {
+                const matrix = targetObj.matrix;
+                return matrix && matrix.length >= 11
+                  ? [
+                      Math.sqrt(matrix[0] * matrix[0] + matrix[1] * matrix[1] + matrix[2] * matrix[2]) || 1,
+                      Math.sqrt(matrix[4] * matrix[4] + matrix[5] * matrix[5] + matrix[6] * matrix[6]) || 1,
+                      Math.sqrt(matrix[8] * matrix[8] + matrix[9] * matrix[9] + matrix[10] * matrix[10]) || 1,
+                    ]
+                  : (targetObj.scale || [1, 1, 1]);
+              })();
+
+          // The safe-point resize math may also move the semantic GLB target so
+          // the opposite face stays anchored. Persist that target movement too;
+          // otherwise the live model would look correct until reload and then
+          // snap back to its pre-resize position.
+          if (dragData.isAsset && isGLBModel(targetObj)) {
+            const finalTarget = getGLBPlacementTarget(targetObj);
+            finalTarget.forEach((value, axis) => {
+              const startValue = dragData.startPosition?.[axis] ?? value;
+              if (Math.abs(value - startValue) > 1e-9) {
+                stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value);
+              }
+            });
+          }
 
           dragData.axesList.forEach(({ axis }) => {
-            stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, matrixScale[axis]);
+            stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, currentScale[axis]);
           });
         }
       }

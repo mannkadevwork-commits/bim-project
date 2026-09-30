@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef } from 'react';
 import { ChevronRight, ChevronDown, Search, Box, FileBox } from 'lucide-react';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:3000';
@@ -55,6 +55,8 @@ function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection
   const isActive = placementMode?.id === placementId;
   const modelUrl = assetUrl(item.model_url || item.url);
 
+  const dragStartedRef = useRef(false);
+
   const catalogId = String(item.id ?? '').trim();
   const itemType = String(item.type || '').trim().toLowerCase();
   const itemCategory = String(item.category || '').trim().toLowerCase();
@@ -80,15 +82,32 @@ function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection
   });
 
   const handleDragStart = (e) => {
+    dragStartedRef.current = true;
     e.dataTransfer.setData('application/json', JSON.stringify(buildPlacementAsset()));
     e.dataTransfer.effectAllowed = 'copy';
+  };
+
+  const handleDragEnd = () => {
+    // Keep the flag alive long enough to cover Chromium's synthetic click
+    // that can follow a completed drag. A zero-delay reset is too early on
+    // some browser event sequences.
+    setTimeout(() => {
+      dragStartedRef.current = false;
+    }, 250);
+  };
+
+  const handleClick = () => {
+    if (dragStartedRef.current) return;
+    setPlacementMode(buildPlacementAsset());
+    resetSelection();
   };
 
   return (
     <div
       draggable
       onDragStart={handleDragStart}
-      onClick={() => { setPlacementMode(buildPlacementAsset()); resetSelection(); }}
+      onDragEnd={handleDragEnd}
+      onClick={handleClick}
       className={`flex flex-col rounded-xl border transition-all cursor-grab active:cursor-grabbing overflow-hidden
         ${isActive
           ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-900/30 shadow-sm'

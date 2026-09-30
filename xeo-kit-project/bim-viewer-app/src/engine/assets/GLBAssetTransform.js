@@ -255,14 +255,40 @@ export const getGLBLocalPivot = (model, fallbackMode = GLB_DEFAULT_PIVOT_MODE) =
   return computeGLBLocalPivot(model, fallbackMode).pivotLocal;
 };
 
+const readCanonicalTransform = (model) => {
+  const state = model?._glbTransformState;
+  const target = state?.target;
+  const rotation = state?.rotation;
+  const scale = state?.scale;
+
+  return {
+    target: Array.isArray(target) && target.length === 3 ? sanitizePosition(target) : null,
+    rotation: Array.isArray(rotation) && rotation.length === 3 ? sanitizeRotation(rotation) : null,
+    scale: Array.isArray(scale) && scale.length === 3 ? sanitizeScale(scale) : null,
+  };
+};
+
+export const getGLBRotation = (model) => {
+  const canonical = readCanonicalTransform(model);
+  return canonical.rotation || sanitizeRotation(model?.rotation);
+};
+
+export const getGLBScale = (model) => {
+  const canonical = readCanonicalTransform(model);
+  return canonical.scale || sanitizeScale(model?.scale);
+};
+
 export const getGLBPlacementTarget = (model) => {
   if (!model) return [0, 0, 0];
+
+  const canonical = readCanonicalTransform(model);
+  if (canonical.target) return [...canonical.target];
 
   const pivot = getGLBLocalPivot(model);
   const transformedPivot = transformLocalPoint(
     pivot,
-    model.rotation || [0, 0, 0],
-    model.scale || [1, 1, 1],
+    canonical.rotation || model.rotation || [0, 0, 0],
+    canonical.scale || model.scale || [1, 1, 1],
   );
 
   const position = vector3(model.position, [0, 0, 0]);
@@ -293,6 +319,68 @@ export const applyGLBPlacementTransform = (model, targetPosition, rotation, scal
     target[1] - transformedPivot[1],
     target[2] - transformedPivot[2],
   ];
+
+  // Keep one semantic source of truth for GLB transforms. This prevents a
+  // resize path that writes model.matrix from silently fighting the normalized
+  // position/rotation/scale contract used by move and rotate.
+  model._glbTransformState = {
+    target: [...target],
+    rotation: [...nextRotation],
+    scale: [...nextScale],
+    version: GLB_TRANSFORM_VERSION,
+  };
+
+  model._transformPivot = {
+    local: [...pivot],
+    world: [...target],
+    version: GLB_TRANSFORM_VERSION,
+  };
+
+  return model;
+};
+
+/**
+ * Resize-only GLB transform path.
+ *
+ * The working pre-normalization resize implementation wrote the composed
+ * matrix directly. Keep that behaviour for live handle drags, but compose the
+ * matrix from the canonical GLB rotation/scale/semantic target so resize never
+ * resets rotation or fights the TRS setters. This is intentionally separate
+ * from applyGLBPlacementTransform: placement/move/rotate keep the normal TRS
+ * path, while pointer-driven resize uses one authoritative matrix write.
+ */
+export const applyGLBResizeTransform = (model, targetPosition, rotation, scale) => {
+  if (!model) return null;
+
+  const target = sanitizePosition(targetPosition);
+  const nextRotation = sanitizeRotation(rotation);
+  const nextScale = sanitizeScale(scale);
+  const pivot = getGLBLocalPivot(model);
+  const transformedPivot = transformLocalPoint(pivot, nextRotation, nextScale);
+  const rootPosition = [
+    target[0] - transformedPivot[0],
+    target[1] - transformedPivot[1],
+    target[2] - transformedPivot[2],
+  ];
+
+  const ry = (nextRotation[1] * Math.PI) / 180;
+  const c = Math.cos(ry);
+  const sn = Math.sin(ry);
+
+  // Column-major matrix, matching xeokit's SceneModel.matrix layout.
+  model.matrix = [
+    nextScale[0] * c, 0, -nextScale[0] * sn, 0,
+    0, nextScale[1], 0, 0,
+    nextScale[2] * sn, 0, nextScale[2] * c, 0,
+    rootPosition[0], rootPosition[1], rootPosition[2], 1,
+  ];
+
+  model._glbTransformState = {
+    target: [...target],
+    rotation: [...nextRotation],
+    scale: [...nextScale],
+    version: GLB_TRANSFORM_VERSION,
+  };
 
   model._transformPivot = {
     local: [...pivot],

@@ -1,28 +1,60 @@
 import { axesKey } from '../utils/helpers';
 import { AXIS_HANDLE_COLORS, STRETCH_HANDLE_FACE_OPACITY } from '../utils/constants';
 import { animateHandleTo } from './StretchHandles';
-import { applyGLBPlacementTransform, getGLBPlacementTarget, isGLBModel } from '../assets/GLBAssetTransform';
+import {
+  applyGLBPlacementTransform,
+  applyGLBResizeTransform,
+  getGLBPlacementTarget,
+  getGLBRotation,
+  getGLBScale,
+  isGLBModel,
+} from '../assets/GLBAssetTransform';
 
-export const applyScale = (viewerRef, targetId, isAsset, scaleVec) => {
+/**
+ * Apply resize to the selected asset.
+ *
+ * IMPORTANT:
+ * - GLB assets use the new normalized GLB transform contract.
+ * - IFC catalogue assets deliberately keep the exact safe-point resize
+ *   representation: a direct scale matrix, followed by the existing
+ *   model.position update in useBIMEngine.
+ *
+ * Do not route IFC assets through GLB normalization.
+ */
+export const applyScale = (
+  viewerRef,
+  targetId,
+  isAsset,
+  scaleVec,
+  targetPosition = null,
+) => {
   const viewer = viewerRef.current;
+  if (!viewer || !Array.isArray(scaleVec) || scaleVec.length !== 3) return;
+
   const [sx, sy, sz] = scaleVec;
+
   if (isAsset) {
     const model = viewer.scene.models[targetId];
     if (!model) return;
 
     if (isGLBModel(model)) {
-      // GLB normalization owns the placement pivot. Scaling must not replace
-      // the full matrix and accidentally erase rotation/pivot information.
-      applyGLBPlacementTransform(
+      const target = Array.isArray(targetPosition) && targetPosition.length === 3
+        ? targetPosition
+        : getGLBPlacementTarget(model);
+
+      // GLB path is unchanged: normalized pivot + semantic transform.
+      applyGLBResizeTransform(
         model,
-        getGLBPlacementTarget(model),
-        model.rotation || [0, 0, 0],
-        [sx, sy, sz]
+        target,
+        getGLBRotation(model),
+        [sx, sy, sz],
       );
       return;
     }
 
-    // Existing non-GLB asset/IFC behavior remains unchanged.
+    // IFC catalogue asset SAFE POINT:
+    // Preserve the original working resize representation. The surrounding
+    // useBIMEngine logic updates model.position after this matrix write.
     const p = model.position || [0, 0, 0];
     model.matrix = [
       sx, 0,  0,  0,
@@ -30,17 +62,20 @@ export const applyScale = (viewerRef, targetId, isAsset, scaleVec) => {
       0,  0,  sz, 0,
       p[0], p[1], p[2], 1,
     ];
-  } else {
-    const entity = viewer.scene.objects[targetId];
-    if (!entity) return;
-    const p = entity.position || [0, 0, 0];
-    entity.matrix = [
-      sx, 0,  0,  0,
-      0,  sy, 0,  0,
-      0,  0,  sz, 0,
-      p[0], p[1], p[2], 1,
-    ];
+    return;
   }
+
+  // Native IFC entity SAFE POINT.
+  const entity = viewer.scene.objects[targetId];
+  if (!entity) return;
+
+  const p = entity.position || [0, 0, 0];
+  entity.matrix = [
+    sx, 0,  0,  0,
+    0,  sy, 0,  0,
+    0,  0,  sz, 0,
+    p[0], p[1], p[2], 1,
+  ];
 };
 
 export const resetHoveredStretchHandle = (hoveredStretchMeshRef, stretchAnimFramesRef) => {

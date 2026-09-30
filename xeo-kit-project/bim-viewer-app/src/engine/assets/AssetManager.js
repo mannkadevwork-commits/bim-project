@@ -14,6 +14,39 @@ import { inspectGLBSource } from './GLBAssetDescriptor';
 
 const nativeIsolationInFlight = new Set();
 
+// IMPORTANT: loadIFCAssetIntoScene can be called from two independent paths:
+// 1) the live catalog placement path, and
+// 2) projectState restoration.
+// React state updates can cause both paths to request the same instanceId before
+// either caller knows that the other one has already created a SceneModel.
+// Keep one registry per loader instance so the same asset instance can never
+// create two SceneModels during that race.
+const loadedAssetModelsByLoader = new WeakMap();
+
+const getAssetRegistry = (loader) => {
+  let registry = loadedAssetModelsByLoader.get(loader);
+  if (!registry) {
+    registry = new Map();
+    loadedAssetModelsByLoader.set(loader, registry);
+  }
+  return registry;
+};
+
+const getLiveRegisteredModel = (registry, instanceId) => {
+  const model = registry.get(instanceId);
+  if (!model) return null;
+
+  // SceneModel exposes `destroyed` in xeokit releases where the component
+  // lifecycle flag is available. Also verify the id so a stale entry can never
+  // be returned for a different model.
+  if (model.id !== instanceId || model.destroyed === true) {
+    registry.delete(instanceId);
+    return null;
+  }
+
+  return model;
+};
+
 const resolveAssetFormat = (srcUrl, options = {}) => {
   const explicit = String(
     options.assetFormat ||
@@ -41,28 +74,39 @@ export const loadIFCAssetIntoScene = async (
   options = {}
 ) => {
   const assetFormat = resolveAssetFormat(srcUrl, options);
+  const loader = assetFormat === 'glb'
+    ? loadersRef.current.gltf
+    : loadersRef.current.ifc;
 
-  if (assetFormat === 'glb') {
-    if (!loadersRef.current.gltf) {
+  if (!loader) {
+    if (assetFormat === 'glb') {
       throw new Error('GLTF loader is not initialized.');
     }
+    return null;
+  }
 
+  // Idempotency guard: if another code path already created this instance, reuse
+  // that exact SceneModel instead of creating another one.
+  const registry = getAssetRegistry(loader);
+  const existingModel = getLiveRegisteredModel(registry, instanceId);
+  if (existingModel) {
+    return existingModel;
+  }
+
+  if (assetFormat === 'glb') {
     try {
       const assetLoadEnd = perfTimer('ASSET', `load GLB ${instanceId}`, { instanceId, srcUrl });
-      // GLTFLoaderPlugin loads GLB/GLTF from src directly. Do not send a GLB
-      // through WebIFCLoaderPlugin - that is what caused the xeokit
-      // "reading 'arguments'" failure for GLB catalog doors.
-      const assetModel = loadersRef.current.gltf.load({
+      const assetModel = loader.load({
         id: instanceId,
         src: srcUrl,
         edges: true,
       });
 
-      // Inspect the authored GLB scene graph in parallel with xeokit's loader.
-      // This descriptor resolves the pivot from the source node hierarchy,
-      // including root/unit/axis conversion matrices, instead of guessing from
-      // a post-transform world AABB. Cache by URL so repeated instances pay the
-      // inspection cost only once.
+      // Register IMMEDIATELY after loader.load(). The model can still be loading;
+      // that is exactly the window in which restoreProjectStateToScene may race
+      // with a live drag/drop request.
+      registry.set(instanceId, assetModel);
+
       const descriptorPromise = inspectGLBSource(srcUrl).catch((error) => {
         console.warn('[BIM Engine] GLB source inspection unavailable; using runtime fallback:', {
           instanceId,
@@ -72,10 +116,6 @@ export const loadIFCAssetIntoScene = async (
         return null;
       });
 
-      // GLBs get their own transform contract. We never modify the source mesh;
-      // instead we normalize the root's pivot once and keep authored placement
-      // anchored to that pivot. This is intentionally separate from the existing
-      // IFC/native AABB logic below.
       assetModel._assetMeta = {
         instanceId,
         fileType: 'glb',
@@ -85,9 +125,6 @@ export const loadIFCAssetIntoScene = async (
 
       const applyLoadedTransform = async () => {
         try {
-          // Read the authored source scene before applying user placement.
-          // Unlike model.aabb, this descriptor is in the GLB's own scene space
-          // and includes every node/root transform emitted by the DCC converter.
           const sourceDescriptor = await descriptorPromise;
           const existingNormalization = options.glbNormalization;
           const normalization = existingNormalization?.version === GLB_TRANSFORM_VERSION
@@ -109,10 +146,6 @@ export const loadIFCAssetIntoScene = async (
           assetModel._assetMeta.glbNormalized = true;
           assetModel._assetMeta.assetDimensions = [...normalization.dimensions];
 
-          // Legacy GLB records may still have the old persisted matrix. Preserve
-          // the visible pivot from that matrix during migration, then immediately
-          // switch to the normalized root contract. New records use semantic
-          // position directly.
           const legacyMatrix = isValidMatrix16(options.persistedMatrix)
             ? options.persistedMatrix
             : null;
@@ -132,8 +165,6 @@ export const loadIFCAssetIntoScene = async (
             );
           }
 
-          // If we did not have a target or legacy matrix, treat the current raw
-          // pivot as the target at its current world position.
           if (!semanticTarget) {
             semanticTarget = getGLBPlacementTarget(assetModel);
           }
@@ -149,6 +180,7 @@ export const loadIFCAssetIntoScene = async (
             options.onLoaded(assetModel);
           }
         } catch (error) {
+          registry.delete(instanceId);
           assetLoadEnd({ loaded: false, format: 'glb', error: error?.message || String(error) });
           console.error('[BIM Engine] GLB normalization/placement failure:', {
             instanceId,
@@ -162,8 +194,6 @@ export const loadIFCAssetIntoScene = async (
         perfLog('ASSET', 'GLB model loaded', { instanceId, modelId: assetModel.id, srcUrl });
 
         if (typeof options.onPlaced === 'function') {
-          // Persist the semantic normalized pivot location, not the internal
-          // xeokit root translation. This is what keeps Move/Rotate/Scale stable.
           const persistedTarget = getGLBPlacementTarget(assetModel);
           options.onPlaced(instanceId, persistedTarget, assetModel);
         }
@@ -171,6 +201,7 @@ export const loadIFCAssetIntoScene = async (
 
       assetModel.on('loaded', applyLoadedTransform);
       assetModel.on('error', (error) => {
+        registry.delete(instanceId);
         assetLoadEnd({ loaded: false, format: 'glb', error: error?.message || String(error) });
         console.error('[BIM Engine] GLB asset load failure:', {
           instanceId,
@@ -181,6 +212,7 @@ export const loadIFCAssetIntoScene = async (
 
       return assetModel;
     } catch (error) {
+      registry.delete(instanceId);
       console.error('[BIM Engine] GLB placement failure:', {
         instanceId,
         srcUrl,
@@ -190,9 +222,8 @@ export const loadIFCAssetIntoScene = async (
     }
   }
 
-  if (!loadersRef.current.ifc) return null;
-
   const assetLoadEnd = perfTimer('ASSET', `load IFC ${instanceId}`, { instanceId, srcUrl });
+
   try {
     const response = await perfFetch('ASSET', `IFC ${instanceId}`, srcUrl);
     if (!response.ok) throw new Error(`Asset fetch failed (${response.status})`);
@@ -200,15 +231,17 @@ export const loadIFCAssetIntoScene = async (
     const bufferTimer = perfTimer('ASSET', `decode IFC response ${instanceId}`);
     const buffer = await response.arrayBuffer();
     bufferTimer({ bytes: buffer.byteLength });
-    const assetModel = loadersRef.current.ifc.load({
+
+    const assetModel = loader.load({
       id: instanceId,
       ifc: new Uint8Array(buffer),
       edges: true,
       globalizeCoordinates: false,
     });
 
-    // This marker is the authoritative discriminator between a separately loaded
-    // editable asset and the original/native IFC model. Do not infer this from IDs.
+    // Register immediately, before the IFC model's async `loaded` event.
+    registry.set(instanceId, assetModel);
+
     assetModel._assetMeta = {
       instanceId,
       fileType: 'ifc',
@@ -261,8 +294,19 @@ export const loadIFCAssetIntoScene = async (
       }
     });
 
+    assetModel.on('error', (error) => {
+      registry.delete(instanceId);
+      assetLoadEnd({ loaded: false, format: 'ifc', error: error?.message || String(error) });
+      console.error('[BIM Engine] IFC asset load failure:', {
+        instanceId,
+        srcUrl,
+        error,
+      });
+    });
+
     return assetModel;
   } catch (error) {
+    registry.delete(instanceId);
     assetLoadEnd({ loaded: false, format: 'ifc', error: error?.message || String(error) });
     console.error('[BIM Engine] Placement failure:', error);
     throw error;
@@ -362,11 +406,6 @@ export const isolateAndMakeMoveable = async (ctx, entityId, onAdoptCallback, upd
     }
     await loadedPromise;
 
-    // IMPORTANT: the isolated IFC can contain the same GlobalId as the native
-    // element. Once it has loaded, scene.objects[entityId] may resolve to the
-    // isolated entity instead of the original one. We therefore hide the exact
-    // native entity reference captured BEFORE loading the isolated model.
-    // Never hide by a post-load global ID lookup.
     const nativeEntitiesToHide = originalNativeEntities.length > 0
       ? originalNativeEntities
       : (viewerRef.current
@@ -491,7 +530,7 @@ export const updateDynamicTransform = (viewerRef, modelId, type, axis, value) =>
       model.scale = newScale;
   } else if (type === 'rotation') {
       const newRot = [...(model.rotation || [0, 0, 0])];
-      newRot[1] = value; 
+      newRot[1] = value;
       model.rotation = newRot;
   } else if (type === 'position') {
       const newPos = [...(model.position || [0, 0, 0])];
