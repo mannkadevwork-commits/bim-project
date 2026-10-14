@@ -16,6 +16,108 @@ import { AssetContextMenu } from './components/AssetContextMenu';
 import { MATERIAL_LIBRARY, COLOR_LIBRARY, FABRIC_LIBRARY, TEXTURE_LIBRARY } from './utils/materialCatalog';
 import { clearNativeIFCMaterialOverride } from './utils/materialScene';
 import { useCatalog } from './hooks/useCatalog';
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
+
+const doorIntrinsicBoundsCache = new Map();
+
+function resolveAssetUrlForBounds(asset) {
+  const raw = String(asset?.url || asset?.src || asset?.model_url || '').trim();
+  if (!raw) throw new Error('Door catalog asset has no model URL.');
+  if (/^https?:\/\//i.test(raw)) return raw;
+  const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+  return `${apiBase.replace(/\/$/, '')}/${raw.replace(/^\//, '')}`;
+}
+
+async function loadDoorIntrinsicBounds(asset) {
+  const url = resolveAssetUrlForBounds(asset);
+  if (!doorIntrinsicBoundsCache.has(url)) {
+    const promise = new Promise((resolve, reject) => {
+      const loader = new GLTFLoader();
+      loader.setMeshoptDecoder(MeshoptDecoder);
+      loader.load(url, (gltf) => {
+        try {
+          gltf.scene.updateMatrixWorld(true);
+          const bounds = new THREE.Box3().setFromObject(gltf.scene);
+          if (bounds.isEmpty()) throw new Error('GLB contains no measurable geometry.');
+          const size = bounds.getSize(new THREE.Vector3());
+          const min = bounds.min.clone();
+          const max = bounds.max.clone();
+          const values = [size.x, size.y, size.z, min.x, min.y, min.z, max.x, max.y, max.z];
+          if (!values.every(Number.isFinite) || size.x <= 0 || size.y <= 0 || size.z <= 0) {
+            throw new Error('GLB bounds are degenerate or non-finite.');
+          }
+          // This loader is only for metadata; dispose its temporary resources.
+          gltf.scene.traverse((node) => {
+            if (node.geometry) node.geometry.dispose();
+            if (node.material) {
+              const materials = Array.isArray(node.material) ? node.material : [node.material];
+              materials.forEach((material) => {
+                if (material && typeof material.dispose === 'function') material.dispose();
+                Object.values(material || {}).forEach((value) => {
+                  if (value?.isTexture && typeof value.dispose === 'function') value.dispose();
+                });
+              });
+            }
+          });
+          resolve({
+            x: size.x, y: size.y, z: size.z,
+            min: [min.x, min.y, min.z], max: [max.x, max.y, max.z],
+          });
+        } catch (error) { reject(error); }
+      }, undefined, reject);
+    });
+    doorIntrinsicBoundsCache.set(url, promise);
+    promise.catch(() => doorIntrinsicBoundsCache.delete(url));
+  }
+  return doorIntrinsicBoundsCache.get(url);
+}
+
+function fallbackDoorDimensions(asset, catalogAssetId) {
+  const defaults = {
+    door_single: { width: 0.9, height: 2.1, thickness: 0.05 },
+    door_double: { width: 1.2, height: 2.1, thickness: 0.05 },
+    door_sliding: { width: 2.0, height: 2.1, thickness: 0.05 },
+    door_revolving: { width: 2.0, height: 2.1, thickness: 0.1 },
+    door_fire: { width: 1.0, height: 2.1, thickness: 0.06 },
+    door_3bhk: { width: 0.9, height: 2.1, thickness: 0.04 },
+  };
+  const id = String(catalogAssetId || '').toLowerCase();
+  const name = String(asset?.name || '').toLowerCase();
+  return defaults[id] || (name.includes('sliding') ? defaults.door_sliding
+    : name.includes('double') ? defaults.door_double
+    : name.includes('fire') ? defaults.door_fire
+    : name.includes('revolving') ? defaults.door_revolving
+    : name.includes('3bhk') ? defaults.door_3bhk
+    : defaults.door_single);
+}
+
+async function resolveDoorDimensionsForPlacement(asset, catalogAssetId, projectState) {
+  const fallback = fallbackDoorDimensions(asset, catalogAssetId);
+  try {
+    const bounds = await loadDoorIntrinsicBounds(asset);
+    const baseScale = Array.isArray(asset?.scale) && asset.scale.length === 3 ? asset.scale : [1, 1, 1];
+    const calibration = projectState?.scene_calibration?.scaleFactor || { x: 1, y: 1, z: 1 };
+    const effectiveScale = [
+      Number(baseScale[0] || 1) * Number(calibration.x || 1),
+      Number(baseScale[1] || 1) * Number(calibration.y || 1),
+      Number(baseScale[2] || 1) * Number(calibration.z || 1),
+    ].map((value) => Math.abs(Number(value)) || 1);
+    const sx = bounds.x * effectiveScale[0];
+    const sy = bounds.y * effectiveScale[1];
+    const sz = bounds.z * effectiveScale[2];
+    const dimensions = { width: Math.max(sx, sz), height: sy, thickness: Math.max(0.025, Math.min(sx, sz)) };
+    if (dimensions.width < 0.4 || dimensions.width > 3.0 || dimensions.height < 1.5 || dimensions.height > 3.5) {
+      throw new Error(`Measured dimensions ${dimensions.width.toFixed(3)} × ${dimensions.height.toFixed(3)} m are outside safe door limits.`);
+    }
+    console.info(`[DoorPlacement] Measured ${asset?.name || catalogAssetId}: ${dimensions.width.toFixed(3)}m × ${dimensions.height.toFixed(3)}m; thickness ${dimensions.thickness.toFixed(3)}m.`);
+    return dimensions;
+  } catch (error) {
+    console.warn('[DoorPlacement] GLB dimension measurement failed; using catalog fallback.', error);
+    return fallback;
+  }
+}
 
 const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSavedLayout, onSavedLayoutCreated }) => {
   const { file, jobId, fileName } = activeProject || {};
@@ -70,33 +172,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         : asset.id
     );
     
-    const doorDimsById = {
-      'door_single': { width: 0.9, height: 2.1, thickness: 0.05 },
-      'door_double': { width: 1.2, height: 2.1, thickness: 0.05 },
-      'door_sliding': { width: 2.0, height: 2.1, thickness: 0.05 },
-      'door_revolving': { width: 2.0, height: 2.1, thickness: 0.1 },
-      'door_fire': { width: 1.0, height: 2.1, thickness: 0.06 },
-      'door_3bhk': { width: 0.9, height: 2.1, thickness: 0.04 },
-    };
-
-    const doorName = String(asset.name || '').toLowerCase();
-    const doorDims = doorDimsById[catalogAssetId] ||
-      (doorName.includes('sliding')
-        ? doorDimsById.door_sliding
-        : doorName.includes('double')
-          ? doorDimsById.door_double
-          : doorName.includes('fire')
-            ? doorDimsById.door_fire
-            : doorName.includes('revolving')
-              ? doorDimsById.door_revolving
-              : doorName.includes('3bhk')
-                ? doorDimsById.door_3bhk
-                : doorDimsById.door_single);
-    
     engineActions.setIsLoading(true);
-    setToastMessage(`Cutting void in wall...`);
-    
+    setToastMessage(`Measuring door and cutting wall opening...`);
+
     try {
+      const doorDims = await resolveDoorDimensionsForPlacement(asset, catalogAssetId, projectStateRef.current);
       const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
       const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${wallGlobalId}/insert-door`, {
         method: 'POST',
@@ -117,7 +197,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       beginHistoryTransaction('Insert door');
       const wallEntity = refs.viewerRef.current?.scene.objects[wallGlobalId];
       clearNativeIFCMaterialOverride(refs.viewerRef.current, wallGlobalId);
-      if (wallEntity) wallEntity.visible = false;
+      if (wallEntity) {
+        if (typeof wallEntity.__hciDoorOriginalVisible !== 'boolean') {
+          wallEntity.__hciDoorOriginalVisible = wallEntity.visible !== false;
+        }
+        wallEntity.visible = false;
+      }
       updateStructuralEdit(wallGlobalId, 'visible', false, false);
       
       const modifiedWallId = `${wallGlobalId}_cut_${Date.now()}`;
@@ -133,7 +218,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       }
       // Do not mutate the shared catalog asset object. A catalog item can be
       // reused for another wall later; hostWallId is placement-specific state.
-      const placedDoorAsset = { ...asset, hostWallId: wallGlobalId };
+      const placedDoorAsset = { ...asset, hostWallId: wallGlobalId, doorDimensions: doorDims };
       await spawnAsset(placedDoorAsset, data.doorPlacement.position, engineActions.loadIFCAssetIntoScene, data.doorPlacement.rotation);
       endHistoryTransaction();
       
@@ -609,13 +694,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
 
   // Sync Engine Visual Transforms -> React State (so it saves to the cloud)
   useEffect(() => {
-    engineActions.setStretchPersistCallback((targetId, type, axis, value) => {
+    engineActions.setStretchPersistCallback((targetId, type, axis, value, transformOptions = {}) => {
       if (type === 'position') {
-        updateAsset(refs.viewerRef, targetId, axis, value, false, false);
+        updateAsset(refs.viewerRef, targetId, axis, value, false, false, transformOptions);
       } else if (type === 'rotation') {
-        updateAsset(refs.viewerRef, targetId, axis, value, true, false);
+        updateAsset(refs.viewerRef, targetId, axis, value, true, false, transformOptions);
       } else if (type === 'scale') {
-        updateAsset(refs.viewerRef, targetId, axis, value, false, true);
+        updateAsset(refs.viewerRef, targetId, axis, value, false, true, transformOptions);
       }
     });
   }, [engineActions, updateAsset]);

@@ -12,16 +12,23 @@ export interface RoomPolygonPoint {
 export interface RoomPortal {
   id: string;
   type: "door" | "opening";
-  source: "ifc-opening";
-  openingExpressId: number;
-  sourceFile: string;
+  source: "ifc-opening" | "hosted-glb-door";
+  openingExpressId?: number | null;
+  sourceFile?: string | null;
   center: RoomPolygonPoint;
   roomA: string | null;
   roomB: string | null;
   hostWallId?: string | null;
   doorExpressId?: number | null;
   doorGlobalId?: string | null;
-  associationMethod: "ifc-rel-fills" | "ifc-rel-voids" | "door-name" | "door-geometry-match" | "opening-only";
+  /** Frontend X/Y/Z basis; normal is horizontal and points toward roomA. */
+  normal?: [number, number, number] | null;
+  width?: number | null;
+  height?: number | null;
+  wallThickness?: number | null;
+  instanceId?: string | null;
+  assetId?: string | null;
+  associationMethod?: "ifc-rel-fills" | "ifc-rel-voids" | "door-name" | "door-geometry-match" | "opening-only" | "hosted-door-side-sampling";
 }
 
 export interface DetectedRoom {
@@ -89,6 +96,8 @@ export interface RoomDebugArtifact {
   cellSize: number;
   floorElevation: number;
   sourceFiles: string[];
+  /** Generated per-door preview IFCs excluded because the canonical structural IFC already contains cumulative wall cuts. */
+  excludedDuplicatePreviewSources: string[];
   rooms: DetectedRoom[];
   portals: RoomPortal[];
   stats: {

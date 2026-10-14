@@ -18,9 +18,11 @@ import { toggleMeasurementMode, clearMeasurements, syncMeasurementsList, deleteM
 import { scaleModelByMeasurement, calibrateWallHeight } from './calibration/CalibrationController';
 import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './placement/PlacementController';
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
-import { calculateGrabPoint } from './stretch/TranslationController';
+import { calculateGrabPoint, translateMatrixWorld } from './stretch/TranslationController';
 import { CameraManager } from './CameraManager';
 import { applyGLBPlacementTransform, getGLBPlacementTarget, getGLBRotation, getGLBScale, isGLBModel, GLB_TRANSFORM_VERSION } from './assets/GLBAssetTransform';
+import { beginIFCRotation, updateIFCRotation, commitIFCRotationState, projectWorldToCanvas } from './assets/IFCRotationController';
+import { beginIFCResize, updateIFCResize, commitIFCResize, isIFCModel } from './stretch/IFCResizeController';
 import { applyMaterialDefinitionToSceneTarget, configureNativeIFCMaterialController, disposeNativeIFCMaterialController } from '../utils/materialScene';
 import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
 
@@ -161,20 +163,139 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     hoveredStretchMeshRef, activeResizeFaceKeyRef, canvasRef
   };
 
+  // One selection-visual contract for every editable asset model (GLB or
+  // isolated/native IFC). Transform implementations remain separate; only the
+  // presentation layer is shared. We deliberately do not use selected/
+  // highlighted/xrayed emphasis on these objects because GLB emphasis shaders
+  // can replace textured materials with a strong cyan fill. Instead we apply a
+  // restrained, reversible visual treatment directly to the object entities.
+  const editableSelectionVisualsRef = useRef(new Map());
+
+  const getEditableModelObjects = (viewer, model) => {
+    const objects = new Set();
+    if (!viewer || !model) return objects;
+
+    Object.values(viewer.scene?.objects || {}).forEach((object) => {
+      if (object?.model === model) objects.add(object);
+    });
+    Object.values(model?.objects || {}).forEach((object) => objects.add(object));
+    return objects;
+  };
+
+  const setEditableAssetSelectionVisual = (viewer, model, active) => {
+    if (!viewer || !model) return;
+
+    const modelObjects = getEditableModelObjects(viewer, model);
+
+    // Editable asset models must never participate in Xeokit's filled selection
+    // emphasis. This also clears stale emphasis that may have been left behind
+    // by a previous selection path.
+    try { model.selected = false; } catch (_) {}
+    try { model.highlighted = false; } catch (_) {}
+    try { model.xrayed = false; } catch (_) {}
+
+    if (active) {
+      editableSelectionVisualsRef.current.set(model.id, model);
+
+      modelObjects.forEach((object) => {
+        if (!object) return;
+
+        if (!object._hciSelectionVisualBackup) {
+          let colorize = null;
+          try {
+            const current = object.colorize;
+            colorize = Array.isArray(current) ? [...current] : current ?? null;
+          } catch (_) {}
+
+          object._hciSelectionVisualBackup = {
+            opacity: typeof object.opacity === 'number' ? object.opacity : 1,
+            edges: typeof object.edges === 'boolean' ? object.edges : false,
+            colorize,
+          };
+        }
+
+        try { object.selected = false; } catch (_) {}
+        try { object.highlighted = false; } catch (_) {}
+        try { object.xrayed = false; } catch (_) {}
+
+        // Modern editor treatment: readable original material + gentle
+        // translucency + a restrained cool tint + enhanced edges. It makes the
+        // gizmo the primary affordance without hiding the furniture itself.
+        try {
+          const baseOpacity = object._hciSelectionVisualBackup.opacity;
+          object.opacity = Math.max(0.64, Math.min(0.78, baseOpacity * 0.78));
+        } catch (_) {}
+        try { object.colorize = [0.88, 0.92, 0.96]; } catch (_) {}
+        try { object.edges = true; } catch (_) {}
+      });
+
+      return;
+    }
+
+    modelObjects.forEach((object) => {
+      if (!object) return;
+
+      try { object.selected = false; } catch (_) {}
+      try { object.highlighted = false; } catch (_) {}
+      try { object.xrayed = false; } catch (_) {}
+
+      const backup = object._hciSelectionVisualBackup;
+      if (backup) {
+        try { object.opacity = backup.opacity; } catch (_) {}
+        try { object.edges = backup.edges; } catch (_) {}
+        try { object.colorize = backup.colorize ?? null; } catch (_) {}
+        try { delete object._hciSelectionVisualBackup; } catch (_) {}
+      }
+    });
+
+    editableSelectionVisualsRef.current.delete(model.id);
+  };
+
+  const clearEditableAssetSelectionVisuals = (viewer) => {
+    if (!viewer) return;
+    [...editableSelectionVisualsRef.current.values()].forEach((model) => {
+      setEditableAssetSelectionVisual(viewer, model, false);
+    });
+    editableSelectionVisualsRef.current.clear();
+  };
+
   const clearSelection = () => {
     const viewer = viewerRef.current;
     if (!viewer) return;
 
-    const ids = [...viewer.scene.selectedObjectIds];
+    // First restore any editable-asset visual overrides. This is what prevents
+    // the previous GLB/isolated-IFC from remaining dark/translucent after the
+    // user clicks another element.
+    clearEditableAssetSelectionVisuals(viewer);
 
-    for (const id of ids) {
-      const object = viewer.scene.objects[id];
-      if (object) object.selected = false;
-    }
+    // Clear Xeokit's own object emphasis registries as well as model-level
+    // emphasis. Batch APIs keep Scene.selectedObjects/highlightedObjects in
+    // sync with the Entity flags instead of relying on ad-hoc property writes.
+    try {
+      const selectedIds = [...(viewer.scene.selectedObjectIds || [])];
+      if (selectedIds.length) viewer.scene.setObjectsSelected(selectedIds, false);
+    } catch (_) {}
+    try {
+      const highlightedIds = [...(viewer.scene.highlightedObjectIds || [])];
+      if (highlightedIds.length) viewer.scene.setObjectsHighlighted(highlightedIds, false);
+    } catch (_) {}
+    try {
+      const xrayedIds = [...(viewer.scene.xrayedObjectIds || [])];
+      if (xrayedIds.length) viewer.scene.setObjectsXRayed(xrayedIds, false);
+    } catch (_) {}
 
-    for (const model of Object.values(viewer.scene.models || {})) {
-      if (model) model.selected = false;
-    }
+    Object.values(viewer.scene.objects || {}).forEach((object) => {
+      try { object.selected = false; } catch (_) {}
+      try { object.highlighted = false; } catch (_) {}
+      try { object.xrayed = false; } catch (_) {}
+    });
+
+    Object.values(viewer.scene.models || {}).forEach((model) => {
+      if (!model) return;
+      try { model.selected = false; } catch (_) {}
+      try { model.highlighted = false; } catch (_) {}
+      try { model.xrayed = false; } catch (_) {}
+    });
 
     setSelectedElements([]);
     selectedElementsRef.current = [];
@@ -302,12 +423,17 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     if (!model || !item) return;
 
     // GLB assets are restored by the normalized pivot-aware loader contract.
-    // Applying the legacy raw matrix afterward would undo normalization.
     if (isGLBModel(model) || item.fileType === 'glb' || item.file_type === 'glb') return;
-
-    // IFC assets are restored from semantic position/rotation/scale. Ignore
-    // legacy raw matrices created by the failed IFC transform experiments.
     if (!item.isNativeIsolation) return;
+
+    // Native-isolated IFCs now persist the exact runtime matrix produced by the
+    // rotation/transform controller. Prefer that matrix so reload/undo reproduces
+    // the visual transform exactly. Older records without a matrix fall back to
+    // the semantic TRS reconstruction for backwards compatibility.
+    if (Array.isArray(item.matrix) && item.matrix.length === 16) {
+      try { model.matrix = Array.from(item.matrix, Number); } catch (_) {}
+      return;
+    }
 
     const position = Array.isArray(item.position) && item.position.length === 3
       ? [...item.position]
@@ -338,6 +464,75 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     void applyMaterialDefinitionToSceneTarget(viewerRef.current, model.id, material);
   };
 
+  // Reconcile an already-loaded furniture model from project state. Undo/redo
+  // changes projectState without necessarily destroying/recreating the model,
+  // so an existing SceneModel must be updated in-place as well.
+  const applyFurnitureStateToExistingModel = (model, item) => {
+    if (!model || !item) return;
+
+    const fileType = String(item.fileType || item.file_type || '').toLowerCase();
+    const isGLB = isGLBModel(model) || fileType === 'glb' || fileType === 'gltf';
+    const position = Array.isArray(item.position) && item.position.length === 3
+      ? [...item.position]
+      : [0, 0, 0];
+    const rotation = Array.isArray(item.rotation) && item.rotation.length === 3
+      ? [...item.rotation]
+      : [0, 0, 0];
+    const scale = Array.isArray(item.scale) && item.scale.length === 3
+      ? [...item.scale]
+      : [1, 1, 1];
+
+    if (isGLB) {
+      applyGLBPlacementTransform(model, position, rotation, scale);
+      return;
+    }
+
+    if (item.isNativeIsolation) {
+      // Native isolation keeps its established matrix-based representation.
+      applyPersistedModelMatrix(model, item);
+      return;
+    }
+
+    // Placed IFC assets use the proven TRS contract. The saved `position` is a
+    // semantic target (floor/contact center), not the internal IFC model origin.
+    // First apply rotation/scale, then derive the local target offset from the
+    // current AABB relative to model.position so undo/redo does not teleport the
+    // asset by applying an already-translated AABB as though it were local space.
+    try { model.rotation = rotation; } catch (_) {}
+    try { model.scale = scale; } catch (_) {}
+
+    const currentPos = Array.isArray(model.position) ? [...model.position] : [0, 0, 0];
+    const aabb = model.aabb;
+    if (aabb && aabb.length >= 6) {
+      const localCenterX = ((aabb[0] + aabb[3]) / 2) - currentPos[0];
+      const localBottomY = aabb[1] - currentPos[1];
+      const localCenterZ = ((aabb[2] + aabb[5]) / 2) - currentPos[2];
+      model.position = [
+        position[0] - localCenterX,
+        position[1] - localBottomY,
+        position[2] - localCenterZ,
+      ];
+    } else {
+      model.position = position;
+    }
+  };
+
+
+    // Door insertion hides a native host wall immediately for responsiveness.
+    // Undo/redo must restore the non-React Xeokit visibility side-effect as well
+    // as projectState. Reconcile every wall we marked, including the case where
+    // undo removes the structural_edits entry entirely.
+    Object.values(viewerRef.current.scene.objects || {}).forEach((entity) => {
+      if (!entity || entity.model !== currentModelRef.current) return;
+      if (typeof entity.__hciDoorOriginalVisible !== 'boolean') return;
+      const edit = state.structural_edits?.[entity.id];
+      const nextVisible = edit?.visible === false
+        ? false
+        : entity.__hciDoorOriginalVisible;
+      try { entity.visible = nextVisible; } catch (error) {
+        console.warn('[DoorHistory] Could not restore host-wall visibility:', entity.id, error);
+      }
+    });
 
   // Restore native IFC edits FIRST, before loading any isolated IFC assets.
     //
@@ -385,21 +580,51 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       });
     }
 
-    // Now restore separately loaded editable assets. Any native isolation has
-    // already had its source geometry hidden above, so a duplicate GlobalId in
-    // the isolated IFC cannot visually resurrect the original native element.
+    // Reconcile separately loaded editable assets. Existing SceneModels must be
+    // updated in place for undo/redo; they must not simply be skipped because
+    // the model already exists. Models that no longer belong to projectState are
+    // destroyed so undoing a placement/delete removes the visual counterpart.
+    const furnitureItems = Array.isArray(state.furniture) ? state.furniture : [];
+    const furnitureById = new Map(
+      furnitureItems
+        .filter(item => item?.instanceId)
+        .map(item => [item.instanceId, item])
+    );
+
+    Object.values(viewerRef.current.scene.models || {}).forEach(model => {
+      if (!model || model === currentModelRef.current) return;
+
+      const instanceId = model._assetMeta?.instanceId || model.id;
+      const isManagedAsset = Boolean(model._assetMeta?.instanceId) || furnitureById.has(model.id);
+      if (!isManagedAsset) return;
+
+      const desiredItem = furnitureById.get(instanceId);
+      if (desiredItem) {
+        applyFurnitureStateToExistingModel(model, desiredItem);
+        applyPersistedMaterialToModel(model, desiredItem, state);
+        return;
+      }
+
+      // A native-isolation model is created slightly before adoptIsolatedAsset
+      // inserts its furniture entry into state. Keep it alive while its source
+      // native element is still marked hidden; destroy it when undo restores the
+      // native element and removes the isolation record.
+      if (model._assetMeta?.isNativeIsolation) {
+        const sourceId = model._assetMeta?.nativeSourceId;
+        const sourceEdit = sourceId ? state.structural_edits?.[sourceId] : null;
+        if (sourceEdit?.visible === false) return;
+      }
+
+      try { model.destroy(); } catch (_) {}
+    });
+
     const restorePromises = [];
     if (state.furniture) {
-      state.furniture.forEach(item => {
-        if (!item?.instanceId || !item?.src) return;
+      furnitureItems.forEach(item => {
+      if (!item?.instanceId || !item?.src) return;
 
-        // A furniture/ghost model can be created by a live user action (for
-        // example Unlock/Isolate) and then immediately added to projectState.
-        // The projectState effect will run again after that state update. Never
-        // create a second xeokit model for an instance that already exists or
-        // is currently being loaded.
-        if (viewerRef.current.scene.models[item.instanceId]) return;
-        if (loadingModelsRef.current.has(item.instanceId)) return;
+      if (viewerRef.current.scene.models[item.instanceId]) return;
+      if (loadingModelsRef.current.has(item.instanceId)) return;
 
         loadingModelsRef.current.add(item.instanceId);
 
@@ -437,13 +662,21 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             scale: item.scale || [1, 1, 1],
             nativeSourceId: item.nativeSourceId || item.id || null,
             isNativeIsolation,
-            persistedMatrix: isGLBAsset ? item.matrix : null,
+            persistedMatrix: hasPersistedMatrix ? item.matrix : null,
             glbNormalization: isGLBAsset ? item.glbNormalization : null,
             onLoaded: (model) => {
-              // Matrix is the authoritative authored transform once present.
-              // Legacy records fall back to the proven target-position + TRS path.
-              applyPersistedModelMatrix(model, item);
-              applyPersistedMaterialToModel(model, item, state);
+              const stillExpected = (projectStateRef.current?.furniture || [])
+                .some(currentItem => currentItem?.instanceId === item.instanceId);
+              if (!stillExpected) {
+                // The user may have undone a placement while its IFC/GLB bytes
+                // were still loading. Do not leave that orphaned SceneModel in
+                // the viewer after the async load completes.
+                try { model.destroy(); } catch (_) {}
+                return;
+              }
+
+              applyFurnitureStateToExistingModel(model, item);
+              applyPersistedMaterialToModel(model, item, projectStateRef.current || state);
             },
           }
         ).then((model) => {
@@ -542,6 +775,31 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   useEffect(() => {
     configureTransformHandles(transformMode);
   }, [transformMode]);
+
+  // Keep asset gizmo activation deterministic. Selection and toolbar clicks can
+  // happen in the same React tick, so do not rely on the render cycle to create
+  // or reveal handles. This helper only manages gizmo lifecycle/visibility; it
+  // does not change any GLB/IFC transform math.
+  const ensureSelectedAssetGizmos = (mode = 'move') => {
+    const viewer = viewerRef.current;
+    const selectedId = selectedAssetIdRef.current;
+    if (!viewer || !selectedId || mode === 'select') return false;
+
+    const model = viewer.scene.models?.[selectedId];
+    if (!model) return false;
+
+    if (!stretchHandlesRef.current.some((mesh) => mesh?._stretchMeta?.targetId === selectedId)) {
+      buildStretchHandlesRef.current?.(stretchCtx, selectedId, true);
+    }
+
+    if (!stretchHandlesRef.current.some((mesh) => mesh?._stretchMeta?.targetId === selectedId)) {
+      return false;
+    }
+
+    transformModeRef.current = mode;
+    configureTransformHandles(mode);
+    return true;
+  };
 
   const destroyPointMeasurementPreview = () => {
     const plugin = measurementsPluginRef.current;
@@ -930,15 +1188,47 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     viewerRef.current = viewer;
     initializeIFCEngine();
 
+    // GLTF/GLB picks are not guaranteed to have the same entity shape: depending
+    // on loader representation, xeokit can return the SceneModel root itself or
+    // one of its drawable child entities. Resolve the owning asset model before
+    // converting the pick into React selection state.
+    const resolvePickedAssetModel = (entity) => {
+      if (!entity) return null;
+
+      if (entity?.model) return entity.model;
+
+      // The model root can itself be the picked entity.
+      if (entity.isModel || entity._assetMeta?.instanceId) return entity;
+
+      const models = viewer.scene.models || {};
+      const hintedModelId = entity?.modelId || entity?.sceneModelId || entity?._modelId;
+      if (hintedModelId && models[hintedModelId]) return models[hintedModelId];
+
+      // Last-resort child lookup. This path is selection-only and is not used by
+      // any move/rotate/resize calculation.
+      const entityId = entity?.id;
+      if (entityId) {
+        for (const model of Object.values(models)) {
+          if (!model) continue;
+          if (model.id === entityId) return model;
+          if (model.objects?.[entityId] || model.meshes?.[entityId]) return model;
+        }
+      }
+
+      return null;
+    };
+
     const isPlacedAssetEntity = (entity) => {
-      const model = entity?.model;
+      const model = resolvePickedAssetModel(entity);
       if (!model) return false;
 
-      // AssetManager/loadSceneAsset stamps separately loaded editable assets
-      // with _assetMeta. The original project model does not have this marker.
-      // Use this as the authoritative native-vs-asset discriminator instead
-      // of relying on model IDs, which can diverge across loader/model wrappers.
-      return !!model._assetMeta;
+      if (model._assetMeta?.instanceId || model._assetMeta?.assetFormat === 'glb') return true;
+
+      // During placement/reconciliation, the model may be live before the GLB
+      // metadata marker is visible on the picked drawable. The furniture state
+      // is then the safe secondary identity for the selected SceneModel.
+      return (projectStateRef.current?.furniture || [])
+        .some(item => item?.instanceId === model.id);
     };
 
     const buildSelectionRecord = (entity, isPlacedAsset) => {
@@ -947,7 +1237,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       const metaObject = viewer.metaScene.metaObjects[entity.id];
 
       if (isPlacedAsset) {
-        const model = entity.model;
+        const model = resolvePickedAssetModel(entity);
         const assetId = model?.id;
         if (!assetId) return null;
 
@@ -1076,7 +1366,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         const existing = currentSelection.find(item => item.id === record.id);
         if (existing) {
           if (isPlacedAsset) {
-            if (entity.model) entity.model.selected = false;
+            setEditableAssetSelectionVisual(viewer, resolvePickedAssetModel(entity), false);
           } else {
             entity.selected = false;
           }
@@ -1085,7 +1375,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         }
 
         if (isPlacedAsset) {
-          if (entity.model) entity.model.selected = true;
+          setEditableAssetSelectionVisual(viewer, resolvePickedAssetModel(entity), true);
         } else {
           entity.selected = true;
           if (entity.model) entity.model.selected = false;
@@ -1096,16 +1386,23 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
       clearSelection();
       if (isPlacedAsset) {
-        const assetModel = entity.model;
+        const assetModel = resolvePickedAssetModel(entity);
         if (!assetModel) return;
-        assetModel.selected = true;
-        buildStretchHandlesRef.current?.(stretchCtx, assetModel.id, true);
-        setTimeout(() => configureTransformHandles('select'), 0);
+        setEditableAssetSelectionVisual(viewer, assetModel, true);
       } else {
         if (entity.model) entity.model.selected = false;
         entity.selected = true;
       }
       applySelectionState([record]);
+
+      if (isPlacedAsset) {
+        // Selection state is now committed to the refs before we create/reveal
+        // the GLB gizmos. Move is the default editing tool.
+        requestAnimationFrame(() => {
+          ensureSelectedAssetGizmos('move');
+          setTransformMode('move');
+        });
+      }
     });
 
     const onMultiSelectionKeyDown = (event) => {
@@ -1115,6 +1412,94 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     
     const canvas = canvasRef.current;
     
+    const projectMoveGizmoHit = (canvasPos) => {
+      const selectedId = selectedAssetIdRef.current || selectedAssetId;
+      if (!selectedId || multiSelectModeRef.current || transformModeRef.current !== 'move') return null;
+
+      const model = viewer.scene.models[selectedId];
+      if (!model) return null;
+
+      let best = null;
+      let bestDistanceSq = Infinity;
+      const moveHandles = stretchHandlesRef.current.filter((mesh) => {
+        const meta = mesh?._stretchMeta;
+        return meta?.isStretchHandle && meta?.transformMode === 'move' && meta?.targetId === selectedId;
+      });
+
+      moveHandles.forEach((mesh) => {
+        const meta = mesh._stretchMeta;
+        const worldPoint = meta.moveInteractionPointWorld || meta.moveInteractionCenterWorld;
+        if (!worldPoint) return;
+        const projected = projectWorldToCanvas(viewerRef, canvas, worldPoint);
+        if (!projected || !Number.isFinite(projected[0]) || !Number.isFinite(projected[1])) return;
+        const dx = canvasPos[0] - projected[0];
+        const dy = canvasPos[1] - projected[1];
+        const distanceSq = dx * dx + dy * dy;
+        if (distanceSq < bestDistanceSq) {
+          bestDistanceSq = distanceSq;
+          best = {
+            entity: mesh,
+            meta,
+            projected,
+          };
+        }
+      });
+
+      const anchorMeta = moveHandles[0]?._stretchMeta;
+      const hitRadius = Number.isFinite(anchorMeta?.moveHitRadiusPx) ? anchorMeta.moveHitRadiusPx : 34;
+      return best && bestDistanceSq <= hitRadius * hitRadius ? best : null;
+    };
+
+    const startMoveDrag = (e, canvasPos, meta) => {
+      if (!meta || meta.transformMode !== 'move') return false;
+
+      const targetId = meta.targetId;
+      const targetObj = viewer.scene.models[targetId];
+      if (!targetObj) return false;
+
+      const isIFCMove = isIFCModel(targetObj);
+      const startPosition = isGLBModel(targetObj)
+        ? [...getGLBPlacementTarget(targetObj)]
+        : [...(targetObj.position || [0, 0, 0])];
+      const startGrab = calculateGrabPoint(viewerRef, canvas, canvasPos, startPosition[1]);
+      if (!startGrab) return false;
+
+      const moveGizmoMeshes = stretchHandlesRef.current.filter((mesh) => {
+        const handleMeta = mesh?._stretchMeta;
+        return handleMeta?.isStretchHandle
+          && handleMeta?.transformMode === 'move'
+          && handleMeta?.targetId === targetId;
+      });
+      const moveGizmoStartPositions = moveGizmoMeshes.map((mesh) => (
+        mesh?.position && typeof mesh.position.length === 'number'
+          ? Array.from(mesh.position, Number)
+          : [0, 0, 0]
+      ));
+
+      e.stopPropagation();
+      e.preventDefault();
+      viewer.cameraControl.active = false;
+
+      stretchDragRef.current = {
+        type: 'move',
+        targetId,
+        isAsset: true,
+        isIFCMove,
+        startPosition,
+        startGrab: [...startGrab],
+        startMatrix: isIFCMove && targetObj.matrix?.length === 16
+          ? Array.from(targetObj.matrix, Number)
+          : null,
+        moveGizmoMeshes,
+        moveGizmoStartPositions,
+      };
+      isStretchingRef.current = true;
+      setIsStretching(true);
+      canvas.style.cursor = 'grabbing';
+      setActiveStretchData({ label: 'Move • drag to reposition', x: e.clientX, y: e.clientY });
+      return true;
+    };
+
     const onCanvasMouseDown = (e) => {
       if (isMeasuringRef.current && (measurementModeRef.current === 'point' || measurementModeRef.current === 'orthogonal')) {
         return;
@@ -1123,11 +1508,36 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       const rect = canvas.getBoundingClientRect();
       const canvasPos = [e.clientX - rect.left, e.clientY - rect.top];
       const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
-      const meta = pick?.entity?._stretchMeta;
-      
-      if (!meta?.isStretchHandle) return;
+      let meta = pick?.entity?._stretchMeta;
       
       const mode = transformModeRef.current;
+
+      // Move is allowed to use both real Xeokit gizmo hits and a screen-space
+      // fallback. The fallback matters when the selected IFC is visually in
+      // front of the tiny gizmo geometry, causing Scene.pick() to return the IFC
+      // mesh instead of the control.
+      if (mode === 'move') {
+        const moveHit = meta?.isStretchHandle && meta.transformMode === 'move'
+          ? { entity: pick.entity, meta }
+          : projectMoveGizmoHit(canvasPos);
+        if (moveHit?.meta && startMoveDrag(e, canvasPos, moveHit.meta)) return;
+
+        const selectedId = selectedAssetIdRef.current || selectedAssetId;
+        const selectedModel = selectedId ? viewer.scene.models[selectedId] : null;
+        const pickedModel = pick?.entity?.model;
+        const pickedSelectedAsset = !!selectedModel && (pick?.entity === selectedModel || pickedModel === selectedModel);
+        if (pickedSelectedAsset) {
+          const moveMetaFromScene = stretchHandlesRef.current.find((mesh) => {
+            const handleMeta = mesh?._stretchMeta;
+            return handleMeta?.isStretchHandle && handleMeta?.transformMode === 'move' && handleMeta?.targetId === selectedId;
+          })?._stretchMeta;
+          if (moveMetaFromScene && startMoveDrag(e, canvasPos, moveMetaFromScene)) return;
+        }
+
+        return;
+      }
+
+      if (!meta?.isStretchHandle) return;
       const baseMetaMode = mode === 'stretch' ? 'stretch' : mode;
       if (meta.transformMode !== baseMetaMode) return;
       
@@ -1146,56 +1556,53 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       const targetObj = viewer.scene.models[targetId];
       if (!targetObj) return;
 
-      if (mode === 'move' && type === 'move') {
-        const startPosition = isAsset && isGLBModel(targetObj)
-          ? getGLBPlacementTarget(targetObj)
-          : (isAsset
-            ? [...(targetObj.position || [0, 0, 0])]
-            : [...(targetObj.offset || [0, 0, 0])]);
-        const startGrab = calculateGrabPoint(viewerRef, canvas, canvasPos, startPosition[1]);
-        if (!startGrab) {
-          viewer.cameraControl.active = true;
-          return;
-        }
-
-        stretchDragRef.current = {
-          type: 'move',
-          targetId,
-          isAsset,
-          startPosition,
-          startGrab: [...startGrab],
-        };
-        isStretchingRef.current = true;
-        setIsStretching(true);
-        setActiveStretchData({ label: 'Move', x: e.clientX, y: e.clientY });
-        return;
-      }
-
       if (mode === 'rotate' && type === 'rotate') {
         const center = isAsset && isGLBModel(targetObj)
           ? getGLBPlacementTarget(targetObj)
           : (targetObj.aabb
             ? [(targetObj.aabb[0] + targetObj.aabb[3]) / 2, (targetObj.aabb[1] + targetObj.aabb[4]) / 2, (targetObj.aabb[2] + targetObj.aabb[5]) / 2]
             : [...(targetObj.position || [0, 0, 0])]);
-        
-        const startGrab = calculateGrabPoint(viewerRef, canvas, canvasPos, center[1]);
-        if (!startGrab) {
+
+        // GLB keeps the existing pointer-angle implementation. Native/isolated
+        // IFC uses a dedicated screen-space rotation controller: the ring center
+        // is projected once, the pointer angle is accumulated incrementally, and
+        // the IFC model matrix is rotated around that fixed world pivot.
+        let ifcRotationState = null;
+        if (isAsset && !isGLBModel(targetObj)) {
+          ifcRotationState = beginIFCRotation({
+            viewerRef,
+            canvas,
+            pointer: canvasPos,
+            pivotWorld: center,
+            model: targetObj,
+          });
+          if (!ifcRotationState) {
+            viewer.cameraControl.active = true;
+            return;
+          }
+        }
+
+        const startGrab = ifcRotationState
+          ? null
+          : calculateGrabPoint(viewerRef, canvas, canvasPos, center[1]);
+        if (!ifcRotationState && !startGrab) {
           viewer.cameraControl.active = true;
           return;
         }
-        
+
         stretchDragRef.current = {
           type: 'rotate',
           targetId,
           isAsset,
           center,
-          startGrab: [...startGrab],
+          startGrab: startGrab ? [...startGrab] : null,
           startRotationY: isGLBModel(targetObj) ? getGLBRotation(targetObj)[1] : (targetObj.rotation?.[1] || 0),
           rotationGizmoMeshes: stretchHandlesRef.current.filter(mesh => (
             mesh?._stretchMeta?.type === 'rotate' &&
             mesh?._stretchMeta?.targetId === targetId &&
             mesh?._stretchMeta?.isAsset === isAsset
           )),
+          ifcRotationState,
         };
         
         isStretchingRef.current = true;
@@ -1234,9 +1641,26 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           return [sx || 1, sy || 1, sz || 1];
         };
 
-        const startScale = isGLBModel(targetObj)
-          ? getGLBScale(targetObj)
-          : getScale(targetObj);
+        const isIFCResize = isAsset && isIFCModel(targetObj);
+        const ifcResizeState = isIFCResize
+          ? beginIFCResize({
+              viewerRef,
+              canvas,
+              pointer: canvasPos,
+              axesList: axes,
+              model: targetObj,
+              projectWorldToCanvas,
+            })
+          : null;
+
+        if (isIFCResize && !ifcResizeState) {
+          viewer.cameraControl.active = true;
+          return;
+        }
+
+        const startScale = ifcResizeState
+          ? [...ifcResizeState.currentScale]
+          : (isGLBModel(targetObj) ? getGLBScale(targetObj) : getScale(targetObj));
         const startPosition = isAsset && isGLBModel(targetObj)
           ? getGLBPlacementTarget(targetObj)
           : (targetObj.position ? [...targetObj.position] : (targetObj.offset ? [...targetObj.offset] : [0, 0, 0]));
@@ -1257,6 +1681,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             startAabb[5] - startAabb[2],
           ] : [1, 1, 1],
           localAxes,
+          ifcResizeState,
         };
 
         isStretchingRef.current = true;
@@ -1280,13 +1705,26 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         const currentGrab = calculateGrabPoint(viewerRef, canvas, [curX, curY], dragData.startPosition[1]);
         if (!currentGrab) return;
 
+        const delta = [
+          currentGrab[0] - dragData.startGrab[0],
+          0,
+          currentGrab[2] - dragData.startGrab[2],
+        ];
         const next = [
-          dragData.startPosition[0] + currentGrab[0] - dragData.startGrab[0],
+          dragData.startPosition[0] + delta[0],
           dragData.startPosition[1],
-          dragData.startPosition[2] + currentGrab[2] - dragData.startGrab[2],
+          dragData.startPosition[2] + delta[2],
         ];
 
-        if (dragData.isAsset && isGLBModel(targetObj)) {
+        if (dragData.isAsset && dragData.isIFCMove && dragData.startMatrix) {
+          // Native/isolated IFCs use their full matrix as the authoritative
+          // runtime transform. Move only the world translation column so the
+          // existing IFC rotation/scale/pivot remain untouched.
+          const nextMatrix = translateMatrixWorld(dragData.startMatrix, delta);
+          if (nextMatrix) {
+            try { targetObj.matrix = nextMatrix; } catch (_) {}
+          }
+        } else if (dragData.isAsset && isGLBModel(targetObj)) {
           applyGLBPlacementTransform(
             targetObj,
             next,
@@ -1299,11 +1737,50 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           targetObj.offset = next;
         }
 
+        // Move the gizmo with the exact same world delta. This keeps the
+        // interaction layer attached to the asset for the entire drag.
+        if (dragData.moveGizmoMeshes?.length) {
+          dragData.moveGizmoMeshes.forEach((mesh, index) => {
+            const start = dragData.moveGizmoStartPositions?.[index] || mesh.position || [0, 0, 0];
+            try {
+              mesh.position = [
+                start[0] + delta[0],
+                start[1] + delta[1],
+                start[2] + delta[2],
+              ];
+            } catch (_) {}
+          });
+        }
+
         setActiveStretchData({ label: 'Move', x: e.clientX, y: e.clientY });
         return;
       }
 
       if (dragData.type === 'rotate') {
+        if (dragData.isAsset && !isGLBModel(targetObj) && dragData.ifcRotationState) {
+          dragData.ifcRotationState = updateIFCRotation({
+            state: dragData.ifcRotationState,
+            viewerRef,
+            canvas,
+            pointer: [curX, curY],
+            model: targetObj,
+          });
+
+          const nextRotation = dragData.ifcRotationState.currentRotationY ?? dragData.startRotationY;
+
+          if (dragData.rotationGizmoMeshes?.length) {
+            dragData.rotationGizmoMeshes.forEach(mesh => {
+              try {
+                mesh.position = [...dragData.center];
+                mesh.rotation = [0, nextRotation, 0];
+              } catch (_) {}
+            });
+          }
+
+          setActiveStretchData({ label: `Rotate: ${nextRotation.toFixed(1)}°`, x: e.clientX, y: e.clientY });
+          return;
+        }
+
         const currentGrab = calculateGrabPoint(viewerRef, canvas, [curX, curY], dragData.center[1]);
         if (!currentGrab) return;
         
@@ -1348,6 +1825,23 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         }
         
         setActiveStretchData({ label: `Rotate: ${nextRotation.toFixed(1)}°`, x: e.clientX, y: e.clientY });
+        return;
+      }
+
+      if (dragData.ifcResizeState && dragData.isAsset && isIFCModel(targetObj)) {
+        dragData.ifcResizeState = updateIFCResize({
+          state: dragData.ifcResizeState,
+          pointer: [curX, curY],
+          model: targetObj,
+        });
+        dragData.currentScale = [...(dragData.ifcResizeState.currentScale || dragData.startScale)];
+        const names = dragData.axesList.map(({ axis }) => axis === 0 ? 'Width' : axis === 1 ? 'Height' : 'Depth');
+        const activeValues = dragData.axesList.map(({ axis }) => dragData.currentScale[axis].toFixed(2));
+        setActiveStretchData({
+          label: `${names.join(' + ')}: ${activeValues.join(' × ')}`,
+          x: e.clientX,
+          y: e.clientY,
+        });
         return;
       }
 
@@ -1410,51 +1904,89 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       
       if (targetObj && stretchPersistCallbackRef.current) {
         if (dragData.type === 'move') {
-          const position = dragData.isAsset && isGLBModel(targetObj)
-            ? getGLBPlacementTarget(targetObj)
-            : (dragData.isAsset ? (targetObj.position || [0, 0, 0]) : (targetObj.offset || [0, 0, 0]));
-          position.forEach((value, axis) => {
-            stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value);
-          });
-        } else if (dragData.type === 'rotate') {
-          const rotationY = dragData.isAsset && isGLBModel(targetObj)
-            ? getGLBRotation(targetObj)[1]
-            : (targetObj.rotation?.[1] || 0);
-          stretchPersistCallbackRef.current(dragData.targetId, 'rotation', 1, rotationY);
-        } else {
-          // GLBs are persisted through their normalized semantic scale. Do not
-          // read it back from a raw matrix because that would reintroduce the
-          // old matrix-vs-TRS conflict. Non-GLB assets keep the legacy matrix path.
-          const currentScale = dragData.isAsset && isGLBModel(targetObj)
-            ? (dragData.currentScale || getGLBScale(targetObj))
-            : (() => {
-                const matrix = targetObj.matrix;
-                return matrix && matrix.length >= 11
-                  ? [
-                      Math.sqrt(matrix[0] * matrix[0] + matrix[1] * matrix[1] + matrix[2] * matrix[2]) || 1,
-                      Math.sqrt(matrix[4] * matrix[4] + matrix[5] * matrix[5] + matrix[6] * matrix[6]) || 1,
-                      Math.sqrt(matrix[8] * matrix[8] + matrix[9] * matrix[9] + matrix[10] * matrix[10]) || 1,
-                    ]
-                  : (targetObj.scale || [1, 1, 1]);
-              })();
-
-          // The safe-point resize math may also move the semantic GLB target so
-          // the opposite face stays anchored. Persist that target movement too;
-          // otherwise the live model would look correct until reload and then
-          // snap back to its pre-resize position.
-          if (dragData.isAsset && isGLBModel(targetObj)) {
-            const finalTarget = getGLBPlacementTarget(targetObj);
-            finalTarget.forEach((value, axis) => {
-              const startValue = dragData.startPosition?.[axis] ?? value;
-              if (Math.abs(value - startValue) > 1e-9) {
-                stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value);
-              }
+          if (dragData.isAsset && dragData.isIFCMove) {
+            const finalMatrix = targetObj.matrix && targetObj.matrix.length === 16
+              ? Array.from(targetObj.matrix, Number)
+              : null;
+            const position = finalMatrix
+              ? [finalMatrix[12], finalMatrix[13], finalMatrix[14]]
+              : (targetObj.position || [0, 0, 0]);
+            position.forEach((value, axis) => {
+              stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value, {
+                matrixOverride: finalMatrix,
+                preserveRuntimeTransform: true,
+              });
+            });
+          } else {
+            const position = dragData.isAsset && isGLBModel(targetObj)
+              ? getGLBPlacementTarget(targetObj)
+              : (dragData.isAsset ? (targetObj.position || [0, 0, 0]) : (targetObj.offset || [0, 0, 0]));
+            position.forEach((value, axis) => {
+              stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value);
             });
           }
+        } else if (dragData.type === 'rotate') {
+          if (dragData.isAsset && !isGLBModel(targetObj) && dragData.ifcRotationState) {
+            const committed = commitIFCRotationState(targetObj, dragData.ifcRotationState);
+            const rotationY = committed?.rotation?.[1] ?? dragData.ifcRotationState.currentRotationY ?? 0;
+            stretchPersistCallbackRef.current(
+              dragData.targetId,
+              'rotation',
+              1,
+              rotationY,
+              { matrix: committed?.matrix || targetObj.matrix, preserveRuntimeTransform: true }
+            );
+          } else {
+            const rotationY = dragData.isAsset && isGLBModel(targetObj)
+              ? getGLBRotation(targetObj)[1]
+              : (targetObj.rotation?.[1] || 0);
+            stretchPersistCallbackRef.current(dragData.targetId, 'rotation', 1, rotationY);
+          }
+        } else {
+          if (dragData.ifcResizeState && dragData.isAsset && isIFCModel(targetObj)) {
+            const committed = commitIFCResize(targetObj, dragData.ifcResizeState);
+            const currentScale = committed?.scale || dragData.ifcResizeState.currentScale || [1, 1, 1];
+            const finalMatrix = committed?.matrix || targetObj.matrix;
+            dragData.ifcResizeState = null;
+            dragData.currentScale = [...currentScale];
+            dragData.axesList.forEach(({ axis }) => {
+              stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, currentScale[axis], {
+                matrixOverride: finalMatrix,
+                preserveRuntimeTransform: true,
+                scaleOverride: currentScale,
+              });
+            });
+          } else {
+            // GLBs are persisted through their normalized semantic scale. Do not
+            // read it back from a raw matrix because that would reintroduce the
+            // old matrix-vs-TRS conflict. Non-GLB assets keep the legacy matrix path.
+            const currentScale = dragData.isAsset && isGLBModel(targetObj)
+              ? (dragData.currentScale || getGLBScale(targetObj))
+              : (() => {
+                  const matrix = targetObj.matrix;
+                  return matrix && matrix.length >= 11
+                    ? [
+                        Math.sqrt(matrix[0] * matrix[0] + matrix[1] * matrix[1] + matrix[2] * matrix[2]) || 1,
+                        Math.sqrt(matrix[4] * matrix[4] + matrix[5] * matrix[5] + matrix[6] * matrix[6]) || 1,
+                        Math.sqrt(matrix[8] * matrix[8] + matrix[9] * matrix[9] + matrix[10] * matrix[10]) || 1,
+                      ]
+                    : (targetObj.scale || [1, 1, 1]);
+                })();
 
-          dragData.axesList.forEach(({ axis }) => {
-            stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, currentScale[axis]);
-          });
+            if (dragData.isAsset && isGLBModel(targetObj)) {
+              const finalTarget = getGLBPlacementTarget(targetObj);
+              finalTarget.forEach((value, axis) => {
+                const startValue = dragData.startPosition?.[axis] ?? value;
+                if (Math.abs(value - startValue) > 1e-9) {
+                  stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value);
+                }
+              });
+            }
+
+            dragData.axesList.forEach(({ axis }) => {
+              stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, currentScale[axis]);
+            });
+          }
         }
       }
       
@@ -1476,8 +2008,36 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       if (isMeasuringRef.current && (measurementModeRef.current === 'point' || measurementModeRef.current === 'orthogonal')) return;
       if (!stretchHandlesRef.current.length) return;
       
-      const pick = viewer.scene.pick({ canvasPos: [e.offsetX, e.offsetY], pickSurface: false });
-      const meta = pick?.entity?._stretchMeta;
+      const canvasPos = [e.offsetX, e.offsetY];
+
+      // Hover runs for every pointer movement. Xeokit can legitimately return
+      // null when the pointer is over empty space, clipping gaps, or while the
+      // scene is being updated. Treat that as a normal miss instead of allowing
+      // the hover loop to throw and poison the rest of the interaction state.
+      let pick = null;
+      try {
+        pick = viewer.scene.pick({ canvasPos, pickSurface: false }) || null;
+      } catch (error) {
+        // A transient pick failure must never break hover/transform controls.
+        pick = null;
+      }
+
+      const pickedEntity = pick && pick.entity ? pick.entity : null;
+      let meta = pickedEntity?._stretchMeta || null;
+
+      let hoverEntity = pickedEntity && pickedEntity._stretchMeta === meta ? pickedEntity : null;
+      if (!meta?.isStretchHandle && transformModeRef.current === 'move') {
+        let moveHit = null;
+        try {
+          moveHit = projectMoveGizmoHit(canvasPos);
+        } catch (error) {
+          // Projection can briefly fail while camera/model state changes.
+          // Hover should simply behave as a miss in that frame.
+          moveHit = null;
+        }
+        meta = moveHit?.meta || null;
+        hoverEntity = moveHit?.entity || null;
+      }
       
       if (meta?.isStretchHandle) {
         if (hideTimeoutRef.current) {
@@ -1488,12 +2048,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         // Resize disclosure is click-driven. Hover only highlights the grip;
         // it must never reveal additional controls unexpectedly.
 
-        if (hoveredStretchMeshRef.current !== pick.entity) {
+        if (hoverEntity && hoveredStretchMeshRef.current !== hoverEntity) {
           resetHoveredStretchHandle(hoveredStretchMeshRef, stretchAnimFramesRef);
           
           const hoverColor = brightenColor(meta.type === 'rotate' ? (meta.hoverColor || meta.color) : meta.color);
           if (meta.type === 'rotate') {
-            const group = meta.rotationGroup || [pick.entity];
+            const group = meta.rotationGroup || [hoverEntity];
             group.forEach(mesh => {
               const color = brightenColor(meta.hoverColor || meta.color);
               mesh.material.diffuse = color;
@@ -1501,22 +2061,32 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
               mesh.material.opacity = 1.0;
             });
           } else {
-            pick.entity.material.diffuse = hoverColor;
-            pick.entity.material.emissive = hoverColor;
-            animateHandleTo(pick.entity, stretchAnimFramesRef, { opacity: 1, scale: STRETCH_HANDLE_HOVER_SCALE });
+            hoverEntity.material.diffuse = hoverColor;
+            hoverEntity.material.emissive = hoverColor;
+            animateHandleTo(hoverEntity, stretchAnimFramesRef, { opacity: 1, scale: STRETCH_HANDLE_HOVER_SCALE });
           }
-          hoveredStretchMeshRef.current = pick.entity;
+          hoveredStretchMeshRef.current = hoverEntity;
         }
         
         if (meta.type === 'rotate') {
           canvas.style.cursor = 'grab';
+          setActiveStretchData({ label: 'Drag to rotate', x: e.clientX, y: e.clientY });
+        } else if (meta.type === 'move') {
+          canvas.style.cursor = 'grab';
+          setActiveStretchData({ label: 'Move • drag to reposition', x: e.clientX, y: e.clientY });
         } else {
           canvas.style.cursor = cursorForAxes(meta.axes);
+          const axisLabel = (axis) => axis === 0 ? 'Width' : axis === 1 ? 'Height' : 'Depth';
+          const label = Array.isArray(meta.axes) && meta.axes.length
+            ? `Drag to resize ${meta.axes.map(({ axis }) => axisLabel(axis)).join(' + ')}`
+            : 'Drag to resize';
+          setActiveStretchData({ label, x: e.clientX, y: e.clientY });
         }
       } else {
         if (hoveredStretchMeshRef.current) {
           resetHoveredStretchHandle(hoveredStretchMeshRef, stretchAnimFramesRef);
         }
+        setActiveStretchData(null);
         // Keep any click-revealed resize controls visible until another face
         // is clicked or the selection is cleared.
         canvas.style.cursor = '';
@@ -2022,17 +2592,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         // Toolbar actions can fire in the same tick as selection updates.
         // Rebuild the local gizmo set synchronously when needed so the chosen
         // tool always has real pickable handles before the next mouse event.
-        const viewer = viewerRef.current;
-        const selectedId = selectedAssetIdRef.current || selectedAssetId;
-        if (viewer && mode !== 'select' && stretchHandlesRef.current.length === 0 && selectedId) {
-          const model = viewer.scene.models[selectedId];
-          if (model) {
-            buildStretchHandlesRef.current?.(stretchCtx, selectedId, true);
-          }
+        if (mode !== 'select') {
+          ensureSelectedAssetGizmos(mode);
         }
 
         setTransformMode(mode);
-        requestAnimationFrame(() => configureTransformHandles(mode));
+        requestAnimationFrame(() => ensureSelectedAssetGizmos(mode));
       },
       setResizeSubmode: (submode) => {
         if (!['face', 'edge', 'corner'].includes(submode)) return;

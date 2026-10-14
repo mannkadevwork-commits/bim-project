@@ -44,6 +44,7 @@ interface SemanticOpening {
   sourceFile: string;
   openingExpressId: number;
   openingGlobalId: string | null;
+  openingName: string;
   hostWallExpressId: number | null;
   hostWallGlobalId: string | null;
   doorExpressId: number | null;
@@ -207,6 +208,7 @@ function collectSemanticRelationships(
       sourceFile,
       openingExpressId,
       openingGlobalId: lineGlobalId(line),
+      openingName: lineName(line),
       hostWallExpressId: null,
       hostWallGlobalId: null,
       doorExpressId: null,
@@ -923,12 +925,15 @@ function findHostWall(
 
 export interface RoomDetectorOptions {
   jobDirectory: string;
+  inputIfcPath?: string;
+  outputPath?: string;
 }
 
 export class RoomDetector {
   static async run(options: RoomDetectorOptions): Promise<RoomDebugArtifact> {
     const { jobDirectory } = options;
-    const inputIfcPath = path.join(jobDirectory, "input.ifc");
+    const inputIfcPath = options.inputIfcPath ?? path.join(jobDirectory, "input.ifc");
+    const outputPath = options.outputPath ?? path.join(jobDirectory, "rooms_debug.json");
     const statePath = path.join(jobDirectory, "project_state.json");
     if (!fs.existsSync(inputIfcPath)) throw new Error(`RoomDetector: input.ifc not found at ${inputIfcPath}`);
     if (!fs.existsSync(statePath)) throw new Error(`RoomDetector: project_state.json not found at ${statePath}`);
@@ -941,11 +946,30 @@ export class RoomDetector {
     );
 
     const replacementSources = new Map<string, string>();
+    const excludedDuplicatePreviewSources: string[] = [];
     for (const item of Array.isArray(projectState?.furniture) ? projectState.furniture : []) {
       if (!(item?.isNativeIsolation || item?.nativeSourceId)) continue;
       if (String(item?.fileType ?? "").toLowerCase() !== "ifc") continue;
       const resolved = resolveJobRelativeSource(jobDirectory, String(item?.src ?? ""));
       if (!resolved) continue;
+
+      const sourceBasename = path.basename(resolved);
+      const isGeneratedDoorWallPreview = /_door_\d+_preview\.ifc$/i.test(sourceBasename)
+        || (/_preview\.ifc$/i.test(sourceBasename) && /wall[_ -]?with[_ -]?void/i.test(String(item?.name ?? "")));
+      if (isGeneratedDoorWallPreview) {
+        excludedDuplicatePreviewSources.push(sourceBasename);
+
+        // The editor keeps a wall-only preview IFC for each door insertion and
+        // marks the original wall hidden while that preview is mounted. The
+        // render compiler now uses the cumulative structural IFC instead of
+        // stacking those previews. Room topology must follow the same authority:
+        // keep the cumulative wall (which already contains all hosted openings)
+        // and do not load each single-door preview as another wall/opening source.
+        const nativeWallId = String(item?.nativeSourceId ?? item?.id ?? "").trim();
+        if (nativeWallId) hiddenWallIds.delete(nativeWallId);
+        continue;
+      }
+
       replacementSources.set(resolved, String(item?.nativeSourceId ?? item?.id ?? "unknown"));
     }
 
@@ -955,6 +979,14 @@ export class RoomDetector {
     const openedModelIds: number[] = [];
 
     const warnings: string[] = [];
+    if (excludedDuplicatePreviewSources.length) {
+      warnings.push(
+        `Excluded ${excludedDuplicatePreviewSources.length} generated per-door wall-preview IFC source(s); topology uses the cumulative structural IFC for those host walls.`,
+      );
+      console.log(
+        `[RoomDetector] Excluded ${excludedDuplicatePreviewSources.length} generated per-door wall-preview IFC source(s); using cumulative structural IFC host walls.`,
+      );
+    }
     const sourceFiles: string[] = [];
     const wallElements: ElementFootprint[] = [];
     const allWallElements: ElementFootprint[] = [];
@@ -968,7 +1000,7 @@ export class RoomDetector {
     try {
       const baseId = ifc.OpenModel(await bytesFor(inputIfcPath), { COORDINATE_TO_ORIGIN: false });
       openedModelIds.push(baseId);
-      models.push({ label: "input.ifc", filePath: inputIfcPath, modelId: baseId, hiddenWallGlobalIds: hiddenWallIds });
+      models.push({ label: path.basename(inputIfcPath), filePath: inputIfcPath, modelId: baseId, hiddenWallGlobalIds: hiddenWallIds });
 
       for (const [replacementPath] of replacementSources) {
         const modelId = ifc.OpenModel(await bytesFor(replacementPath), { COORDINATE_TO_ORIGIN: false });
@@ -1080,24 +1112,41 @@ export class RoomDetector {
       // those rooms. This keeps physical room semantics separate from walkability.
       for (const wall of wallElements) rasterizePolygon(grid, wall.points, grid.blocked);
 
-      const sealableDoors = semanticOpenings
-        .filter((opening) => opening.doorExpressId != null)
+      const sealableOpenings = semanticOpenings
+        .filter((opening) => opening.doorExpressId != null || DOOR_MATCH_NAME.test(opening.openingName))
         .map((opening) => {
-          const door = semanticDoors.find((d) => d.expressId === opening.doorExpressId && d.sourceFile === opening.sourceFile);
-          if (!door) return null;
-          const placement = extractPlacementPoint(ifc, models.find((m) => m.label === opening.sourceFile)?.modelId ?? 0, door.objectPlacementExpressId);
+          const model = models.find((candidate) => candidate.label === opening.sourceFile);
+          const door = opening.doorExpressId == null
+            ? null
+            : semanticDoors.find((d) => d.expressId === opening.doorExpressId && d.sourceFile === opening.sourceFile) ?? null;
+          const placementExpressId = door?.objectPlacementExpressId
+            ?? lineRefId(ifc.GetLine(model?.modelId ?? 0, opening.openingExpressId), "ObjectPlacement");
+          const placement = model ? extractPlacementPoint(ifc, model.modelId, placementExpressId) : null;
           return { opening, door, placement };
         })
-        .filter((value): value is { opening: SemanticOpening; door: SemanticDoor; placement: Point3 } => Boolean(value?.placement));
+        .filter((value): value is { opening: SemanticOpening; door: SemanticDoor | null; placement: Point3 } => Boolean(value?.placement));
 
-      for (const sealed of sealableDoors) {
-        const wall = sealed.opening.hostWallExpressId == null
-          ? null
-          : wallElements.find((candidate) => candidate.sourceFile === sealed.opening.sourceFile && candidate.expressId === sealed.opening.hostWallExpressId);
+      for (const sealed of sealableOpenings) {
+        const hostWallGlobalId = sealed.opening.hostWallGlobalId;
+        const wall = hostWallGlobalId
+          ? (wallElements.find((candidate) => candidate.globalId === hostWallGlobalId)
+            ?? allWallElements.find((candidate) => candidate.globalId === hostWallGlobalId))
+          : (sealed.opening.hostWallExpressId == null
+            ? null
+            : wallElements.find((candidate) => candidate.sourceFile === sealed.opening.sourceFile && candidate.expressId === sealed.opening.hostWallExpressId));
         if (!wall) continue;
 
         const wallWidth = Math.min(wall.sizeX || Infinity, wall.sizeY || Infinity);
-        const width = Math.max(grid.cellSize * 2, sealed.door.width ?? grid.cellSize * 8);
+        const openingGeometry = openingElements.find(
+          (candidate) => candidate.sourceFile === sealed.opening.sourceFile && candidate.expressId === sealed.opening.openingExpressId,
+        );
+        const openingWidth = openingGeometry
+          ? Math.max(openingGeometry.sizeX, openingGeometry.sizeY)
+          : null;
+        const width = Math.max(
+          grid.cellSize * 2,
+          sealed.door?.width ?? openingWidth ?? grid.cellSize * 8,
+        );
         const depth = Number.isFinite(wallWidth) && wallWidth > 0 ? wallWidth + ROOM_SEAL_PADDING * 2 : grid.cellSize * 4;
         const center = { x: sealed.placement.x, y: sealed.placement.z };
         const horizontal = wall.sizeX >= wall.sizeY;
@@ -1155,12 +1204,29 @@ export class RoomDetector {
         const placement = door
           ? extractPlacementPoint(ifc, model.modelId, door.objectPlacementExpressId)
           : null;
+        const openingGeometry = openingElements.find(
+          (e) => e.sourceFile === semanticOpening.sourceFile && e.expressId === semanticOpening.openingExpressId,
+        ) ?? null;
+        const hasOpeningFootprint = Boolean(
+          openingGeometry && openingGeometry.points.length >= 3 &&
+          Number.isFinite(openingGeometry.center.x) && Number.isFinite(openingGeometry.center.y),
+        );
+        const openingLine: any = ifc.GetLine(model.modelId, semanticOpening.openingExpressId);
+        const openingPlacement = extractPlacementPoint(
+          ifc,
+          model.modelId,
+          lineRefId(openingLine, "ObjectPlacement"),
+        );
+        // A semantic IfcOpeningElement may have no standalone mesh. In that
+        // case collectElements retains its default (0,0) center; never use that
+        // placeholder as a portal. Use the actual opening placement instead.
         const center = placement
           ? { x: placement.x, y: placement.z }
-          : (() => {
-              const geom = openingElements.find((e) => e.sourceFile === semanticOpening.sourceFile && e.expressId === semanticOpening.openingExpressId);
-              return geom?.center ?? null;
-            })();
+          : hasOpeningFootprint
+            ? openingGeometry!.center
+            : openingPlacement
+              ? { x: openingPlacement.x, y: openingPlacement.z }
+              : null;
         if (!center) continue;
 
         const hostWallResolution = findHostWall(wallElements, allWallElements, semanticOpening);
@@ -1182,11 +1248,11 @@ export class RoomDetector {
 
         const associationMethod: RoomPortal["associationMethod"] = door
           ? "ifc-rel-fills"
-          : "ifc-rel-voids";
+          : (DOOR_MATCH_NAME.test(semanticOpening.openingName) ? "door-name" : "ifc-rel-voids");
         const id = `portal-${semanticOpening.sourceFile}-${semanticOpening.openingExpressId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
         portals.push({
           id,
-          type: door ? "door" : "opening",
+          type: (door || DOOR_MATCH_NAME.test(semanticOpening.openingName)) ? "door" : "opening",
           source: "ifc-opening",
           openingExpressId: semanticOpening.openingExpressId,
           sourceFile: semanticOpening.sourceFile,
@@ -1196,6 +1262,10 @@ export class RoomDetector {
           hostWallId: semanticOpening.hostWallGlobalId,
           doorExpressId: semanticOpening.doorExpressId,
           doorGlobalId: semanticOpening.doorGlobalId,
+          normal: [normal.x, 0, normal.y],
+          width: door?.width ?? (openingGeometry ? Math.max(openingGeometry.sizeX, openingGeometry.sizeY) : null),
+          height: door?.height ?? null,
+          wallThickness,
           associationMethod,
         });
       }
@@ -1298,6 +1368,7 @@ export class RoomDetector {
         cellSize: CELL_SIZE,
         floorElevation: actualFloorY,
         sourceFiles,
+        excludedDuplicatePreviewSources,
         rooms,
         portals,
         stats: {
@@ -1309,7 +1380,9 @@ export class RoomDetector {
           blockedCellCount,
           componentCount: components.length,
           retainedRoomCount: rooms.length,
-          sealedDoorCount: semanticOpenings.filter((opening) => opening.doorExpressId != null).length,
+          // Count all openings intentionally sealed for room partitioning,
+          // including hosted GLB door openings identified by their opening name.
+          sealedDoorCount: sealableOpenings.length,
           portalCount: portals.length,
         },
         warnings,
@@ -1327,9 +1400,8 @@ export class RoomDetector {
         },
       };
 
-      const debugPath = path.join(jobDirectory, "rooms_debug.json");
-      fs.writeFileSync(debugPath, JSON.stringify(artifact, null, 2), "utf8");
-      console.log(`[RoomDetector] Wrote ${debugPath} (${rooms.length} rooms, ${portals.length} portals)`);
+      fs.writeFileSync(outputPath, JSON.stringify(artifact, null, 2), "utf8");
+      console.log(`[RoomDetector] Wrote ${outputPath} (${rooms.length} rooms, ${portals.length} portals)`);
       return artifact;
     } finally {
       for (const modelId of openedModelIds) {

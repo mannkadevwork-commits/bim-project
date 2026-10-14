@@ -27,10 +27,10 @@ export default function WalkthroughPage() {
   const { jobId } = useParams();
   const navigate = useNavigate();
   const viewportRef = useRef(null);
-  const [railOpen, setRailOpen] = useState(true);
+  const [railOpen, setRailOpen] = useState(false);
   const [touring, setTouring] = useState(false);
   const [heightOffset, setHeightOffset] = useState(0.35);
-  const [sensitivity, setSensitivity] = useState(0.0048);
+  const [sensitivity, setSensitivity] = useState(0.0042);
   const [viewMode, setViewMode] = useState('overview');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [viewsOpen, setViewsOpen] = useState(false);
@@ -39,7 +39,7 @@ export default function WalkthroughPage() {
   const lockToastTimer = useRef(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [autoRotate, setAutoRotate] = useState(false);
-  const [fov, setFov] = useState(120);
+  const [fov, setFov] = useState(78);
   const [walkMode, setWalkMode] = useState('guided');
   const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
   const [displayName, setDisplayName] = useState('');
@@ -127,6 +127,15 @@ export default function WalkthroughPage() {
   const navigationPlan = walkthrough.navigationPlan || null;
   const navigationHotspots = navigationPlan?.hotspots || [];
   const effectiveWalkMode = walkthrough.walkMode || walkMode;
+
+  useEffect(() => {
+    if (walkthrough.immersivePresentationActive) {
+      setRailOpen(false);
+      setSettingsOpen(false);
+      setViewsOpen(false);
+      setMoreOpen(false);
+    }
+  }, [walkthrough.immersivePresentationActive]);
 
   useEffect(() => {
     if (walkthrough.lookLocked === undefined) return;
@@ -250,12 +259,12 @@ export default function WalkthroughPage() {
             <Move3d className="h-4 w-4 text-[#ffad73]" />
           </div>
           <div>
-            <div className="text-sm font-semibold tracking-tight text-white">HCI Walkthrough</div>
+            <div className="text-sm font-semibold tracking-tight text-white">HCI Presentation</div>
             <div
               className="max-w-[min(72vw,620px)] truncate text-[10px] uppercase tracking-[0.16em] text-slate-300"
               title={displayName || undefined}
             >
-              {viewMode === 'walk' ? 'Interactive presentation' : '3D preview'} · {displayName || 'Loading…'}
+              {viewMode === 'walk' ? (walkthrough.immersivePresentationActive ? '360° Home Presentation' : 'Interactive Walkthrough') : '3D Preview'} · {displayName || 'Loading…'}
             </div>
           </div>
         </div>
@@ -293,6 +302,22 @@ export default function WalkthroughPage() {
           </div>
         </div>
       )} */}
+
+      {viewMode === 'walk' && walkthrough.immersivePresentationActive && !railOpen && (
+        <button
+          type="button"
+          onClick={() => setRailOpen(true)}
+          className="absolute left-4 top-20 z-30 flex items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/62 px-3.5 py-2.5 text-left shadow-[0_18px_60px_rgba(0,0,0,.25)] backdrop-blur-2xl transition hover:bg-slate-950/78"
+          title="Open rooms and floor map"
+        >
+          <Map className="h-4 w-4 text-[#ff914d]" />
+          <span>
+            <span className="block text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Rooms</span>
+            <span className="block max-w-[170px] truncate text-xs font-semibold text-white">{walkthrough.immersivePresentationLabel || 'Choose a room'}</span>
+          </span>
+          <ChevronDown className="ml-1 h-4 w-4 text-slate-400" />
+        </button>
+      )}
 
       {viewMode === 'walk' && (
         <div className="absolute left-4 top-20 z-30 w-[300px] overflow-hidden rounded-[24px] border border-white/10 bg-slate-950/54 shadow-[0_28px_90px_rgba(0,0,0,.32)] backdrop-blur-2xl sm:w-[310px]">
@@ -411,7 +436,7 @@ export default function WalkthroughPage() {
           <div className="space-y-4">
             <label className="block">
               <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Field of view (FOV)</span><span className="font-mono text-slate-500">{fov}°</span></div>
-              <input className="w-full accent-[#ff914d]" type="range" min="30" max="120" step="1" value={fov} onChange={(e) => applyFov(e.target.value)} />
+              <input className="w-full accent-[#ff914d]" type="range" min="45" max="100" step="1" value={fov} onChange={(e) => applyFov(e.target.value)} />
               <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Narrow</span><span>Presentation</span><span>Wide</span></div>
             </label>
             <label className={`block ${''}`}>
@@ -424,7 +449,7 @@ export default function WalkthroughPage() {
               <input className="w-full accent-[#ff914d]" type="range" min="-0.15" max="0.35" step="0.01" value={heightOffset} onChange={(e) => applyHeight(e.target.value)} />
               <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Lower</span><span>Neutral</span><span>Higher</span></div>
             </label>
-            <button type="button" onClick={() => { applyHeight(0.35); applyFov(120); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-200 hover:bg-white/[0.08]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
+            <button type="button" onClick={() => { applyHeight(0.35); applyFov(78); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-200 hover:bg-white/[0.08]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
           </div>
         </div>
       )}
@@ -497,6 +522,23 @@ export default function WalkthroughPage() {
         </div>
       )}
 
+      {walkthrough.immersivePresentationActive && (
+        <div className="absolute bottom-[92px] left-1/2 z-30 flex -translate-x-1/2 items-center gap-1 rounded-2xl border border-white/10 bg-slate-950/72 p-1.5 shadow-[0_22px_65px_rgba(0,0,0,.32)] backdrop-blur-2xl">
+          <button type="button" onClick={() => setRailOpen((v) => !v)} className="flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.08]">
+            <Map className="h-4 w-4 text-[#ff914d]" /> Rooms
+          </button>
+          <button type="button" onClick={reset360View} className="flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.08]">
+            <RotateCcw className="h-4 w-4" /> Recenter
+          </button>
+          <button type="button" onClick={toggle360AutoRotate} className={`flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition ${walkthrough.immersive360AutoRotate ? 'bg-[#ff914d]/16 text-[#ffd1b3]' : 'text-slate-200 hover:bg-white/[0.08]'}`}>
+            <RotateCw className="h-4 w-4" /> {walkthrough.immersive360AutoRotate ? 'Auto' : 'Manual'}
+          </button>
+          <button type="button" onClick={() => walkthrough.exitImmersivePresentation()} className="flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.08]">
+            <X className="h-4 w-4" /> Exit 360
+          </button>
+        </div>
+      )}
+
       <div className="absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1 rounded-[22px] border border-white/12 bg-slate-950/84 p-1.5 shadow-[0_24px_70px_rgba(0,0,0,.36)] backdrop-blur-2xl">
         <IconButton
           title={viewMode === 'walk' ? 'Exit first-person view' : 'Back to renderer'}
@@ -524,6 +566,8 @@ export default function WalkthroughPage() {
             <Play className="h-4 w-4" /> Start Walkthrough
           </button>
         ) : (
+          <>
+          {!walkthrough.immersivePresentationActive && (
           <div className="flex items-center rounded-xl border border-white/10 bg-white/[0.03] p-0.5" aria-label="Walkthrough interaction mode">
             <button type="button" onClick={() => switchWalkMode('guided')} title="Guided mode: click destinations, slow cinematic camera pan" className={`flex h-8 items-center gap-1.5 rounded-[10px] px-2.5 text-[11px] font-semibold transition ${effectiveWalkMode === 'guided' ? 'bg-white text-slate-950 shadow-sm' : 'text-slate-200 hover:bg-white/[0.08]'}`}>
               <MousePointer2 className="h-3.5 w-3.5" /> Guided
@@ -532,12 +576,14 @@ export default function WalkthroughPage() {
               <Move3d className="h-3.5 w-3.5" /> Explore
             </button>
           </div>
-        )}
-        <IconButton title="Camera views" active={viewsOpen} onClick={() => { setViewsOpen((v) => !v); setMoreOpen(false); setSettingsOpen(false); }}><Camera className="h-4 w-4" /></IconButton>
-        <IconButton title="Walk settings" active={settingsOpen} onClick={() => { setSettingsOpen((v) => !v); setViewsOpen(false); setMoreOpen(false); }}><Settings2 className="h-4 w-4" /></IconButton>
-        <IconButton title="More controls" active={moreOpen} onClick={() => { setMoreOpen((v) => !v); setViewsOpen(false); setSettingsOpen(false); }}><ChevronUp className="h-4 w-4" /></IconButton>
+          )}
+          {!walkthrough.immersivePresentationActive && <IconButton title="Camera views" active={viewsOpen} onClick={() => { setViewsOpen((v) => !v); setMoreOpen(false); setSettingsOpen(false); }}><Camera className="h-4 w-4" /></IconButton>}
+        {!walkthrough.immersivePresentationActive && <IconButton title="Walk settings" active={settingsOpen} onClick={() => { setSettingsOpen((v) => !v); setViewsOpen(false); setMoreOpen(false); }}><Settings2 className="h-4 w-4" /></IconButton>}
+        {!walkthrough.immersivePresentationActive && <IconButton title="More controls" active={moreOpen} onClick={() => { setMoreOpen((v) => !v); setViewsOpen(false); setSettingsOpen(false); }}><ChevronUp className="h-4 w-4" /></IconButton>}
         <IconButton title={helpOpen ? 'Close help' : 'Help'} active={helpOpen} onClick={() => setHelpOpen((v) => !v)}><CircleHelp className="h-4 w-4" /></IconButton>
         <div className="mx-1 h-7 w-px bg-white/10" />
+        </>
+        )}
         {/* <button type="button" onClick={handleTour} disabled={!areas.length} className={`flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition ${touring ? 'bg-white text-slate-950' : 'bg-[#ff914d] text-slate-950 hover:bg-[#ff7a28]'}`}>
           {touring ? <><StopCircle className="h-4 w-4" /> Stop</> : <><Play className="h-4 w-4" /> Tour</>}
         </button> */}
@@ -551,8 +597,12 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      <div className="pointer-events-none absolute left-1/2 top-16 z-20 -translate-x-1/2 rounded-full border border-white/10 bg-slate-950/82 px-4 py-2 text-xs font-medium text-slate-100 shadow-xl backdrop-blur-xl">
-        {statusText}
+      <div className="pointer-events-none absolute left-1/2 top-16 z-20 -translate-x-1/2">
+        <div className={`rounded-full border px-4 py-2 text-xs font-medium shadow-xl backdrop-blur-xl ${walkthrough.immersivePresentationActive ? 'border-white/10 bg-slate-950/72 text-white' : 'border-white/10 bg-slate-950/82 text-slate-100'}`}>
+          {walkthrough.immersivePresentationActive
+            ? `${walkthrough.immersivePresentationLabel || 'Room'} · ${walkthrough.smart720Active ? 'guided 360 tour' : '360° view'}`
+            : statusText}
+        </div>
       </div>
 
       {walkthrough.immersivePresentationActive && (

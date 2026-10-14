@@ -8,6 +8,7 @@ import {
   init as initRecast,
   NavMesh,
   NavMeshQuery,
+  QueryFilter,
 } from "recast-navigation";
 import { generateSoloNavMesh } from "recast-navigation/generators";
 
@@ -47,6 +48,8 @@ interface ExtractedGeometry {
   meshes: MeshRecord[];
   floorMeshNames: string[];
   floorElevation: number;
+  hostedDoorMeshNodesExcluded: number;
+  hostedDoorInstanceIdsMatched: string[];
 }
 
 interface HotspotCandidate {
@@ -97,6 +100,23 @@ function isDoor(name: string): boolean {
 function isFurniture(name: string): boolean {
   return keyWords(name, FURNITURE_KEYWORDS);
 }
+function readHostedDoorInstanceIds(jobDirectory: string): Set<string> {
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(jobDirectory, "project_state.json"), "utf8"));
+    // The hosted door leaf can be IFC or GLB. The portal metadata, rather than
+    // the asset file format, decides that it is a visual leaf on a traversable
+    // opening and must not become a second NavMesh obstacle.
+    return new Set(
+      Array.isArray(state?.furniture)
+        ? state.furniture
+            .filter((item: any) => Boolean(item?.doorHostWallId) && item?.instanceId)
+            .map((item: any) => String(item.instanceId))
+        : [],
+    );
+  } catch {
+    return new Set();
+  }
+}
 
 function triNormal(positions: number[], ia: number, ib: number, ic: number): THREE.Vector3 {
   const a = new THREE.Vector3(positions[ia], positions[ia + 1], positions[ia + 2]);
@@ -137,7 +157,39 @@ function triangleIndicesForPrimitive(primitive: any, mode: number, vertexCount: 
   return out;
 }
 
-async function extractFinalGlb(glbPath: string): Promise<ExtractedGeometry> {
+/**
+ * Resolve the hosted-door instance represented by a mesh node or one of its
+ * ancestors. compiler.ts wraps every imported GLB under a node named
+ * `${instanceId}_geometry` (not `instanceId` exactly). The old equality check
+ * therefore missed every imported hosted GLB door and left its leaf in the
+ * structural obstacle soup, blocking the doorway that was just cut into the
+ * host wall.
+ */
+function findHostedDoorAncestorId(node: GltfNode, instanceIds: Set<string>): string | null {
+  let ancestor: any = node;
+  while (ancestor) {
+    const name = String(ancestor.getName?.() || "");
+
+    // compiler.ts tags every mesh-bearing hosted GLB-door node explicitly.
+    // Parent/wrapper-based detection failed in the uploaded job: 0/4 instance
+    // wrappers matched even though the door meshes were in the scene.
+    const marker = "HCI_HOSTED_DOOR::";
+    if (name.startsWith(marker)) {
+      const instanceId = name.slice(marker.length).split("::", 1)[0];
+      if (instanceIds.has(instanceId)) return instanceId;
+    }
+
+    if (instanceIds.has(name)) return name;
+    if (name.endsWith("_geometry")) {
+      const wrapperInstanceId = name.slice(0, -"_geometry".length);
+      if (instanceIds.has(wrapperInstanceId)) return wrapperInstanceId;
+    }
+    ancestor = typeof ancestor.getParent === "function" ? ancestor.getParent() : null;
+  }
+  return null;
+}
+
+async function extractFinalGlb(glbPath: string, hostedDoorInstanceIds: Set<string>): Promise<ExtractedGeometry> {
   const io = new NodeIO();
   const document = await io.read(glbPath);
   const scene = document.getRoot().getDefaultScene() ?? document.getRoot().listScenes()[0];
@@ -147,12 +199,26 @@ async function extractFinalGlb(glbPath: string): Promise<ExtractedGeometry> {
   const indices: number[] = [];
   const labels: string[] = [];
   const meshes: MeshRecord[] = [];
+  let hostedDoorMeshNodesExcluded = 0;
+  const hostedDoorInstanceIdsMatched = new Set<string>();
 
   scene.traverse((node: GltfNode) => {
     const mesh = node.getMesh();
     if (!mesh) return;
 
     const meshName = node.getName() || mesh.getName() || "unnamed_mesh";
+
+    // Do this before generic name-based filtering: hosted GLB door assets often
+    // have child mesh names like "Geom_0_0" that do not contain the word door.
+    // Their imported root is `${instanceId}_geometry`, so matching only the bare
+    // instance ID silently failed and the door leaf blocked its own NavMesh gap.
+    const hostedDoorId = findHostedDoorAncestorId(node, hostedDoorInstanceIds);
+    if (hostedDoorId) {
+      hostedDoorMeshNodesExcluded += 1;
+      hostedDoorInstanceIdsMatched.add(hostedDoorId);
+      return;
+    }
+
     if (isDoor(meshName)) return;
 
     const worldMatrix = new THREE.Matrix4().fromArray(node.getWorldMatrix());
@@ -235,7 +301,16 @@ async function extractFinalGlb(glbPath: string): Promise<ExtractedGeometry> {
 
   console.log(`[WalkNav] Floor candidates: ${floorMeshNames.join(", ") || "NONE"}`);
   console.log(`[WalkNav] Floor elevation: ${Number.isFinite(floorElevation) ? floorElevation : "unknown"}`);
-  return { positions, indices, labels, meshes, floorMeshNames, floorElevation };
+  return {
+    positions,
+    indices,
+    labels,
+    meshes,
+    floorMeshNames,
+    floorElevation,
+    hostedDoorMeshNodesExcluded,
+    hostedDoorInstanceIdsMatched: Array.from(hostedDoorInstanceIdsMatched),
+  };
 }
 
 function buildFilteredSoup(input: ExtractedGeometry, slopeAngle: number) {
@@ -312,6 +387,621 @@ function readScale(jobDirectory: string): number {
 
 function distanceXZ(a: [number, number, number], b: [number, number, number]): number {
   return Math.hypot(a[0] - b[0], a[2] - b[2]);
+}
+
+function writeRoomConnectivity(jobDirectory: string, query: NavMeshQuery, physicalMetersPerUnit: number) {
+  const topologyPath = path.join(jobDirectory, "presentation_rooms.json");
+  const hotspotPath = path.join(jobDirectory, "walk_hotspots.json");
+  if (!fs.existsSync(topologyPath) && !fs.existsSync(hotspotPath)) return;
+
+  try {
+    const payload = fs.existsSync(topologyPath) ? JSON.parse(fs.readFileSync(topologyPath, "utf8")) : { rooms: [] };
+    const hotspotPayload = fs.existsSync(hotspotPath) ? JSON.parse(fs.readFileSync(hotspotPath, "utf8")) : null;
+    const toVec3 = (value: any): [number, number, number] | null => {
+      const values = Array.isArray(value)
+        ? value
+        : value && typeof value === "object"
+          ? [value.x, value.y, value.z]
+          : null;
+      if (!values || values.length < 3) return null;
+      const result = values.slice(0, 3).map(Number);
+      return result.every(Number.isFinite) ? [result[0], result[1], result[2]] : null;
+    };
+    const curatedSpaces = Array.isArray(hotspotPayload?.areas) ? hotspotPayload.areas : [];
+    const useCuratedSpaces = curatedSpaces.length > 1;
+    const entities = useCuratedSpaces ? curatedSpaces : (Array.isArray(payload?.rooms) ? payload.rooms : []);
+    const rooms = entities.map((room: any) => ({ room, center: toVec3(room?.center) }))
+      .filter((entry: any) => entry.room?.id && entry.center);
+    if (!rooms.length) {
+      console.warn("[WalkNav] Connectivity diagnostics skipped: no semantic rooms or curated navigation spaces with valid centers.");
+      return;
+    }
+
+    const unit = Math.max(Number(physicalMetersPerUnit) || 1, 1e-6);
+    const completePathTolerance = Math.max(0.4 * unit, 0.3);
+    const verticalTolerance = Math.max(0.5 * unit, 0.35);
+    const snapped = rooms.map(({ room, center }: any) => {
+      const point = query.findClosestPoint(
+        { x: center[0], y: Number(center[1]) || 0, z: center[2] },
+        {
+          halfExtents: {
+            x: Math.max(1.0 * unit, 0.35),
+            y: Math.max(1.5 * unit, 0.7),
+            z: Math.max(1.0 * unit, 0.35),
+          },
+          filter: new QueryFilter(),
+        },
+      );
+      const snappedPoint = point?.success ? toVec3(point.point) : null;
+      const snapDistance = snappedPoint
+        ? Math.hypot(snappedPoint[0] - center[0], snappedPoint[2] - center[2]) / unit
+        : null;
+      return { room, center, point, snappedPoint, snapDistance };
+    });
+
+    const connections: Array<Record<string, any>> = [];
+    const unreachable: string[] = [];
+    let reachablePairs = 0;
+    // Count every ordered pair up front so an unsnappable source room cannot
+    // accidentally make the report look fully connected by reducing its denominator.
+    const possiblePairs = Math.max(0, snapped.length * (snapped.length - 1));
+
+    for (const from of snapped) {
+      if (!from.point?.success || !from.snappedPoint) {
+        unreachable.push(String(from.room.id));
+        for (const to of snapped) {
+          if (from.room.id === to.room.id) continue;
+          connections.push({
+            from: String(from.room.id),
+            to: String(to.room.id),
+            reachable: false,
+            reason: "source-has-no-nearby-navmesh-point",
+            sourceSnapDistanceMeters: from.snapDistance,
+            targetSnapDistanceMeters: to.snapDistance,
+          });
+        }
+        continue;
+      }
+      for (const to of snapped) {
+        if (from.room.id === to.room.id) continue;
+        if (!to.point?.success || !to.snappedPoint) {
+          connections.push({
+            from: String(from.room.id),
+            to: String(to.room.id),
+            reachable: false,
+            reason: "target-has-no-nearby-navmesh-point",
+            targetSnapDistanceMeters: to.snapDistance,
+          });
+          continue;
+        }
+
+        const result = query.computePath(from.point.point, to.point.point, {
+          filter: new QueryFilter(),
+          maxStraightPathSize: 512,
+          maxPathSize: 512,
+        });
+        const pathPoints: any[] = Array.isArray(result?.path) ? result.path : [];
+        const endpoint = pathPoints.length ? pathPoints[pathPoints.length - 1] : null;
+        const endpointDistance = endpoint
+          ? Math.hypot(endpoint.x - to.point.point.x, endpoint.z - to.point.point.z)
+          : Infinity;
+        const endpointVerticalDistance = endpoint
+          ? Math.abs(endpoint.y - to.point.point.y)
+          : Infinity;
+        // Detour can return a valid partial path whose endpoint is merely the
+        // nearest reachable polygon. Non-empty path + success is NOT proof that
+        // the requested room was reached; require the last point to match target.
+        const reachable = Boolean(
+          result?.success && pathPoints.length > 0 &&
+          endpointDistance <= completePathTolerance &&
+          endpointVerticalDistance <= verticalTolerance
+        );
+
+        let pathLength = 0;
+        let previous = from.point.point;
+        for (const point of pathPoints) {
+          pathLength += Math.hypot(point.x - previous.x, point.z - previous.z);
+          previous = point;
+        }
+        const endpointDistanceMeters = Number.isFinite(endpointDistance)
+          ? Number((endpointDistance / unit).toFixed(3))
+          : null;
+        const pathLengthMeters = Number((pathLength / unit).toFixed(3));
+        if (reachable) reachablePairs += 1;
+        connections.push({
+          from: String(from.room.id),
+          to: String(to.room.id),
+          reachable,
+          reason: reachable ? "complete-path" : result?.success && pathPoints.length ? "partial-path-endpoint" : "no-path",
+          pathLengthMeters,
+          endpointDistanceMeters,
+          endpointVerticalDistanceMeters: Number.isFinite(endpointVerticalDistance)
+            ? Number((endpointVerticalDistance / unit).toFixed(3))
+            : null,
+          targetSnapDistanceMeters: to.snapDistance,
+          startPolyRef: from.point.polyRef ?? from.point.ref ?? null,
+          targetPolyRef: to.point.polyRef ?? to.point.ref ?? null,
+          ...(endpoint ? { endpoint: [endpoint.x, endpoint.y, endpoint.z] } : {}),
+          target: [to.point.point.x, to.point.point.y, to.point.point.z],
+        });
+      }
+    }
+
+    const fullyConnected = possiblePairs === 0 || reachablePairs === possiblePairs;
+    const artifact = {
+      version: 3,
+      source: useCuratedSpaces ? "recast-curated-navigation-space-connectivity-check" : "recast-room-connectivity-check",
+      entityType: useCuratedSpaces ? "navigation-space" : "detected-room",
+      validation: "complete-endpoint-required",
+      completePathToleranceMeters: Number((completePathTolerance / unit).toFixed(3)),
+      roomCount: useCuratedSpaces ? undefined : rooms.length,
+      spaceCount: useCuratedSpaces ? rooms.length : undefined,
+      entityCount: rooms.length,
+      reachablePairs,
+      possiblePairs,
+      fullyConnected,
+      unreachableRooms: Array.from(new Set(unreachable)),
+      snappedRooms: snapped.map((entry: any) => ({
+        id: String(entry.room.id),
+        requestedCenter: entry.center,
+        snappedCenter: entry.snappedPoint,
+        snapDistanceMeters: entry.snapDistance,
+        polyRef: entry.point?.polyRef ?? entry.point?.ref ?? null,
+        success: Boolean(entry.point?.success),
+      })),
+      connections,
+    };
+    fs.writeFileSync(path.join(jobDirectory, "room_connectivity.json"), JSON.stringify(artifact, null, 2), "utf8");
+    const entityLabel = useCuratedSpaces ? "navigation-space" : "detected-room";
+    console.log(`[WalkNav] ${entityLabel} connectivity (complete paths only): ${reachablePairs}/${possiblePairs} directed pairs reachable.`);
+    if (!fullyConnected) {
+      const partial = connections.filter((entry) => !entry.reachable);
+      console.warn(`[WalkNav] ${partial.length} ${entityLabel} route(s) failed complete-endpoint validation; see room_connectivity.json.`);
+    }
+  } catch (error) {
+    console.warn(`[WalkNav] Room connectivity check failed: ${(error as Error).message}`);
+  }
+}
+
+function writeDoorwayTraversability(jobDirectory: string, query: NavMeshQuery, physicalMetersPerUnit: number) {
+  const sourcePath = path.join(jobDirectory, "hosted_door_portals.json");
+  if (!fs.existsSync(sourcePath)) return;
+
+  try {
+    const payload = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+    const doors = Array.isArray(payload?.doors) ? payload.doors : [];
+    if (!doors.length) return;
+
+    const unit = Math.max(Number(physicalMetersPerUnit) || 1, 1e-6);
+    const endpointTolerance = Math.max(0.4 * unit, 0.3);
+    const verticalTolerance = Math.max(0.5 * unit, 0.35);
+    const searchRadius = Math.max(0.28 * unit, 0.22);
+    const results: Array<Record<string, any>> = [];
+
+    const findSidePoint = (probe: [number, number, number]) => {
+      return query.findClosestPoint(
+        { x: probe[0], y: probe[1], z: probe[2] },
+        {
+          halfExtents: {
+            x: searchRadius,
+            y: Math.max(1.2 * unit, 0.7),
+            z: searchRadius,
+          },
+          filter: new QueryFilter(),
+        },
+      );
+    };
+
+    for (const door of doors) {
+      const placement = door?.doorPlacement?.position;
+      if (!Array.isArray(placement) || placement.length < 3 || !placement.slice(0, 3).every(Number.isFinite)) {
+        results.push({
+          id: String(door?.instanceId || door?.globalId || "unknown-door"),
+          connected: false,
+          reason: "missing-door-placement",
+        });
+        continue;
+      }
+      const center: [number, number, number] = [Number(placement[0]), Number(placement[1]) || 0, Number(placement[2])];
+      const rawAxis = door?.hostPlacement?.thicknessAxis;
+      let nx = Array.isArray(rawAxis) ? Number(rawAxis[0]) : 0;
+      let nz = Array.isArray(rawAxis) ? -Number(rawAxis[1]) : 0;
+      let norm = Math.hypot(nx, nz);
+      if (!Number.isFinite(norm) || norm < 1e-6) {
+        const yaw = Number(door?.doorPlacement?.rotation?.[1] ?? 0) * Math.PI / 180;
+        nx = -Math.sin(yaw);
+        nz = Math.cos(yaw);
+        norm = Math.hypot(nx, nz);
+      }
+      if (!Number.isFinite(norm) || norm < 1e-6) {
+        results.push({ id: String(door?.instanceId || door?.globalId || "unknown-door"), connected: false, reason: "invalid-portal-normal" });
+        continue;
+      }
+      nx /= norm;
+      nz /= norm;
+
+      const wallThickness = Math.max(0, Number(door?.hostPlacement?.wallThickness) || 0);
+      const baseOffset = Math.max(0.55 * unit, wallThickness * 0.5 + 0.4 * unit);
+      let bestAttempt: any = null;
+      for (const offsetMultiplier of [1, 1.35, 1.7]) {
+        const offset = baseOffset * offsetMultiplier;
+        const probeA: [number, number, number] = [center[0] + nx * offset, center[1], center[2] + nz * offset];
+        const probeB: [number, number, number] = [center[0] - nx * offset, center[1], center[2] - nz * offset];
+        const sideA = findSidePoint(probeA);
+        const sideB = findSidePoint(probeB);
+        if (!sideA?.success || !sideB?.success || !sideA.point || !sideB.point) {
+          bestAttempt = {
+            id: String(door.instanceId || door.globalId || "unknown-door"),
+            assetId: door.assetId ?? null,
+            wallGlobalId: door.globalId ?? door.hostPlacement?.wallGlobalId ?? null,
+            openingGlobalId: door.openingGlobalId ?? null,
+            center,
+            widthMeters: Number(door?.voidDimensions?.width) || null,
+            heightMeters: Number(door?.voidDimensions?.height) || null,
+            offsetMeters: Number((offset / unit).toFixed(3)),
+            connected: false,
+            reason: !sideA?.success && !sideB?.success ? "no-navmesh-point-on-either-side"
+              : !sideA?.success ? "no-navmesh-point-on-side-a" : "no-navmesh-point-on-side-b",
+            sideA: sideA?.success ? [sideA.point.x, sideA.point.y, sideA.point.z] : null,
+            sideB: sideB?.success ? [sideB.point.x, sideB.point.y, sideB.point.z] : null,
+          };
+          continue;
+        }
+
+        const pathResult = query.computePath(sideA.point, sideB.point, {
+          filter: new QueryFilter(),
+          maxStraightPathSize: 512,
+          maxPathSize: 512,
+        });
+        const points: any[] = Array.isArray(pathResult?.path) ? pathResult.path : [];
+        const endpoint = points.length ? points[points.length - 1] : null;
+        const endpointDistance = endpoint ? Math.hypot(endpoint.x - sideB.point.x, endpoint.z - sideB.point.z) : Infinity;
+        const endpointVerticalDistance = endpoint ? Math.abs(endpoint.y - sideB.point.y) : Infinity;
+        const connected = Boolean(
+          pathResult?.success && points.length > 0 &&
+          endpointDistance <= endpointTolerance && endpointVerticalDistance <= verticalTolerance
+        );
+        let pathLength = 0;
+        let previous = sideA.point;
+        for (const point of points) {
+          pathLength += Math.hypot(point.x - previous.x, point.z - previous.z);
+          previous = point;
+        }
+        bestAttempt = {
+          id: String(door.instanceId || door.globalId || "unknown-door"),
+          assetId: door.assetId ?? null,
+          wallGlobalId: door.globalId ?? door.hostPlacement?.wallGlobalId ?? null,
+          openingGlobalId: door.openingGlobalId ?? null,
+          center,
+          widthMeters: Number(door?.voidDimensions?.width) || null,
+          heightMeters: Number(door?.voidDimensions?.height) || null,
+          offsetMeters: Number((offset / unit).toFixed(3)),
+          connected,
+          reason: connected ? "complete-path-through-portal" : pathResult?.success && points.length ? "partial-path-endpoint" : "no-path-between-sides",
+          sideA: [sideA.point.x, sideA.point.y, sideA.point.z],
+          sideB: [sideB.point.x, sideB.point.y, sideB.point.z],
+          sideAPolyRef: sideA.polyRef ?? sideA.ref ?? null,
+          sideBPolyRef: sideB.polyRef ?? sideB.ref ?? null,
+          endpoint: endpoint ? [endpoint.x, endpoint.y, endpoint.z] : null,
+          endpointDistanceMeters: Number.isFinite(endpointDistance) ? Number((endpointDistance / unit).toFixed(3)) : null,
+          pathLengthMeters: Number((pathLength / unit).toFixed(3)),
+        };
+        if (connected) break;
+      }
+      results.push(bestAttempt || {
+        id: String(door?.instanceId || door?.globalId || "unknown-door"),
+        connected: false,
+        reason: "portal-test-not-completed",
+      });
+    }
+
+    const traversableCount = results.filter((result) => result.connected).length;
+    const summary = {
+      version: 1,
+      source: "hosted-door-navmesh-side-to-side-test",
+      validation: "complete-path-endpoint-required",
+      hostedDoorCount: doors.length,
+      traversableCount,
+      blockedCount: doors.length - traversableCount,
+      endpointToleranceMeters: Number((endpointTolerance / unit).toFixed(3)),
+      doors: results,
+    };
+    fs.writeFileSync(path.join(jobDirectory, "doorway_traversability.json"), JSON.stringify(summary, null, 2), "utf8");
+    console.log(`[WalkNav] Doorway traversability: ${traversableCount}/${doors.length} hosted door passages reachable side-to-side.`);
+    for (const result of results) {
+      console.log(`[WalkNav] Door ${result.id}: ${result.connected ? "PASS" : "BLOCKED"} (${result.reason || "unknown"})`);
+    }
+  } catch (error) {
+    console.warn(`[WalkNav] Doorway traversability check failed: ${(error as Error).message}`);
+  }
+}
+
+function horizontalDistance(a: any, b: any): number {
+  const av = Array.isArray(a) ? a : a && typeof a === "object" ? [a.x, a.y, a.z] : null;
+  const bv = Array.isArray(b) ? b : b && typeof b === "object" ? [b.x, b.y, b.z] : null;
+  if (!av || !bv || av.length < 3 || bv.length < 3) return Infinity;
+  return Math.hypot(Number(av[0]) - Number(bv[0]), Number(av[2]) - Number(bv[2]));
+}
+
+function connectedComponentsForGraph(nodes: Array<{ id: string; neighbors: string[] }>): string[][] {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const visited = new Set<string>();
+  const groups: string[][] = [];
+  for (const node of nodes) {
+    if (visited.has(node.id)) continue;
+    const queue = [node.id];
+    const group: string[] = [];
+    visited.add(node.id);
+    while (queue.length) {
+      const id = queue.shift()!;
+      group.push(id);
+      for (const next of byId.get(id)?.neighbors || []) {
+        if (visited.has(next) || !byId.has(next)) continue;
+        visited.add(next);
+        queue.push(next);
+      }
+    }
+    groups.push(group);
+  }
+  return groups;
+}
+
+function writePresentationPortalGraph(jobDirectory: string, query: NavMeshQuery, physicalMetersPerUnit: number) {
+  const manifestPath = path.join(jobDirectory, "presentation_portals.json");
+  const hotspotsPath = path.join(jobDirectory, "walk_hotspots.json");
+  const hostedPath = path.join(jobDirectory, "hosted_door_portals.json");
+  const traversalPath = path.join(jobDirectory, "doorway_traversability.json");
+  if (!fs.existsSync(manifestPath) || !fs.existsSync(hotspotsPath)) return;
+
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    const hotspotPayload = JSON.parse(fs.readFileSync(hotspotsPath, "utf8"));
+    const hostedPayload = fs.existsSync(hostedPath) ? JSON.parse(fs.readFileSync(hostedPath, "utf8")) : { doors: [] };
+    const traversalPayload = fs.existsSync(traversalPath) ? JSON.parse(fs.readFileSync(traversalPath, "utf8")) : { doors: [] };
+    const connectivityPath = path.join(jobDirectory, "room_connectivity.json");
+    const connectivityPayload = fs.existsSync(connectivityPath) ? JSON.parse(fs.readFileSync(connectivityPath, "utf8")) : { connections: [] };
+    const hostedDoors = Array.isArray(hostedPayload?.doors) ? hostedPayload.doors : [];
+    const traversalDoors = Array.isArray(traversalPayload?.doors) ? traversalPayload.doors : [];
+    const areas = (Array.isArray(hotspotPayload?.areas) ? hotspotPayload.areas : [])
+      .filter((area: any) => area?.id && Array.isArray(area?.center) && area.center.length >= 3)
+      .map((area: any) => ({ ...area, portalIds: [], neighbors: [] as string[] }));
+    const portals = Array.isArray(manifest?.portals) ? manifest.portals : [];
+    const byArea = new Map(areas.map((area: any) => [String(area.id), area]));
+
+    const getDoorRecord = (portal: any) => hostedDoors.find((door: any) =>
+      String(door?.instanceId || "") === String(portal?.assetInstanceId || "")
+    ) ?? null;
+    const getTraversalRecord = (portal: any, door: any) => {
+      if (!door) return null;
+      const instanceId = String(portal?.assetInstanceId || portal?.instanceId || door?.instanceId || "");
+      const exact = traversalDoors.find((entry: any) => String(entry?.id || "") === instanceId);
+      if (exact) return exact;
+      const center = portal?.center ?? door?.doorPlacement?.position;
+      let best: any = null;
+      let bestDistance = Infinity;
+      for (const entry of traversalDoors) {
+        const distance = horizontalDistance(center, entry?.center);
+        if (distance < bestDistance) { best = entry; bestDistance = distance; }
+      }
+      return bestDistance <= 0.5 ? best : null;
+    };
+    const probePortalOnNavMesh = (center: number[], nx: number, nz: number, wallThickness = 0.2) => {
+      const unit = Math.max(Number(physicalMetersPerUnit) || 1, 1e-6);
+      const endpointTolerance = Math.max(0.4 * unit, 0.3);
+      const verticalTolerance = Math.max(0.5 * unit, 0.35);
+      const offset0 = Math.max(0.55 * unit, Math.max(0, wallThickness) * 0.5 + 0.4 * unit);
+      let best: any = null;
+      for (const multiplier of [1, 1.35, 1.7]) {
+        const offset = offset0 * multiplier;
+        const pa = { x: center[0] + nx * offset, y: Number(center[1]) || 0, z: center[2] + nz * offset };
+        const pb = { x: center[0] - nx * offset, y: Number(center[1]) || 0, z: center[2] - nz * offset };
+        const opts = { halfExtents: { x: Math.max(0.45 * unit, 0.3), y: Math.max(1.2 * unit, 0.7), z: Math.max(0.45 * unit, 0.3) }, filter: new QueryFilter() };
+        const sideA = query.findClosestPoint(pa, opts);
+        const sideB = query.findClosestPoint(pb, opts);
+        if (!sideA?.success || !sideB?.success || !sideA.point || !sideB.point) {
+          best = { connected: false, reason: !sideA?.success && !sideB?.success ? "no-navmesh-point-on-either-side" : !sideA?.success ? "no-navmesh-point-on-side-a" : "no-navmesh-point-on-side-b", sideA: sideA?.success ? [sideA.point.x, sideA.point.y, sideA.point.z] : null, sideB: sideB?.success ? [sideB.point.x, sideB.point.y, sideB.point.z] : null };
+          continue;
+        }
+        const route = query.computePath(sideA.point, sideB.point, { filter: new QueryFilter(), maxStraightPathSize: 512, maxPathSize: 512 });
+        const points: any[] = Array.isArray(route?.path) ? route.path : [];
+        const endpoint = points.length ? points[points.length - 1] : null;
+        const distance = endpoint ? Math.hypot(endpoint.x - sideB.point.x, endpoint.z - sideB.point.z) : Infinity;
+        const vertical = endpoint ? Math.abs(endpoint.y - sideB.point.y) : Infinity;
+        const connected = Boolean(route?.success && points.length && distance <= endpointTolerance && vertical <= verticalTolerance);
+        best = { connected, reason: connected ? "complete-path-through-portal" : route?.success && points.length ? "partial-path-endpoint" : "no-path-between-sides", sideA: [sideA.point.x, sideA.point.y, sideA.point.z], sideB: [sideB.point.x, sideB.point.y, sideB.point.z], endpoint: endpoint ? [endpoint.x, endpoint.y, endpoint.z] : null, endpointDistanceMeters: Number.isFinite(distance) ? Number((distance / unit).toFixed(3)) : null };
+        if (connected) break;
+      }
+      return best || { connected: false, reason: "portal-test-not-completed" };
+    };
+
+    for (const portal of portals) {
+      const door = getDoorRecord(portal);
+      let traversal = door ? getTraversalRecord(portal, door) : null;
+      const center = Array.isArray(portal?.center) ? portal.center : door?.doorPlacement?.position;
+      let nx = Number(portal?.normal?.[0]);
+      let nz = Number(portal?.normal?.[2]);
+      if (!Number.isFinite(nx) || !Number.isFinite(nz) || Math.hypot(nx, nz) < 1e-5) {
+        const rawAxis = door?.hostPlacement?.thicknessAxis;
+        nx = Array.isArray(rawAxis) ? Number(rawAxis[0]) : 0;
+        nz = Array.isArray(rawAxis) ? -Number(rawAxis[1]) : 0;
+      }
+      let norm = Math.hypot(nx, nz);
+      if ((!Number.isFinite(norm) || norm < 1e-5) && door) {
+        const yaw = Number(door?.doorPlacement?.rotation?.[1] ?? 0) * Math.PI / 180;
+        nx = -Math.sin(yaw); nz = Math.cos(yaw); norm = Math.hypot(nx, nz);
+      }
+      if (!Array.isArray(center) || center.length < 3 || !Number.isFinite(norm) || norm < 1e-5) {
+        portal.spaceA = null; portal.spaceB = null;
+        portal.navigationStatus = "unresolved-portal-transform";
+        portal.traversable = false;
+        continue;
+      }
+      nx /= norm; nz /= norm;
+      portal.normal = [nx, 0, nz];
+      if (!traversal) {
+        traversal = probePortalOnNavMesh(center, nx, nz, Number(portal?.wallThickness) || 0.2);
+      }
+
+      const sampleA = Array.isArray(traversal?.sideA) ? traversal.sideA : [center[0] + nx * 0.6, center[1] || 0, center[2] + nz * 0.6];
+      const sampleB = Array.isArray(traversal?.sideB) ? traversal.sideB : [center[0] - nx * 0.6, center[1] || 0, center[2] - nz * 0.6];
+      const selectSpace = (side: 1 | -1, probe: number[]) => {
+        const candidates = areas.map((area: any) => {
+          const c = area.center;
+          const signed = (Number(c[0]) - Number(center[0])) * nx + (Number(c[2]) - Number(center[2])) * nz;
+          if (signed * side < 0.08) return null;
+          const distance = Math.hypot(Number(c[0]) - Number(probe[0]), Number(c[2]) - Number(probe[2]));
+          return { area, distance };
+        }).filter(Boolean) as Array<{ area: any; distance: number }>;
+        candidates.sort((a, b) => a.distance - b.distance);
+        return candidates[0] && candidates[0].distance <= 12 ? candidates[0].area : null;
+      };
+      const spaceA = selectSpace(1, sampleA);
+      const spaceB = selectSpace(-1, sampleB);
+      portal.spaceA = spaceA?.id ?? null;
+      portal.spaceB = spaceB?.id ?? null;
+      portal.navigationValidation = traversal ? {
+        traversable: Boolean(traversal.connected),
+        reason: String(traversal.reason || "unknown"),
+        endpointDistanceMeters: traversal.endpointDistanceMeters ?? null,
+      } : { traversable: false, reason: "no-doorway-traversability-result" };
+      portal.traversable = Boolean(traversal?.connected);
+      portal.navigationStatus = traversal?.connected
+        ? (spaceA && spaceB && spaceA.id !== spaceB.id ? "traversable" : "traversable-space-unmapped")
+        : /no-navmesh-point-on-(side-a|side-b|either-side)/.test(String(traversal?.reason || ""))
+          ? "exterior-or-no-walkable-side"
+          : traversal?.reason === "partial-path-endpoint" || traversal?.reason === "no-path-between-sides"
+            ? "blocked-in-navmesh"
+            : "unverified";
+      if (spaceA && !spaceA.portalIds.includes(portal.id)) spaceA.portalIds.push(portal.id);
+      if (spaceB && spaceB.id !== spaceA?.id && !spaceB.portalIds.includes(portal.id)) spaceB.portalIds.push(portal.id);
+      if (spaceA && spaceB && spaceA.id !== spaceB.id && traversal?.connected) {
+        if (!spaceA.neighbors.includes(spaceB.id)) spaceA.neighbors.push(spaceB.id);
+        if (!spaceB.neighbors.includes(spaceA.id)) spaceB.neighbors.push(spaceA.id);
+      }
+    }
+
+    const spaceNodes = areas.map((area: any) => ({ id: String(area.id), label: String(area.label || area.id), center: area.center, neighbors: [] as string[] }));
+    const spacePortalEdges = portals
+      .filter((portal: any) => portal.navigationStatus === "traversable" && portal.spaceA && portal.spaceB && portal.spaceA !== portal.spaceB)
+      .map((portal: any) => ({ id: `space-portal-edge-${portal.id}`, portalId: portal.id, from: portal.spaceA, to: portal.spaceB, status: "traversable", edgeType: "door-portal" }));
+    const spaceById = new Map(spaceNodes.map((space: any) => [space.id, space]));
+    for (const edge of spacePortalEdges) {
+      const from: any = spaceById.get(edge.from);
+      const to: any = spaceById.get(edge.to);
+      if (from && to) {
+        if (!from.neighbors.includes(to.id)) from.neighbors.push(to.id);
+        if (!to.neighbors.includes(from.id)) to.neighbors.push(from.id);
+      }
+    }
+    const reachabilityRows = Array.isArray(connectivityPayload?.connections) ? connectivityPayload.connections : [];
+    const reachablePairMap = new Map<string, any>();
+    for (const row of reachabilityRows) {
+      if (!row?.reachable || !row?.from || !row?.to || row.from === row.to) continue;
+      const key = [String(row.from), String(row.to)].sort().join("::");
+      if (!reachablePairMap.has(key)) reachablePairMap.set(key, { from: String(row.from), to: String(row.to), pathLengthMeters: row.pathLengthMeters ?? null, status: "complete-navmesh-path" });
+    }
+    const reachablePairs = Array.from(reachablePairMap.values());
+    const reachabilityNeighbors = new Map(spaceNodes.map((node: any) => [node.id, new Set<string>()]));
+    for (const pair of reachablePairs) {
+      const a: any = reachabilityNeighbors.get(pair.from);
+      const b: any = reachabilityNeighbors.get(pair.to);
+      if (a && b) { a.add(pair.to); b.add(pair.from); }
+    }
+    const reachabilityComponents = connectedComponentsForGraph(spaceNodes.map((node: any) => ({
+      id: node.id,
+      neighbors: Array.from(reachabilityNeighbors.get(node.id) || []),
+    })));
+    const roomNodes = (Array.isArray(manifest?.rooms) ? manifest.rooms : []).map((room: any) => ({
+      id: String(room.id), label: String(room.label || room.id), center: room.center,
+      portalIds: Array.isArray(room.portals) ? room.portals : [],
+    }));
+    const roomEdges = portals
+      .filter((portal: any) => portal.roomA && portal.roomB && portal.roomA !== portal.roomB && portal.navigationStatus === "traversable")
+      .map((portal: any) => ({ id: `room-edge-${portal.id}`, portalId: portal.id, from: portal.roomA, to: portal.roomB, status: "traversable" }));
+    const roomAdjacency: Record<string, string[]> = Object.fromEntries(roomNodes.map((node: any) => [node.id, []]));
+    for (const edge of roomEdges) {
+      if (roomAdjacency[edge.from] && !roomAdjacency[edge.from].includes(edge.to)) roomAdjacency[edge.from].push(edge.to);
+      if (roomAdjacency[edge.to] && !roomAdjacency[edge.to].includes(edge.from)) roomAdjacency[edge.to].push(edge.from);
+    }
+    const roomPortalIdsByRoom = Object.fromEntries(roomNodes.map((node: any) => [node.id, portals.filter((portal: any) => portal.roomA === node.id || portal.roomB === node.id).map((portal: any) => portal.id)]));
+    const portalAdjacencyComponentCount = connectedComponentsForGraph(
+      spaceNodes.map((node: any) => ({ id: node.id, neighbors: node.neighbors })),
+    ).length;
+
+    manifest.version = Math.max(3, Number(manifest.version) || 0);
+    manifest.spaces = areas;
+    manifest.graph = {
+      version: 2,
+      nodeType: "detected-room",
+      adjacency: roomAdjacency,
+      portalIdsByRoom: roomPortalIdsByRoom,
+      edges: roomEdges,
+      validation: "complete-doorway-navmesh-test",
+    };
+    manifest.navigationSpaceGraph = {
+      version: 2,
+      nodeType: "curated-navigation-space",
+      nodes: spaceNodes,
+      // Direct physical adjacency established by a traversable door/portal.
+      portalEdges: spacePortalEdges,
+      // Reachability edges describe a complete NavMesh path, which may pass
+      // through several doors or an open-plan passage; they are not claimed to
+      // represent direct room adjacency.
+      reachablePairs,
+      connectedComponents: reachabilityComponents,
+      componentCount: reachabilityComponents.length,
+      fullyConnected: reachabilityComponents.length <= 1 && spaceNodes.length > 0,
+      portalAdjacencyComponentCount,
+      validation: "portal-edges-require-navmesh-side-to-side-pass; reachability-edges-require-complete-room-connectivity-path",
+    };
+    manifest.stats = {
+      ...(manifest.stats || {}),
+      roomCount: roomNodes.length,
+      portalCount: portals.length,
+      spaceCount: areas.length,
+      connectedPortalCount: portals.filter((p: any) => p.roomA && p.roomB && p.roomA !== p.roomB).length,
+      traversablePortalCount: portals.filter((p: any) => p.navigationStatus === "traversable").length,
+      navigationSpacePortalEdgeCount: spacePortalEdges.length,
+      navigationSpaceReachablePairCount: reachablePairs.length,
+      navigationSpaceComponentCount: reachabilityComponents.length,
+    };
+
+    for (const room of Array.isArray(manifest.rooms) ? manifest.rooms : []) {
+      room.portals = portals.filter((p: any) => p.roomA === room.id || p.roomB === room.id).map((p: any) => p.id);
+    }
+
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+    fs.writeFileSync(path.join(jobDirectory, "presentation_room_graph.json"), JSON.stringify({
+      version: 1,
+      source: "presentation_portals.json + walk_hotspots.json + doorway_traversability.json",
+      roomGraph: { nodes: roomNodes, edges: roomEdges },
+      navigationSpaceGraph: manifest.navigationSpaceGraph,
+      portals: portals.map((portal: any) => ({
+        id: portal.id, assetInstanceId: portal.assetInstanceId ?? null,
+        hostWallId: portal.hostWallId ?? null, center: portal.center,
+        roomA: portal.roomA ?? null, roomB: portal.roomB ?? null,
+        spaceA: portal.spaceA ?? null, spaceB: portal.spaceB ?? null,
+        traversable: Boolean(portal.traversable), navigationStatus: portal.navigationStatus,
+        width: portal.width ?? null, height: portal.height ?? null,
+      })),
+      diagnostics: {
+        detectedRoomCount: roomNodes.length,
+        navigationSpaceCount: spaceNodes.length,
+        hostedDoorCount: hostedDoors.length,
+        navmeshTraversableDoorCount: portals.filter((p: any) => p.navigationValidation?.traversable).length,
+        mappedTraversablePortalEdges: spacePortalEdges.length,
+        completeReachablePairs: reachablePairs.length,
+        navigationSpaceComponentCount: reachabilityComponents.length,
+        unmappedPortals: portals.filter((p: any) => p.navigationValidation?.traversable && p.navigationStatus === "traversable-space-unmapped").map((p: any) => p.id),
+      },
+    }, null, 2), "utf8");
+    console.log(`[WalkGraph] Spaces: ${areas.length}; portals: ${portals.length}; verified portal edges: ${spacePortalEdges.length}; NavMesh-connected components: ${reachabilityComponents.length}.`);
+    for (const portal of portals) {
+      console.log(`[WalkGraph] ${portal.id}: ${portal.spaceA || "outside/unmapped"} ↔ ${portal.spaceB || "outside/unmapped"} (${portal.navigationStatus || "unverified"}).`);
+    }
+  } catch (error) {
+    console.warn(`[WalkGraph] Room/portal graph enrichment failed: ${(error as Error).message}`);
+  }
 }
 
 function closestCandidate(candidates: HotspotCandidate[], target: [number, number, number]): HotspotCandidate | null {
@@ -816,7 +1506,18 @@ export class WalkNavigationPipeline {
 
     console.log(`[WalkNav] physical metres -> GLB units: ${physicalMetersPerUnit}`);
 
-    const extracted = await extractFinalGlb(outputGlbPath);
+    const hostedDoorInstanceIds = readHostedDoorInstanceIds(jobDirectory);
+    const extracted = await extractFinalGlb(outputGlbPath, hostedDoorInstanceIds);
+    const matchedDoorIds = new Set(extracted.hostedDoorInstanceIdsMatched);
+    const unmatchedDoorIds = Array.from(hostedDoorInstanceIds).filter((id) => !matchedDoorIds.has(id));
+    console.log(
+      `[WalkNav] Hosted GLB door obstacle exclusion: ${matchedDoorIds.size}/${hostedDoorInstanceIds.size} door instance IDs matched; ${extracted.hostedDoorMeshNodesExcluded} mesh nodes excluded by explicit node marker.`,
+    );
+    if (unmatchedDoorIds.length) {
+      console.warn(
+        `[WalkNav] Hosted door instance wrappers were not found in the navigation scene: ${unmatchedDoorIds.join(", ")}`,
+      );
+    }
     const filtered = buildFilteredSoup(extracted, DEFAULT_METRES.slope);
     if (filtered.soup.indices.length === 0) throw new Error("WalkNavigationPipeline: filtered navigation geometry is empty.");
 
@@ -838,6 +1539,8 @@ export class WalkNavigationPipeline {
 
     if (!generation.success || !generation.navMesh) throw new Error("WalkNavigationPipeline: Recast generation failed.");
     const navMesh = generation.navMesh;
+    const topologyQuery = new NavMeshQuery(navMesh);
+    writeDoorwayTraversability(jobDirectory, topologyQuery, physicalMetersPerUnit);
     const [surfacePositions, surfaceIndices] = getNavMeshPositionsAndIndices(navMesh);
     const serialized = exportNavMesh(navMesh);
     fs.writeFileSync(path.join(jobDirectory, "navigation_navmesh.bin"), Buffer.from(serialized));
@@ -889,6 +1592,13 @@ export class WalkNavigationPipeline {
       areas: curated.areas,
       hotspots: curated.hotspots,
     }, null, 2), "utf8");
+
+    // Curated navigation spaces are sampled from the generated NavMesh itself,
+    // unlike room-detector centroids which can sit on the wrong side of a wall.
+    // Use these for the route matrix, then produce one canonical portal/space graph.
+    writeRoomConnectivity(jobDirectory, topologyQuery, physicalMetersPerUnit);
+    writePresentationPortalGraph(jobDirectory, topologyQuery, physicalMetersPerUnit);
+    topologyQuery.destroy?.();
 
     const meta = {
       version: 5,

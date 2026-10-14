@@ -1,12 +1,45 @@
-# Node and React
-node_modules/
-.env
+# JavaScript / frontend dependencies and generated builds
+**/node_modules/
+**/.vite/
+**/dist/
+**/build/
+**/coverage/
+**/.next/
+**/.turbo/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
 
-# Python
-__pycache__/
-*.pyc
-venv/
-env/
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Python caches and virtual environments
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/venv/
+**/env/
+
+# HCI runtime data and generated ML artifacts
+**/gdrive_dataset/
+**/runs/
+**/runs_*/
+**/wandb/
+**/jobs/
+**/uploads/
+
+# Local-only backups and generated test files
+/frontend_backup_zip/
+/uploads.zip
+/xeo-kit-project/bim-viewer-app/output.glb
+/xeo-kit-project/bim-viewer-app/working_src.zip
+**/final_output.glb
 
 jobs/
 19-06-2026/

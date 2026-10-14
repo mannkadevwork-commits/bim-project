@@ -16,7 +16,6 @@ const app = express();
 app.use(cors());
 app.use(express.json()); 
 
-const { generate360ViewerFromGLB } = require('./aps-pipeline');
 
 // 1. Ensure dynamic directories exist
 const jobsDir = path.join(__dirname, 'jobs');
@@ -185,7 +184,12 @@ function requireActiveProject(jobId, res) {
 }
 
 // 2. Serve static folders publicly
-app.use('/jobs', express.static(jobsDir));
+app.use('/jobs', (req, res, next) => {
+    if (req.path.endsWith('/360_viewer.html') || req.path === '/360_viewer.html') {
+        return res.status(410).json({ error: 'Legacy 360 viewer has been removed. Use /walkthrough/:jobId.' });
+    }
+    return express.static(jobsDir)(req, res, next);
+});
 app.use('/assets', express.static(assetsDir));
 
 // Serve uploaded catalog files
@@ -1331,15 +1335,20 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
             return res.status(500).json({ error: "output.glb was not generated." });
         }
 
+        // React /walkthrough/:jobId is the only client-facing presentation runtime.
+        // No standalone HTML viewer is generated anymore.
+        const legacyViewerPath = path.join(jobDir, '360_viewer.html');
         try {
-            generate360ViewerFromGLB(jobDir);
-        } catch (err) {
-            return res.status(500).json({ error: "Failed to generate 360 viewer." });
+            if (fs.existsSync(legacyViewerPath)) fs.unlinkSync(legacyViewerPath);
+        } catch (cleanupError) {
+            console.warn('[Render] Unable to remove legacy 360_viewer.html:', cleanupError.message);
         }
 
         return res.json({
             type: "360",
-            url: `${baseUrl}/jobs/${jobId}/360_viewer.html`,
+            url: `/walkthrough/${encodeURIComponent(jobId)}`,
+            walkthroughPath: `/walkthrough/${encodeURIComponent(jobId)}`,
+            modelUrl: `${baseUrl}/jobs/${encodeURIComponent(jobId)}/output.glb`,
             jobId
         });
     }

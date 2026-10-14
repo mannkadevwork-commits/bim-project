@@ -108,7 +108,7 @@ export const RenderStudioModal = ({
   if (isRendering) return (
     <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex flex-col items-center justify-center text-white">
       <Loader2 className="w-16 h-16 animate-spin text-indigo-500 mb-6" />
-      <h2 className="text-3xl font-bold mb-2">Preparing Interactive 360° Render...</h2>
+      <h2 className="text-3xl font-bold mb-2">Preparing Interactive Home Presentation...</h2>
       <p className="text-slate-300">Compiling the final GLB and navigation data for the walkthrough.</p>
       <p className="text-slate-400 text-sm mt-2">This may take a little while depending on scene complexity.</p>
     </div>
@@ -120,7 +120,7 @@ export const RenderStudioModal = ({
         <div className="flex justify-between items-center p-4 border-b border-slate-200 dark:border-slate-800">
           <div className="flex items-center gap-3">
             <div>
-              <h3 className="font-bold text-lg text-slate-800 dark:text-white">Interactive 360° Render</h3>
+              <h3 className="font-bold text-lg text-slate-800 dark:text-white">Interactive Home Presentation</h3>
               <p
                 className="mt-0.5 max-w-[760px] break-words text-xs font-medium leading-5 text-slate-400"
                 title={renderDisplayName}
@@ -215,7 +215,7 @@ export const RenderStudioModal = ({
                 rel="noreferrer"
                 className="flex items-center gap-2 px-5 py-2.5 bg-slate-800 hover:bg-slate-900 dark:bg-slate-700 dark:hover:bg-slate-600 text-white rounded-lg font-semibold transition-colors"
               >
-                <ExternalLink className="w-4 h-4" /> Open 360° Fullscreen
+                <ExternalLink className="w-4 h-4" /> Open Presentation Fullscreen
               </a>
               {downloadError && <span className="w-full text-right text-xs text-rose-500">{downloadError}</span>}
             </>

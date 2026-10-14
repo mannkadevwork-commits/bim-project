@@ -58,6 +58,22 @@ export const intersectXZPlane = (px, py, invViewProj, planeY, w, h) => {
     return [near[0] + t * rd[0], near[1] + t * rd[1], near[2] + t * rd[2]];
 };
 
+export const translateMatrixWorld = (baseMatrix, delta) => {
+    if ((!Array.isArray(baseMatrix) && !ArrayBuffer.isView(baseMatrix)) || baseMatrix.length !== 16) return null;
+    if ((!Array.isArray(delta) && !ArrayBuffer.isView(delta)) || delta.length !== 3) return null;
+
+    const next = Array.from(baseMatrix, Number);
+    const d = Array.from(delta, Number);
+    if (![...next, ...d].every(Number.isFinite)) return null;
+
+    // Xeokit matrices are column-major. Adding world-space translation to
+    // indices 12..14 preserves the existing IFC rotation and scale exactly.
+    next[12] += d[0];
+    next[13] += d[1];
+    next[14] += d[2];
+    return next;
+};
+
 export const calculateGrabPoint = (viewerRef, canvas, canvasPos, elevationY) => {
     try {
         const viewer = viewerRef.current;

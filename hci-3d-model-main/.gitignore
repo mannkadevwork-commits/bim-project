@@ -1,0 +1,25 @@
+# Runtime data is generated/managed by the app and must not be committed.
+/gdrive_dataset/
+/runs/
+/iterations/
+/cubicasa_hqa_500/
+/cubicasa_server_package_2121/
+/yolov8n-seg.pt
+/best_gdrive.pt
+/best_hci21.pt
+
+# Python/editor artifacts
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp
+*.bak
+*.zip

@@ -7,38 +7,39 @@ const LIGHTING_MODES = {
   day: {
     label: 'Day',
     icon: '☀',
-    background: 0xd9e1e7,
-    environmentIntensity: 0.68,
-    exposure: 0.93,
-    hemisphere: { sky: 0xf4f8fb, ground: 0x59636d, intensity: 0.60 },
-    key: { color: 0xfff1dc, intensity: 1.60, direction: [-0.50, 0.88, 0.46] },
-    fill: { color: 0xbdd4ee, intensity: 0.28, direction: [0.64, 0.42, -0.60] },
-    rim: { color: 0xffffff, intensity: 0.12, direction: [0.16, 0.54, -0.84] },
+    // Restrained architectural daylight: preserve highlight detail and add shape to walls/furniture.
+    background: 0xe2e9ef,
+    environmentIntensity: 0.44,
+    exposure: 0.90,
+    hemisphere: { sky: 0xf4f7fb, ground: 0x51483f, intensity: 0.36 },
+    key: { color: 0xffe9cc, intensity: 1.62, direction: [-0.50, 0.88, 0.46] },
+    fill: { color: 0xc4d8ed, intensity: 0.24, direction: [0.64, 0.42, -0.60] },
+    rim: { color: 0xf8fbff, intensity: 0.07, direction: [0.16, 0.54, -0.84] },
     practical: { intensity: 0.0, color: 0xffc98f },
   },
   evening: {
     label: 'Evening',
     icon: '◐',
-    background: 0x4c5868,
-    environmentIntensity: 0.52,
-    exposure: 0.92,
-    hemisphere: { sky: 0xffcfa6, ground: 0x252d38, intensity: 0.44 },
-    key: { color: 0xffb36f, intensity: 1.02, direction: [-0.46, 0.76, 0.48] },
-    fill: { color: 0x8eaed8, intensity: 0.25, direction: [0.58, 0.38, -0.66] },
-    rim: { color: 0xffd1aa, intensity: 0.20, direction: [0.18, 0.55, -0.82] },
-    practical: { intensity: 0.32, color: 0xffb978 },
+    background: 0x48515f,
+    environmentIntensity: 0.35,
+    exposure: 0.88,
+    hemisphere: { sky: 0xffd7b9, ground: 0x28262a, intensity: 0.30 },
+    key: { color: 0xffb87f, intensity: 0.88, direction: [-0.46, 0.76, 0.48] },
+    fill: { color: 0x9bbbe5, intensity: 0.20, direction: [0.58, 0.38, -0.66] },
+    rim: { color: 0xffd1aa, intensity: 0.13, direction: [0.18, 0.55, -0.82] },
+    practical: { intensity: 0.42, color: 0xffbb80 },
   },
   night: {
     label: 'Night',
     icon: '☾',
-    background: 0x08111d,
-    environmentIntensity: 0.30,
-    exposure: 0.82,
-    hemisphere: { sky: 0x607da5, ground: 0x111822, intensity: 0.18 },
-    key: { color: 0x87aee8, intensity: 0.38, direction: [-0.34, 0.86, 0.42] },
-    fill: { color: 0x526c98, intensity: 0.12, direction: [0.62, 0.34, -0.70] },
-    rim: { color: 0x6f8fbe, intensity: 0.11, direction: [0.12, 0.52, -0.86] },
-    practical: { intensity: 0.82, color: 0xffa15d },
+    background: 0x0b1420,
+    environmentIntensity: 0.22,
+    exposure: 0.78,
+    hemisphere: { sky: 0x6881a4, ground: 0x151923, intensity: 0.16 },
+    key: { color: 0x8db1e5, intensity: 0.26, direction: [-0.34, 0.86, 0.42] },
+    fill: { color: 0x5d78a2, intensity: 0.12, direction: [0.62, 0.34, -0.70] },
+    rim: { color: 0x7997c3, intensity: 0.07, direction: [0.12, 0.52, -0.86] },
+    practical: { intensity: 0.70, color: 0xffaa69 },
   },
 };
 
@@ -63,20 +64,81 @@ function directionVector(direction, scale) {
   return new THREE.Vector3(...direction).normalize().multiplyScalar(scale);
 }
 
-function classifyMesh(obj) {
-  const text = `${obj.name || ''} ${obj.parent?.name || ''}`.toLowerCase();
-  if (/(window|glazing|glass|mirror)/.test(text)) return 'glass';
-  if (/(metal|steel|chrome|handle|rail)/.test(text)) return 'metal';
+function nodeAndMaterialName(obj, material) {
+  const parts = [material?.name, obj?.name];
+  let parent = obj?.parent;
+  let depth = 0;
+  while (parent && depth < 4) {
+    parts.push(parent.name);
+    parent = parent.parent;
+    depth += 1;
+  }
+  return parts.filter(Boolean).join(' ').toLowerCase();
+}
+
+function classifyMesh(obj, material) {
+  const text = nodeAndMaterialName(obj, material);
+  if (/(window|glazing|glass|mirror|translucent)/.test(text) || (material?.transparent && material.opacity < 0.96)) return 'glass';
+  if (/(chrome|stainless|steel|aluminium|aluminum|brass|metal|iron|copper|handle|hinge|rail)/.test(text)) return 'metal';
+  if (/(fabric|linen|velvet|upholstery|cushion|curtain|carpet|rug|mattress)/.test(text)) return 'fabric';
+  if (/(wood|timber|oak|walnut|teak|plywood|veneer|door wood|door leaf)/.test(text)) return 'wood';
+  if (/(floor|tile|marble|granite|stone|slab|concrete|ceramic|porcelain)/.test(text)) return 'floor';
+  if (/(wall|ceiling|plaster|drywall|gypsum|paint)/.test(text)) return 'wall';
   if (/(chair|sofa|bed|table|desk|wardrobe|cabinet|tv|sink|basin|wc|toilet|shower|lamp|light|plant|decor|appliance|counter|furniture)/.test(text)) return 'furniture';
+
+  // IFC exports often use generic names (Geom_18_0, Mat_18_0). Use world-space
+  // proportions only as a conservative fallback; never recolour authored meshes.
+  try {
+    const box = new THREE.Box3().setFromObject(obj);
+    const size = box.getSize(new THREE.Vector3());
+    const horizontalSpan = Math.max(size.x, size.z);
+    const thinSpan = Math.min(size.x, size.z);
+    if (size.y <= 0.16 && size.x > 0.7 && size.z > 0.7) return 'floor';
+    if (size.y > 1.2 && thinSpan < 0.32 && horizontalSpan > 0.6) return 'wall';
+  } catch {
+    // Geometry bounds are optional metadata; leave the mesh in the neutral profile.
+  }
   return 'structure';
 }
 
+function clamp(value, min, max) {
+  return THREE.MathUtils.clamp(Number.isFinite(value) ? value : 0.8, min, max);
+}
+
 function roughnessFor(kind, current) {
-  const base = Number.isFinite(current) ? current : 0.8;
-  if (kind === 'glass') return Math.min(base, 0.24);
-  if (kind === 'metal') return Math.min(base, 0.42);
-  if (kind === 'furniture') return Math.min(base, 0.62);
-  return Math.min(base, 0.74);
+  const base = Number.isFinite(current) ? current : 0.82;
+  // Preserve plausible authoring values while preventing obviously unsuitable
+  // material response (e.g. opaque IFC walls behaving like polished metal).
+  switch (kind) {
+    case 'glass': return clamp(base, 0.12, 0.34);
+    case 'metal': return clamp(base, 0.24, 0.56);
+    case 'wood': return clamp(base, 0.48, 0.84);
+    case 'fabric': return clamp(base, 0.78, 0.98);
+    case 'floor': return clamp(base, 0.48, 0.92);
+    case 'wall': return clamp(base, 0.76, 0.98);
+    case 'furniture': return clamp(base, 0.52, 0.92);
+    default: return clamp(base, 0.70, 0.98);
+  }
+}
+
+function metalnessFor(kind, current) {
+  const base = Number.isFinite(current) ? current : 0;
+  if (kind === 'metal') return clamp(base < 0.25 ? 0.65 : base, 0.35, 1.0);
+  // Real wood, fabric, plaster, stone and glass are non-metal PBR surfaces.
+  return 0;
+}
+
+function environmentIntensityFor(kind) {
+  switch (kind) {
+    case 'metal': return 1.05;
+    case 'glass': return 0.82;
+    case 'wood': return 0.78;
+    case 'floor': return 0.68;
+    case 'fabric': return 0.58;
+    case 'wall': return 0.60;
+    case 'furniture': return 0.78;
+    default: return 0.66;
+  }
 }
 
 export class LightingDirector {
@@ -100,14 +162,15 @@ export class LightingDirector {
     this.environmentRenderTarget = null;
     this.staticShadowPrepared = false;
 
-    this.hemisphere = new THREE.HemisphereLight(PREPARED_MODES.day.hemisphereSky, PREPARED_MODES.day.hemisphereGround, 0.60);
-    this.keyLight = new THREE.DirectionalLight(PREPARED_MODES.day.keyColor, 1.60);
-    this.fillLight = new THREE.DirectionalLight(PREPARED_MODES.day.fillColor, 0.28);
-    this.rimLight = new THREE.DirectionalLight(PREPARED_MODES.day.rimColor, 0.12);
+    this.hemisphere = new THREE.HemisphereLight(PREPARED_MODES.day.hemisphereSky, PREPARED_MODES.day.hemisphereGround, 0.36);
+    this.keyLight = new THREE.DirectionalLight(PREPARED_MODES.day.keyColor, 1.62);
+    this.fillLight = new THREE.DirectionalLight(PREPARED_MODES.day.fillColor, 0.24);
+    this.rimLight = new THREE.DirectionalLight(PREPARED_MODES.day.rimColor, 0.07);
     this.keyLight.castShadow = true;
     this.keyLight.shadow.mapSize.set(1024, 1024);
-    this.keyLight.shadow.bias = -0.00010;
-    this.keyLight.shadow.normalBias = 0.014;
+    this.keyLight.shadow.radius = 3.5;
+    this.keyLight.shadow.bias = -0.00008;
+    this.keyLight.shadow.normalBias = 0.010;
     this.keyLight.shadow.camera.near = 0.1;
     this.keyLight.shadow.camera.far = 80;
 
@@ -149,25 +212,42 @@ export class LightingDirector {
 
     model.traverse((obj) => {
       if (!obj.isMesh) return;
-      const kind = classifyMesh(obj);
-      obj.receiveShadow = true;
+      const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+      const primaryMaterial = materials.find(Boolean) || null;
+      const kind = classifyMesh(obj, primaryMaterial);
+      obj.receiveShadow = kind !== 'glass';
       obj.castShadow = kind !== 'glass';
 
-      const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
       materials.forEach((material) => {
         if (!material) return;
+        const materialKind = classifyMesh(obj, material);
         if ('envMapIntensity' in material) {
-          material.envMapIntensity = kind === 'structure' ? 0.88 : 1.05;
+          material.envMapIntensity = environmentIntensityFor(materialKind);
         }
         if ('roughness' in material) {
-          material.roughness = roughnessFor(kind, material.roughness);
+          material.roughness = roughnessFor(materialKind, material.roughness);
         }
-        if (kind === 'glass' && 'metalness' in material) {
-          material.metalness = Math.min(material.metalness, 0.02);
+        if ('metalness' in material) {
+          material.metalness = metalnessFor(materialKind, material.metalness);
         }
+        // Respect authored colour maps and base colours; only tune the PBR
+        // response here so material identity is not destroyed by heuristics.
         material.needsUpdate = true;
       });
     });
+
+    // Higher shadow resolution for typical apartments, but stay at 1024 for
+    // very large scenes to avoid an outsized shadow-map cost.
+    const span = Math.max(this.modelSize.x, this.modelSize.y, this.modelSize.z);
+    const shadowResolution = span <= 24 ? 2048 : 1024;
+    if (this.keyLight.shadow.mapSize.x !== shadowResolution || this.keyLight.shadow.mapSize.y !== shadowResolution) {
+      // The renderer may have allocated the default shadow target before the
+      // GLB finished loading. Dispose it so the new map resolution takes effect.
+      this.keyLight.shadow.map?.dispose?.();
+      this.keyLight.shadow.map = null;
+    }
+    this.keyLight.shadow.mapSize.set(shadowResolution, shadowResolution);
+    this.keyLight.shadow.camera.updateProjectionMatrix();
 
     this._refreshLightRig();
     this._rebuildPracticalLights();

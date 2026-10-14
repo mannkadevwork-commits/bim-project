@@ -262,3 +262,18 @@ button.bg-indigo-600:hover, button.bg-cyan-600:hover, a.bg-indigo-600:hover, a.b
     border-radius: 0 !important;
   }
 }
+
+
+/* Transform gizmo interaction chrome. Presentation only; no transform math. */
+.hci-transform-action {
+  position: relative;
+  isolation: isolate;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.hci-transform-action:not(:disabled):active {
+  transform: translateY(0) scale(0.96);
+}
+.hci-transform-action--move:not(:disabled) { border-color: rgba(52,211,153,0.08); }
+.hci-transform-action--rotate:not(:disabled) { border-color: rgba(96,165,250,0.08); }
+.hci-transform-action--resize:not(:disabled) { border-color: rgba(255,181,94,0.08); }

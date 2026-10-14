@@ -40,3 +40,35 @@ export const buildSelectionCage = (viewerRef, selectionCageRef, aabb) => {
     collidable: false,
   });
 };
+/** Build an oriented selection cage from eight world-space corners. */
+export const buildOrientedSelectionCage = (viewerRef, selectionCageRef, corners) => {
+  destroySelectionCage(selectionCageRef);
+  const viewer = viewerRef.current;
+  if (!viewer || !Array.isArray(corners) || corners.length !== 8) return;
+
+  // Corner order produced by IFC resize frame:
+  // dx -/+, dy -/+, dz -/+ (nested order). Build the same edge topology
+  // without assuming any world-axis alignment.
+  const positions = corners.flat();
+  const indices = [
+    0, 1, 1, 3, 3, 2, 2, 0,
+    4, 5, 5, 7, 7, 6, 6, 4,
+    0, 4, 1, 5, 3, 7, 2, 6,
+  ];
+
+  selectionCageRef.current = new Mesh(viewer.scene, {
+    id: `sel_obb_${Date.now()}`,
+    geometry: new ReadableGeometry(viewer.scene, {
+      primitive: 'lines',
+      positions,
+      indices,
+    }),
+    material: new PhongMaterial(viewer.scene, {
+      diffuse: SELECTION_CAGE_COLOR,
+      emissive: SELECTION_CAGE_COLOR,
+      lineWidth: 1,
+    }),
+    pickable: false,
+    collidable: false,
+  });
+};

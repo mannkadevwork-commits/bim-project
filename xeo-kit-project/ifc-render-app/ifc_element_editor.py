@@ -372,14 +372,47 @@ VOID_THICKNESS_MARGIN = 0.05
 
 
 def _parse_vec3(raw, label):
-    """Parses server.js's comma-joined 'x,y,z' string args into 3 floats."""
-    try:
-        parts = [float(p) for p in raw.split(",")]
-    except (ValueError, AttributeError):
-        raise ValueError(f"--{label} must be a comma-separated 'x,y,z' string, got: {raw!r}")
+    """Parse a 3D vector from a list/tuple, JSON array string, or x,y,z string.
+
+    The hosted-door batch compiler passes ``position`` as a JSON array, while
+    the legacy CLI routes pass comma-separated strings. Supporting both forms
+    keeps the interactive and batch door paths on the same implementation.
+    """
+    parts = None
+
+    if isinstance(raw, (list, tuple)):
+        parts = list(raw)
+    elif isinstance(raw, str):
+        value = raw.strip()
+        if value.startswith("["):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"--{label} must be a valid JSON vector or comma-separated 'x,y,z' string, got: {raw!r}"
+                ) from exc
+            if not isinstance(decoded, (list, tuple)):
+                raise ValueError(f"--{label} JSON value must be an array of 3 numbers, got: {raw!r}")
+            parts = list(decoded)
+        else:
+            parts = value.split(",")
+    else:
+        raise ValueError(
+            f"--{label} must be a 3-number array or comma-separated 'x,y,z' string, got: {raw!r}"
+        )
+
     if len(parts) != 3:
         raise ValueError(f"--{label} must have exactly 3 components, got: {raw!r}")
-    return tuple(parts)
+
+    try:
+        vector = tuple(float(part) for part in parts)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"--{label} components must be numeric, got: {raw!r}") from exc
+
+    if not all(math.isfinite(component) for component in vector):
+        raise ValueError(f"--{label} components must be finite numbers, got: {raw!r}")
+
+    return vector
 
 
 def _frontend_to_ifc_point(x, y, z):
@@ -595,32 +628,39 @@ def _ifc_horizontal_to_frontend_yaw(axis):
 
 
 def _write_isolated_wall_preview(source, wall, opening, output_path):
-    """Write only the edited host wall + its opening relationship.
+    """Write the wall and ALL opening relationships currently hosted by it.
 
-    The main output remains a full IFC for downstream compilation/history.
-    The preview is intentionally wall-only so the frontend never loads another
-    complete copy of the building and pollutes Xeokit picking.
+    Preview IFCs are wall-only for Xeokit picking, but they must be cumulative: if
+    the source IFC already contains earlier doors on this wall, the new preview
+    must keep every existing IfcRelVoidsElement instead of showing one competing
+    wall copy with only the most recent opening.
     """
     target = ifcopenshell.file(schema=source.schema)
 
-    projects = source.by_type("IfcProject")
-    for project in projects:
+    for project in source.by_type("IfcProject"):
         target.add(project)
 
     target_wall = target.add(wall)
-    target_opening = target.add(opening)
+    source_relations = [
+        rel for rel in source.by_type("IfcRelVoidsElement")
+        if rel.RelatingBuildingElement == wall
+    ]
 
-    relation = None
-    for rel in source.by_type("IfcRelVoidsElement"):
-        if rel.RelatingBuildingElement == wall and rel.RelatedOpeningElement == opening:
-            relation = rel
-            break
+    # The current opening should normally already have a relationship, but keep
+    # it as a fallback for IFC files produced by older IfcOpenShell versions.
+    relation_openings = {rel.RelatedOpeningElement.id() for rel in source_relations}
+    if opening is not None and opening.id() not in relation_openings:
+        source_relations = source_relations + [None]
 
-    if relation is not None:
-        owner_history = target.add(relation.OwnerHistory) if relation.OwnerHistory else None
-        kwargs = {
-            "GlobalId": relation.GlobalId,
-        }
+    copied_opening_ids = set()
+    for relation in source_relations:
+        source_opening = relation.RelatedOpeningElement if relation is not None else opening
+        if source_opening is None or source_opening.id() in copied_opening_ids:
+            continue
+        target_opening = target.add(source_opening)
+        copied_opening_ids.add(source_opening.id())
+        owner_history = target.add(relation.OwnerHistory) if relation is not None and relation.OwnerHistory else None
+        kwargs = {"GlobalId": relation.GlobalId} if relation is not None else {}
         if owner_history is not None:
             kwargs["OwnerHistory"] = owner_history
         target.create_entity(
@@ -634,74 +674,43 @@ def _write_isolated_wall_preview(source, wall, opening, output_path):
     return output_path
 
 
-def cmd_insert_door(args):
+def _create_hosted_door_opening(source, wall, asset_id, position, width=None, height=None, thickness=None):
+    """Create one real IfcOpeningElement hosted by ``wall``.
+
+    This is the single physical portal-opening implementation used by both the
+    interactive editor route and the production compiler.  The returned data is
+    deliberately serialisable so a batch compile can persist a portal manifest.
     """
-    Insert a semantic IFC opening hosted by the selected wall.
-
-    Placement is wall-host driven:
-      1. frontend supplies only the actual picked world point + host wall id;
-      2. this function reads the wall's real IFC placement/profile;
-      3. the click is projected into the wall's local run/thickness frame;
-      4. the door is clamped so its full width stays inside the wall;
-      5. the opening is centered on the wall's measured thickness centerline;
-      6. the door base is aligned with the host wall's actual extrusion base;
-      7. the returned visual transform uses the same host frame.
-
-    The existing IfcOpeningElement + IfcRelVoidsElement mechanism is preserved.
-    """
-    source = ifcopenshell.open(args.input)
-    wall = find_element(source, args.global_id)
-
-    logger.info(
-        f"[DoorHost] Inserting hosted door into wall {args.global_id} "
-        f"(asset {args.asset_id})"
-    )
-
-    fx, fy, fz = _parse_vec3(args.position, "position")
-    frontend_point = (fx, fy, fz)
+    fx, fy, fz = _parse_vec3(position, "position")
     ifc_point = _frontend_to_ifc_point(fx, fy, fz)
-
-    # Rotation is deliberately ignored for hosted placement. The wall's IFC
-    # frame is the authoritative orientation; the frontend value remains in
-    # the request only for backwards compatibility with the existing route.
-    _, requested_yaw = _parse_vec3(args.rotation, "rotation")[:2]
-    logger.info(f"[DoorHost] Ignoring frontend yaw {requested_yaw:.3f}°; using IFC wall frame.")
 
     frame = _get_host_wall_frame(wall)
     body_matrix = frame["bodyMatrix"]
-    logger.info(
-        "[DoorHost] Wall frame resolved: run=%s thickness=%s height=%s runAxis=%s",
-        frame["wallRun"], frame["wallThickness"], frame["wallHeight"],
-        [round(float(v), 6) for v in frame["runAxis"]],
-    )
-    local_hit = _world_point_to_wall_local(body_matrix, ifc_point)
 
-    width = float(args.width if args.width is not None else DEFAULT_DOOR_WIDTH)
-    height = float(args.height if args.height is not None else DEFAULT_DOOR_HEIGHT)
-    if width <= 0 or height <= 0:
+    requested_width = float(width if width is not None else DEFAULT_DOOR_WIDTH)
+    requested_height = float(height if height is not None else DEFAULT_DOOR_HEIGHT)
+    requested_thickness = float(thickness if thickness is not None else 0.05)
+
+    if requested_width <= 0 or requested_height <= 0:
         raise ValueError("Door width and height must be positive.")
+    if requested_thickness <= 0:
+        requested_thickness = 0.05
 
-    if frame["wallRun"] + 1e-9 < width:
+    if frame["wallRun"] + 1e-9 < requested_width:
         raise ValueError(
-            f"Door width {width:.3f}m is larger than host wall run {frame['wallRun']:.3f}m."
+            f"Door width {requested_width:.3f}m is larger than host wall run {frame['wallRun']:.3f}m."
         )
-    if frame["wallHeight"] + 1e-9 < height:
+    if frame["wallHeight"] + 1e-9 < requested_height:
         raise ValueError(
-            f"Door height {height:.3f}m is larger than host wall height {frame['wallHeight']:.3f}m."
+            f"Door height {requested_height:.3f}m is larger than host wall height {frame['wallHeight']:.3f}m."
         )
 
-    # Project the click onto the wall's run axis, then clamp the CENTER so the
-    # entire opening remains inside the wall profile.
-    run_center_min = frame["runMin"] + width / 2.0
-    run_center_max = frame["runMax"] - width / 2.0
-    clicked_along = float(local_hit[frame["runAxisIndex"]]) if "runAxisIndex" in frame else float(
-        local_hit[0] if frame["wallRun"] == frame["runMax"] - frame["runMin"] else local_hit[1]
-    )
+    local_hit = _world_point_to_wall_local(body_matrix, ifc_point)
+    run_center_min = frame["runMin"] + requested_width / 2.0
+    run_center_max = frame["runMax"] - requested_width / 2.0
+    clicked_along = float(local_hit[frame["runAxisIndex"]])
     center_along = min(max(clicked_along, run_center_min), run_center_max)
 
-    # The opening is always centered through the real wall thickness. The
-    # vertical click coordinate is intentionally ignored: standard door
-    # placement starts at the host wall's extrusion base.
     center_through = (frame["thicknessMin"] + frame["thicknessMax"]) / 2.0
     base_height = 0.0
     center_local = np.array([local_hit[0], local_hit[1], base_height], dtype=float)
@@ -720,44 +729,33 @@ def cmd_insert_door(args):
     run_axis = frame["runAxis"]
     thickness_axis = frame["thicknessAxis"]
     up_axis = frame["upAxis"]
-    # add_wall_representation creates a local box from X=0..width, Y centered
-    # by offset, and extrudes along +Z. Shift the local X origin back by half
-    # the requested width so the resulting opening is centered on our host point.
-    origin = np.array([center_x, center_y, center_z], dtype=float) - (width / 2.0) * run_axis
+    origin = np.array([center_x, center_y, center_z], dtype=float) - (requested_width / 2.0) * run_axis
 
     wall_thickness = frame["wallThickness"]
-    if args.thickness is not None:
-        logger.info(
-            f"--thickness={args.thickness} received (door leaf thickness only); "
-            f"using measured wall thickness {wall_thickness:.4f}m."
-        )
     void_thickness = wall_thickness + (2 * VOID_THICKNESS_MARGIN)
 
     _, wall_body_rep = get_extruded_solid(wall)
     if wall_body_rep is None:
         raise ValueError(
-            f"Wall {args.global_id} has no Body representation to attach the opening geometry to."
+            f"Wall {wall.GlobalId} has no Body representation to attach the opening geometry to."
         )
 
     context = wall_body_rep.ContextOfItems
-
     opening = ifcopenshell.api.root.create_entity(
         source,
         ifc_class="IfcOpeningElement",
-        name=f"Door Opening ({args.asset_id})",
+        name=f"Door Opening ({asset_id})",
     )
 
     opening_rep = ifcopenshell.api.geometry.add_wall_representation(
         source,
         context=context,
-        length=width,
-        height=height,
+        length=requested_width,
+        height=requested_height,
         thickness=void_thickness,
         offset=-void_thickness / 2.0,
     )
-    ifcopenshell.api.geometry.assign_representation(
-        source, product=opening, representation=opening_rep
-    )
+    ifcopenshell.api.geometry.assign_representation(source, product=opening, representation=opening_rep)
 
     world_matrix = np.array([
         [run_axis[0], thickness_axis[0], up_axis[0], origin[0]],
@@ -765,44 +763,25 @@ def cmd_insert_door(args):
         [run_axis[2], thickness_axis[2], up_axis[2], origin[2]],
         [0.0,         0.0,              0.0,         1.0],
     ])
-    ifcopenshell.api.geometry.edit_object_placement(
-        source, product=opening, matrix=world_matrix
-    )
+    ifcopenshell.api.geometry.edit_object_placement(source, product=opening, matrix=world_matrix)
+    ifcopenshell.api.feature.add_feature(source, feature=opening, element=wall)
 
-    # Preserve the semantic IFC hosting model.
-    ifcopenshell.api.feature.add_feature(
-        source, feature=opening, element=wall
-    )
-
-    source.write(args.output)
-    logger.info(f"[DoorHost] Door void written to: {args.output}")
-
-    preview_path = str(Path(args.output).with_name(Path(args.output).stem + "_preview.ifc"))
-    _write_isolated_wall_preview(source, wall, opening, preview_path)
-    logger.info(f"[DoorHost] Wall-only preview written to: {preview_path}")
-
-    placement_fx, placement_fy, placement_fz = _ifc_to_frontend_point(
-        center_x, center_y, center_z
-    )
+    placement_fx, placement_fy, placement_fz = _ifc_to_frontend_point(center_x, center_y, center_z)
     yaw_deg = _ifc_horizontal_to_frontend_yaw(run_axis)
+    host_offset = max(0.0, min(center_along - frame["runMin"], frame["wallRun"]))
 
-    host_offset = center_along - frame["runMin"]
-    host_offset = max(0.0, min(host_offset, frame["wallRun"]))
-
-    print(json.dumps({
+    return {
         "success": True,
-        "globalId": args.global_id,
+        "globalId": wall.GlobalId,
         "openingGlobalId": opening.GlobalId,
-        "assetId": args.asset_id,
-        "outputPath": args.output,
+        "assetId": asset_id,
         "voidDimensions": {
-            "width": width,
-            "height": height,
+            "width": requested_width,
+            "height": requested_height,
             "thickness": void_thickness,
         },
-        "previewFileName": Path(preview_path).name,
         "hostPlacement": {
-            "wallGlobalId": args.global_id,
+            "wallGlobalId": wall.GlobalId,
             "offsetAlongWall": host_offset,
             "wallRun": frame["wallRun"],
             "wallThickness": wall_thickness,
@@ -816,13 +795,115 @@ def cmd_insert_door(args):
             "position": [placement_fx, placement_fy, placement_fz],
             "rotation": [0, yaw_deg, 0],
         },
+    }
+
+
+def _load_hosted_door_specs(path):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    specs = payload.get("doors") if isinstance(payload, dict) else payload
+    if not isinstance(specs, list):
+        raise ValueError("Hosted door specs must be a JSON array or an object with a 'doors' array.")
+    return specs
+
+
+def cmd_apply_hosted_doors(args):
+    """Apply all persisted GLB-door portals to one IFC in one pass.
+
+    This command intentionally reuses the exact wall-hosting routine used by the
+    interactive insert-door endpoint.  The important difference is that every
+    opening is committed to the same IFC file before the compiler builds the raw
+    GLB and Recast navigation mesh.
+    """
+    source = ifcopenshell.open(args.input)
+    specs = _load_hosted_door_specs(args.door_specs)
+    results = []
+
+    for index, spec in enumerate(specs, start=1):
+        wall_global_id = spec.get("wallGlobalId") or spec.get("hostWallId")
+        asset_id = spec.get("assetId") or spec.get("id") or f"hosted-door-{index}"
+        instance_id = spec.get("instanceId") or asset_id
+        position = spec.get("position")
+        dimensions = spec.get("dimensions") or {}
+
+        if not wall_global_id:
+            raise ValueError(f"Hosted door {instance_id} is missing wallGlobalId.")
+        if not isinstance(position, (list, tuple)) or len(position) != 3:
+            raise ValueError(f"Hosted door {instance_id} has invalid position.")
+
+        wall = find_element(source, str(wall_global_id))
+        if not wall.is_a("IfcWall") and not wall.is_a("IfcWallStandardCase"):
+            raise ValueError(f"Hosted door {instance_id} host {wall_global_id} is not an IFC wall.")
+
+        result = _create_hosted_door_opening(
+            source,
+            wall,
+            asset_id,
+            position,
+            dimensions.get("width"),
+            dimensions.get("height"),
+            dimensions.get("thickness"),
+        )
+        result["instanceId"] = instance_id
+        result["renderType"] = "glb"
+        result["portalType"] = "door"
+        results.append(result)
+        logger.info(
+            "[DoorHost] Batch portal %s -> wall %s at %s",
+            instance_id,
+            wall_global_id,
+            result["doorPlacement"]["position"],
+        )
+
+    source.write(args.output)
+    print(json.dumps({
+        "success": True,
+        "inputPath": args.input,
+        "outputPath": args.output,
+        "count": len(results),
+        "doors": results,
     }))
+
+
+def cmd_insert_door(args):
+    """Insert one semantic IFC opening hosted by the selected wall.
+
+    The interactive editor and the production compiler share the same physical
+    opening implementation via _create_hosted_door_opening().
+    """
+    source = ifcopenshell.open(args.input)
+    wall = find_element(source, args.global_id)
+
+    logger.info(
+        f"[DoorHost] Inserting hosted door into wall {args.global_id} "
+        f"(asset {args.asset_id})"
+    )
+
+    result = _create_hosted_door_opening(
+        source,
+        wall,
+        args.asset_id,
+        args.position,
+        args.width,
+        args.height,
+        args.thickness,
+    )
+
+    source.write(args.output)
+    logger.info(f"[DoorHost] Door void written to: {args.output}")
+
+    preview_path = str(Path(args.output).with_name(Path(args.output).stem + "_preview.ifc"))
+    _write_isolated_wall_preview(source, wall, source.by_guid(result["openingGlobalId"]), preview_path)
+    logger.info(f"[DoorHost] Wall-only preview written to: {preview_path}")
+
+    result["outputPath"] = args.output
+    result["previewFileName"] = Path(preview_path).name
+    print(json.dumps(result))
 
 
 # 2. ADD THIS ENTIRE BLOCK: Without this, Python just reads the file and exits without doing anything!
 def main():
     parser = argparse.ArgumentParser(description="Server-side IFC element editor")
-    parser.add_argument("mode", choices=["inspect", "resize", "isolate", "rescale", "insert-door"])
+    parser.add_argument("mode", choices=["inspect", "resize", "isolate", "rescale", "insert-door", "apply-hosted-doors"])
     parser.add_argument("--input", required=True)
     parser.add_argument("--output")
     parser.add_argument("--global-id", dest="global_id")
@@ -835,6 +916,7 @@ def main():
     parser.add_argument("--position")
     parser.add_argument("--rotation")
     parser.add_argument("--thickness", type=float)
+    parser.add_argument("--door-specs")
 
     args = parser.parse_args()
 
@@ -849,6 +931,10 @@ def main():
             cmd_rescale(args)
         elif args.mode == "insert-door":
             cmd_insert_door(args)
+        elif args.mode == "apply-hosted-doors":
+            if not args.output or not args.door_specs:
+                raise ValueError("apply-hosted-doors requires --output and --door-specs")
+            cmd_apply_hosted_doors(args)
     except Exception as e:
         logger.error(f"Error during execution: {str(e)}")
         print(json.dumps({"error": str(e)}))

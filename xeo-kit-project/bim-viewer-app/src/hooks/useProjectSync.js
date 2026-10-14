@@ -23,7 +23,9 @@ const inferFileType = (url, explicitType) => {
 const sanitizePersistedFurniture = (items) => (Array.isArray(items) ? items : []).map((item) => {
   if (!item || typeof item !== 'object') return item;
   const type = inferFileType(item.src || item.url, item.fileType || item.file_type);
-  if (type === 'glb' || type === 'gltf') return item;
+  if (type === 'glb' || type === 'gltf' || item.isNativeIsolation) return item;
+  // Standalone catalogue IFCs keep their semantic position/rotation/scale
+  // contract. Drop only obsolete raw matrices from those items.
   const { matrix: _legacyMatrix, ...semanticItem } = item;
   return semanticItem;
 });
@@ -742,7 +744,7 @@ export const useProjectSync = (activeProject) => {
   };
 
   // ACTION: Update asset transform
-  const updateAsset = (viewerRef, selectedAssetId, axis, value, isRotation = false, isScale = false) => {
+  const updateAsset = (viewerRef, selectedAssetId, axis, value, isRotation = false, isScale = false, transformOptions = {}) => {
     if (!selectedAssetId || !viewerRef.current) return;
     const assetModel = viewerRef.current.scene.models[selectedAssetId];
     if (!assetModel) return;
@@ -750,6 +752,7 @@ export const useProjectSync = (activeProject) => {
     if (!Number.isFinite(numValue)) return;
 
     const isGLB = isGLBModel(assetModel);
+    const isNativeIsolation = !!assetModel?._assetMeta?.isNativeIsolation;
     const currentGLBTarget = isGLB ? getGLBPlacementTarget(assetModel) : null;
     const currentGLBRotation = isGLB ? getGLBRotation(assetModel) : null;
     const currentGLBScale = isGLB ? getGLBScale(assetModel) : null;
@@ -759,9 +762,11 @@ export const useProjectSync = (activeProject) => {
     let updatedScale;
 
     if (isScale) {
-      updatedScale = isGLB
-        ? [...currentGLBScale]
-        : [...(assetModel.scale || [1, 1, 1])];
+      updatedScale = Array.isArray(transformOptions.scaleOverride) && transformOptions.scaleOverride.length === 3
+        ? Array.from(transformOptions.scaleOverride, Number)
+        : (isGLB
+          ? [...currentGLBScale]
+          : [...(assetModel.scale || [1, 1, 1])]);
       updatedScale[axis] = Math.max(0.001, numValue);
       if (isGLB) {
         applyGLBPlacementTransform(
@@ -785,7 +790,9 @@ export const useProjectSync = (activeProject) => {
           updatedRot,
           currentGLBScale
         );
-      } else {
+      } else if (!transformOptions.preserveRuntimeTransform) {
+        // Normal property-panel rotation uses xeokit's TRS path. A live IFC gizmo
+        // drag can opt out because it has already committed a pivot-correct matrix.
         assetModel.rotation = updatedRot;
       }
     } else {
@@ -798,6 +805,11 @@ export const useProjectSync = (activeProject) => {
           currentGLBRotation,
           currentGLBScale
         );
+      } else if (transformOptions.preserveRuntimeTransform || transformOptions.matrixOverride) {
+        const overrideMatrix = normalizeMatrix(transformOptions.matrixOverride || assetModel.matrix);
+        updatedPos = overrideMatrix
+          ? [overrideMatrix[12], overrideMatrix[13], overrideMatrix[14]]
+          : [...(assetModel.position || [0, 0, 0])];
       } else {
         updatedPos = [...(assetModel.position || [0, 0, 0])];
         updatedPos[axis] = numValue;
@@ -805,14 +817,35 @@ export const useProjectSync = (activeProject) => {
       }
     }
 
+    // Persist the position in the same coordinate contract that the runtime
+    // transform path uses. This is critical because undo/redo/state restoration
+    // can immediately reconcile an already-loaded model after this update.
+    //
+    // - GLB: semantic normalized pivot target.
+    // - Native-isolated IFC: matrix translation when the runtime transform was
+    //   authored by the IFC gizmo; otherwise raw model.position.
+    // - Placed catalogue IFC: semantic floor/contact target derived from the
+    //   current post-transform AABB. Persisting it on rotation/scale prevents
+    //   restoreProjectStateToScene() from recomputing a new position from a
+    //   stale pre-transform target and visibly jumping the model.
+    const hasRuntimeMatrixOverride = !isGLB && (transformOptions.preserveRuntimeTransform || transformOptions.matrixOverride);
+    const runtimeMatrix = hasRuntimeMatrixOverride
+      ? normalizeMatrix(transformOptions.matrixOverride || assetModel.matrix)
+      : null;
     const persistedPosition = isGLB
       ? (updatedPos || currentGLBTarget)
-      : (isRotation || isScale ? null : assetModelToTargetPosition(assetModel));
-    // Persist semantic transforms only. GLBs additionally persist normalization;
-    // IFC raw matrices are intentionally excluded from project state.
+      : runtimeMatrix
+        ? [runtimeMatrix[12], runtimeMatrix[13], runtimeMatrix[14]]
+        : isNativeIsolation
+          ? [...(assetModel.position || [0, 0, 0])]
+          : assetModelToTargetPosition(assetModel);
+    // Persist semantic transforms for normal assets. Native-isolated IFCs also
+    // retain the exact runtime matrix because that matrix is the authoritative
+    // pivot-correct transform produced by the gizmo.
     const glbNormalization = isGLB
       ? assetModel?._assetMeta?.glbNormalization
       : null;
+    const persistedMatrix = runtimeMatrix;
 
     setProjectStateTracked(prev => ({
       ...prev,
@@ -824,6 +857,7 @@ export const useProjectSync = (activeProject) => {
               rotation: updatedRot || f.rotation || [0, 0, 0],
               scale: updatedScale || f.scale || [1, 1, 1],
               ...(glbNormalization ? { glbNormalization } : {}),
+              ...(persistedMatrix ? { matrix: persistedMatrix } : {}),
             }
           : f
       ),
@@ -877,7 +911,7 @@ export const useProjectSync = (activeProject) => {
             existingItem.instanceId === instanceId
               ? {
                   ...existingItem,
-                  position: semanticPosition,
+                  position: existingItem.doorHostWallId ? existingItem.position : semanticPosition,
                   ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
                 }
               : existingItem
@@ -903,6 +937,8 @@ export const useProjectSync = (activeProject) => {
         rotation: item.rotation || [0, 0, 0],
         scale: effectiveScale,
         ...(item.glbNormalization ? { glbNormalization: item.glbNormalization } : {}),
+        ...(item.doorHostWallId ? { doorHostWallId: item.doorHostWallId } : {}),
+        ...(item.doorDimensions ? { doorDimensions: item.doorDimensions } : {}),
       };
     });
 
@@ -950,6 +986,13 @@ export const useProjectSync = (activeProject) => {
     // tells the compiler to use the exact Python-computed void-center position
     // instead of applying a furniture-style AABB pivot correction.
     const doorHostWallId = asset.hostWallId || null;
+    const doorDimensions = doorHostWallId && asset.doorDimensions && typeof asset.doorDimensions === 'object'
+      ? {
+          width: Number(asset.doorDimensions.width),
+          height: Number(asset.doorDimensions.height),
+          thickness: Number(asset.doorDimensions.thickness),
+        }
+      : null;
 
     const furnitureItem = {
       id: asset.id,
@@ -961,6 +1004,9 @@ export const useProjectSync = (activeProject) => {
       rotation: safeRotation,
       scale: effectiveScale,
       ...(doorHostWallId ? { doorHostWallId } : {}),
+      ...(doorHostWallId && doorDimensions && Object.values(doorDimensions).every((value) => Number.isFinite(value) && value > 0)
+        ? { doorDimensions }
+        : {}),
     };
 
     setProjectStateTracked(prev => ({
@@ -984,7 +1030,7 @@ export const useProjectSync = (activeProject) => {
           item.instanceId === instanceId
             ? {
                 ...item,
-                position: semanticPosition || item.position,
+                position: item.doorHostWallId ? item.position : (semanticPosition || item.position),
                 ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
               }
             : item
@@ -1081,6 +1127,7 @@ export const useProjectSync = (activeProject) => {
             scale: Array.isArray(scale) ? [...scale] : [1, 1, 1],
             nativeSourceId: metadata?.nativeSourceId || entityId,
             isNativeIsolation: metadata?.isNativeIsolation !== false,
+            ...(normalizeMatrix(metadata?.matrix) ? { matrix: normalizeMatrix(metadata?.matrix) } : {}),
           },
         ],
       };

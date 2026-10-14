@@ -16,7 +16,6 @@ const PRODUCTION_ONLY_ARTIFACTS = [
   "output.raw.glb",
   "walk_nav_input_debug.obj",
   "rooms_debug.json",
-  "360_viewer.html",
 ];
 
 function cleanupProductionOnlyArtifacts(
@@ -51,7 +50,7 @@ function cleanupProductionOnlyArtifacts(
 }
 
 /**
- * Production 360 render entry point.
+ * Production presentation render entry point.
  *
  * There is exactly ONE GLB optimization pass:
  *

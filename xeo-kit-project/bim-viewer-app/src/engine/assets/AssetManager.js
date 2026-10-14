@@ -11,6 +11,7 @@ import {
   sanitizeScale,
 } from './GLBAssetTransform';
 import { inspectGLBSource } from './GLBAssetDescriptor';
+import { ensureIFCResizeMetadata } from '../stretch/IFCResizeController';
 
 const nativeIsolationInFlight = new Set();
 
@@ -250,6 +251,11 @@ export const loadIFCAssetIntoScene = async (
     };
 
     assetModel.on('loaded', () => {
+      // Capture the model's local geometry bounds before any user transform is
+      // applied. IFC resize uses these bounds to build a true oriented gizmo and
+      // to keep the opposite face anchored during local-axis scaling.
+      ensureIFCResizeMetadata(assetModel);
+
       const userScale = Array.isArray(options.scale) && options.scale.length === 3
         ? options.scale
         : [1, 1, 1];
@@ -258,12 +264,19 @@ export const loadIFCAssetIntoScene = async (
         ? rotation
         : [0, 0, 0];
 
+      const persistedIFCMatrix = isValidMatrix16(options.persistedMatrix)
+        ? Array.from(options.persistedMatrix)
+        : null;
+
       assetModel.scale = [...userScale];
       assetModel.rotation = [...safeRotation];
 
-      // Placed library assets use a target-position semantic: the saved target is
-      // the desired floor/contact center, not the raw loaded model origin.
-      if (Array.isArray(targetPosition) && targetPosition.length === 3) {
+      if (persistedIFCMatrix) {
+        // A native-isolated IFC is a full SceneModel created from the isolated IFC
+        // bytes. Restore the exact runtime matrix produced by the gizmo instead of
+        // rebuilding it from TRS; this preserves the pivot-correct transform.
+        try { assetModel.matrix = persistedIFCMatrix; } catch (_) {}
+      } else if (Array.isArray(targetPosition) && targetPosition.length === 3) {
         const aabb = assetModel.aabb;
         if (aabb && aabb.length >= 6) {
           const centerX = (aabb[0] + aabb[3]) / 2;

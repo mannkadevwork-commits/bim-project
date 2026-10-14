@@ -118,6 +118,9 @@ function writeReport(
  *   presentation/camera code can still use semantic mesh/node names.
  * - Meshopt is delivery compression; geometry simplification and flattening
  *   are what reduce browser runtime work.
+ * - Visual Phase 1 uses a high-fidelity simplify floor (0.88) and less geometric
+ *   error, because previous output reduced triangles by 70–90% and softened
+ *   architectural edges. Textures are preserved at high quality when present.
  */
 export async function optimizeGlb(
   options: GlbOptimizationOptions,
@@ -138,32 +141,31 @@ export async function optimizeGlb(
   const document = await io.read(options.inputPath);
   const before = countGeometryStats(document);
 
-  // 0.60 is the production visual target. It is intentionally bounded so
-  // callers cannot accidentally configure an extreme collapse.
+  // Visual Phase 1 favours visible detail over the previous aggressively small
+  // output. The caller may request a higher ratio, but quality mode will not
+  // collapse below 88% of triangles. This still leaves meshopt compression on.
   const ratio = Math.min(
     1,
-    Math.max(
-      0.55,
-      options.simplifyRatio ?? 0.60,
-    ),
+    Math.max(0.88, options.simplifyRatio ?? 0.90),
   );
 
+  // A smaller geometric error better preserves door frames, wall edges and
+  // thin interior details. Keep caller values only when they are stricter.
   const error = Math.max(
     0,
-    options.simplifyError ?? 0.001,
+    Math.min(0.0005, options.simplifyError ?? 0.0005),
   );
 
+  // Preserve high resolution for catalog textures when they exist. Current IFC
+  // jobs may have no textures; this does not synthesize textures that are absent.
   const maxTextureSize = Math.max(
-    512,
-    options.maxTextureSize ?? 2048,
+    4096,
+    options.maxTextureSize ?? 4096,
   );
 
   const textureQuality = Math.min(
     100,
-    Math.max(
-      60,
-      options.textureQuality ?? 86,
-    ),
+    Math.max(92, options.textureQuality ?? 92),
   );
 
   await document.transform(

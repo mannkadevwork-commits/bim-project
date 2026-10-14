@@ -1,0 +1,32 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments and IDEs
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# Logs, temp files and archives
+*.log
+*.tmp
+*.bak
+*.zip
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Model weights should be provisioned separately when developing the app alone
+*.pt
+
+# Local test/build output
+dist/
+build/

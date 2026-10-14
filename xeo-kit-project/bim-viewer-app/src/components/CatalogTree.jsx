@@ -61,15 +61,27 @@ function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection
   const itemType = String(item.type || '').trim().toLowerCase();
   const itemCategory = String(item.category || '').trim().toLowerCase();
   const itemName = String(item.name || '').trim().toLowerCase();
-  const inferredDoor =
+  const modelExtension = String(modelUrl || '').split('?')[0].split('#')[0].split('.').pop()?.toLowerCase();
+  const normalizedFileType = String(item.file_type || item.fileType || modelExtension || 'ifc').trim().toLowerCase();
+  const doorText = `${catalogId} ${itemName} ${itemCategory}`;
+  const isDoorAccessory = /\b(door\s*mat|doormat|doorstop|door\s*stop|doorbell)\b/i.test(doorText);
+  // Do not require a curated naming convention. Real catalog assets frequently
+  // use labels such as "Wooden Door 1" / "Wooden Door 2" and those must enter
+  // the same host-wall/opening flow as the built-in IFC door presets.
+  const hasDoorIdentity = /\bdoor\b/i.test(doorText) || /(?:^|[_-])door(?:[_-]|$)/i.test(catalogId);
+  const isDoorCategory = /\bdoors?\b/i.test(itemCategory);
+  const inferredDoor = !isDoorAccessory && (
     itemType === 'door' ||
     /^door[_-]/i.test(catalogId) ||
-    (itemCategory === 'structural' && itemName.includes('door')) ||
+    isDoorCategory ||
+    (normalizedFileType === 'glb' && hasDoorIdentity) ||
+    (itemCategory === 'structural' && hasDoorIdentity) ||
     itemName.includes('sliding door') ||
     itemName.includes('flush door') ||
     itemName.includes('swing door') ||
     itemName.includes('fire-rated door') ||
-    itemName.includes('revolving door');
+    itemName.includes('revolving door')
+  );
 
   const buildPlacementAsset = () => ({
     ...item,
@@ -77,7 +89,7 @@ function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection
     catalogId: item.id,
     url: modelUrl,
     type: inferredDoor ? 'door' : (itemType || 'furniture'),
-    file_type: item.file_type || item.fileType || 'ifc',
+    file_type: normalizedFileType,
     source: 'catalog',
   });
 

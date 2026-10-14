@@ -5,17 +5,23 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { LightingDirector } from './walkthrough/lightingDirector.js';
 import { init as initRecast, importNavMesh, NavMeshQuery, QueryFilter } from 'recast-navigation';
+import { immersive360DirectorMethods } from './walkthrough/immersive360Director.js';
+import { immersivePresentationDirectorMethods } from './walkthrough/immersivePresentationDirector.js';
+import { immersiveSceneDirectorMethods } from './walkthrough/immersiveSceneDirector.js';
+import { smart720TourDirectorMethods } from './walkthrough/smart720TourDirector.js';
 
 const DEFAULT_SPEEDS = { walk: 1.65, run: 3.2 };
-const DEFAULT_EYE_HEIGHT_METERS = 1.84;
+const DEFAULT_EYE_HEIGHT_METERS = 1.68;
 const DEFAULT_HEIGHT_OFFSET_METERS = 0.0;
 const MIN_HEIGHT_OFFSET_METERS = -0.45;
 const MAX_HEIGHT_OFFSET_METERS = 1.0;
-const DEFAULT_FOV_DEGREES = 115;
-const GUIDED_CAMERA_HEIGHT_METERS = 2.16;
+const DEFAULT_FOV_DEGREES = 74;
+const GUIDED_CAMERA_HEIGHT_METERS = 1.72;
 const GUIDED_PAN_AMPLITUDE_DEG = 16;
 const GUIDED_PAN_RATE_RAD_PER_SEC = 0.045;
 const CAMERA_BODY_CLEARANCE_METERS = 0.28;
+const PHASE_A_MAX_NAV_STEP_METERS = 0.07;
+const PHASE_A_MAX_LOCAL_SNAP_METERS = 0.18;
 const CAMERA_CLEARANCE_CHECK_INTERVAL_SEC = 0.10;
 const SAFE_ANCHOR_MIN_OPEN_SPACE_METERS = 0.90;
 const SAFE_ANCHOR_HISTORY_LIMIT = 14;
@@ -28,10 +34,10 @@ class WalkRuntime {
     this.scene.background = new THREE.Color(0xf4f6f8);
     this.camera = new THREE.PerspectiveCamera(DEFAULT_FOV_DEGREES, 1, 0.05, 5000);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.AgXToneMapping ?? THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
+    this.renderer.toneMappingExposure = 0.96;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     canvas.appendChild(this.renderer.domElement);
@@ -61,6 +67,12 @@ class WalkRuntime {
     this.filter = null;
     this.walkAreas = [];
     this.hotspots = [];
+    this.presentationRooms = [];
+    this.presentationSpaces = [];
+    this.presentationPortals = [];
+    this.presentationRoomGraph = null;
+    this.navigationSpaceGraph = null;
+    this.presentationPortalById = new Map();
     this.path = null;
     this.pathIndex = 0;
     this.pathVelocity = new THREE.Vector3();
@@ -178,6 +190,14 @@ class WalkRuntime {
     this.autoRotate = false;
     this.lastMoveDirection = new THREE.Vector3();
     this.blockedTime = 0;
+
+    // Presentation directors are runtime-owned. These were previously present
+    // in the source tree but never connected to WalkRuntime, which left the
+    // WalkthroughPage 360/Smart 720 controls without their implementation.
+    this._resetImmersive360State();
+    this._resetImmersivePresentationState();
+    this._resetImmersiveSceneState();
+    this._resetSmart720TourState();
     this.portalClickSuppressedUntil = 0;
     this.stuck = false;
     this.recoveryAvailable = false;
@@ -342,6 +362,11 @@ class WalkRuntime {
       if (e.button !== 0 || this.viewMode !== 'walk') return;
       this.pointerDownAt = performance.now();
 
+      if (this.immersive360Active) {
+        this._beginImmersive360Pointer(e);
+        return;
+      }
+
       // Guided: left-drag is an explicit, modern way to yaw the camera.
       // A simple click remains a navigation action, so we defer the floor/hotspot
       // click until pointer-up and only treat it as a click when the pointer did
@@ -376,6 +401,10 @@ class WalkRuntime {
       this.setLookLocked(!this.lookLocked, true);
     };
     this.onPointerUp = (e) => {
+      if (e.button === 0 && this.immersive360Active && this.viewMode === 'walk') {
+        this._endImmersive360Pointer(e);
+        return;
+      }
       if (e.button === 0 && this.walkMode === 'guided' && this.viewMode === 'walk') {
         const wasDragging = this.guidedPointerDragging;
         this.guidedPointerDown = null;
@@ -396,6 +425,11 @@ class WalkRuntime {
     this.onPointerMove = (e) => {
       if (this.viewMode !== 'walk') return;
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+
+      if (this.immersive360Active) {
+        this._moveImmersive360Pointer(e);
+        return;
+      }
 
       if (this.walkMode === 'guided') {
         if (!this.guidedPointerDown || !this.guidedLastPointer) return;
@@ -467,6 +501,16 @@ class WalkRuntime {
       this.renderer.domElement.releasePointerCapture?.(e.pointerId);
     };
 
+    const previousPointerCancel = this.onPointerCancel;
+    this.onPointerCancel = (e) => {
+      if (e.pointerId == null) return;
+      if (this.immersive360Active) {
+        this._cancelImmersive360Pointer(e);
+        return;
+      }
+      previousPointerCancel?.(e);
+    };
+
     this.renderer.domElement.addEventListener('pointerdown', this.onPointerDown);
     this.renderer.domElement.addEventListener('pointerup', this.onPointerUp);
     this.renderer.domElement.addEventListener('pointercancel', this.onPointerCancel);
@@ -487,11 +531,15 @@ class WalkRuntime {
     const jobBase = `${baseUrl.replace(/\/$/, '')}/jobs/${encodeURIComponent(jobId)}`;
     this.onState?.({ type: 'loading', value: true });
 
-    const [surfacePayload, hotspotsPayload, navBuffer, gltf] = await Promise.all([
+    const [surfacePayload, hotspotsPayload, topologyPayload, navBuffer, gltf] = await Promise.all([
       fetch(`${jobBase}/navigation_surface.json`, { cache: 'no-store' }).then(this._assertJson('navigation_surface.json')),
       fetch(`${jobBase}/walk_hotspots.json`, { cache: 'no-store' }).then(this._assertJson('walk_hotspots.json')).catch((error) => {
         console.warn('[Walkthrough] walk_hotspots.json unavailable; no destinations will be shown.', error);
         return { hotspots: [] };
+      }),
+      fetch(`${jobBase}/presentation_portals.json`, { cache: 'no-store' }).then(this._assertJson('presentation_portals.json')).catch((error) => {
+        console.warn('[Walkthrough] presentation_portals.json unavailable; using hotspot-only navigation.', error);
+        return { rooms: [], portals: [] };
       }),
       fetch(`${jobBase}/navigation_navmesh.bin`, { cache: 'no-store' }).then(async (r) => {
         if (!r.ok) throw new Error(`navigation_navmesh.bin returned ${r.status}`);
@@ -529,12 +577,25 @@ class WalkRuntime {
     this.heightOffset = this.walkMode === 'guided'
       ? GUIDED_CAMERA_HEIGHT_METERS - this.eyeHeight
       : DEFAULT_HEIGHT_OFFSET_METERS;
-    this.fov = this.walkMode === 'guided' ? 120 : DEFAULT_FOV_DEGREES;
+    this.fov = this.walkMode === 'guided' ? 72 : 78;
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
     this.radius = Number(surfacePayload?.metadata?.agentRadiusMeters) > 0 ? Number(surfacePayload.metadata.agentRadiusMeters) : 0.15;
     this.walkSpeed = DEFAULT_SPEEDS.walk * this.metersPerUnit;
     this.runSpeed = DEFAULT_SPEEDS.run * this.metersPerUnit;
+
+    this.presentationRooms = Array.isArray(topologyPayload?.rooms)
+      ? topologyPayload.rooms.filter((room) => Array.isArray(room?.center) && room.center.length >= 3)
+      : [];
+    this.presentationSpaces = Array.isArray(topologyPayload?.spaces)
+      ? topologyPayload.spaces.filter((space) => space?.id && Array.isArray(space?.center) && space.center.length >= 3)
+      : [];
+    this.presentationRoomGraph = topologyPayload?.graph || null;
+    this.navigationSpaceGraph = topologyPayload?.navigationSpaceGraph || null;
+    this.presentationPortals = Array.isArray(topologyPayload?.portals)
+      ? topologyPayload.portals.filter((portal) => portal?.id && Array.isArray(portal?.center) && portal.center.length >= 3)
+      : [];
+    this.presentationPortalById = new Map(this.presentationPortals.map((portal) => [portal.id, portal]));
 
     this.model = gltf.scene;
     this.model.updateMatrixWorld(true);
@@ -542,6 +603,16 @@ class WalkRuntime {
     this.lightingDirector.attachModel(this.model);
     this.onState?.({ type: 'lighting', ...this.lightingDirector.getState() });
     this._buildPresentationSubjectIndex();
+
+    this.onState?.({
+      type: 'presentation-topology',
+      rooms: this.presentationRooms,
+      spaces: this.presentationSpaces,
+      portals: this.presentationPortals,
+      roomGraph: this.presentationRoomGraph,
+      navigationSpaceGraph: this.navigationSpaceGraph,
+      stats: topologyPayload?.stats || null,
+    });
 
     this._buildNavigationSurface(surfacePayload);
 
@@ -553,9 +624,21 @@ class WalkRuntime {
       if (!obj.isMesh) return;
       meshCount += 1;
       obj.visible = true;
+
+      // Phase 0 safety: preserve the known-working walkthrough visibility
+      // behavior. Robust bounds/culling will be introduced as a separate,
+      // measured performance phase.
       obj.frustumCulled = false;
       visibleMeshCount += obj.visible ? 1 : 0;
     });
+
+    const box = new THREE.Box3().setFromObject(this.model);
+    const modelSphere = box.getBoundingSphere(new THREE.Sphere());
+    if (Number.isFinite(modelSphere.radius) && modelSphere.radius > 0) {
+      const recommendedFar = THREE.MathUtils.clamp(modelSphere.radius * 4, 250, 2500);
+      this.camera.far = Math.min(this.camera.far, recommendedFar);
+      this.camera.updateProjectionMatrix();
+    }
 
     // Never expose or spawn on destinations where the presentation camera would
     // be underneath a low object (e.g. a bed, table, cabinet) even if the
@@ -577,6 +660,7 @@ class WalkRuntime {
     }
     this.lightingDirector.setRoomAnchors(this.walkAreas);
     this._assignHotspotRoles();
+    this._buildDestinationPresentationIndex();
     this._buildSafeAnchorRegistry();
     this.navigationPlan = this._buildNavigationPlan(surfacePayload, augmentedHotspots);
     if (safeRenderedHotspots.length !== rawHotspots.length) {
@@ -592,7 +676,6 @@ class WalkRuntime {
       });
     }
 
-    const box = new THREE.Box3().setFromObject(this.model);
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z, 1);
@@ -855,6 +938,56 @@ class WalkRuntime {
     return this.hotspotRoles.get(hotspot.id) || hotspot.presentationRole || 'walkpoint';
   }
 
+  _buildDestinationPresentationIndex() {
+    const records = (this.hotspots || [])
+      .filter((hotspot) => hotspot?.id && Array.isArray(hotspot.position))
+      .map((hotspot) => {
+        const role = this._getHotspotRole(hotspot);
+        const kind = role === 'room-center' ? 'primary' : role === 'viewpoint' ? 'optional' : 'internal';
+        const areaLabel = String(hotspot.areaLabel || '').trim();
+        const presentationLabel = kind === 'primary'
+          ? (areaLabel || hotspot.label || 'Room')
+          : kind === 'optional'
+            ? (areaLabel ? `${areaLabel} · View` : (hotspot.label || 'Viewpoint'))
+            : (hotspot.label || 'Navigation point');
+        return { ...hotspot, destinationKind: kind, presentationRole: role, presentationLabel };
+      });
+
+    // Guarantee one client-facing destination for each known area.
+    const byArea = new Map();
+    records.forEach((record) => {
+      if (!record.areaId) return;
+      if (!byArea.has(record.areaId)) byArea.set(record.areaId, []);
+      byArea.get(record.areaId).push(record);
+    });
+    for (const areaRecords of byArea.values()) {
+      if (areaRecords.some((record) => record.destinationKind === 'primary')) continue;
+      const fallback = areaRecords.find((record) => record.destinationKind === 'optional') || areaRecords[0];
+      if (fallback) fallback.destinationKind = 'primary';
+    }
+
+    this.destinationPresentation = {
+      version: 1,
+      byId: new Map(records.map((record) => [record.id, record])),
+      presentationHotspots: records.filter((record) => record.destinationKind !== 'internal'),
+    };
+    return this.destinationPresentation;
+  }
+
+  _getDestinationPresentation(hotspotOrId) {
+    const id = typeof hotspotOrId === 'string' ? hotspotOrId : hotspotOrId?.id;
+    return id ? this.destinationPresentation?.byId?.get(id) || null : null;
+  }
+
+  _isCustomerFacingDestination(hotspotOrId) {
+    const destination = this._getDestinationPresentation(hotspotOrId);
+    return Boolean(destination && destination.destinationKind !== 'internal');
+  }
+
+  _getCustomerFacingDestinations() {
+    return this.destinationPresentation?.presentationHotspots || [];
+  }
+
   _buildSafeAnchorRegistry() {
     this.safeAnchorIds.clear();
     this.safeAnchorById.clear();
@@ -958,7 +1091,7 @@ class WalkRuntime {
         maxStraightPathSize: 256,
         maxPathSize: 256,
       });
-      if (!result?.success || !result.path?.length) continue;
+      if (!this._isCompleteNavPath(result, entry.point)) continue;
 
       let length = 0;
       let previous = startPoint;
@@ -1040,7 +1173,21 @@ class WalkRuntime {
   }
 
   _closestWalkPoint(point, toleranceMeters = 0.45) {
-    const p = { x: Number(point[0]), y: Number(point[1]) || 0, z: Number(point[2]) };
+    // Navigation callers use both compact arrays ([x,y,z]) and Recast point
+    // objects ({x,y,z}). Normalize at the boundary so a valid Recast point
+    // cannot become NaN merely because a caller used the object form.
+    const coordinates = Array.isArray(point)
+      ? point
+      : point && typeof point === 'object'
+        ? [point.x, point.y, point.z]
+        : [];
+    if (coordinates.length < 3) return null;
+    const p = {
+      x: Number(coordinates[0]),
+      y: Number(coordinates[1]) || 0,
+      z: Number(coordinates[2]),
+    };
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) return null;
     const tolerance = Math.max(0.12, toleranceMeters * Math.max(this.metersPerUnit, 1e-6));
     const result = this.query.findClosestPoint(p, {
       halfExtents: { x: tolerance, y: Math.max(0.6, 1.5 * Math.max(this.metersPerUnit, 1e-6)), z: tolerance },
@@ -1055,6 +1202,53 @@ class WalkRuntime {
       z: result.point.z,
       polyRef: result.polyRef ?? result.ref ?? 0,
     };
+  }
+
+  _inspectPathEndpoint(result, target, toleranceMeters = 0.4) {
+    const coordinates = Array.isArray(target)
+      ? target
+      : target && typeof target === 'object'
+        ? [target.x, target.y, target.z]
+        : [];
+    const targetX = Number(coordinates[0]);
+    const targetY = Number(coordinates[1]) || 0;
+    const targetZ = Number(coordinates[2]);
+    const path = Array.isArray(result?.path) ? result.path : [];
+    const endpoint = path.length ? path[path.length - 1] : null;
+    const unit = Math.max(Number(this.metersPerUnit) || 1, 1e-6);
+    const horizontalTolerance = Math.max(toleranceMeters * unit, 0.25);
+    const verticalTolerance = Math.max(0.5 * unit, 0.35);
+
+    if (!result?.success || !endpoint || ![targetX, targetY, targetZ, endpoint.x, endpoint.y, endpoint.z].every(Number.isFinite)) {
+      return {
+        complete: false,
+        reason: 'no-path',
+        endpoint: endpoint ? [endpoint.x, endpoint.y, endpoint.z] : null,
+        target: Number.isFinite(targetX) && Number.isFinite(targetZ) ? [targetX, targetY, targetZ] : null,
+        horizontalDistance: Infinity,
+        verticalDistance: Infinity,
+        horizontalTolerance,
+        verticalTolerance,
+      };
+    }
+
+    const horizontalDistance = Math.hypot(endpoint.x - targetX, endpoint.z - targetZ);
+    const verticalDistance = Math.abs(endpoint.y - targetY);
+    const complete = path.length > 0 && horizontalDistance <= horizontalTolerance && verticalDistance <= verticalTolerance;
+    return {
+      complete,
+      reason: complete ? 'complete-path' : 'partial-path-endpoint',
+      endpoint: [endpoint.x, endpoint.y, endpoint.z],
+      target: [targetX, targetY, targetZ],
+      horizontalDistance,
+      verticalDistance,
+      horizontalTolerance,
+      verticalTolerance,
+    };
+  }
+
+  _isCompleteNavPath(result, target, toleranceMeters = 0.4) {
+    return this._inspectPathEndpoint(result, target, toleranceMeters).complete;
   }
 
   _simplifyPath(points) {
@@ -1123,13 +1317,37 @@ class WalkRuntime {
     return true;
   }
 
+  _isWalkablePortalVisual(object) {
+    let current = object;
+    while (current) {
+      const extras = current.userData || {};
+      if (extras.hciWalkablePortal === true || extras.hciPortalType === 'door' && extras.hciWalkablePortal !== false) {
+        return true;
+      }
+      current = current.parent || null;
+    }
+    return false;
+  }
+
+  _firstBlockingModelHit(origin, direction) {
+    if (!this.model) return null;
+    this.raycaster.set(origin, direction);
+    const hits = this.raycaster.intersectObject(this.model, true);
+    return hits.find((hit) => !this._isWalkablePortalVisual(hit.object)) || null;
+  }
+
   _hasCameraBodyClearance(point) {
-    if (!this.model || !Array.isArray(point) || point.length < 3) return true;
+    const coordinates = Array.isArray(point)
+      ? point
+      : point && typeof point === 'object'
+        ? [point.x, point.y, point.z]
+        : [];
+    if (!this.model || coordinates.length < 3) return true;
 
     const unit = Math.max(this.metersPerUnit, 0.000001);
     const bodyRadius = CAMERA_BODY_CLEARANCE_METERS * unit;
-    const cameraY = Number(point[1]) + this.eyeHeight * unit + this.heightOffset * unit * 0.92;
-    const origin = new THREE.Vector3(Number(point[0]), cameraY, Number(point[2]));
+    const cameraY = Number(coordinates[1]) + this.eyeHeight * unit + this.heightOffset * unit * 0.92;
+    const origin = new THREE.Vector3(Number(coordinates[0]), cameraY, Number(coordinates[2]));
 
     // This is a deliberately cheaper movement-time collision test than the full
     // hotspot clearance probe. It protects the camera body from entering walls or
@@ -1138,8 +1356,7 @@ class WalkRuntime {
     for (let i = 0; i < directions; i += 1) {
       const angle = (Math.PI * 2 * i) / directions;
       const direction = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
-      this.raycaster.set(origin, direction);
-      const hit = this.raycaster.intersectObject(this.model, true)[0];
+      const hit = this._firstBlockingModelHit(origin, direction);
       if (hit && hit.distance < bodyRadius) return false;
     }
 
@@ -1147,8 +1364,7 @@ class WalkRuntime {
     // outward shell in the opposite direction of the last movement.
     if (this.lastMoveDirection.lengthSq() > 1e-8) {
       const back = this.lastMoveDirection.clone().normalize().negate();
-      this.raycaster.set(origin, back);
-      const hit = this.raycaster.intersectObject(this.model, true)[0];
+      const hit = this._firstBlockingModelHit(origin, back);
       if (hit && hit.distance < bodyRadius * 0.72) return false;
     }
     return true;
@@ -1164,12 +1380,11 @@ class WalkRuntime {
     // Vertical ray catches the exact class of failure seen in the screenshot:
     // a valid floor position exists underneath a bed/table, but there isn't
     // enough head room for the walkthrough camera.
-    this.raycaster.set(
+    const verticalHit = this._firstBlockingModelHit(
       new THREE.Vector3(Number(point[0]), originY, Number(point[2])),
       new THREE.Vector3(0, 1, 0),
     );
-    const verticalHits = this.raycaster.intersectObject(this.model, true);
-    if (verticalHits.length && verticalHits[0].distance < cameraClearance) return false;
+    if (verticalHit && verticalHit.distance < cameraClearance) return false;
 
     // Also reject destinations with a very tight horizontal envelope around the
     // avatar. This is intentionally conservative for customer-facing hotspots.
@@ -1178,9 +1393,8 @@ class WalkRuntime {
     for (let i = 0; i < 8; i++) {
       const angle = (Math.PI * 2 * i) / 8;
       const direction = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
-      this.raycaster.set(horizontalOrigin, direction);
-      const hits = this.raycaster.intersectObject(this.model, true);
-      if (hits.length && hits[0].distance < clearance) return false;
+      const hit = this._firstBlockingModelHit(horizontalOrigin, direction);
+      if (hit && hit.distance < clearance) return false;
     }
     return true;
   }
@@ -1190,16 +1404,14 @@ class WalkRuntime {
     const unit = Math.max(this.metersPerUnit, 0.000001);
     const origin = new THREE.Vector3(Number(point[0]), Number(point[1]) + 0.12 * unit, Number(point[2]));
     const requiredHeadroom = (this.eyeHeight + 0.08) * unit;
-    this.raycaster.set(origin, new THREE.Vector3(0, 1, 0));
-    const ceilingHit = this.raycaster.intersectObject(this.model, true)[0];
+    const ceilingHit = this._firstBlockingModelHit(origin, new THREE.Vector3(0, 1, 0));
     if (ceilingHit && ceilingHit.distance < requiredHeadroom) return 0;
 
     let nearest = Infinity;
     for (let i = 0; i < 16; i++) {
       const angle = (Math.PI * 2 * i) / 16;
       const dir = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
-      this.raycaster.set(origin, dir);
-      const hit = this.raycaster.intersectObject(this.model, true)[0];
+      const hit = this._firstBlockingModelHit(origin, dir);
       if (hit) nearest = Math.min(nearest, hit.distance);
     }
     const comfort = 0.55 * unit;
@@ -1494,15 +1706,21 @@ class WalkRuntime {
       maxPathSize: 256,
     });
 
-    if (result?.success && result.path?.length) {
-      return this.travelTo([point.x, point.y, point.z], label, { resolvedPoint: point });
+    const endpointStatus = this._inspectPathEndpoint(result, point);
+    if (!endpointStatus.complete) {
+      console.warn('[Walkthrough] Destination rejected because the NavMesh route is incomplete.', {
+        hotspotId: resolvedHotspot.id || null,
+        label,
+        ...endpointStatus,
+      });
+      this.stuck = true;
+      this.recoveryAvailable = this.hotspots.length > 0;
+      this.onState?.({ type: 'error', message: `${label} is not fully reachable through the current walkable route.` });
+      this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
+      return false;
     }
 
-    // A floor-map point is an explicit user destination. When the physical
-    // NavMesh cannot connect the current location to it (for example a closed
-    // door or disconnected room), do not drag the camera through the scene.
-    // Teleport directly to the already-validated destination instead.
-    return this._teleportToDestination(point, label, 'map-teleport');
+    return this.travelTo([point.x, point.y, point.z], label, { resolvedPoint: point });
   }
 
   async travelTo(target, label = 'Destination', options = null) {
@@ -1518,8 +1736,13 @@ class WalkRuntime {
       maxStraightPathSize: 256,
       maxPathSize: 256,
     });
-    if (!result.success || !result.path?.length) {
-      this.onState?.({ type: 'error', message: `${label} is not reachable from here.` });
+    const endpointStatus = this._inspectPathEndpoint(result, closest);
+    if (!endpointStatus.complete) {
+      console.warn('[Walkthrough] Travel rejected because the NavMesh route is incomplete.', {
+        label,
+        ...endpointStatus,
+      });
+      this.onState?.({ type: 'error', message: `${label} is not fully reachable from the current position.` });
       this.stuck = true;
       this.recoveryAvailable = this.hotspots.length > 0;
       this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
@@ -1551,9 +1774,14 @@ class WalkRuntime {
     if (!this.query) return false;
 
     const areaId = target?.id;
-    const targetPoint = Array.isArray(target?.center) ? target.center : [0, 0, 0];
+    const semanticRoom = this.presentationRooms.find((room) => room?.id === areaId)
+      || this.presentationSpaces.find((space) => space?.id === areaId)
+      || null;
+    const targetPoint = Array.isArray(semanticRoom?.center)
+      ? [semanticRoom.center[0], semanticRoom.center[1], semanticRoom.center[2]]
+      : (Array.isArray(target?.center) ? target.center : [0, 0, 0]);
     const pool = this.hotspots
-      .filter((hotspot) => !areaId || hotspot.areaId === areaId)
+      .filter((hotspot) => !areaId || !semanticRoom || hotspot.areaId === areaId || !hotspot.areaId)
       .filter((hotspot) => Array.isArray(hotspot.position) && this._hasCameraClearance(hotspot.position));
 
     const candidates = (pool.length ? pool : this.hotspots)
@@ -1567,24 +1795,25 @@ class WalkRuntime {
         return (priority(a.role) - priority(b.role)) || (a.distance - b.distance);
       });
 
+    const start = { x: this.position.x, y: this.position.y, z: this.position.z };
     for (const candidate of candidates) {
+      const closest = this._closestWalkPoint(candidate.hotspot.position, 1.0);
+      if (!closest) continue;
+      const route = this.query.computePath(start, closest, {
+        filter: this.filter,
+        maxStraightPathSize: 256,
+        maxPathSize: 256,
+      });
+      if (!this._isCompleteNavPath(route, closest)) continue;
       this._armGuidedTourForHotspot(candidate.hotspot);
-      const ok = await this.travelTo(candidate.hotspot.position, label);
+      const ok = await this.travelTo([closest.x, closest.y, closest.z], label, { resolvedPoint: closest });
       if (ok) return true;
     }
 
-    // Semantic room navigation may cross a blocked doorway, but the arrival point
-    // must still be a verified safe hotspot. Never direct-travel to an arbitrary
-    // NavMesh point that could sit behind a door or inside furniture.
-    const safe = candidates[0]?.hotspot;
-    if (safe) {
-      const closest = this._closestWalkPoint(safe.position);
-      if (closest && this._hasCameraClearance([closest.x, closest.y, closest.z])) {
-        return this._startDirectRoomTravel(closest, label, 'room-recovery');
-      }
-    }
-
-    this.onState?.({ type: 'error', message: `${label} has no safe reachable presentation destination.` });
+    // Room selection must not interpolate/teleport through structural geometry.
+    // A failed full path is surfaced as a navigation issue until the wall opening
+    // and Recast surface are genuinely connected.
+    this.onState?.({ type: 'error', message: `${label} has no complete walkable route from the current room.` });
     return false;
   }
 
@@ -1689,7 +1918,7 @@ class WalkRuntime {
         point,
         { filter: this.filter, maxStraightPathSize: 256, maxPathSize: 256 },
       );
-      if (!result?.success || !result.path?.length) continue;
+      if (!this._isCompleteNavPath(result, point)) continue;
 
       let pathLength = 0;
       let previous = this.position;
@@ -1753,7 +1982,10 @@ class WalkRuntime {
     this.guidedShotSubjectId = null;
     this.guidedShotSubjectUntil = 0;
     this._armGuidedTourForHotspot(next.hotspot);
-    const started = this.travelTo(next.point, next.hotspot.label || 'Next destination');
+    const target = [next.point.x, next.point.y, next.point.z];
+    const started = this.travelTo(target, next.hotspot.label || 'Next destination', {
+      resolvedPoint: next.point,
+    });
     if (!started) this.guidedTourAdvanceLock = false;
     if (started) {
       this.onState?.({
@@ -1780,7 +2012,7 @@ class WalkRuntime {
         const result = this.query.computePath(start, destination, {
           filter: this.filter, maxStraightPathSize: 128, maxPathSize: 128,
         });
-        if (!result.success || !result.path?.length) return null;
+        if (!this._isCompleteNavPath(result, destination)) return null;
         return { hotspot, destination, distance: Math.hypot(destination.x - start.x, destination.z - start.z) };
       })
       .filter(Boolean)
@@ -1792,10 +2024,8 @@ class WalkRuntime {
       return this.travelTo(chosen.destination, label);
     }
 
-    const fallback = target ? this._closestWalkPoint(target) : null;
-    if (fallback && this._hasCameraClearance([fallback.x, fallback.y, fallback.z])) {
-      return this._startDirectRoomTravel(fallback, label, 'recovery');
-    }
+    // Do not use direct camera interpolation as a fallback: it can cross walls
+    // and makes a disconnected NavMesh look like successful room traversal.
     return false;
   }
 
@@ -1830,7 +2060,7 @@ class WalkRuntime {
 
   _resetWalkCameraDefaults() {
     this.heightOffset = DEFAULT_HEIGHT_OFFSET_METERS;
-    this.fov = DEFAULT_FOV_DEGREES;
+    this.fov = this.walkMode === 'guided' ? 72 : 78;
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
     this._notifyCameraSettings();
@@ -1871,7 +2101,7 @@ class WalkRuntime {
       this.guidedPitch = this.currentPitch;
       this.targetPitch = this.currentPitch;
       this.heightOffset = GUIDED_CAMERA_HEIGHT_METERS - this.eyeHeight;
-      this.fov = 120;
+      this.fov = 100;
       this.camera.fov = this.fov;
       this.camera.updateProjectionMatrix();
       this._notifyCameraSettings();
@@ -2039,7 +2269,7 @@ if (name === 'top') {
   }
 
   setFov(value) {
-    this.fov = THREE.MathUtils.clamp(Number(value) || DEFAULT_FOV_DEGREES, 30, 120);
+    this.fov = THREE.MathUtils.clamp(Number(value) || DEFAULT_FOV_DEGREES, 45, 100);
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
     this._notifyCameraSettings();
@@ -2121,6 +2351,15 @@ if (name === 'top') {
   }
 
   _updateMovement(dt) {
+    if (this.immersive360Active) {
+      // Showcase 360 is stationary by design. Ignore any stale keyboard input
+      // while the user is looking around the current architectural scene.
+      this.velocity.set(0, 0, 0);
+      this.pathVelocity.set(0, 0, 0);
+      this.keys.clear();
+      return;
+    }
+
     if (this.directTravel) {
       const now = performance.now();
       const elapsed = now - this.directTravel.startTime;
@@ -2224,17 +2463,11 @@ if (name === 'top') {
       this.cameraClearanceTimer += dt;
       this.progressWatchTime += dt;
 
-      // Recast keeps the movement point on the walkable surface, but its authored
-      // agent radius is intentionally smaller than the customer-facing camera
-      // envelope. Catch wall/furniture penetration at the camera level and force
-      // a controlled recovery instead of allowing the view to enter geometry.
-      const cameraBodySafe = this._hasCameraBodyClearance(this.position);
-      if (!cameraBodySafe && this.cameraClearanceTimer >= CAMERA_CLEARANCE_CHECK_INTERVAL_SEC) {
-        this.position.copy(before);
-        this.pathVelocity.set(0, 0, 0);
-        this.blockedTime += Math.max(dt, 0.12);
-        this.cameraClearanceTimer = 0;
-      }
+      // NavMesh is the physical movement authority. Do not veto a valid NavMesh
+      // step with raycasts against the full visual GLB: wall faces/door frames can
+      // still be hit near a correctly cut opening and make room transitions feel
+      // blocked even when Recast reports connected paths. Camera-clearance checks
+      // remain enabled for spawn and curated destination selection only.
 
       const progressDistance = this.position.distanceTo(this.lastMovementPosition);
       if (progressDistance > 0.035 * Math.max(this.metersPerUnit, 0.000001)) {
@@ -2248,19 +2481,21 @@ if (name === 'top') {
         this.blockedTime += dt;
         if (this.blockedTime > 0.65) {
           const recovered = this.recoverToSafeSpot('Recovered walk position');
-          if (recovered) this.blockedTime = 0;
-        }
-        if (this.blockedTime > 1.25) {
+          if (recovered) {
+            this.blockedTime = 0;
+            return;
+          }
+          // Recovery cancels the old route. Stop it explicitly rather than
+          // retrying forever or keeping a dead path active.
           this.path = null;
           this.pathIndex = 0;
           this.pathVelocity.set(0, 0, 0);
           this.velocity.set(0, 0, 0);
-          this.blockedTime = 0;
           this.stuck = true;
           this.recoveryAvailable = this.hotspots.length > 0;
           this.onState?.({ type: 'travel', active: false });
           this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
-          this.onState?.({ type: 'error', message: 'Navigation paused. Choose a nearby safe floor marker to continue.' });
+          this.onState?.({ type: 'error', message: 'Navigation paused because the route stopped making progress. Choose a reachable floor marker or return to the last safe point.' });
           return;
         }
       } else {
@@ -2283,7 +2518,7 @@ if (name === 'top') {
     const speed = this.keys.has('shift') ? this.runSpeed : this.walkSpeed;
     const targetVelocity = wish.multiplyScalar(speed);
     const response = moving ? 8 : 12;
-    this.velocity.lerp(targetVelocity, Math.min(1, response * dt));
+    this.velocity.lerp(targetVelocity, 1 - Math.exp(-response * dt));
     if (!moving && this.velocity.lengthSq() < 1e-5) this.velocity.set(0, 0, 0);
 
     if (this.velocity.lengthSq() > 1e-8) {
@@ -2294,12 +2529,19 @@ if (name === 'top') {
       const moved = before.distanceTo(this.position);
       if (moved < 0.0002 * Math.max(1, this.metersPerUnit)) {
         this.blockedTime += dt;
-        if (this.blockedTime > 0.8) {
-          const recovered = this.recoverToSafeSpot('Recovered walk position');
-          if (recovered) this.blockedTime = 0;
+        if (this.blockedTime > 0.18) {
+          // A user pressing into a wall in free Explore mode is not a route
+          // failure. Bleed off momentum; do not trigger recovery/teleport logic.
+          this.velocity.set(0, 0, 0);
+          this.blockedTime = 0;
         }
       } else {
         this.blockedTime = 0;
+        if (this.stuck) {
+          this.stuck = false;
+          this.recoveryAvailable = false;
+          this.onState?.({ type: 'stuck', available: false });
+        }
       }
     } else {
     }
@@ -2335,7 +2577,8 @@ if (name === 'top') {
     this.directTravel = null;
     this.pathVelocity.set(0, 0, 0);
     this.velocity.set(0, 0, 0);
-    this.blockedTime = 0;
+    // Preserve blockedTime until a valid recovery route starts. Callers need
+    // to distinguish a successful reroute from a recovery attempt that failed.
     this.cameraClearanceTimer = 0;
     this.progressWatchTime = 0;
 
@@ -2360,7 +2603,7 @@ if (name === 'top') {
         maxStraightPathSize: 256,
         maxPathSize: 256,
       });
-      if (!result?.success || !result.path?.length) {
+      if (!this._isCompleteNavPath(result, entry.point)) {
         this.recoveryAttemptedIds.add(item.id);
         continue;
       }
@@ -2395,22 +2638,18 @@ if (name === 'top') {
       }
     }
 
-    // 3) Only after route-based recovery fails do we use a controlled recovery
-    // teleport. The destination still has to be a safe anchor, never an arbitrary
-    // NavMesh point inside the building.
-    const teleportCandidate = [...this.safeAnchorById.entries()]
-      .map(([id, entry]) => ({ id, entry }))
-      .filter(({ id, entry }) => !this.recoveryAttemptedIds.has(id) && entry?.point)
-      .sort((a, b) => {
-        const da = Math.hypot(a.entry.point.x - this.position.x, a.entry.point.z - this.position.z);
-        const db = Math.hypot(b.entry.point.x - this.position.x, b.entry.point.z - this.position.z);
-        return da - db;
-      })[0];
-
-    if (!teleportCandidate) return false;
-    this.activeHotspotId = teleportCandidate.id;
-    this.onState?.({ type: 'navigation-recovery', mode: 'teleport', anchorId: teleportCandidate.id });
-    return this._teleportToDestination(teleportCandidate.entry.point, label, 'recovery-teleport');
+    // Phase A: never teleport the camera through the house as an automatic
+    // fallback. If no complete NavMesh route exists, leave the agent where it
+    // is and surface a recoverable stuck state. Teleports hid broken routes and
+    // made room traversal look successful when it was not physically connected.
+    this.stuck = true;
+    this.recoveryAvailable = this.hotspots.length > 0;
+    this.onState?.({
+      type: 'error',
+      message: 'No complete walkable recovery route is available from this position.',
+    });
+    this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
+    return false;
   }
 
   _startPathToDestination(destination, label, mode = 'path') {
@@ -2420,7 +2659,11 @@ if (name === 'top') {
       maxStraightPathSize: 256,
       maxPathSize: 256,
     });
-    if (!result?.success || !result.path?.length) return false;
+    const endpointStatus = this._inspectPathEndpoint(result, destination);
+    if (!endpointStatus.complete) {
+      console.warn('[Walkthrough] Rejected incomplete recovery route.', endpointStatus);
+      return false;
+    }
     this.path = this._simplifyPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
     this.pathIndex = 0;
     this.pathVelocity.set(0, 0, 0);
@@ -2437,33 +2680,157 @@ if (name === 'top') {
     this.lastMovementPosition.copy(this.position);
     this.stuck = false;
     this.recoveryAvailable = false;
-    this.currentPolyRef = destination.polyRef || this.currentPolyRef;
+    // Keep currentPolyRef associated with the agent's current position. The
+    // destination polygon becomes current only after moveAlongSurface reaches it.
+    if (!this.currentPolyRef) {
+      try {
+        const current = this.query.findClosestPoint(start, {
+          halfExtents: { x: 0.65, y: 1.0, z: 0.65 },
+          filter: this.filter,
+        });
+        this.currentPolyRef = current?.polyRef || current?.ref || 0;
+      } catch (_) {
+        this.currentPolyRef = 0;
+      }
+    }
     this.onState?.({ type: 'stuck', available: false });
     this.onState?.({ type: 'travel', label, active: true, mode, hotspotId: this.activeHotspotId });
     return true;
   }
 
+  _resolveMovementPolygon(point) {
+    if (!this.query || !point) return null;
+    const unit = Math.max(this.metersPerUnit || 1, 0.000001);
+    const maxSnap = Math.max(PHASE_A_MAX_LOCAL_SNAP_METERS * unit, 0.06);
+    let snapped = null;
+    try {
+      snapped = this.query.findClosestPoint(point, {
+        halfExtents: {
+          x: Math.max(0.32 * unit, 0.12),
+          y: Math.max(0.55 * unit, 0.3),
+          z: Math.max(0.32 * unit, 0.12),
+        },
+        filter: this.filter,
+      });
+    } catch (error) {
+      return null;
+    }
+    if (!snapped?.success || !snapped.point) return null;
+    const dx = snapped.point.x - point.x;
+    const dy = snapped.point.y - point.y;
+    const dz = snapped.point.z - point.z;
+    const snapDistance = Math.hypot(dx, dy, dz);
+    const polyRef = snapped.polyRef ?? snapped.ref ?? 0;
+    // Only correct floating-point drift. Never snap to a different room or
+    // silently relocate the player when the current physical position is invalid.
+    if (!polyRef || snapDistance > maxSnap) return null;
+    return { point: snapped.point, polyRef, snapDistance };
+  }
+
   _moveTo(desired) {
-    // Recast's agent radius is the physical collision authority during motion.
-    // Camera-clearance raycasts are reserved for spawn/destination validation;
-    // applying them every frame can incorrectly reject a valid corridor and
-    // make the character appear to snag or choose an odd side around furniture.
-    const startRef = this.currentPolyRef || 0;
-    const result = this.query.moveAlongSurface(
-      startRef,
-      { x: this.position.x, y: this.position.y, z: this.position.z },
-      { x: desired.x, y: desired.y, z: desired.z },
+    // The NavMesh is the physical movement authority. Keep the player on it and
+    // advance in short substeps so high frame deltas cannot jump across a narrow
+    // boundary/corner. Do not raycast the visual GLB here: door frames and faces
+    // near a legitimate opening must not veto a NavMesh-valid step.
+    if (!this.query || !desired) return false;
+
+    const unit = Math.max(this.metersPerUnit || 1, 0.000001);
+    const start = this.position.clone();
+    const target = new THREE.Vector3(Number(desired.x), Number(desired.y), Number(desired.z));
+    if (![target.x, target.y, target.z].every(Number.isFinite)) return false;
+
+    const totalDistance = start.distanceTo(target);
+    if (totalDistance <= 1e-7) return true;
+
+    const maxStep = Math.max(PHASE_A_MAX_NAV_STEP_METERS * unit, 0.025);
+    const stepCount = Math.min(32, Math.max(1, Math.ceil(totalDistance / maxStep)));
+    const actualStep = totalDistance / stepCount;
+    let working = { x: start.x, y: start.y, z: start.z };
+    let workingRef = this.currentPolyRef || 0;
+    let movedAny = false;
+
+    const moveAlong = (polyRef, from, to) => this.query.moveAlongSurface(
+      polyRef,
+      from,
+      to,
       { filter: this.filter, maxVisitedSize: 128 },
     );
-    if (result.success) {
-      const candidate = new THREE.Vector3(result.resultPosition.x, result.resultPosition.y, result.resultPosition.z);
-      if (!this._hasCameraBodyClearance(candidate)) return false;
-      this.position.copy(candidate);
-      if (result.visited?.length) this.currentPolyRef = result.visited[result.visited.length - 1];
-      if (result.resultPolyRef) this.currentPolyRef = result.resultPolyRef;
-      return true;
+
+    // Resolve a missing/stale polygon reference only around the agent's current
+    // point. The snap distance is strictly limited to prevent hidden teleports.
+    if (!workingRef) {
+      const resolved = this._resolveMovementPolygon(working);
+      if (!resolved) return false;
+      workingRef = resolved.polyRef;
+      working = {
+        x: resolved.point.x,
+        y: resolved.point.y,
+        z: resolved.point.z,
+      };
     }
-    return false;
+
+    for (let i = 1; i <= stepCount; i += 1) {
+      const t = i / stepCount;
+      const stepTarget = {
+        x: start.x + (target.x - start.x) * t,
+        y: start.y + (target.y - start.y) * t,
+        z: start.z + (target.z - start.z) * t,
+      };
+      let result = null;
+      try {
+        result = moveAlong(workingRef, working, stepTarget);
+      } catch (error) {
+        result = null;
+      }
+
+      if (!result?.success || !result.resultPosition) {
+        // Reacquire only if the cached polygon is stale. This is a tiny local
+        // correction, not a retry against the target room.
+        const resolved = this._resolveMovementPolygon(working);
+        if (!resolved) break;
+        workingRef = resolved.polyRef;
+        working = {
+          x: resolved.point.x,
+          y: resolved.point.y,
+          z: resolved.point.z,
+        };
+        try {
+          result = moveAlong(workingRef, working, stepTarget);
+        } catch (error) {
+          result = null;
+        }
+      }
+      if (!result?.success || !result.resultPosition) break;
+
+      const next = {
+        x: Number(result.resultPosition.x),
+        y: Number(result.resultPosition.y),
+        z: Number(result.resultPosition.z),
+      };
+      if (![next.x, next.y, next.z].every(Number.isFinite)) break;
+
+      const dx = next.x - working.x;
+      const dy = next.y - working.y;
+      const dz = next.z - working.z;
+      const stepMoved = Math.hypot(dx, dy, dz);
+      if (stepMoved < 1e-6) break;
+
+      working = next;
+      const visited = Array.isArray(result.visited) ? result.visited : [];
+      workingRef = result.resultPolyRef || visited[visited.length - 1] || workingRef;
+      movedAny = true;
+
+      // If Recast stopped substantially short of this sub-target, accept its
+      // last valid surface point and stop the frame there instead of repeatedly
+      // pushing through the same boundary.
+      const horizontalResidual = Math.hypot(stepTarget.x - working.x, stepTarget.z - working.z);
+      if (horizontalResidual > Math.max(actualStep * 1.75, 0.035 * unit)) break;
+    }
+
+    if (!movedAny) return false;
+    this.position.set(working.x, working.y, working.z);
+    if (workingRef) this.currentPolyRef = workingRef;
+    return start.distanceToSquared(this.position) > 1e-10;
   }
 
   _updateOverviewKeys(dt) {
@@ -3028,7 +3395,10 @@ if (name === 'top') {
     // Guided mode is a presentation camera: it slowly pans continuously, not
     // only while travelling. Phase 8 adds two higher-priority cinematic states:
     // a final-approach reveal and a short arrival settle.
-    if (this.walkMode === 'guided' && this.guidedAutoRotate) {
+    if (this.immersive360Active) {
+      this.guidedTravelRotating = false;
+      this.targetPitch = this.guidedPitch;
+    } else if (this.walkMode === 'guided' && this.guidedAutoRotate) {
       const now = performance.now();
 
       if (!this.guidedManualActive && this.arrivalSettleUntil > now) {
@@ -3277,6 +3647,10 @@ if (name === 'top') {
     this.lastFrameTime = now;
     this._lastDt = dt;
     this.lightingDirector?.update(dt);
+    this._updateImmersive360?.(now, dt);
+    this._updateSmart720Tour?.(now);
+    this._updateSmart720Offer?.();
+    this._updateImmersiveSceneSwitch?.(now);
     if (this.viewMode === 'walk') {
       this._updateMovement(dt);
       this._syncCamera();
@@ -3338,23 +3712,135 @@ if (name === 'top') {
   }
 }
 
+// These directors are deliberately attached at the runtime boundary instead of
+// monkey-patching Three.js globally. Each director only owns presentation state
+// and delegates physical movement back to the existing WalkRuntime methods.
+Object.assign(
+  WalkRuntime.prototype,
+  immersive360DirectorMethods,
+  immersivePresentationDirectorMethods,
+  immersiveSceneDirectorMethods,
+  smart720TourDirectorMethods,
+);
+
 export function useWalkthroughEngine({ containerRef, jobId }) {
   const runtimeRef = useRef(null);
-  const [state, setState] = useState({ status: 'idle', areas: [], navigationPlan: null, activeArea: null, activeHotspotId: null, message: '', lookLocked: true, walkMode: 'guided', cameraHeightMeters: DEFAULT_EYE_HEIGHT_METERS + DEFAULT_HEIGHT_OFFSET_METERS, heightOffsetMeters: DEFAULT_HEIGHT_OFFSET_METERS, cameraFov: DEFAULT_FOV_DEGREES, lightingMode: 'day', stuck: false, recoveryAvailable: false });
+  const [state, setState] = useState({
+    status: 'idle',
+    areas: [],
+    rooms: [],
+    spaces: [],
+    portals: [],
+    roomGraph: null,
+    navigationSpaceGraph: null,
+    navigationPlan: null,
+    activeArea: null,
+    activeHotspotId: null,
+    message: '',
+    lookLocked: true,
+    walkMode: 'guided',
+    cameraHeightMeters: DEFAULT_EYE_HEIGHT_METERS + DEFAULT_HEIGHT_OFFSET_METERS,
+    heightOffsetMeters: DEFAULT_HEIGHT_OFFSET_METERS,
+    cameraFov: DEFAULT_FOV_DEGREES,
+    lightingMode: 'day',
+    stuck: false,
+    recoveryAvailable: false,
+    immersive360Active: false,
+    immersive360OfferAvailable: false,
+    immersive360AutoRotate: true,
+    immersivePresentationActive: false,
+    immersivePresentationLabel: null,
+    immersiveSceneIndex: 0,
+    immersiveSceneTotal: 0,
+    immersiveSceneLabel: null,
+    immersiveSceneCanPrev: false,
+    immersiveSceneCanNext: false,
+    immersiveSceneSwitching: false,
+    smart720Active: false,
+    smart720OfferAvailable: false,
+    smart720CurrentLabel: null,
+    smart720StopIndex: 0,
+    smart720TotalStops: 0,
+  });
 
   useEffect(() => {
     if (!containerRef.current || !jobId) return undefined;
     const runtime = new WalkRuntime({
       canvas: containerRef.current,
       onState: (event) => {
-        if (event.type === 'loaded') setState({ status: 'ready', areas: event.areas || [], navigationPlan: runtimeRef.current?.navigationPlan || null, activeArea: null, activeHotspotId: null, message: '', lookLocked: runtimeRef.current?.lookLocked ?? false, walkMode: runtimeRef.current?.walkMode ?? 'guided', cameraHeightMeters: (runtimeRef.current?.eyeHeight || DEFAULT_EYE_HEIGHT_METERS) + (runtimeRef.current?.heightOffset || 0), heightOffsetMeters: runtimeRef.current?.heightOffset || 0, cameraFov: runtimeRef.current?.fov || DEFAULT_FOV_DEGREES, lightingMode: runtimeRef.current?.lightingDirector?.targetMode || 'day', stuck: false, recoveryAvailable: false });
+        if (event.type === 'loaded') setState((previous) => ({
+          ...previous,
+          status: 'ready',
+          areas: event.areas || [],
+          rooms: runtimeRef.current?.presentationRooms || [],
+          spaces: runtimeRef.current?.presentationSpaces || [],
+          portals: runtimeRef.current?.presentationPortals || [],
+          roomGraph: runtimeRef.current?.presentationRoomGraph || null,
+          navigationSpaceGraph: runtimeRef.current?.navigationSpaceGraph || null,
+          navigationPlan: runtimeRef.current?.navigationPlan || null,
+          activeArea: null,
+          activeHotspotId: null,
+          message: '',
+          lookLocked: runtimeRef.current?.lookLocked ?? false,
+          walkMode: runtimeRef.current?.walkMode ?? 'guided',
+          cameraHeightMeters: (runtimeRef.current?.eyeHeight || DEFAULT_EYE_HEIGHT_METERS) + (runtimeRef.current?.heightOffset || 0),
+          heightOffsetMeters: runtimeRef.current?.heightOffset || 0,
+          cameraFov: runtimeRef.current?.fov || DEFAULT_FOV_DEGREES,
+          lightingMode: runtimeRef.current?.lightingDirector?.targetMode || 'day',
+          stuck: false,
+          recoveryAvailable: false,
+          immersive360OfferAvailable: true,
+        }));
         if (event.type === 'loading') setState((prev) => ({ ...prev, status: 'loading' }));
         if (event.type === 'travel') setState((prev) => ({ ...prev, activeArea: event.label || null, activeHotspotId: event.hotspotId || prev.activeHotspotId || null, message: event.active ? `Walking to ${event.label}…` : '' }));
         if (event.type === 'error') setState((prev) => ({ ...prev, message: event.message || 'Navigation failed.' }));
         if (event.type === 'look-lock') setState((prev) => ({ ...prev, lookLocked: event.locked }));
         if (event.type === 'walk-mode') setState((prev) => ({ ...prev, walkMode: event.mode }));
+        if (event.type === 'presentation-topology') setState((prev) => ({
+          ...prev,
+          rooms: event.rooms || [],
+          spaces: event.spaces || [],
+          portals: event.portals || [],
+          roomGraph: event.roomGraph || null,
+          navigationSpaceGraph: event.navigationSpaceGraph || null,
+        }));
         if (event.type === 'camera-settings') setState((prev) => ({ ...prev, cameraHeightMeters: event.cameraHeightMeters, heightOffsetMeters: event.heightOffsetMeters, cameraFov: event.fov }));
         if (event.type === 'lighting') setState((prev) => ({ ...prev, lightingMode: event.targetMode || event.mode || 'day' }));
+        if (event.type === 'immersive-360') setState((prev) => ({
+          ...prev,
+          immersive360Active: Boolean(event.active),
+          immersive360AutoRotate: event.autoRotate === undefined ? prev.immersive360AutoRotate : Boolean(event.autoRotate),
+          immersive360OfferAvailable: event.active
+            ? false
+            : (prev.walkMode === 'guided' && prev.status === 'ready'),
+        }));
+        if (event.type === 'immersive-presentation') setState((prev) => ({
+          ...prev,
+          immersivePresentationActive: Boolean(event.active),
+          immersivePresentationLabel: event.label ?? prev.immersivePresentationLabel,
+        }));
+        if (event.type === 'immersive-scene') setState((prev) => ({
+          ...prev,
+          immersiveSceneIndex: Number(event.index) || 0,
+          immersiveSceneTotal: Number(event.total) || 0,
+          immersiveSceneLabel: event.label ?? null,
+          immersiveSceneCanPrev: Boolean(event.canPrev),
+          immersiveSceneCanNext: Boolean(event.canNext),
+          immersiveSceneSwitching: Boolean(event.switching),
+        }));
+        if (event.type === 'smart-720-offer') setState((prev) => ({ ...prev, smart720OfferAvailable: Boolean(event.available) }));
+        if (event.type === 'smart-720-tour') setState((prev) => ({
+          ...prev,
+          smart720Active: Boolean(event.active),
+          smart720CurrentLabel: event.label ?? prev.smart720CurrentLabel,
+          smart720StopIndex: Number(event.stopIndex) || prev.smart720StopIndex,
+          smart720TotalStops: Number(event.totalStops) || prev.smart720TotalStops,
+          smart720OfferAvailable: Boolean(event.active) ? false : prev.smart720OfferAvailable,
+        }));
+        if (event.type === 'view-mode') setState((prev) => ({
+          ...prev,
+          immersive360OfferAvailable: event.mode === 'walk' ? !prev.immersive360Active : false,
+        }));
         if (event.type === 'unstuck') setState((prev) => ({ ...prev, message: 'Recovered walk position.', stuck: false, recoveryAvailable: false }));
         if (event.type === 'stuck') setState((prev) => ({ ...prev, stuck: Boolean(event.available), recoveryAvailable: Boolean(event.available) }));
         if (event.type === 'escape') setState((prev) => ({ ...prev, message: '' }));
@@ -3364,7 +3850,7 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
     const base = import.meta.env.VITE_API_URL || 'http://localhost:3000';
     runtime.load(jobId, base).catch((error) => {
       console.error('[Walkthrough] Failed to load job:', error);
-      setState({ status: 'error', areas: [], activeArea: null, message: error.message, lookLocked: true, walkMode: 'guided', stuck: false, recoveryAvailable: false });
+      setState((previous) => ({ ...previous, status: 'error', areas: [], activeArea: null, message: error.message, lookLocked: true, walkMode: 'guided', stuck: false, recoveryAvailable: false }));
     });
     return () => {
       runtime.dispose();
@@ -3389,5 +3875,36 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
   const zoom = useCallback((value) => runtimeRef.current?.zoom(value), []);
   const fitView = useCallback(() => runtimeRef.current?.fitView(), []);
   const recoverToSafeSpot = useCallback(() => runtimeRef.current?.recoverToSafeSpot(), []);
-  return { ...state, travelTo, switchRoom, navigateToHotspot, stopTravel, recoverToSafeSpot, setHeightOffset, setSensitivity, setWalkMode, setLookLocked, setViewMode, setAutoRotate, setViewPreset, zoom, fitView, setFov, setLightingMode, cycleLighting };
+  const enterImmersivePresentation = useCallback((options = {}) => runtimeRef.current?.enterImmersivePresentation(options), []);
+  const exitImmersivePresentation = useCallback(() => runtimeRef.current?.exitImmersivePresentation(), []);
+  const resetImmersivePresentationView = useCallback(() => runtimeRef.current?.resetImmersivePresentationView(), []);
+  const setImmersive360AutoRotate = useCallback((value) => runtimeRef.current?.setImmersive360AutoRotate(value), []);
+  const switchImmersiveScene = useCallback((direction) => runtimeRef.current?.switchImmersiveScene(direction), []);
+  const startSmart720Tour = useCallback(() => runtimeRef.current?.startSmart720Tour(), []);
+  return {
+    ...state,
+    travelTo,
+    switchRoom,
+    navigateToHotspot,
+    stopTravel,
+    recoverToSafeSpot,
+    setHeightOffset,
+    setSensitivity,
+    setWalkMode,
+    setLookLocked,
+    setViewMode,
+    setAutoRotate,
+    setViewPreset,
+    zoom,
+    fitView,
+    setFov,
+    setLightingMode,
+    cycleLighting,
+    enterImmersivePresentation,
+    exitImmersivePresentation,
+    resetImmersivePresentationView,
+    setImmersive360AutoRotate,
+    switchImmersiveScene,
+    startSmart720Tour,
+  };
 }

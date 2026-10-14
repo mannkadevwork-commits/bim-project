@@ -43,11 +43,18 @@ export const useCloudRender = (activeProject, projectStateRef) => {
         throw new Error(data?.error || `Render failed. Server returned ${response.status}`);
       }
 
+      const walkthroughPath = data?.walkthroughPath || data?.url || `/walkthrough/${encodeURIComponent(jobId)}`;
+      const resolvedWalkthroughUrl = walkthroughPath.startsWith('http')
+        ? walkthroughPath
+        : new URL(walkthroughPath, window.location.origin).toString();
+      const resolvedModelUrl = data?.modelUrl || `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`;
+
       const result = {
         ...data,
         jobId,
-        modelUrl: `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`,
-        walkthroughUrl: `${window.location.origin}/walkthrough/${encodeURIComponent(jobId)}`,
+        modelUrl: resolvedModelUrl,
+        walkthroughPath,
+        walkthroughUrl: resolvedWalkthroughUrl,
         projectState: renderedProjectState,
         renderConfig: { ...renderConfig, type: effectiveRenderType },
       };

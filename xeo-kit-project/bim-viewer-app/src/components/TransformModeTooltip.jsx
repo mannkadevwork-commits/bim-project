@@ -333,9 +333,9 @@ export const TransformModeTooltip = ({
 
             <div className="space-y-1">
               {[
-                { id: 'face', label: 'Face', hint: '1 axis', desc: 'Stretch one dimension', Icon: Square },
-                { id: 'edge', label: 'Edge', hint: '2 axes', desc: 'Resize across two dimensions', Icon: Diamond },
-                { id: 'corner', label: 'Corner', hint: '3 axes', desc: 'Resize in three dimensions', Icon: Box },
+                { id: 'face', label: 'Side', hint: '1 dimension', desc: 'Change width, height, or depth', Icon: Square },
+                { id: 'edge', label: 'Edge', hint: '2 dimensions', desc: 'Resize two dimensions together', Icon: Diamond },
+                { id: 'corner', label: 'Corner', hint: '3 dimensions', desc: 'Resize all three dimensions', Icon: Box },
               ].map(({ id, label, hint, desc, Icon }) => {
                 const active = resizeSubmode === id;
                 return (
@@ -378,10 +378,10 @@ export const TransformModeTooltip = ({
               <span className="text-[8px] font-semibold px-1.5 py-0.5 rounded-md border border-[#ff914d]/25 bg-[#ff914d]/10 text-[#ffb07a]">HCI</span>
             </div>
             <div className="space-y-2.5">
-              <HelpRow tone="move" icon={<Move className="w-4 h-4" />} title="Move" text="Drag the colored arrows. Small translucent planes move on two axes." isDarkMode={isDarkMode} />
+              <HelpRow tone="move" icon={<Move className="w-4 h-4" />} title="Move" text="Drag the four-way move control to reposition the asset on the floor plane." isDarkMode={isDarkMode} />
               <HelpRow tone="rotate" icon={<RotateCw className="w-4 h-4" />} title="Rotate" text="Drag the circular arrow on the left or right side of the object. The highlighted arrow shows the active rotation direction." isDarkMode={isDarkMode} />
               <div className="rounded-xl border border-slate-700/60 bg-slate-900/40 p-2.5">
-                <HelpRow tone="resize" icon={<Scaling className="w-4 h-4" />} title="Resize" text="Choose Resize, then drag a face grip for one dimension. Click a face to reveal its nearby edge and corner grips for broader resizing." isDarkMode={isDarkMode} />
+                <HelpRow tone="resize" icon={<Scaling className="w-4 h-4" />} title="Resize" text="Choose Resize, then drag a Side arrow for one dimension. Use Edge or Corner grips when you need to change multiple dimensions together." isDarkMode={isDarkMode} />
                 <div className="grid grid-cols-3 gap-1.5 mt-2.5">
                   <div className="rounded-lg border border-red-400/20 bg-red-500/5 px-2 py-1.5 text-center">
                     <div className="mx-auto mb-1 w-3 h-3 rounded-sm border-2 border-red-300" />

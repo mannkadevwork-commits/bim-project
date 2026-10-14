@@ -1,6 +1,7 @@
 import * as WebIFC from 'web-ifc';
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'node:url';
 import { Document, Accessor, Node, Buffer, Texture } from '@gltf-transform/core';
 
 interface StructuralEditEntry { visible?: boolean; }
@@ -257,7 +258,7 @@ function createMaterialFromDefinition(
         .setBaseColorFactor([r, g, b, alpha])
         .setDoubleSided(true)
         .setRoughnessFactor(definition.roughness ?? 0.8)
-        .setMetallicFactor(definition.metallic ?? 0.1);
+        .setMetallicFactor(definition.metallic ?? 0.0);
 
     let texture: Texture | null = null;
     if ((definition.kind === 'fabric' || definition.kind === 'texture') && definition.texture?.src) {
@@ -304,6 +305,83 @@ function addTrianglePrimitive(
     void texture;
 }
 
+/**
+ * Opening elements are subtraction volumes, not visible building surfaces.
+ * web-ifc can stream their meshes independently even when the host wall's
+ * Body geometry already has the opening applied. Exporting those cutter meshes
+ * makes them visible/solid again in the GLB and, more importantly, turns the
+ * doorway into an obstacle for Recast. IfcSpace solids are also semantic volumes,
+ * not renderable physical walls/floors, and must not enter the output mesh.
+ */
+function getNonRenderableIfcTypeName(
+    ifcApi: WebIFC.IfcAPI,
+    modelId: number,
+    expressID: number,
+): string | null {
+    try {
+        const typeCode = ifcApi.GetLineType(modelId, expressID);
+        const rawName = ifcApi.GetNameFromTypeCode(typeCode);
+        const typeName = String(rawName || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        if (typeName.startsWith('IFCOPENING') || typeName === 'IFCSPACE') return typeName;
+    } catch (_) {
+        // If an older/unusual IFC schema cannot resolve the type name, preserve
+        // its geometry rather than accidentally hiding an otherwise valid element.
+    }
+    return null;
+}
+
+
+type DefaultVisualSurfaceKind = 'wall' | 'floor';
+
+function getIfcVisualSurfaceKind(
+    ifcApi: WebIFC.IfcAPI,
+    modelId: number,
+    expressID: number,
+): DefaultVisualSurfaceKind | null {
+    try {
+        const typeCode = ifcApi.GetLineType(modelId, expressID);
+        const typeName = String(ifcApi.GetNameFromTypeCode(typeCode) || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        if (typeName === 'IFCWALL' || typeName === 'IFCWALLSTANDARDCASE') return 'wall';
+        if (typeName === 'IFCCOVERING') {
+            const line: any = ifcApi.GetLine(modelId, expressID);
+            const predefined = String(line?.PredefinedType?.value ?? line?.PredefinedType ?? '').toUpperCase();
+            return predefined.includes('FLOORING') ? 'floor' : null;
+        }
+        if (typeName === 'IFCSLAB') {
+            const line: any = ifcApi.GetLine(modelId, expressID);
+            const predefined = String(line?.PredefinedType?.value ?? line?.PredefinedType ?? '').toUpperCase();
+            const objectName = String(line?.Name?.value ?? line?.Name ?? '').toLowerCase();
+            // IFC2x3/older authoring tools often leave PredefinedType unset.
+            // In that case only a clearly named floor/landing slab gets the
+            // default tile map; roof and balcony concrete decks stay untouched.
+            if (predefined === 'FLOOR' || predefined === 'BASESLAB' || predefined === 'LANDING') return 'floor';
+            if (!predefined && /\b(main\s+)?floor\b|\blanding\b/.test(objectName) && !/roof|balcony|deck/.test(objectName)) return 'floor';
+            return null;
+        }
+    } catch (_) {
+        // Unknown schemas/types keep the original, untextured IFC appearance.
+    }
+    return null;
+}
+
+function getDefaultVisualTexture(
+    doc: Document,
+    kind: DefaultVisualSurfaceKind,
+    cache: Map<string, Texture>,
+): Texture | null {
+    const cached = cache.get(kind);
+    if (cached) return cached;
+    const assetName = kind === 'wall' ? 'ifc-wall-plaster.png' : 'ifc-floor-tile.png';
+    const assetPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'visual_assets', assetName);
+    if (!fs.existsSync(assetPath)) {
+        console.warn(`[VisualMaterials] Default ${kind} texture missing at ${assetPath}; preserving flat IFC material.`);
+        return null;
+    }
+    const texture = createTexture(doc, assetPath, `HCI_Default_${kind}_Texture`);
+    cache.set(kind, texture);
+    return texture;
+}
+
 export function extractGeometry(
     ifcApi: WebIFC.IfcAPI,
     modelId: number,
@@ -319,12 +397,26 @@ export function extractGeometry(
     const needsGlobalId = Boolean(structuralEdits || materialOverrides);
     const hasScopedWalls = Object.values(materialOverrides || {}).some(isScopedOverride);
     const wallContexts = hasScopedWalls ? buildWallContexts(ifcApi, modelId, materialOverrides || {}) : new Map<number, WallContext>();
+    const skippedIfcTypes = new Map<string, number>();
+    const defaultVisualTextures = new Map<string, Texture>();
+    let texturedWallMeshes = 0;
+    let texturedFloorMeshes = 0;
 
     ifcApi.StreamAllMeshes(modelId, (flatMesh: WebIFC.FlatMesh) => {
+        const nonRenderableType = getNonRenderableIfcTypeName(ifcApi, modelId, Number(flatMesh.expressID));
+        if (nonRenderableType) {
+            skippedIfcTypes.set(nonRenderableType, (skippedIfcTypes.get(nonRenderableType) || 0) + 1);
+            return;
+        }
         const globalId = needsGlobalId ? getGlobalId(ifcApi, modelId, flatMesh.expressID) : null;
         if (structuralEdits && globalId && structuralEdits[globalId]?.visible === false) return;
 
         const materialOverride = materialOverrides && globalId ? materialOverrides[globalId] : undefined;
+        // Apply subtle default finishes only to unmodified structural walls and
+        // floor-like IFC surfaces. Designer-selected material overrides win.
+        const defaultVisualSurfaceKind = materialOverride
+            ? null
+            : getIfcVisualSurfaceKind(ifcApi, modelId, Number(flatMesh.expressID));
         const size = flatMesh.geometries.size();
         const wallContext = materialOverride && wallContexts.get(Number(flatMesh.expressID));
 
@@ -382,7 +474,7 @@ export function extractGeometry(
                     const nativeDefinition: MaterialDefinition = {
                         rgb: [r, g, b],
                         roughness: 0.8,
-                        metallic: 0.1,
+                        metallic: 0.0,
                     };
 
                     const getBucket = (key: string, definition: MaterialDefinition) => {
@@ -518,15 +610,27 @@ export function extractGeometry(
                 const normalAccessor = doc.createAccessor().setType(Accessor.Type.VEC3).setArray(normals).setBuffer(buffer);
 
                 const [finalR, finalG, finalB] = materialOverride ? materialOverride.rgb : [r, g, b];
-                const repeat = materialOverride?.texture?.repeat || [1, 1];
+                // Procedural tile map contains a 2x2 tile layout. A 0.62 world-UV scale
+                // yields larger, roughly 0.8 m tiles instead of the overly strong
+                // ~0.5 m grid from Visual Phase 1. Explicit material repeats still win.
+                const repeat = materialOverride?.texture?.repeat || (defaultVisualSurfaceKind === 'floor' ? [0.62, 0.62] : [1, 1]);
                 const uv = buildBoxProjectedUVs(positions, normals, repeat);
                 const uvAccessor = doc.createAccessor().setType(Accessor.Type.VEC2).setArray(uv).setBuffer(buffer);
 
                 const material = doc.createMaterial(`Mat_${flatMesh.expressID}_${i}`)
                     .setBaseColorFactor([finalR, finalG, finalB, safeAlpha])
                     .setDoubleSided(true)
-                    .setRoughnessFactor(materialOverride?.roughness ?? 0.8)
-                    .setMetallicFactor(materialOverride?.metallic ?? 0.1);
+                    .setRoughnessFactor(materialOverride?.roughness ?? 0.86)
+                    .setMetallicFactor(materialOverride?.metallic ?? 0.0);
+
+                if (defaultVisualSurfaceKind) {
+                    const defaultTexture = getDefaultVisualTexture(doc, defaultVisualSurfaceKind, defaultVisualTextures);
+                    if (defaultTexture) {
+                        material.setBaseColorTexture(defaultTexture);
+                        if (defaultVisualSurfaceKind === 'wall') texturedWallMeshes += 1;
+                        if (defaultVisualSurfaceKind === 'floor') texturedFloorMeshes += 1;
+                    }
+                }
 
                 if ((materialOverride?.kind === 'fabric' || materialOverride?.kind === 'texture') && materialOverride.texture?.src) {
                     const texturePath = resolveTexturePath(materialOverride.texture.src, assetsDirectory);
@@ -551,5 +655,15 @@ export function extractGeometry(
         }
     });
 
+    if (skippedIfcTypes.size) {
+        const summary = Array.from(skippedIfcTypes.entries())
+            .map(([typeName, count]) => `${typeName}=${count}`)
+            .join(', ');
+        console.info(`[IFC Geometry] Excluded non-renderable semantic/cutter meshes: ${summary}`);
+    }
+
+    if (texturedWallMeshes || texturedFloorMeshes) {
+        console.log(`[VisualMaterials] Applied subtle procedural finishes to ${texturedWallMeshes} IFC wall mesh(es) and ${texturedFloorMeshes} IFC floor mesh(es).`);
+    }
     return rootNode;
 }

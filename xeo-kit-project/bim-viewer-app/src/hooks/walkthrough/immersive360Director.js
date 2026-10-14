@@ -16,6 +16,65 @@ export const immersive360DirectorMethods = {
     this.immersive360AutoSpeedRadPerSec = IMMERSIVE_360_SPEED_RAD_PER_SEC;
   },
 
+  _findImmersivePresentationOrigin() {
+    if (!this.position) return null;
+
+    const unit = Math.max(this.metersPerUnit || 1, 1e-6);
+    const currentPoint = [this.position.x, this.position.y, this.position.z];
+    const currentOpenSpace = Number(this._presentationOpenSpaceScore?.(currentPoint) || 0);
+
+    // Most room-entry positions are already fine. Only move when the current
+    // camera is clearly cramped; this prevents a distracting teleport during
+    // normal presentation entry while rescuing wall/furniture-adjacent shots.
+    if (currentOpenSpace >= 0.55) return null;
+
+    const activeAreaId = this._getGuidedPresentationAreaId?.() || null;
+    const entries = [...(this.safeAnchorById?.entries?.() || [])]
+      .map(([id, entry]) => ({ id, ...entry }))
+      .filter((entry) => entry?.point && entry?.hotspot);
+
+    if (!entries.length) return null;
+
+    const sameArea = activeAreaId
+      ? entries.filter((entry) => entry.hotspot?.areaId === activeAreaId)
+      : entries;
+    const candidates = sameArea.length ? sameArea : entries;
+
+    let best = null;
+    for (const candidate of candidates) {
+      const openness = Number(candidate.openness || 0);
+      if (openness < 0.8) continue;
+      const distanceMeters = Math.hypot(
+        candidate.point.x - this.position.x,
+        candidate.point.z - this.position.z,
+      ) / unit;
+      if (distanceMeters > 6.0) continue;
+
+      const roleBonus = candidate.role === 'room-center' ? 1.35
+        : candidate.role === 'viewpoint' ? 1.15
+        : candidate.role === 'room-entrance' ? 0.7
+        : 0.25;
+      const score = openness * 2.4 + roleBonus - distanceMeters * 0.12;
+      if (!best || score > best.score) best = { ...candidate, score };
+    }
+
+    return best?.point || null;
+  },
+
+  _moveToImmersivePresentationOrigin(point) {
+    if (!point || !this.position) return false;
+    this.position.set(point.x, point.y, point.z);
+    this.currentPolyRef = point.polyRef || this.currentPolyRef;
+    this.lastMovementPosition.copy(this.position);
+    this.path = null;
+    this.pathIndex = 0;
+    this.pathVelocity?.set?.(0, 0, 0);
+    this.velocity?.set?.(0, 0, 0);
+    this.directTravel = null;
+    this._rememberNearestSafeAnchor?.(this.position, 'presentation');
+    return true;
+  },
+
   setImmersive360(active, options = {}) {
     const next = Boolean(active);
     if (next === this.immersive360Active) return next;
@@ -55,7 +114,22 @@ export const immersive360DirectorMethods = {
       this.targetYaw = startYaw;
       this.guidedCompositionYaw = startYaw;
       this.guidedCompositionTargetYaw = startYaw;
-      this.guidedYawCenter = startYaw;
+      const presentationOrigin = this._findImmersivePresentationOrigin?.();
+      if (presentationOrigin) {
+        this._moveToImmersivePresentationOrigin?.(presentationOrigin);
+      }
+
+      const composed = this._findBestGuidedComposition?.(
+        this.position,
+        this.lastMoveDirection,
+        this.currentYaw,
+      );
+      const composedYaw = Number.isFinite(composed?.yaw) ? composed.yaw : startYaw;
+      this.currentYaw = composedYaw;
+      this.targetYaw = composedYaw;
+      this.guidedCompositionYaw = composedYaw;
+      this.guidedCompositionTargetYaw = composedYaw;
+      this.guidedYawCenter = composedYaw;
       this.guidedPitch = Number.isFinite(this.guidedPitch) ? this.guidedPitch : -0.085;
       this.currentPitch = this.guidedPitch;
       this.targetPitch = this.guidedPitch;
