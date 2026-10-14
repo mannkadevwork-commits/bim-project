@@ -6,3 +6,7 @@ fronted_backup/
 jobs/
 uploads/
 assets/
+
+# Keep BIM Viewer engine source modules
+!/bim-viewer-app/src/engine/assets/
+!/bim-viewer-app/src/engine/assets/**
