@@ -1,0 +1,5 @@
+# Deterministic PDF catalogue tile extraction; no AI model/API is used.
+PyMuPDF>=1.24,<2
+opencv-python-headless>=4.9,<5
+numpy>=1.26,<3
+Pillow>=10,<13

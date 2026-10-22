@@ -9,6 +9,7 @@ import { SectionPlanesPlugin } from '@xeokit/xeokit-sdk/src/plugins/SectionPlane
 import { DistanceMeasurementsPlugin } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsPlugin';
 import { DistanceMeasurementsMouseControl } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsMouseControl';
 import * as WebIFC from 'web-ifc';
+import { initializeWebIFCApi } from '../utils/webIfcRuntime';
 
 import { API_BASE_URL, AXIS_HANDLE_COLORS, STRETCH_HANDLE_DRAG_SCALE, STRETCH_HANDLE_HOVER_SCALE } from './utils/constants';
 import { brightenColor } from './utils/helpers';
@@ -829,8 +830,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     const initializeIFCEngine = async () => {
       try {
         const ifcAPI = new WebIFC.IfcAPI();
-        ifcAPI.SetWasmPath('/');
-        await ifcAPI.Init();
+        await initializeWebIFCApi(ifcAPI);
 
         // StrictMode/layout switches can destroy this viewer while WASM init
         // is still pending. Never attach a loader to a dead/stale viewer.

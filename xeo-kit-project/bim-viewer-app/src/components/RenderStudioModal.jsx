@@ -279,18 +279,34 @@ export const RenderStudioModal = ({
         <div>
           <label className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 block">Output Type</label>
           <div className="grid grid-cols-2 gap-3">
-            <button onClick={() => setRenderConfig({ ...renderConfig, type: '360' })} className={`py-3 rounded-xl border flex flex-col items-center gap-2 transition-all ${renderConfig.type === '360' ? 'bg-indigo-50 border-indigo-500 text-indigo-600 dark:bg-indigo-900/30 dark:border-indigo-500 dark:text-indigo-400' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-300 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'}`}><Orbit className="w-5 h-5" /><span className="text-sm font-semibold">Interactive 360°</span></button>
-            <button onClick={() => setRenderConfig({ ...renderConfig, type: 'static' })} className={`py-3 rounded-xl border flex flex-col items-center gap-2 transition-all ${renderConfig.type === 'static' ? 'bg-indigo-50 border-indigo-500 text-indigo-600 dark:bg-indigo-900/30 dark:border-indigo-500 dark:text-indigo-400' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-300 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'}`}><ImageIcon className="w-5 h-5" /><span className="text-sm font-semibold">4K Static Image</span></button>
+            <button onClick={() => setRenderConfig({ ...renderConfig, type: '360' })} className={`py-3 rounded-xl border flex flex-col items-center gap-2 transition-all ${renderConfig.type === '360' ? 'bg-indigo-50 border-indigo-500 text-indigo-600 dark:bg-indigo-900/30 dark:border-indigo-500 dark:text-indigo-400' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-300 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'}`}><Orbit className="w-5 h-5" /><span className="text-sm font-semibold">360° walkthrough</span></button>
+            <button onClick={() => setRenderConfig({ ...renderConfig, type: 'static' })} className={`py-3 rounded-xl border flex flex-col items-center gap-2 transition-all ${renderConfig.type === 'static' ? 'bg-indigo-50 border-indigo-500 text-indigo-600 dark:bg-indigo-900/30 dark:border-indigo-500 dark:text-indigo-400' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-300 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'}`}><ImageIcon className="w-5 h-5" /><span className="text-sm font-semibold">4K still image</span></button>
           </div>
         </div>
 
-        <div>
-          <label className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 block">Lighting Scenario</label>
-          <div className="grid grid-cols-2 gap-3">
-            <button onClick={() => setRenderConfig({ ...renderConfig, lighting: 'daylight' })} className={`py-3 rounded-xl border flex flex-col items-center gap-2 transition-all ${renderConfig.lighting === 'daylight' ? 'bg-amber-50 border-amber-500 text-amber-600 dark:bg-amber-900/30 dark:border-amber-500 dark:text-amber-400' : 'bg-white border-slate-200 text-slate-600 hover:border-amber-300 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'}`}><Sun className="w-5 h-5" /><span className="text-sm font-semibold">Daylight</span></button>
-            <button onClick={() => setRenderConfig({ ...renderConfig, lighting: 'night' })} className={`py-3 rounded-xl border flex flex-col items-center gap-2 transition-all ${renderConfig.lighting === 'night' ? 'bg-slate-800 border-indigo-500 text-indigo-400 dark:bg-slate-900 dark:border-indigo-500 dark:text-indigo-400' : 'bg-white border-slate-200 text-slate-600 hover:border-slate-800 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-400'}`}><Moon className="w-5 h-5" /><span className="text-sm font-semibold">Nighttime</span></button>
+        {renderConfig.type === 'static' ? (
+          <div>
+            <label className="mb-3 block text-xs font-bold uppercase tracking-wider text-slate-400">Image lighting</label>
+            <div className="grid grid-cols-2 gap-3">
+              <button type="button" onClick={() => setRenderConfig({ ...renderConfig, lighting: 'daylight' })} aria-pressed={renderConfig.lighting === 'daylight'} className={`flex flex-col items-center gap-2 rounded-xl border py-3 transition-all ${renderConfig.lighting === 'daylight' ? 'border-amber-500 bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300' : 'border-slate-200 bg-white text-slate-600 hover:border-amber-300 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400'}`}>
+                <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"><Sun className="h-4.5 w-4.5" /></span>
+                <span className="text-sm font-semibold">Daylight</span>
+              </button>
+              <button type="button" onClick={() => setRenderConfig({ ...renderConfig, lighting: 'night' })} aria-pressed={renderConfig.lighting === 'night'} className={`flex flex-col items-center gap-2 rounded-xl border py-3 transition-all ${renderConfig.lighting === 'night' ? 'border-indigo-500 bg-indigo-50 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300' : 'border-slate-200 bg-white text-slate-600 hover:border-indigo-300 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400'}`}>
+                <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300"><Moon className="h-4.5 w-4.5" /></span>
+                <span className="text-sm font-semibold">Nighttime</span>
+              </button>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="flex items-start gap-3 rounded-xl border border-indigo-100 bg-indigo-50/70 p-3 dark:border-indigo-900/40 dark:bg-indigo-950/30">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300"><Orbit className="h-4.5 w-4.5" /></span>
+            <div>
+              <p className="text-xs font-bold text-slate-800 dark:text-slate-100">Set the mood inside the walkthrough</p>
+              <p className="mt-1 text-[11px] leading-4 text-slate-600 dark:text-slate-300">Choose day, evening or night lighting from the walkthrough controls after opening the 360° experience.</p>
+            </div>
+          </div>
+        )}
 
         <div className="rounded-xl border border-indigo-100 dark:border-indigo-900/40 bg-indigo-50/70 dark:bg-indigo-950/30 p-3 text-xs text-slate-600 dark:text-slate-300 flex gap-2">
           <Box className="mt-0.5 w-4 h-4 shrink-0 text-indigo-500" />

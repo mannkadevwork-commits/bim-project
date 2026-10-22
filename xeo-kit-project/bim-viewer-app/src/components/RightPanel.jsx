@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { 
   PanelRightClose, Component, Settings2, Eye, EyeOff, Scissors, 
   Footprints, Orbit, Info, Palette, Maximize2, Move, Ruler,
-  Sun, Moon, Trash2, CloudCog, Loader2, Clock, Layers3, X  
+  Sun, Moon, Trash2, CloudCog, Loader2, Clock, Layers3, X, MousePointer2  
 } from 'lucide-react';
 import { LayoutMetadataForm } from './LayoutMetadataForm';
 
@@ -18,6 +18,18 @@ const PREDEFINED_COLORS = {
     Basics: ['#FFFFFF', '#000000', '#E74C3C', '#3498DB', '#2ECC71']
 };
 
+const formatElementType = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return 'Building element';
+  const normalized = raw.replace(/^Ifc/, '').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ');
+  const friendlyNames = {
+    wall: 'Wall', walls: 'Wall', slab: 'Floor or slab', door: 'Door', window: 'Window',
+    space: 'Room or space', covering: 'Surface finish', 'furnishing element': 'Furniture',
+    'building element proxy': 'Building element', beam: 'Beam', column: 'Column', stair: 'Stair', railing: 'Railing',
+  };
+  return friendlyNames[normalized.toLowerCase()] || normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
+};
+
 export const RightPanel = ({
   isOpen, onClose, rightTab, setRightTab,
   selectedObject, selectedElements = [], multiSelectMode = false, onToggleMultiSelect, onClearSelection, onDeleteSelected, activeAsset, selectedAssetId,
@@ -26,22 +38,37 @@ export const RightPanel = ({
   engineState, engineActions, adoptIsolatedAsset, updateStructuralEdit,
   onDeleteProject, isDarkMode, toggleTheme, activeSavedLayout = null, onSaveLayout, isLayoutSaving = false,
   fileNameForLayoutMetadata = '', existingSavedLayouts = [], saveStatus, onApplyToAllWalls,
-  materialLibrary = [], selectedMaterial = null, onApplyMaterial, onApplyMaterialToAllWalls
+  materialLibrary = [], materialLibraryLoading = false, materialLibraryError = '', selectedMaterial = null, onApplyMaterial, onApplyMaterialToAllWalls,
+  wallSurfaceScope = 'both', onWallSurfaceScopeChange = () => {}
 }) => {
-  const [propertySubTab, setPropertySubTab] = useState('details');
+  const [propertySubTab, setPropertySubTab] = useState('design');
   const [materialMode, setMaterialMode] = useState('color');
-  const [wallSurfaceScope, setWallSurfaceScope] = useState('both');
+  const [paletteSearch, setPaletteSearch] = useState('');
+  const [paletteBrandFilter, setPaletteBrandFilter] = useState('all');
   const [showSaveLayoutForm, setShowSaveLayoutForm] = useState(false);
   const isMultiSelection = selectedElements.length > 1;
   const selectedWallCount = selectedElements.filter(item => item?.isWall).length;
   const selectedAssetCount = selectedElements.length - selectedWallCount;
   const hasWallSelection = selectedWallCount > 0 || String(selectedObject?.type || '').toLowerCase().includes('ifcwall');
 
+  const paletteColors = materialLibrary.filter((material) => material.kind === 'color');
+  const paletteBrands = [...new Set(paletteColors.map((material) => material.brand || 'General colours'))].sort((a, b) => a.localeCompare(b));
+  const filteredPaletteColors = paletteColors.filter((material) => {
+    const query = paletteSearch.trim().toLowerCase();
+    const matchesBrand = paletteBrandFilter === 'all' || (material.brand || 'General colours') === paletteBrandFilter;
+    const haystack = [material.name, material.color, material.category, material.brand, material.collection, material.shadeCode, material.shade_code].filter(Boolean).join(' ').toLowerCase();
+    return matchesBrand && (!query || haystack.includes(query));
+  });
+
   // Unified State for Transform
   const [liveTransform, setLiveTransform] = useState({ 
       x: 0, y: 0, z: 0, rotY: 0, scaleX: 1, scaleY: 1, scaleZ: 1 
   });
   const boundsRef = useRef({ xMin: -8, xMax: 8, zMin: -8, zMax: 8 });
+
+  useEffect(() => {
+    setPropertySubTab('design');
+  }, [selectedObject?.id, selectedAssetId, isMultiSelection]);
 
   // True BIM Resize state (native architectural elements only)
   const [bimDimensions, setBimDimensions] = useState(null);
@@ -154,10 +181,10 @@ export const RightPanel = ({
               }}
               disabled={isLayoutSaving}
               className="flex items-center gap-2 bg-[#ff914d] hover:bg-[#ff7a28] disabled:opacity-75 disabled:cursor-wait text-white px-3 py-1.5 rounded-md text-[10px] font-bold tracking-wide transition-colors shadow-sm"
-              title={activeSavedLayout?.id ? `Save changes to ${activeSavedLayout.name}` : 'Save the current design as a reusable layout'}
+              title={activeSavedLayout?.id ? `Save changes to ${activeSavedLayout.name}` : 'Save a reusable version of this design'}
             >
               {isLayoutSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Layers3 className="w-3.5 h-3.5"/>}
-              {isLayoutSaving ? 'Saving...' : 'Save Layout'}
+              {isLayoutSaving ? 'Saving…' : 'Save design'}
             </button>
           </div>
 
@@ -166,7 +193,7 @@ export const RightPanel = ({
               {isDarkMode ? <Sun className="w-3.5 h-3.5"/> : <Moon className="w-3.5 h-3.5"/>}
             </button>
             <div className="w-px h-3 bg-slate-300 dark:bg-slate-600"></div>
-            <button onClick={onDeleteProject} className="p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10 rounded transition-colors" title="Delete Project">
+            <button onClick={onDeleteProject} className="p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10 rounded transition-colors" title="Delete this project and its working data">
               <Trash2 className="w-3.5 h-3.5"/>
             </button>
           </div>
@@ -176,27 +203,27 @@ export const RightPanel = ({
         <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5">
               {saveStatus === 'saving' ? (
-                <><Loader2 className="w-3 h-3 text-indigo-500 animate-spin" /><span className="text-[9px] font-semibold uppercase text-slate-500">Auto-Saving</span></>
+                <><Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-500" /><span className="text-[10px] font-medium text-slate-600 dark:text-slate-300">Saving changes…</span></>
               ) : saveStatus === 'saved' ? (
-                <><CloudCog className="w-3 h-3 text-emerald-500" /><span className="text-[9px] font-semibold uppercase text-slate-500">Synced</span></>
+                <><CloudCog className="h-3.5 w-3.5 text-emerald-500" /><span className="text-[10px] font-medium text-slate-600 dark:text-slate-300">All changes saved</span></>
               ) : (
-                <><Clock className="w-3 h-3 text-amber-500" /><span className="text-[9px] font-semibold uppercase text-slate-500">Pending</span></>
+                <><Clock className="h-3.5 w-3.5 text-amber-500" /><span className="text-[10px] font-medium text-slate-600 dark:text-slate-300">Changes not saved yet</span></>
               )}
             </div>
 
             {(multiSelectMode || isMultiSelection) && (
               <div className="flex items-center gap-2 rounded-lg border border-cyan-400/20 bg-cyan-500/10 px-2 py-1">
-                <span className="text-[9px] font-bold text-cyan-300">{selectedElements.length} selected</span>
+                <span className="text-[10px] font-semibold text-cyan-300">{selectedElements.length} items selected</span>
                 {multiSelectMode && (
-                  <button type="button" onClick={() => onToggleMultiSelect?.()} className="text-[9px] font-semibold text-cyan-300 hover:text-white">Done</button>
+                  <button type="button" onClick={() => onToggleMultiSelect?.()} className="text-[10px] font-semibold text-cyan-300 hover:text-white">Done</button>
                 )}
-                <button type="button" onClick={onClearSelection} className="text-[9px] font-semibold text-slate-400 hover:text-white">Clear</button>
+                <button type="button" onClick={onClearSelection} className="text-[10px] font-semibold text-slate-400 hover:text-white">Clear selection</button>
               </div>
             )}
 
             <div className="flex bg-slate-200 dark:bg-slate-800 rounded-md p-0.5">
-                <button onClick={() => setRightTab('properties')} className={`px-3 py-1 text-[10px] font-bold rounded shadow-sm transition-all ${rightTab === 'properties' ? 'bg-white dark:bg-slate-700 text-indigo-600 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>Properties</button>
-                <button onClick={() => setRightTab('settings')} className={`px-3 py-1 text-[10px] font-bold rounded shadow-sm transition-all ${rightTab === 'settings' ? 'bg-white dark:bg-slate-700 text-indigo-600 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>Settings</button>
+                <button onClick={() => setRightTab('properties')} className={`px-3 py-1.5 text-[11px] font-semibold rounded-lg shadow-sm transition-all ${rightTab === 'properties' ? 'bg-white dark:bg-slate-700 text-indigo-600 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>Properties</button>
+                <button onClick={() => setRightTab('settings')} className={`px-3 py-1.5 text-[11px] font-semibold rounded-lg shadow-sm transition-all ${rightTab === 'settings' ? 'bg-white dark:bg-slate-700 text-indigo-600 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>Settings</button>
             </div>
         </div>
       </div>
@@ -206,9 +233,9 @@ export const RightPanel = ({
           <div className="min-h-full rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl dark:border-slate-700 dark:bg-slate-900">
             <div className="mb-4 flex items-start justify-between gap-3">
               <div>
-                <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-indigo-500">Save Layout</p>
-                <h3 className="mt-1 text-base font-bold text-slate-900 dark:text-white">Save current design</h3>
-                <p className="mt-1 text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">The current design will be compiled in the background and saved with its latest thumbnail.</p>
+                <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-[#d96b25]">Saved design</p>
+                <h3 className="mt-1 text-lg font-bold text-slate-900 dark:text-white">Save this design</h3>
+                <p className="mt-1 text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">We’ll prepare a reusable saved design in the background, including a preview image.</p>
               </div>
               <button type="button" onClick={() => setShowSaveLayoutForm(false)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-white/5 dark:hover:text-white" aria-label="Close save layout form">
                 <X className="h-4 w-4" />
@@ -233,21 +260,36 @@ export const RightPanel = ({
       {rightTab === 'properties' && (
         <div className="flex flex-col h-full overflow-hidden">
             {!(selectedObject || activeAsset) ? (
-                <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-slate-400 dark:text-slate-500">
-                    <Component className="w-12 h-12 mb-4 opacity-50" />
-                    <p className="text-sm font-medium">No Element Selected</p>
-                    <p className="text-xs mt-2">Click on any wall, floor, or dropped asset in the 3D view to inspect and edit.</p>
+                <div className="flex-1 overflow-y-auto px-4 py-6 text-slate-500 dark:text-slate-400">
+                    <div className="mx-auto flex max-w-[270px] flex-col items-center text-center">
+                        <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-orange-200 bg-orange-50 text-[#ff914d] shadow-sm dark:border-orange-500/20 dark:bg-orange-500/10">
+                            <MousePointer2 className="h-6 w-6" />
+                        </div>
+                        <p className="mt-4 text-base font-bold text-slate-900 dark:text-white">Select something to edit</p>
+                        <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">Click a wall, door, floor or furniture item in the model. Its editing options will appear here.</p>
+                    </div>
+                    <div className="mx-auto mt-6 max-w-[280px] space-y-3">
+                        <div className="flex gap-3 rounded-xl border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-800/60">
+                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-200"><MousePointer2 className="h-4 w-4" /></span>
+                            <div><p className="text-xs font-semibold text-slate-800 dark:text-slate-100">Choose an element</p><p className="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Click it in the 3D view or the Model list.</p></div>
+                        </div>
+                        <div className="flex gap-3 rounded-xl border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-800/60">
+                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-orange-50 text-[#ff914d] dark:bg-orange-500/10"><Palette className="h-4 w-4" /></span>
+                            <div><p className="text-xs font-semibold text-slate-800 dark:text-slate-100">Make it yours</p><p className="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Change its look, position or size from the tabs above.</p></div>
+                        </div>
+                        <p className="px-1 text-center text-[10px] leading-4 text-slate-400">Your changes can be reversed with Undo at the top of the canvas.</p>
+                    </div>
                 </div>
             ) : (
                 <>
                     <div className="px-5 py-4 border-b border-slate-100 dark:border-slate-800 shrink-0">
-                        <h3 className="text-slate-900 dark:text-white font-bold text-sm break-all">{isMultiSelection ? `${selectedElements.length} elements selected` : (activeAsset ? projectState.furniture.find(f => f.instanceId === selectedAssetId)?.name : selectedObject.name)}</h3>
-                        <span className="text-indigo-500 dark:text-indigo-400 text-[10px] uppercase tracking-wider font-bold">{isMultiSelection ? `${selectedWallCount} walls${selectedAssetCount ? ` · ${selectedAssetCount} other` : ''}` : (activeAsset ? 'Placed IFC Asset' : selectedObject.type)}</span>
+                        <h3 className="text-slate-900 dark:text-white font-bold text-sm break-all">{isMultiSelection ? `${selectedElements.length} items selected` : (activeAsset ? projectState.furniture.find(f => f.instanceId === selectedAssetId)?.name : (selectedObject.name || formatElementType(selectedObject.type)))}</h3>
+                        <span className="text-indigo-500 dark:text-indigo-400 text-[10px] uppercase tracking-wider font-bold">{isMultiSelection ? `${selectedWallCount} walls${selectedAssetCount ? ` · ${selectedAssetCount} other items` : ''}` : (activeAsset ? 'Placed item' : formatElementType(selectedObject.type))}</span>
                     </div>
 
                     <div className="flex border-b border-slate-200 dark:border-slate-800 shrink-0">
-                        <button onClick={() => setPropertySubTab('details')} className={`flex-1 py-2.5 text-[11px] font-bold tracking-wider uppercase transition-colors ${propertySubTab === 'details' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-[#ff914d]' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}>Metadata</button>
-                        <button onClick={() => setPropertySubTab('design')} className={`flex-1 py-2.5 text-[11px] font-bold tracking-wider uppercase transition-colors ${propertySubTab === 'design' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-[#ff914d]' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}>Design/Transform</button>
+                        <button onClick={() => setPropertySubTab('details')} className={`flex-1 py-2.5 text-[11px] font-bold tracking-wider uppercase transition-colors ${propertySubTab === 'details' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-[#ff914d]' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}>Details</button>
+                        <button onClick={() => setPropertySubTab('design')} className={`flex-1 py-2.5 text-[11px] font-bold tracking-wider uppercase transition-colors ${propertySubTab === 'design' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-[#ff914d]' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}>Appearance & position</button>
                     </div>
 
                     <div className="flex-1 overflow-y-auto p-5">
@@ -285,7 +327,7 @@ export const RightPanel = ({
                                 {/* Material Library */}
                                 <div>
                                   <div className="flex items-center justify-between mb-3">
-                                    <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><Palette className="w-3.5 h-3.5"/> Surface Finish</h4>
+                                    <div><h4 className="text-xs font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5"><Palette className="w-3.5 h-3.5 text-[#ff914d]"/> Appearance</h4><p className="mt-1 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Choose a color, fabric or texture for the selected surface.</p></div>
                                     <span className="text-[9px] text-slate-400 dark:text-slate-500">Separate color, fabric and texture</span>
                                   </div>
                                   {!activeAsset && hasWallSelection && (
@@ -297,7 +339,7 @@ export const RightPanel = ({
                                         </div>
                                         <select
                                           value={wallSurfaceScope}
-                                          onChange={(e) => setWallSurfaceScope(e.target.value)}
+                                          onChange={(e) => onWallSurfaceScopeChange(e.target.value)}
                                           className="rounded-lg border border-indigo-200 bg-white px-2.5 py-1.5 text-[9px] font-bold text-slate-700 outline-none focus:border-indigo-400 dark:border-indigo-500/30 dark:bg-slate-900 dark:text-slate-200"
                                         >
                                           <option value="interior">Interior</option>
@@ -309,7 +351,7 @@ export const RightPanel = ({
                                   )}
                                   <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 mb-3">
                                     {['color','fabric','texture'].map(tab => (
-                                      <button key={tab} type="button" onClick={() => setMaterialMode(tab)} className={`flex-1 py-1.5 rounded-lg text-[9px] font-bold capitalize transition-colors ${materialMode === tab ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>{tab}</button>
+                                      <button key={tab} type="button" onClick={() => setMaterialMode(tab)} className={`flex-1 py-1.5 rounded-lg text-[9px] font-bold transition-colors ${materialMode === tab ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>{tab === 'color' ? 'Palette' : tab === 'fabric' ? 'Fabric' : 'Texture'}</button>
                                     ))}
                                   </div>
                                   {materialMode === 'color' && (
@@ -321,27 +363,49 @@ export const RightPanel = ({
                                         </label>
                                         <div><div className="text-[9px] text-slate-400 uppercase tracking-wider">Current color</div><div className="font-mono text-xs text-slate-700 dark:text-slate-200 mt-1">{(customColor || '#FFFFFF').toUpperCase()}</div></div>
                                       </div>
-                                      <div className="grid grid-cols-5 gap-2">
-                                        {materialLibrary.filter(m => m.kind === 'color').map(material => (
-                                          <button key={material.id} type="button" title={material.name} onClick={() => onApplyMaterial?.(material, wallSurfaceScope)} style={{backgroundColor: material.color}} className={`aspect-square rounded-lg border transition-all hover:scale-105 ${selectedMaterial?.kind === 'color' && selectedMaterial?.color?.toUpperCase() === material.color.toUpperCase() ? 'border-[#ff914d] ring-2 ring-[#ff914d]/20' : 'border-slate-200 dark:border-slate-600'}`} />
-                                        ))}
+                                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,0.8fr)]">
+                                        <input value={paletteSearch} onChange={(event) => setPaletteSearch(event.target.value)} placeholder="Search shade, code or HEX…" aria-label="Search architectural color palette" className="min-w-0 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[10px] text-slate-700 outline-none focus:border-indigo-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200" />
+                                        <select value={paletteBrandFilter} onChange={(event) => setPaletteBrandFilter(event.target.value)} aria-label="Filter color palette by brand" className="min-w-0 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[10px] text-slate-700 outline-none focus:border-indigo-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200">
+                                          <option value="all">All brands / palettes</option>
+                                          {paletteBrands.map((brand) => <option key={brand} value={brand}>{brand}</option>)}
+                                        </select>
+                                      </div>
+                                      <div className="max-h-72 overflow-y-auto pr-1">
+                                        <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                                          {filteredPaletteColors.map((material) => (
+                                            <button key={material.id} type="button" title={`${material.name} · ${material.brand || material.category || 'Color'} · ${material.collection || ''} · ${material.shadeCode || ''} · ${material.color}`} onClick={() => onApplyMaterial?.(material, wallSurfaceScope)} className={`flex min-w-0 items-center gap-2 rounded-lg border p-1.5 text-left transition-colors ${selectedMaterial?.kind === 'color' && selectedMaterial?.color?.toUpperCase() === material.color.toUpperCase() ? 'border-[#ff914d] bg-orange-50 ring-1 ring-[#ff914d]/20 dark:bg-orange-500/10' : 'border-slate-200 bg-white hover:border-slate-300 dark:border-slate-700 dark:bg-slate-900 dark:hover:border-slate-600'}`}>
+                                              <span className="h-9 w-9 shrink-0 rounded-md border border-black/10 dark:border-white/10" style={{ backgroundColor: material.color }} />
+                                              <span className="min-w-0 flex-1"><span className="block truncate text-[10px] font-bold text-slate-700 dark:text-slate-200">{material.name}</span><span className="block truncate text-[9px] text-slate-400">{[material.brand, material.collection, material.shadeCode].filter(Boolean).join(' · ') || material.category}</span><span className="block font-mono text-[9px] text-slate-500">{String(material.color || '#FFFFFF').toUpperCase()}</span></span>
+                                            </button>
+                                          ))}
+                                        </div>
+                                        {!filteredPaletteColors.length && <p className="px-2 py-3 text-center text-[10px] text-slate-400">No palette colors match this search.</p>}
                                       </div>
                                     </div>
                                   )}
                                   {materialMode !== 'color' && (
                                     <div className="grid grid-cols-2 gap-2">
                                       {materialLibrary.filter(m => m.kind === materialMode).map(material => (
-                                        <button key={material.id} type="button" onClick={() => onApplyMaterial?.(material, wallSurfaceScope)} className={`group flex items-center gap-2 p-2 rounded-xl border text-left transition-all ${selectedMaterial?.kind === material.kind && selectedMaterial?.texture?.id === material.id ? 'border-[#ff914d] bg-orange-50 dark:bg-orange-500/10 ring-1 ring-[#ff914d]/30' : 'border-slate-200/80 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600'}`}>
+                                        <button key={material.id} type="button" onClick={() => onApplyMaterial?.(material, wallSurfaceScope)} className={`group flex items-center gap-2 p-2 rounded-xl border text-left transition-all ${selectedMaterial?.kind === material.kind && (selectedMaterial?.id === material.id || selectedMaterial?.texture?.id === material.slug || selectedMaterial?.texture?.id === material.id) ? 'border-[#ff914d] bg-orange-50 dark:bg-orange-500/10 ring-1 ring-[#ff914d]/30' : 'border-slate-200/80 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600'}`}>
                                           <span className="w-10 h-10 rounded-lg border border-black/10 dark:border-white/10 shrink-0 overflow-hidden shadow-sm bg-cover bg-center" style={{ backgroundColor: material.color, backgroundImage: material.textureSrc ? `url(${material.textureSrc})` : 'none' }} />
                                           <span className="min-w-0"><span className="block text-[9px] font-semibold text-slate-700 dark:text-slate-200 truncate">{material.name}</span><span className="block text-[8px] text-slate-400 mt-0.5">{material.category}</span></span>
                                         </button>
                                       ))}
                                     </div>
                                   )}
+                                  {materialMode !== 'color' && !materialLibraryLoading && !materialLibrary.filter(material => material.kind === materialMode).length && (
+                                    <div className="rounded-xl border border-dashed border-slate-300 px-3 py-4 text-center dark:border-slate-700">
+                                      <p className="text-[10px] font-semibold text-slate-600 dark:text-slate-300">{materialLibraryError ? 'Material library unavailable' : `No ${materialMode === 'fabric' ? 'fabrics' : 'textures'} uploaded yet`}</p>
+                                      <p className="mt-1 text-[9px] leading-4 text-slate-400">{materialLibraryError || 'Open Admin → Surface Materials to upload and manage reusable finishes.'}</p>
+                                    </div>
+                                  )}
+                                  {materialMode !== 'color' && materialLibraryLoading && (
+                                    <div className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 px-3 py-4 text-[10px] text-slate-400 dark:border-slate-700"><span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-indigo-500" /> Loading surface materials…</div>
+                                  )}
                                   {onApplyMaterialToAllWalls && hasWallSelection && (selectedMaterial || materialMode === 'color') && (selectedMaterial || customColor) && (
                                     <div className="pt-3 mt-3 border-t border-slate-200 dark:border-slate-700/50">
                                       <button type="button" onClick={() => onApplyMaterialToAllWalls(selectedMaterial || materialLibrary.find(m => m.kind === 'color' && m.color.toUpperCase() === (customColor || '').toUpperCase()) || { kind:'color', color:customColor, rgb:[parseInt(customColor.slice(1,3),16)/255,parseInt(customColor.slice(3,5),16)/255,parseInt(customColor.slice(5,7),16)/255] }, wallSurfaceScope)} className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border border-indigo-200 dark:border-indigo-500/25 bg-indigo-50 dark:bg-indigo-500/8 text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-500/14 transition-colors">
-                                        <span className="text-left"><span className="block text-[10px] font-bold">Apply finish to all walls</span><span className="block text-[9px] text-indigo-500/80 dark:text-indigo-300/70 mt-0.5">Match the selected color, fabric or texture</span></span>
+                                        <span className="text-left"><span className="block text-[10px] font-bold">Apply finish to every wall</span><span className="block text-[9px] text-indigo-500/80 dark:text-indigo-300/70 mt-0.5">Use this color, fabric or texture across the walls</span></span>
                                         <span className="text-[9px] font-bold uppercase tracking-wider">Apply →</span>
                                       </button>
                                     </div>
@@ -353,24 +417,24 @@ export const RightPanel = ({
                                 {/* Position */}
                                 <div>
                                     <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                                        <Move className="w-3.5 h-3.5"/> {activeAsset ? 'Position' : 'Position (Offset)'}
+                                        <Move className="w-3.5 h-3.5"/> {activeAsset ? 'Position' : 'Position adjustment'}
                                     </h4>
                                     <div className="space-y-4">
                                         <div>
                                             <label className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 flex justify-between mb-1">
-                                                X Axis (Side) <span className="font-mono text-indigo-500">{liveTransform.x.toFixed(2)}</span>
+                                                Side to side (X) <span className="font-mono text-indigo-500">{liveTransform.x.toFixed(2)}</span>
                                             </label>
                                             <input type="range" min={boundsRef.current.xMin} max={boundsRef.current.xMax} step="0.05" value={liveTransform.x} onChange={(e) => handleSlider(0, e.target.value, 'position')} className="w-full accent-indigo-500" />
                                         </div>
                                         <div>
                                             <label className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 flex justify-between mb-1">
-                                                Y Axis (Elevation) <span className="font-mono text-indigo-500">{liveTransform.y.toFixed(2)}</span>
+                                                Height (Y) <span className="font-mono text-indigo-500">{liveTransform.y.toFixed(2)}</span>
                                             </label>
                                             <input type="range" min={ELEVATION_RANGE[0]} max={ELEVATION_RANGE[1]} step="0.02" value={liveTransform.y} onChange={(e) => handleSlider(1, e.target.value, 'position')} className="w-full accent-indigo-500" />
                                         </div>
                                         <div>
                                             <label className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 flex justify-between mb-1">
-                                                Z Axis (Depth) <span className="font-mono text-indigo-500">{liveTransform.z.toFixed(2)}</span>
+                                                Front to back (Z) <span className="font-mono text-indigo-500">{liveTransform.z.toFixed(2)}</span>
                                             </label>
                                             <input type="range" min={boundsRef.current.zMin} max={boundsRef.current.zMax} step="0.05" value={liveTransform.z} onChange={(e) => handleSlider(2, e.target.value, 'position')} className="w-full accent-indigo-500" />
                                         </div>
@@ -381,8 +445,9 @@ export const RightPanel = ({
                                   <button 
   className="w-full mt-4 py-2 bg-[#ff914d] text-white rounded-lg hover:bg-indigo-700 transition text-xs font-semibold"
   onClick={() => engineActions.isolateAndMakeMoveable(selectedObject.id, adoptIsolatedAsset, updateStructuralEdit)}
+  title="Make this building element movable so you can adjust its position."
 >
-  Make Element Moveable
+  Enable editing
 </button>
                                 )}
 
@@ -407,7 +472,7 @@ export const RightPanel = ({
                                 {!isInspecting && !activeAsset && selectedObject && bimDimensions && (
                                     <div className="pt-4 border-t border-slate-100 dark:border-slate-800">
                                         <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                                            <Ruler className="w-3.5 h-3.5"/> Parametric BIM Edit
+                                            <Ruler className="w-3.5 h-3.5"/> Size & dimensions
                                         </h4>
                                         <div className="bg-slate-50 dark:bg-slate-800/50 p-4 rounded-xl border border-slate-200 dark:border-slate-700/50 space-y-3">
                                             <div>
@@ -493,7 +558,7 @@ export const RightPanel = ({
                                         {!activeAsset && selectedObject && (
                                             <div className="mb-3 p-2.5 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40 rounded-lg text-[10px] text-amber-700 dark:text-amber-400 leading-relaxed flex items-start gap-1.5">
                                                 <Info className="w-3 h-3 mt-0.5 shrink-0"/>
-                                                Parametric editing disabled for complex mesh. Using 3D scaling.
+                                                Direct dimension editing isn’t available for this shape. You can still resize it in 3D.
                                             </div>
                                         )}
                                         {/* <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-1.5"><Maximize2 className="w-3.5 h-3.5"/> Scale / Resize</h4>

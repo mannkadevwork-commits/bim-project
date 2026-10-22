@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import * as WebIFC from 'web-ifc';
+import { initializeWebIFCApi } from './webIfcRuntime';
 
 export function generateIfcThumbnail(file, size = 256) {
   return new Promise((resolve, reject) => {
@@ -9,8 +10,7 @@ export function generateIfcThumbnail(file, size = 256) {
         const data = new Uint8Array(e.target.result);
 
         const ifcAPI = new WebIFC.IfcAPI();
-        ifcAPI.SetWasmPath('/');
-        await ifcAPI.Init();
+        await initializeWebIFCApi(ifcAPI);
 
         const modelID = ifcAPI.OpenModel(data);
 

@@ -248,6 +248,10 @@ export const loadIFCAssetIntoScene = async (
       fileType: 'ifc',
       assetFormat: 'ifc',
       srcUrl,
+      ...(options.isNativeIsolation ? { isNativeIsolation: true } : {}),
+      ...(options.nativeSourceId ? { nativeSourceId: options.nativeSourceId } : {}),
+      ...(options.sourceJobId ? { sourceJobId: options.sourceJobId } : {}),
+      ...(options.doorHostWallId ? { doorHostWallId: options.doorHostWallId } : {}),
     };
 
     assetModel.on('loaded', () => {
@@ -264,7 +268,12 @@ export const loadIFCAssetIntoScene = async (
         ? rotation
         : [0, 0, 0];
 
-      const persistedIFCMatrix = isValidMatrix16(options.persistedMatrix)
+      // Raw IFC matrices are authoritative only for native-isolated elements.
+      // Standalone/catalogue IFCs (including hosted doors) persist semantic
+      // target + rotation + scale. Replaying a stale model-origin matrix for
+      // those assets makes them jump because their saved position is an AABB
+      // floor/contact target, not the SceneModel origin translation.
+      const persistedIFCMatrix = options.isNativeIsolation && isValidMatrix16(options.persistedMatrix)
         ? Array.from(options.persistedMatrix)
         : null;
 
@@ -358,12 +367,29 @@ export const isolateAndMakeMoveable = async (ctx, entityId, onAdoptCallback, upd
   try {
     const viewer = viewerRef.current;
     const originalModel = currentModelRef?.current || null;
-    const originalNativeEntities = viewer
+    // Resolve/capture the main-model entity before loading another IFC with the
+    // same GlobalId. The direct reference remains valid even if scene.objects
+    // later indexes the isolated replacement under that id.
+    const rememberedNativeEntry = ctx.rememberNativeEntity?.(entityId);
+    const rememberedNativeEntity = rememberedNativeEntry?.model === originalModel
+      && rememberedNativeEntry?.entity?.destroyed !== true
+      ? rememberedNativeEntry.entity
+      : null;
+    const indexedNativeEntities = viewer
       ? Object.values(viewer.scene.objects || {}).filter((object) => (
           object?.id === entityId
           && (!originalModel || object.model === originalModel)
         ))
       : [];
+    const originalNativeEntities = rememberedNativeEntity
+      ? [rememberedNativeEntity]
+      : indexedNativeEntities;
+    if (!originalNativeEntities.length) {
+      // Refuse before asking the backend to create/load an isolation when there
+      // is no safe reference to the original entity. Guessing from duplicate IDs
+      // after load is how unrelated walls can be hidden.
+      throw new Error(`Cannot safely unlock native element ${entityId}: its main-model entity is not available.`);
+    }
 
     console.info('[NativeEdit] Unlock request:', {
       jobId,
@@ -419,31 +445,16 @@ export const isolateAndMakeMoveable = async (ctx, entityId, onAdoptCallback, upd
     }
     await loadedPromise;
 
-    const nativeEntitiesToHide = originalNativeEntities.length > 0
-      ? originalNativeEntities
-      : (viewerRef.current
-        ? Object.values(viewerRef.current.scene.objects || {}).filter((object) => (
-            object?.id === entityId
-            && object?.model
-            && object.model !== isolatedModel
-          ))
-        : []);
-
+    // Use only the original entity captured before the duplicate-ID model
+    // loaded. Never fall back to an arbitrary scene.objects entry here.
+    const nativeEntitiesToHide = originalNativeEntities;
     nativeEntitiesToHide.forEach((entity) => {
       try { entity.visible = false; } catch (error) {
         console.warn('[NativeEdit] Failed to hide original native entity:', entityId, error);
       }
     });
 
-    if (nativeEntitiesToHide.length > 0) {
-      updateStructuralEdit?.(entityId, 'visible', null, false);
-    } else {
-      console.warn('[NativeEdit] Original native entity was not found after isolation:', {
-        jobId,
-        entityId,
-        isolatedModelId: isolatedModel.id,
-      });
-    }
+    updateStructuralEdit?.(entityId, 'visible', null, false);
 
     onAdoptCallback?.(
       entityId,

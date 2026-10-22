@@ -9,6 +9,7 @@ import { SectionPlanesPlugin } from '@xeokit/xeokit-sdk/src/plugins/SectionPlane
 import { DistanceMeasurementsPlugin } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsPlugin';
 import { DistanceMeasurementsMouseControl } from '@xeokit/xeokit-sdk/src/plugins/DistanceMeasurementsPlugin/DistanceMeasurementsMouseControl';
 import * as WebIFC from 'web-ifc';
+import { initializeWebIFCApi } from '../utils/webIfcRuntime';
 
 import { API_BASE_URL, AXIS_HANDLE_COLORS, STRETCH_HANDLE_DRAG_SCALE, STRETCH_HANDLE_HOVER_SCALE } from './utils/constants';
 import { brightenColor } from './utils/helpers';
@@ -18,12 +19,14 @@ import { toggleMeasurementMode, clearMeasurements, syncMeasurementsList, deleteM
 import { scaleModelByMeasurement, calibrateWallHeight } from './calibration/CalibrationController';
 import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './placement/PlacementController';
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
+import { rememberNativeEntityRef, setNativeEntityVisibleForEdit as setNativeEntityVisible, restoreNativeEntityVisibility as restoreNativeEntityVisible, reconcileNativeEntityVisibility } from './nativeEntityHistory';
 import { calculateGrabPoint, translateMatrixWorld } from './stretch/TranslationController';
 import { CameraManager } from './CameraManager';
 import { applyGLBPlacementTransform, getGLBPlacementTarget, getGLBRotation, getGLBScale, isGLBModel, GLB_TRANSFORM_VERSION } from './assets/GLBAssetTransform';
+import { assetTransformSignature, markAssetTransformApplied } from './assets/assetTransformIdentity';
 import { beginIFCRotation, updateIFCRotation, commitIFCRotationState, projectWorldToCanvas } from './assets/IFCRotationController';
 import { beginIFCResize, updateIFCResize, commitIFCResize, isIFCModel } from './stretch/IFCResizeController';
-import { applyMaterialDefinitionToSceneTarget, configureNativeIFCMaterialController, disposeNativeIFCMaterialController } from '../utils/materialScene';
+import { applyMaterialDefinitionToSceneTarget, reconcileMaterialDefinitionsToScene, configureNativeIFCMaterialController, disposeNativeIFCMaterialController } from '../utils/materialScene';
 import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
 
 const getNavCubeTheme = (isDarkMode) => ({
@@ -51,6 +54,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const ifcAPIRef = useRef(null);
   const sectionPlanesRef = useRef(null);
   const currentModelRef = useRef(null);
+  // Keep direct references to native IFC entities before isolated/cut IFC models
+  // introduce duplicate GlobalIds into xeokit's scene.objects index. Looking up a
+  // host wall by id after that point can return the isolated copy, not the original.
+  const nativeEntityRefsRef = useRef(new Map());
   const currentPlaneRef = useRef(null);
   const measurementsPluginRef = useRef(null);
   const measurementControlRef = useRef(null);
@@ -72,6 +79,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
   const [sceneScaleFactor, setSceneScaleFactor] = useState({ x: 1, y: 1, z: 1 });
   const [isLoading, setIsLoading] = useState(false);
+  const [isWebGLContextLost, setIsWebGLContextLost] = useState(false);
   const [isXRay, setIsXRay] = useState(false);
   const [isClipping, setIsClipping] = useState(false);
   const [navMode, setNavMode] = useState('orbit');
@@ -357,6 +365,16 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     return snapshot;
   };
 
+  const nativeEntityHistoryContext = { viewerRef, currentModelRef, nativeEntityRefsRef };
+  const rememberNativeEntity = (entityId) => rememberNativeEntityRef(nativeEntityHistoryContext, entityId);
+  const setNativeEntityVisibleForEdit = (entityId, visible) => (
+    setNativeEntityVisible(nativeEntityHistoryContext, entityId, visible)
+  );
+  const restoreNativeEntityVisibilityFromState = (state) => (
+    reconcileNativeEntityVisibility(nativeEntityHistoryContext, state)
+  );
+
+
   const restoreProjectStateToScene = (stateOverride) => {
     if (!viewerRef.current || !currentModelRef.current) return Promise.resolve([]);
     const state = stateOverride || projectStateRef.current;
@@ -409,11 +427,17 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       return Promise.resolve([]);
     }
 
-    if (state.materials) {
-      Object.entries(state.materials).forEach(([targetId, matData]) => {
-        void applyMaterialDefinitionToSceneTarget(viewerRef.current, targetId, matData);
-      });
-    }
+    // Reconcile visual materials against the full persisted snapshot. Merely
+    // applying entries that still exist leaves stale overrides visible after
+    // undoing the first application. Hidden/deleted native walls keep their
+    // material in project state for undo, but their viewport overlay is removed
+    // until visibility is restored.
+    const sceneMaterialDefinitions = Object.fromEntries(
+      Object.entries(state.materials || {}).filter(([targetId]) => (
+        state.structural_edits?.[targetId]?.visible !== false
+      ))
+    );
+    reconcileMaterialDefinitionsToScene(viewerRef.current, sceneMaterialDefinitions);
 
     // Reconstruct the exact model matrix after an asset/isolation finishes loading.
   // Resize writes model.matrix directly (the authoritative Xeokit transform).
@@ -470,6 +494,15 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const applyFurnitureStateToExistingModel = (model, item) => {
     if (!model || !item) return;
 
+    const isNativeIsolation = !!item.isNativeIsolation;
+    const transformKey = assetTransformSignature(item);
+
+    // Scene reconciliation runs after many unrelated project edits (for example,
+    // deleting a different IFC object). Do not reapply an unchanged transform:
+    // doing so can turn the world-space AABB target back into a model-origin offset
+    // on matrix-authored IFCs, making a hosted door jump between two locations.
+    if (model._assetMeta?.lastAppliedTransformKey === transformKey) return;
+
     const fileType = String(item.fileType || item.file_type || '').toLowerCase();
     const isGLB = isGLBModel(model) || fileType === 'glb' || fileType === 'gltf';
     const position = Array.isArray(item.position) && item.position.length === 3
@@ -484,12 +517,14 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     if (isGLB) {
       applyGLBPlacementTransform(model, position, rotation, scale);
+      markAssetTransformApplied(model, item);
       return;
     }
 
     if (item.isNativeIsolation) {
       // Native isolation keeps its established matrix-based representation.
       applyPersistedModelMatrix(model, item);
+      markAssetTransformApplied(model, item);
       return;
     }
 
@@ -515,24 +550,16 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     } else {
       model.position = position;
     }
+
+    markAssetTransformApplied(model, item);
   };
 
 
-    // Door insertion hides a native host wall immediately for responsiveness.
-    // Undo/redo must restore the non-React Xeokit visibility side-effect as well
-    // as projectState. Reconcile every wall we marked, including the case where
-    // undo removes the structural_edits entry entirely.
-    Object.values(viewerRef.current.scene.objects || {}).forEach((entity) => {
-      if (!entity || entity.model !== currentModelRef.current) return;
-      if (typeof entity.__hciDoorOriginalVisible !== 'boolean') return;
-      const edit = state.structural_edits?.[entity.id];
-      const nextVisible = edit?.visible === false
-        ? false
-        : entity.__hciDoorOriginalVisible;
-      try { entity.visible = nextVisible; } catch (error) {
-        console.warn('[DoorHistory] Could not restore host-wall visibility:', entity.id, error);
-      }
-    });
+    // Reconcile direct native references before isolated models are reconciled.
+    // A cut-wall IFC repeats the host wall's GlobalId; once loaded it may shadow
+    // the original in scene.objects. Direct references make undo/redo independent
+    // of that id-indexed lookup and restore the original wall even after shadowing.
+    restoreNativeEntityVisibilityFromState(state);
 
   // Restore native IFC edits FIRST, before loading any isolated IFC assets.
     //
@@ -547,10 +574,14 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     // function is only called from the main model's `loaded` callback.
     if (state.structural_edits) {
       Object.entries(state.structural_edits).forEach(([entityId, edit]) => {
-        const entity = currentModelRef.current
-          ? Object.values(viewerRef.current.scene.objects || {})
-              .find(object => object?.id === entityId && object.model === currentModelRef.current)
-          : null;
+        const remembered = nativeEntityRefsRef.current.get(entityId);
+        const entity = remembered?.model === currentModelRef.current && remembered.entity?.destroyed !== true
+          ? remembered.entity
+          : (currentModelRef.current
+            ? Object.values(viewerRef.current.scene.objects || {})
+                .find(object => object?.id === entityId && object.model === currentModelRef.current)
+            : null);
+        if (entity && remembered?.model !== currentModelRef.current) rememberNativeEntity(entityId);
 
         if (!entity) {
           console.warn('[NativeEdit][RESTORE] Original native entity not found in main model:', {
@@ -637,7 +668,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         // GLB assets use the semantic normalized pivot target. Legacy GLBs with
         // a persisted matrix are migrated from that exact matrix by AssetManager.
         // Native-isolated IFCs retain the existing matrix/position restoration path.
+        // Legacy GLBs may still need their matrix migrated by AssetManager.
+        // For IFCs, only native-isolated geometry has an authoritative runtime
+        // matrix; catalogue IFC furniture/doors restore from semantic target TRS.
         const hasPersistedMatrix = Array.isArray(item.matrix) && item.matrix.length === 16;
+        const hasPersistedNativeIFCMatrix = isNativeIsolation && hasPersistedMatrix;
         const targetPosition = isGLBAsset
           ? (hasGLBNormalization || !hasPersistedMatrix
             ? (Array.isArray(item.position) ? [...item.position] : [0, 0, 0])
@@ -662,21 +697,39 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             scale: item.scale || [1, 1, 1],
             nativeSourceId: item.nativeSourceId || item.id || null,
             isNativeIsolation,
-            persistedMatrix: hasPersistedMatrix ? item.matrix : null,
+            doorHostWallId: item.doorHostWallId || null,
+            persistedMatrix: (isGLBAsset || hasPersistedNativeIFCMatrix) && hasPersistedMatrix ? item.matrix : null,
             glbNormalization: isGLBAsset ? item.glbNormalization : null,
             onLoaded: (model) => {
-              const stillExpected = (projectStateRef.current?.furniture || [])
-                .some(currentItem => currentItem?.instanceId === item.instanceId);
-              if (!stillExpected) {
-                // The user may have undone a placement while its IFC/GLB bytes
-                // were still loading. Do not leave that orphaned SceneModel in
-                // the viewer after the async load completes.
+              // A restore can finish after undo/redo or another edit has changed
+              // the same item's transform. Never apply the stale item captured
+              // when loading began; use the latest committed state instead.
+              const latestState = projectStateRef.current || state;
+              const latestItem = (latestState.furniture || [])
+                .find(currentItem => currentItem?.instanceId === item.instanceId);
+              if (!latestItem) {
                 try { model.destroy(); } catch (_) {}
                 return;
               }
 
-              applyFurnitureStateToExistingModel(model, item);
-              applyPersistedMaterialToModel(model, item, projectStateRef.current || state);
+              const sameTransformAsLoadSnapshot = (
+                assetTransformSignature(latestItem) === assetTransformSignature(item)
+              );
+              // AssetManager has already applied the state used to start this load:
+              // TRS + semantic target for catalogue assets/doors, GLB normalization
+              // for GLBs, and the saved matrix for native-isolated IFCs that have one.
+              // Re-running the AABB-based reconciler with the identical state is
+              // redundant and can shift a hosted IFC door to its alternate position.
+              const loaderAppliedPersistedTransform = !isNativeIsolation || hasPersistedNativeIFCMatrix;
+              if (sameTransformAsLoadSnapshot && loaderAppliedPersistedTransform) {
+                markAssetTransformApplied(model, latestItem);
+              } else {
+                // State changed while the asynchronous load was in flight, or this is
+                // a legacy native isolation without a persisted matrix. Reconcile the
+                // current state exactly once.
+                applyFurnitureStateToExistingModel(model, latestItem);
+              }
+              applyPersistedMaterialToModel(model, latestItem, latestState);
             },
           }
         ).then((model) => {
@@ -885,6 +938,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     const canvas = canvasRef.current;
 
     const handlePointMove = (event) => {
+      if (!viewerRef.current?.scene?.models) return;
       const activeMode = measurementModeRef.current;
       if (activeMode !== 'point' && activeMode !== 'orthogonal') return;
 
@@ -922,6 +976,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     };
 
     const handlePointDown = (event) => {
+      if (!viewerRef.current?.scene?.models) return;
       const activeMode = measurementModeRef.current;
       if ((activeMode !== 'point' && activeMode !== 'orthogonal') || event.button !== 0) return;
 
@@ -1163,12 +1218,39 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     
     let viewerAlive = true;
+    setIsWebGLContextLost(false);
+
+    // Xeokit destroys its WebGL resources when a Viewer is torn down. If the
+    // browser loses the context while this Viewer is still active, show a clear
+    // recovery state and stop canvas handlers from picking against a dead Scene.
+    const handleWebGLContextLost = (event) => {
+      if (!viewerAlive || viewerRef.current !== viewer) return;
+      event.preventDefault();
+      viewerAlive = false;
+      try { viewer.cameraControl.active = false; } catch (_) {}
+      setIsWebGLContextLost(true);
+      setIsLoading(false);
+      setSelectedObject(null);
+      setSelectedAssetIdSafe(null);
+      selectedElementsRef.current = [];
+      setSelectedElements([]);
+      isStretchingRef.current = false;
+      setIsStretching(false);
+      stretchDragRef.current = null;
+      setActiveStretchData(null);
+    };
+    const handleWebGLContextRestored = () => {
+      // Do not resume editing on a scene whose GPU resources may be invalid.
+      // A fresh page load creates a consistent Viewer and Scene instance.
+      if (viewerRef.current === viewer) setIsWebGLContextLost(true);
+    };
+    canvasRef.current?.addEventListener('webglcontextlost', handleWebGLContextLost, false);
+    canvasRef.current?.addEventListener('webglcontextrestored', handleWebGLContextRestored, false);
 
     const initializeIFCEngine = async () => {
       try {
         const ifcAPI = new WebIFC.IfcAPI();
-        ifcAPI.SetWasmPath('/');
-        await ifcAPI.Init();
+        await initializeWebIFCApi(ifcAPI);
 
         // StrictMode/layout switches can destroy this viewer while WASM init
         // is still pending. Never attach a loader to a dead/stale viewer.
@@ -1501,13 +1583,15 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     };
 
     const onCanvasMouseDown = (e) => {
+      if (!viewerAlive || viewerRef.current !== viewer || !viewer.scene?.models) return;
       if (isMeasuringRef.current && (measurementModeRef.current === 'point' || measurementModeRef.current === 'orthogonal')) {
         return;
       }
 
       const rect = canvas.getBoundingClientRect();
       const canvasPos = [e.clientX - rect.left, e.clientY - rect.top];
-      const pick = viewer.scene.pick({ canvasPos, pickSurface: false });
+      let pick = null;
+      try { pick = viewer.scene.pick({ canvasPos, pickSurface: false }); } catch (_) { return; }
       let meta = pick?.entity?._stretchMeta;
       
       const mode = transformModeRef.current;
@@ -1692,6 +1776,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     };
 
     const onDocMouseMove = (e) => {
+      if (!viewerAlive || viewerRef.current !== viewer || !viewer.scene?.models) return;
       if (!isStretchingRef.current || !stretchDragRef.current) return;
       const dragData = stretchDragRef.current;
       const rect = canvas.getBoundingClientRect();
@@ -1898,6 +1983,13 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     };
 
     const onDocMouseUp = () => {
+      if (!viewerAlive || viewerRef.current !== viewer || !viewer.scene?.models) {
+        stretchDragRef.current = null;
+        isStretchingRef.current = false;
+        setIsStretching(false);
+        setActiveStretchData(null);
+        return;
+      }
       if (!isStretchingRef.current || !stretchDragRef.current) return;
       const dragData = stretchDragRef.current;
       const targetObj = dragData.isAsset ? viewer.scene.models[dragData.targetId] : viewer.scene.objects[dragData.targetId];
@@ -1908,14 +2000,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             const finalMatrix = targetObj.matrix && targetObj.matrix.length === 16
               ? Array.from(targetObj.matrix, Number)
               : null;
-            const position = finalMatrix
-              ? [finalMatrix[12], finalMatrix[13], finalMatrix[14]]
+            const isNativeIsolation = !!targetObj._assetMeta?.isNativeIsolation;
+            const aabb = targetObj.aabb;
+            const semanticPosition = aabb && aabb.length >= 6
+              ? [(aabb[0] + aabb[3]) / 2, aabb[1], (aabb[2] + aabb[5]) / 2]
               : (targetObj.position || [0, 0, 0]);
+            // Native-isolated IFCs persist the exact matrix-origin translation.
+            // Catalogue IFCs/hosted doors persist the world AABB center/bottom;
+            // their SceneModel origin is not the semantic placement target.
+            const position = isNativeIsolation && finalMatrix
+              ? [finalMatrix[12], finalMatrix[13], finalMatrix[14]]
+              : semanticPosition;
+            const transformOptions = isNativeIsolation
+              ? { matrixOverride: finalMatrix, preserveRuntimeTransform: true }
+              : { preserveRuntimeTransform: true };
             position.forEach((value, axis) => {
-              stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value, {
-                matrixOverride: finalMatrix,
-                preserveRuntimeTransform: true,
-              });
+              stretchPersistCallbackRef.current(dragData.targetId, 'position', axis, value, transformOptions);
             });
           } else {
             const position = dragData.isAsset && isGLBModel(targetObj)
@@ -1934,7 +2034,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
               'rotation',
               1,
               rotationY,
-              { matrix: committed?.matrix || targetObj.matrix, preserveRuntimeTransform: true }
+              targetObj._assetMeta?.isNativeIsolation
+                ? { matrixOverride: committed?.matrix || targetObj.matrix, preserveRuntimeTransform: true }
+                : { preserveRuntimeTransform: true }
             );
           } else {
             const rotationY = dragData.isAsset && isGLBModel(targetObj)
@@ -1947,11 +2049,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             const committed = commitIFCResize(targetObj, dragData.ifcResizeState);
             const currentScale = committed?.scale || dragData.ifcResizeState.currentScale || [1, 1, 1];
             const finalMatrix = committed?.matrix || targetObj.matrix;
+            const isNativeIsolation = !!targetObj._assetMeta?.isNativeIsolation;
             dragData.ifcResizeState = null;
             dragData.currentScale = [...currentScale];
             dragData.axesList.forEach(({ axis }) => {
               stretchPersistCallbackRef.current(dragData.targetId, 'scale', axis, currentScale[axis], {
-                matrixOverride: finalMatrix,
+                ...(isNativeIsolation ? { matrixOverride: finalMatrix } : {}),
                 preserveRuntimeTransform: true,
                 scaleOverride: currentScale,
               });
@@ -2004,6 +2107,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     };
 
     const onCanvasHoverMove = (e) => {
+      if (!viewerAlive || viewerRef.current !== viewer || !viewer.scene?.models) return;
       if (isStretchingRef.current) return;
       if (isMeasuringRef.current && (measurementModeRef.current === 'point' || measurementModeRef.current === 'orthogonal')) return;
       if (!stretchHandlesRef.current.length) return;
@@ -2114,6 +2218,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     document.addEventListener('mouseup', onDocMouseUp);
     
     viewer.cameraControl.on('pickedNothing', () => {
+      if (!viewerAlive || viewerRef.current !== viewer || !viewer.scene?.models) return;
       if (placementModeRef.current) { setPlacementMode(null); return; }
       clearSelection();
       setSelectedObject(null);
@@ -2153,6 +2258,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       navCubeRef.current = null;
       setMeasurementPhase('idle');
       viewerAlive = false;
+      canvasRef.current?.removeEventListener('webglcontextlost', handleWebGLContextLost, false);
+      canvasRef.current?.removeEventListener('webglcontextrestored', handleWebGLContextRestored, false);
       ifcLoaderOwnerRef.current = null;
       try { disposeNativeIFCMaterialController(viewer); } catch (_) {}
       ifcAPIRef.current = null;
@@ -2213,6 +2320,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         });
       }
       currentModelRef.current = null;
+      nativeEntityRefsRef.current.clear();
       // Clear the render boundary lock to wait for the new model
       isModelLoadedRef.current = false;
     };
@@ -2466,6 +2574,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     loadersRef,
     globalScaleFactorRef,
     loadingModelsRef,
+    rememberNativeEntity,
     setSelectedAssetId: setSelectedAssetIdSafe,
     setSelectedObject,
   };
@@ -2477,6 +2586,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     refs: { canvasRef, treeContainerRef, navCubeCanvasRef, viewerRef },
     state: {
       isLoading,
+      isWebGLContextLost,
       isXRay,
       isClipping,
       navMode,
@@ -2544,6 +2654,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           throw err;
         }
       },
+      rememberNativeEntity: (entityId) => rememberNativeEntity(entityId),
+      setNativeEntityVisibleForEdit,
+      restoreNativeEntityVisibility: (entityId) => (
+        restoreNativeEntityVisible(nativeEntityHistoryContext, entityId)
+      ),
       getDropPosition: (c, a) => getDropPosition(viewerRef, projectStateRef, c, a),
       getWallSnapData: (c) => getWallSnapData(viewerRef, c),
       toggleMeasurementMode: () => toggleMeasurementMode(isMeasuring, setIsMeasuring, setPlacementMode, setSelectedObject, setSelectedAssetId, viewerRef),

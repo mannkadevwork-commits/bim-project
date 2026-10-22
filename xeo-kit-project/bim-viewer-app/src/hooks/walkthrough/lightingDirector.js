@@ -146,6 +146,9 @@ export class LightingDirector {
     this.scene = scene;
     this.renderer = renderer;
     this.onChange = onChange;
+    // Shared presentation settings scale the selected lighting preset consistently
+    // across overview, guided, explore and immersive views.
+    this.presentationOverrides = { exposureMultiplier: 1, environmentMultiplier: 1 };
 
     this.mode = 'day';
     this.targetMode = 'day';
@@ -335,8 +338,8 @@ export class LightingDirector {
     this.transitionElapsed = this.transitionSeconds;
 
     this.scene.background.copy(current.background);
-    if ('environmentIntensity' in this.scene) this.scene.environmentIntensity = current.environmentIntensity;
-    this.renderer.toneMappingExposure = current.exposure;
+    if ('environmentIntensity' in this.scene) this.scene.environmentIntensity = current.environmentIntensity * this.presentationOverrides.environmentMultiplier;
+    this.renderer.toneMappingExposure = current.exposure * this.presentationOverrides.exposureMultiplier;
 
     this.hemisphere.color.copy(current.hemisphereSky);
     this.hemisphere.groundColor.copy(current.hemisphereGround);
@@ -352,6 +355,24 @@ export class LightingDirector {
     this._refreshLightRig();
 
     if (refreshShadows && this.staticShadowPrepared) this.renderer.shadowMap.needsUpdate = true;
+  }
+
+
+  setPresentationOverrides(overrides = {}) {
+    const exposureMultiplier = Number(overrides.exposureMultiplier);
+    const environmentMultiplier = Number(overrides.environmentMultiplier);
+    this.presentationOverrides = {
+      exposureMultiplier: THREE.MathUtils.clamp(Number.isFinite(exposureMultiplier) ? exposureMultiplier : 1, 0.75, 1.25),
+      environmentMultiplier: THREE.MathUtils.clamp(Number.isFinite(environmentMultiplier) ? environmentMultiplier : 1, 0.5, 1.5),
+    };
+    // Apply immediately to the currently visible profile while preserving any
+    // in-progress interpolation between Day / Evening / Night.
+    const current = profile(this.mode);
+    if ('environmentIntensity' in this.scene) {
+      this.scene.environmentIntensity = current.environmentIntensity * this.presentationOverrides.environmentMultiplier;
+    }
+    this.renderer.toneMappingExposure = current.exposure * this.presentationOverrides.exposureMultiplier;
+    this.onChange?.(this.getState());
   }
 
   setMode(mode, { immediate = false } = {}) {
@@ -393,9 +414,9 @@ export class LightingDirector {
 
     this.scene.background.lerpColors(from.background, to.background, t);
     if ('environmentIntensity' in this.scene) {
-      this.scene.environmentIntensity = THREE.MathUtils.lerp(from.environmentIntensity, to.environmentIntensity, t);
+      this.scene.environmentIntensity = THREE.MathUtils.lerp(from.environmentIntensity, to.environmentIntensity, t) * this.presentationOverrides.environmentMultiplier;
     }
-    this.renderer.toneMappingExposure = THREE.MathUtils.lerp(from.exposure, to.exposure, t);
+    this.renderer.toneMappingExposure = THREE.MathUtils.lerp(from.exposure, to.exposure, t) * this.presentationOverrides.exposureMultiplier;
     this.hemisphere.color.lerpColors(from.hemisphereSky, to.hemisphereSky, t);
     this.hemisphere.groundColor.lerpColors(from.hemisphereGround, to.hemisphereGround, t);
     this.hemisphere.intensity = THREE.MathUtils.lerp(from.hemisphere.intensity, to.hemisphere.intensity, t);

@@ -10,6 +10,9 @@ interface MaterialDefinition {
     color?: string;
     rgb: [number, number, number];
     texture?: { id?: string; name?: string; src?: string; repeat?: [number, number] } | null;
+    // Compatibility with editor project states created before nested texture metadata.
+    textureSrc?: string;
+    repeat?: [number, number];
     roughness?: number;
     metallic?: number;
 }
@@ -48,20 +51,34 @@ function getGlobalId(ifcApi: WebIFC.IfcAPI, modelId: number, expressID: number):
 
 function resolveTexturePath(src: string | undefined, assetsDirectory?: string): string | null {
     if (!src) return null;
-    const clean = String(src).split('?')[0].split('#')[0];
+    let clean = String(src).split('?')[0].split('#')[0];
+    if (/^https?:\/\//i.test(clean)) {
+        try {
+            const parsed = new URL(clean);
+            if (!parsed.pathname.startsWith('/assets/')) return null;
+            clean = parsed.pathname;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    const resolveWithin = (baseDirectory: string, relativePath: string): string | null => {
+        const base = path.resolve(baseDirectory);
+        const candidate = path.resolve(base, relativePath);
+        if (candidate !== base && !candidate.startsWith(`${base}${path.sep}`)) return null;
+        return fs.existsSync(candidate) ? candidate : null;
+    };
+
     if (clean.startsWith('/materials/')) {
-        const compilerPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', clean.slice(1));
-        return fs.existsSync(compilerPath) ? compilerPath : null;
+        const compilerMaterials = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'materials');
+        return resolveWithin(compilerMaterials, clean.slice('/materials/'.length));
     }
     if (clean.startsWith('/assets/')) {
-        const candidate = path.resolve(assetsDirectory || '', clean.slice('/assets/'.length));
-        return fs.existsSync(candidate) ? candidate : null;
+        if (!assetsDirectory) return null;
+        return resolveWithin(assetsDirectory, clean.slice('/assets/'.length));
     }
     if (path.isAbsolute(clean) && fs.existsSync(clean)) return clean;
-    if (assetsDirectory) {
-        const candidate = path.resolve(assetsDirectory, clean);
-        if (fs.existsSync(candidate)) return candidate;
-    }
+    if (assetsDirectory) return resolveWithin(assetsDirectory, clean);
     return null;
 }
 
@@ -70,6 +87,16 @@ function mimeFor(filePath: string): string {
     if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
     if (ext === '.webp') return 'image/webp';
     return 'image/png';
+}
+
+function getMaterialTextureSource(definition: MaterialDefinition): string | undefined {
+    if (definition.texture?.src) return definition.texture.src;
+    if (definition.textureSrc) return definition.textureSrc;
+    return undefined;
+}
+
+function getMaterialTextureRepeat(definition: MaterialDefinition): [number, number] {
+    return definition.texture?.repeat || definition.repeat || [1, 1];
 }
 
 function createTexture(doc: Document, texturePath: string, id: string): Texture {
@@ -91,6 +118,37 @@ function buildBoxProjectedUVs(positions: Float32Array, normals: Float32Array, re
         else { u = x; v = y; }
         uv[i * 2] = u * rx;
         uv[i * 2 + 1] = v * rz;
+    }
+    return uv;
+}
+
+// Uploaded library materials use repeat counts across the selected surface, matching
+// NativeIFCMaterialController's side-aware projection in the editor. Built-in visual
+// surfaces keep the separate world-space UV scale above.
+function buildNormalizedSurfaceUVs(positions: Float32Array, normals: Float32Array, repeat: [number, number]): Float32Array {
+    const uv = new Float32Array((positions.length / 3) * 2);
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < positions.length; i += 3) {
+        for (let axis = 0; axis < 3; axis++) {
+            const value = positions[i + axis];
+            min[axis] = Math.min(min[axis], value);
+            max[axis] = Math.max(max[axis], value);
+        }
+    }
+    const size = [0, 1, 2].map(axis => Math.max(max[axis] - min[axis], 1e-5));
+    const rx = Math.max(0.05, Math.min(100, Number(repeat[0]) || 1));
+    const ry = Math.max(0.05, Math.min(100, Number(repeat[1]) || 1));
+
+    for (let i = 0; i < positions.length / 3; i++) {
+        const point = [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]];
+        const nx = Math.abs(normals[i * 3]), ny = Math.abs(normals[i * 3 + 1]), nz = Math.abs(normals[i * 3 + 2]);
+        let axisU: number; let axisV: number;
+        if (ny >= nx && ny >= nz) { axisU = 0; axisV = 2; }
+        else if (nx >= nz) { axisU = 2; axisV = 1; }
+        else { axisU = 0; axisV = 1; }
+        uv[i * 2] = ((point[axisU] - min[axisU]) / size[axisU]) * rx;
+        uv[i * 2 + 1] = (1 - (point[axisV] - min[axisV]) / size[axisV]) * ry;
     }
     return uv;
 }
@@ -261,10 +319,10 @@ function createMaterialFromDefinition(
         .setMetallicFactor(definition.metallic ?? 0.0);
 
     let texture: Texture | null = null;
-    if ((definition.kind === 'fabric' || definition.kind === 'texture') && definition.texture?.src) {
-        const texturePath = resolveTexturePath(definition.texture.src, assetsDirectory);
+    if ((definition.kind === 'fabric' || definition.kind === 'texture') && getMaterialTextureSource(definition)) {
+        const texturePath = resolveTexturePath(getMaterialTextureSource(definition), assetsDirectory);
         if (texturePath) {
-            texture = createTexture(doc, texturePath, `Tex_${idPrefix}_${definition.texture.id || 'material'}`);
+            texture = createTexture(doc, texturePath, `Tex_${idPrefix}_${definition.texture?.id || 'material'}`);
             material.setBaseColorTexture(texture);
         }
     }
@@ -286,7 +344,13 @@ function addTrianglePrimitive(
     if (!positions.length) return;
     const positionArray = new Float32Array(positions);
     const normalArray = new Float32Array(normals);
-    const uv = buildBoxProjectedUVs(positionArray, normalArray, definition.texture?.repeat || [1, 1]);
+    const texturePath = (definition.kind === 'fabric' || definition.kind === 'texture')
+        ? resolveTexturePath(getMaterialTextureSource(definition), assetsDirectory)
+        : null;
+    const repeat = texturePath ? getMaterialTextureRepeat(definition) : [1, 1] as [number, number];
+    const uv = texturePath
+        ? buildNormalizedSurfaceUVs(positionArray, normalArray, repeat)
+        : buildBoxProjectedUVs(positionArray, normalArray, repeat);
     const indexAccessor = doc.createAccessor().setType(Accessor.Type.SCALAR).setArray(new Uint32Array(indices)).setBuffer(buffer);
     const positionAccessor = doc.createAccessor().setType(Accessor.Type.VEC3).setArray(positionArray).setBuffer(buffer);
     const normalAccessor = doc.createAccessor().setType(Accessor.Type.VEC3).setArray(normalArray).setBuffer(buffer);
@@ -610,11 +674,17 @@ export function extractGeometry(
                 const normalAccessor = doc.createAccessor().setType(Accessor.Type.VEC3).setArray(normals).setBuffer(buffer);
 
                 const [finalR, finalG, finalB] = materialOverride ? materialOverride.rgb : [r, g, b];
-                // Procedural tile map contains a 2x2 tile layout. A 0.62 world-UV scale
-                // yields larger, roughly 0.8 m tiles instead of the overly strong
-                // ~0.5 m grid from Visual Phase 1. Explicit material repeats still win.
-                const repeat = materialOverride?.texture?.repeat || (defaultVisualSurfaceKind === 'floor' ? [0.62, 0.62] : [1, 1]);
-                const uv = buildBoxProjectedUVs(positions, normals, repeat);
+                // Uploaded materials interpret repeat X/Y as repeats across the selected
+                // surface, matching the editor's material projection. Built-in visual
+                // materials retain their prior world-space UV scale.
+                const materialTexturePath = materialOverride && (materialOverride.kind === 'fabric' || materialOverride.kind === 'texture')
+                    ? resolveTexturePath(getMaterialTextureSource(materialOverride), assetsDirectory)
+                    : null;
+                const defaultRepeat: [number, number] = defaultVisualSurfaceKind === 'floor' ? [0.62, 0.62] : [1, 1];
+                const repeat = materialTexturePath ? getMaterialTextureRepeat(materialOverride!) : defaultRepeat;
+                const uv = materialTexturePath
+                    ? buildNormalizedSurfaceUVs(positions, normals, repeat)
+                    : buildBoxProjectedUVs(positions, normals, repeat);
                 const uvAccessor = doc.createAccessor().setType(Accessor.Type.VEC2).setArray(uv).setBuffer(buffer);
 
                 const material = doc.createMaterial(`Mat_${flatMesh.expressID}_${i}`)
@@ -632,11 +702,8 @@ export function extractGeometry(
                     }
                 }
 
-                if ((materialOverride?.kind === 'fabric' || materialOverride?.kind === 'texture') && materialOverride.texture?.src) {
-                    const texturePath = resolveTexturePath(materialOverride.texture.src, assetsDirectory);
-                    if (texturePath) {
-                        material.setBaseColorTexture(createTexture(doc, texturePath, `Tex_${materialOverride.texture.id || flatMesh.expressID}_${i}`));
-                    }
+                if (materialTexturePath && materialOverride) {
+                    material.setBaseColorTexture(createTexture(doc, materialTexturePath, `Tex_${materialOverride.texture?.id || flatMesh.expressID}_${i}`));
                 }
 
                 const primitive = doc.createPrimitive()

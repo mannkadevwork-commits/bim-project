@@ -43,3 +43,5 @@ pnpm-debug.log*
 
 jobs/
 19-06-2026/
+# Local backup archive - do not commit
+/backend_before_autodesk_work.zip

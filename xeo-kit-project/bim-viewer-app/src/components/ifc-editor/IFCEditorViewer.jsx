@@ -3,6 +3,7 @@ import { Viewer } from '@xeokit/xeokit-sdk/src/viewer/Viewer';
 import { WebIFCLoaderPlugin } from '@xeokit/xeokit-sdk/src/plugins/WebIFCLoaderPlugin/WebIFCLoaderPlugin';
 import { NavCubePlugin } from '@xeokit/xeokit-sdk/src/plugins/NavCubePlugin/NavCubePlugin';
 import * as WebIFC from 'web-ifc';
+import { initializeWebIFCApi } from '../../utils/webIfcRuntime';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -107,8 +108,7 @@ export function IFCEditorViewer({ sessionId, selectedIds, rooms, onSelect, onMul
     let alive = true;
     const init = async () => {
       const ifcAPI = new WebIFC.IfcAPI();
-      ifcAPI.SetWasmPath('/');
-      await ifcAPI.Init();
+      await initializeWebIFCApi(ifcAPI);
       if (!alive) return;
 
       const loader = new WebIFCLoaderPlugin(viewer, { WebIFC, IfcAPI: ifcAPI });

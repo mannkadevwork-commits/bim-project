@@ -69,4 +69,22 @@ router.get('/items/:id', async (req, res) => {
   }
 });
 
+
+// GET /api/catalog/materials — only active surface assets are offered to the editor.
+router.get('/materials', async (req, res) => {
+  try {
+    const kind = ['color', 'fabric', 'texture'].includes(String(req.query.kind || '').toLowerCase())
+      ? String(req.query.kind).toLowerCase()
+      : null;
+    const result = kind
+      ? await db.query('SELECT * FROM material_assets WHERE is_active = true AND kind = $1 ORDER BY category, name', [kind])
+      : await db.query('SELECT * FROM material_assets WHERE is_active = true ORDER BY kind, category, name');
+    res.set('Cache-Control', 'no-store');
+    res.json(result.rows);
+  } catch (err) {
+    console.error('[Catalog] Materials error:', err.message);
+    res.status(500).json({ error: 'Failed to load material library. Ensure the material library migration has been applied.' });
+  }
+});
+
 module.exports = router;

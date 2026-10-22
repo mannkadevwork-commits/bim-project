@@ -20,9 +20,10 @@ Combines four sources of truth into ONE unified, render-ready mesh:
 
 It then applies the Z-up -> Y-up axis correction 3ds Max / APS expects to
 the STRUCTURAL IFC geometry only (see 2026-07-08 fix note below), and
-writes a single merged OBJ (+ MTL) plus a JSON bounding-box sidecar (printed
-to stdout) that the caller (aps-pipeline.js) uses to park the interior
-camera in the middle of the room.
+writes a merged OBJ + MTL and a self-contained scene_package.zip containing
+all exported texture images. The package is passed through the legacy APS
+MaterialFile slot so the existing Activity input schema can stay unchanged.
+The caller (aps-pipeline.js) uses the JSON bounding box to position the camera.
 
 --------------------------------------------------------------------------
 2026-07-08 fix note -- furniture floating outside/below the floor plan.
@@ -74,16 +75,14 @@ references), it has nothing to fall back on but that generic gray Kd --
 exactly the "wall renders gray" symptom, even though the JSON asked for a
 specific hex color.
 
-The real fix is to never let per-element colors go through that atlas
-packer at all. scene_merger.py no longer merges geometry with
-trimesh.util.concatenate(). Instead it builds a trimesh.Scene and adds
-every structural element and every furniture part as its own named
-geometry node. A Scene's OBJ exporter writes one `usemtl` per node against
-its own untouched SimpleMaterial, so each element's actual Kd color lands
-in the .mtl file with no shared atlas and no PNG in the loop at all. This
-also incidentally fixes multi-material furniture (e.g. a sofa with wood
-legs + fabric cushions loaded from one GLB) which was suffering the exact
-same atlas-collapse bug internally.
+The real fix is to never let per-element solid colors go through that atlas
+packer. scene_merger.py builds a trimesh.Scene and adds each structural
+element and furniture part as its own named geometry node. Solid-color
+materials remain explicit Kd entries in the MTL; intentional base-color and
+fabric textures remain separate map_Kd images packaged alongside the OBJ
+and MTL. The export does not concatenate all materials into one atlas, so
+differently textured parts (such as sofa wood legs and fabric cushions) do
+not collapse into a shared generic material.
 --------------------------------------------------------------------------
 
 Usage:
@@ -98,6 +97,8 @@ Stdout (and ONLY stdout) on success is a single JSON line:
     {
       "success": true,
       "output": "...",
+      "scene_package": "...",
+      "texture_count": 2,
       "bbox": {"min": [x,y,z], "max": [x,y,z], "center": [x,y,z], "size": [x,y,z]},
       "furniture_count": 2,
       "materials_applied": 1,
@@ -113,12 +114,15 @@ JSON contract the Node caller depends on.
 """
 
 import argparse
+import copy
+import io
 import json
 import os
 import re
 import sys
 import tempfile
 import traceback
+import zipfile
 from urllib.parse import urlparse
 
 import numpy as np
@@ -199,64 +203,280 @@ SKIP_IFC_TYPES = {
 }
 
 
+def _extract_native_ifc_rgba(shape, warnings, global_id):
+    """Read one safe diffuse color from IfcOpenShell's documented style list.
+
+    IfcOpenShell exposes style/material data via shape.geometry.materials.
+    Material extraction is deliberately isolated from mesh construction: a
+    version-specific color/style object must never cause valid geometry to be
+    discarded.
+    """
+    fallback = [200, 200, 200, 255]
+    geometry = getattr(shape, "geometry", None)
+    try:
+        styles = getattr(geometry, "materials", None) or []
+        for style in styles:
+            try:
+                has_diffuse = getattr(style, "has_diffuse", None)
+                diffuse = getattr(style, "diffuse", None)
+                if has_diffuse is False or diffuse is None:
+                    continue
+                values = np.asarray(diffuse, dtype=np.float64).reshape(-1)
+                if values.size < 3 or not np.isfinite(values[:3]).all():
+                    continue
+                rgb = values[:3]
+                # IfcOpenShell style diffuse colors are normally normalized
+                # floats. Be tolerant of wrappers returning 0..255 channels.
+                if float(np.max(rgb)) > 1.0:
+                    rgb = rgb / 255.0 if float(np.max(rgb)) <= 255.0 else rgb
+                if float(np.min(rgb)) < 0.0 or float(np.max(rgb)) > 1.0:
+                    continue
+                transparency = 0.0
+                try:
+                    has_transparency = getattr(style, "has_transparency", None)
+                    raw_transparency = getattr(style, "transparency", None)
+                    if raw_transparency is not None and has_transparency is not False:
+                        transparency = float(raw_transparency)
+                    if not np.isfinite(transparency):
+                        transparency = 0.0
+                except Exception:
+                    transparency = 0.0
+                transparency = max(0.0, min(1.0, transparency))
+                return [
+                    int(round(float(rgb[0]) * 255)),
+                    int(round(float(rgb[1]) * 255)),
+                    int(round(float(rgb[2]) * 255)),
+                    int(round((1.0 - transparency) * 255)),
+                ]
+            except Exception as style_error:
+                warnings.append(
+                    f"Element {global_id}: ignored unreadable IFC material style "
+                    f"({type(style_error).__name__}: {style_error})."
+                )
+    except Exception as style_list_error:
+        warnings.append(
+            f"Element {global_id}: could not read IFC material list "
+            f"({type(style_list_error).__name__}: {style_list_error}); using neutral gray."
+        )
+    return fallback
+
+
+def _ifc_shape_to_mesh(shape, elem, warnings):
+    """Convert one IfcOpenShell shape without letting material errors drop it."""
+    ifc_type = elem.is_a()
+    if ifc_type in SKIP_IFC_TYPES:
+        return None
+
+    global_id = getattr(elem, "GlobalId", f"elem_{getattr(shape, 'id', 'unknown')}")
+    geometry = getattr(shape, "geometry", None)
+    if geometry is None:
+        raise ValueError("IfcOpenShell shape has no geometry object")
+
+    verts_raw = getattr(geometry, "verts", None)
+    faces_raw = getattr(geometry, "faces", None)
+    if verts_raw is None or faces_raw is None:
+        raise ValueError("IfcOpenShell geometry is missing verts or faces arrays")
+
+    verts_flat = np.asarray(verts_raw, dtype=np.float64).reshape(-1)
+    faces_flat = np.asarray(faces_raw, dtype=np.int64).reshape(-1)
+    if verts_flat.size < 9 or verts_flat.size % 3 != 0:
+        raise ValueError(f"invalid vertex array length {verts_flat.size}")
+    if faces_flat.size < 3 or faces_flat.size % 3 != 0:
+        raise ValueError(f"invalid triangle index array length {faces_flat.size}")
+
+    verts = verts_flat.reshape(-1, 3)
+    faces = faces_flat.reshape(-1, 3)
+    if not np.isfinite(verts).all():
+        raise ValueError("geometry vertices contain NaN or infinity")
+    if faces.min() < 0 or faces.max() >= len(verts):
+        raise ValueError(
+            f"triangle indices out of range (vertices={len(verts)}, "
+            f"minIndex={int(faces.min())}, maxIndex={int(faces.max())})"
+        )
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    rgba = _extract_native_ifc_rgba(shape, warnings, global_id)
+    try:
+        mesh.visual.vertex_colors = rgba
+    except Exception as color_error:
+        # Keep the geometry and report the lost optional display color.
+        warnings.append(
+            f"Element {global_id}: could not apply native color "
+            f"({type(color_error).__name__}: {color_error}); geometry retained."
+        )
+
+    mesh.metadata["global_id"] = global_id
+    mesh.metadata["ifc_type"] = ifc_type
+    mesh.metadata["name"] = global_id
+    mesh.metadata["native_rgba"] = rgba
+    return (global_id, ifc_type, mesh)
+
+
 def load_ifc_as_named_meshes(ifc_path, warnings):
-    """Returns list of (global_id, ifc_type, trimesh.Trimesh) in world coords."""
+    """Returns renderable (global_id, ifc_type, trimesh.Trimesh) in world coords.
+
+    The parallel iterator is the fast path. If it yields no usable meshes, a
+    serial create_shape pass is attempted once before the renderer fails. This
+    accommodates iterator/backend differences while keeping unsupported or
+    malformed products visible in diagnostics instead of silently skipping
+    every element.
+    """
     if not os.path.exists(ifc_path):
         raise FileNotFoundError(f"IFC file not found: {ifc_path}")
 
     ifc_file = ifcopenshell.open(ifc_path)
-
     settings = ifcopenshell.geom.settings()
     settings.set(settings.USE_WORLD_COORDS, True)
     settings.set(settings.WELD_VERTICES, True)
     settings.set(settings.APPLY_DEFAULT_MATERIALS, True)
 
     meshes = []
-    iterator = ifcopenshell.geom.iterator(settings, ifc_file, num_threads=os.cpu_count() or 2)
-
-    if not iterator.initialize():
-        log("[scene_merger] IFC geometry iterator found nothing to render.")
-        return meshes
-
-    while True:
-        shape = iterator.get()
+    diagnostics = {
+        "iterator_initialized": False,
+        "shapes_seen": 0,
+        "skipped_types": {},
+        "empty_or_invalid_shapes": 0,
+        "shape_errors": 0,
+        "fallback_attempted": False,
+        "fallback_errors": 0,
+    }
+    product_candidates = []
+    try:
+        products = ifc_file.by_type("IfcProduct")
+    except Exception:
+        products = []
+    for elem in products:
         try:
-            elem = ifc_file.by_id(shape.id)
-            ifc_type = elem.is_a()
-            if ifc_type in SKIP_IFC_TYPES:
+            if elem.is_a() in SKIP_IFC_TYPES:
+                continue
+            if getattr(elem, "Representation", None) is not None:
+                product_candidates.append(elem)
+        except Exception:
+            continue
+
+    iterator = None
+    try:
+        iterator = ifcopenshell.geom.iterator(
+            settings, ifc_file, num_threads=max(1, min(os.cpu_count() or 2, 8))
+        )
+        diagnostics["iterator_initialized"] = bool(iterator.initialize())
+    except Exception as iterator_error:
+        warnings.append(
+            f"IFC geometry iterator failed to initialize "
+            f"({type(iterator_error).__name__}: {iterator_error})."
+        )
+
+    if diagnostics["iterator_initialized"] and iterator is not None:
+        while True:
+            try:
+                shape = iterator.get()
+                diagnostics["shapes_seen"] += 1
+                try:
+                    elem = ifc_file.by_id(shape.id)
+                    ifc_type = elem.is_a()
+                    if ifc_type in SKIP_IFC_TYPES:
+                        diagnostics["skipped_types"][ifc_type] = diagnostics["skipped_types"].get(ifc_type, 0) + 1
+                    else:
+                        converted = _ifc_shape_to_mesh(shape, elem, warnings)
+                        if converted is not None:
+                            meshes.append(converted)
+                except Exception as shape_error:
+                    diagnostics["shape_errors"] += 1
+                    try:
+                        failed_elem = ifc_file.by_id(shape.id)
+                        failed_label = (
+                            f"{failed_elem.is_a()} "
+                            f"{getattr(failed_elem, 'GlobalId', '#'+str(shape.id))}"
+                        )
+                    except Exception:
+                        failed_label = f"shape #{getattr(shape, 'id', 'unknown')}"
+                    warnings.append(
+                        f"{failed_label}: geometry conversion failed "
+                        f"({type(shape_error).__name__}: {shape_error})."
+                    )
+            except Exception as iterator_read_error:
+                diagnostics["shape_errors"] += 1
+                warnings.append(
+                    f"IFC geometry iterator read failed "
+                    f"({type(iterator_read_error).__name__}: {iterator_read_error})."
+                )
+                break
+            try:
                 if not iterator.next():
                     break
-                continue
+            except Exception as iterator_next_error:
+                diagnostics["shape_errors"] += 1
+                warnings.append(
+                    f"IFC geometry iterator advance failed "
+                    f"({type(iterator_next_error).__name__}: {iterator_next_error})."
+                )
+                break
+    else:
+        log("[scene_merger] IFC geometry iterator did not initialize; checking products individually.")
 
-            global_id = getattr(elem, "GlobalId", f"elem_{shape.id}")
-            verts = np.array(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)
-            faces = np.array(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
+    # If the bulk iterator returned no valid scene, diagnose and try one shape
+    # at a time. This is deliberately only a fallback; healthy IFCs keep the
+    # fast multi-threaded path.
+    if not meshes:
+        diagnostics["fallback_attempted"] = True
+        log(
+            f"[scene_merger] Iterator produced 0 mesh(es) from "
+            f"{diagnostics['shapes_seen']} shape(s); trying {len(product_candidates)} "
+            "represented IfcProduct(s) individually."
+        )
+        create_shape = getattr(ifcopenshell.geom, "create_shape", None)
+        if not callable(create_shape):
+            warnings.append("IfcOpenShell geom.create_shape is unavailable for serial fallback.")
+        else:
+            for elem in product_candidates:
+                try:
+                    shape = create_shape(settings, elem)
+                    converted = _ifc_shape_to_mesh(shape, elem, warnings)
+                    if converted is not None:
+                        meshes.append(converted)
+                except Exception as fallback_error:
+                    diagnostics["fallback_errors"] += 1
+                    gid = getattr(elem, "GlobalId", f"step_{getattr(elem, 'id', 'unknown')}")
+                    warnings.append(
+                        f"Serial geometry fallback failed for {elem.is_a()} {gid} "
+                        f"(#{getattr(elem, 'id', '?')}): "
+                        f"{type(fallback_error).__name__}: {fallback_error}."
+                    )
 
-            if len(verts) == 0 or len(faces) == 0:
-                if not iterator.next():
-                    break
-                continue
+    log(
+        "[scene_merger] IFC extraction diagnostics: "
+        f"productsWithBodyRepresentation={len(product_candidates)}, "
+        f"iteratorInitialized={diagnostics['iterator_initialized']}, "
+        f"shapesSeen={diagnostics['shapes_seen']}, meshes={len(meshes)}, "
+        f"shapeErrors={diagnostics['shape_errors']}, "
+        f"serialFallbackErrors={diagnostics['fallback_errors']}."
+    )
+    if diagnostics["skipped_types"]:
+        log(f"[scene_merger] Skipped non-rendered IFC types: {diagnostics['skipped_types']}")
 
-            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-            mesh.metadata["global_id"] = global_id
-            mesh.metadata["ifc_type"] = ifc_type
-            # "name" (not just "global_id") is what several trimesh export
-            # paths look at for a geometry's own identity; setting it here,
-            # on the raw ifcopenshell product's GlobalId, is what lets the
-            # exported OBJ's "o"/"g" line end up as the exact GlobalId string
-            # -- with no sanitization -- so aps-pipeline.js can look it up
-            # directly in project_state.json["materials"] with no fuzzy
-            # matching needed (see build_merged_scene()/main() below).
-            mesh.metadata["name"] = global_id
-            meshes.append((global_id, ifc_type, mesh))
-        except Exception as e:
-            warnings.append(f"Skipped one IFC element due to geometry error: {e}")
-        if not iterator.next():
-            break
+    if not meshes:
+        log(
+            "[scene_merger] No IFC meshes could be extracted. First diagnostic messages:"
+        )
+        if warnings:
+            for warning in warnings[:20]:
+                log(f"  - {warning}")
+        else:
+            log(
+                "  - No per-element errors were captured; inspect the IFC geometry "
+                "representation validity and the installed IfcOpenShell/geometry-kernel version."
+            )
+        try:
+            log(f"[scene_merger] IfcOpenShell version: {getattr(ifcopenshell, 'version', 'unknown')}")
+            log(f"[scene_merger] IFC schema: {getattr(ifc_file, 'schema', 'unknown')}")
+        except Exception:
+            pass
+    elif warnings:
+        log(f"[scene_merger] IFC geometry warnings captured: {len(warnings)} (first 5 follow).")
+        for warning in warnings[:5]:
+            log(f"  - {warning}")
 
     return meshes
-
-
 # --------------------------------------------------------------------------
 # Material overrides: project_state.json["materials"] is keyed by GlobalId
 # and looks like: { "<GlobalId>": { "color": [r,g,b], "roughness": 0.5,
@@ -306,71 +526,140 @@ def _parse_rgba(raw_color):
     return fallback
 
 
-def apply_material_override(mesh, mat_def, warnings=None, context_id="unknown"):
-    """
-    Applies a per-element material override (color/roughness/metalness) from
-    project_state.json to a trimesh.Trimesh as a PURE Kd color -- no image,
-    no texture map, nothing for a downstream importer to fail to load.
+def _material_rgb_from_definition(mat_def):
+    """Choose an authored color without discarding a texture when one exists."""
+    if mat_def.get("color") is not None:
+        return _parse_rgba(mat_def.get("color"))
+    rgb = mat_def.get("rgb")
+    if isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
+        return _parse_rgba(list(rgb[:3]))
+    return [220, 220, 220, 255]
 
-    image=None is not just "no swatch was provided" -- it's load-bearing.
-    Do not reintroduce a baked PIL swatch here (see the fix notes at the top
-    of this file for why that was tried before and what it broke). Distinct
-    per-element colors are now preserved through the final export by never
-    running these meshes through trimesh.util.concatenate()'s texture-atlas
-    packer at all -- see build_merged_scene() below, which keeps every
-    mesh as its own object/material pair in a trimesh.Scene instead.
 
-    Never raises: a malformed mat_def degrades to "mesh left as-is" plus a
-    warning, rather than crashing the whole render.
-    """
+def _generate_planar_uv(mesh, repeat=(1.0, 1.0)):
+    """Create simple deterministic planar UVs for meshes that have no UV channel."""
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if not len(vertices):
+        return np.zeros((0, 2), dtype=np.float64)
+    mins = vertices.min(axis=0)
+    extents = np.maximum(vertices.max(axis=0) - mins, 1e-8)
+    axes = sorted(range(3), key=lambda axis: extents[axis], reverse=True)[:2]
+    uv = np.column_stack(((vertices[:, axes[0]] - mins[axes[0]]) / extents[axes[0]],
+                          (vertices[:, axes[1]] - mins[axes[1]]) / extents[axes[1]]))
+    uv[:, 0] *= float(repeat[0])
+    uv[:, 1] *= float(repeat[1])
+    return uv
+
+
+def _texture_repeats(mat_def, warnings, context_id):
+    raw = mat_def.get("repeat")
+    if not (isinstance(raw, (list, tuple)) and len(raw) >= 2):
+        texture = mat_def.get("texture") if isinstance(mat_def.get("texture"), dict) else {}
+        raw = texture.get("repeat", [2, 2])
+    try:
+        values = [float(raw[0]), float(raw[1])]
+        if any(not np.isfinite(v) or v <= 0 for v in values):
+            raise ValueError("repeat values must be finite and positive")
+        return values
+    except Exception as e:
+        warnings.append(f"Element {context_id}: invalid texture repeat; using [2, 2] ({e}).")
+        return [2.0, 2.0]
+
+
+def apply_material_override(mesh, mat_def, warnings=None, context_id="unknown", *,
+                            job_dir=None, project_root=None, asset_base_url=None, asset_dir=None):
+    """Apply a persisted color or texture definition while preserving usable UVs."""
     if warnings is None:
         warnings = []
+    if not isinstance(mat_def, dict) or not mat_def:
+        return mesh
 
-    if not mat_def or "color" not in mat_def:
+    # Wall-side scoped overrides cannot be represented exactly until the IFC
+    # geometry is split into interior/exterior face sets. Use the top-level
+    # authored definition (which mirrors the latest action) and make the limit
+    # explicit rather than silently claiming both side materials were applied.
+    surfaces = mat_def.get("surfaces")
+    if mat_def.get("surfaceScope") == "scoped" and isinstance(surfaces, dict):
+        inside, outside = surfaces.get("interior"), surfaces.get("exterior")
+        if inside and outside and inside != outside:
+            warnings.append(
+                f"Element {context_id}: distinct interior/exterior finishes are stored, but the still-render mesh is not split by side; using the top-level finish."
+            )
+
+    texture_def = mat_def.get("texture") if isinstance(mat_def.get("texture"), dict) else {}
+    texture_src = (mat_def.get("textureSrc") or texture_def.get("src") or
+                   mat_def.get("texturePath") or texture_def.get("texture_url"))
+    kind = str(mat_def.get("kind") or "color").lower()
+
+    # A fabric/texture assignment without a source is not equivalent to a
+    # solid color. Report it as a material failure so the render caller can
+    # refuse to submit a visually incorrect scene instead of silently
+    # replacing a requested texture with a flat swatch.
+    if kind in ("fabric", "texture") and not texture_src:
+        warnings.append(
+            f"Element {context_id}: material override failed (kind='{kind}' has no textureSrc/texture.src)."
+        )
         return mesh
 
     try:
-        rgba = _parse_rgba(mat_def.get("color"))
+        if texture_src and kind in ("fabric", "texture"):
+            if not job_dir or not project_root:
+                raise ValueError("render job paths were not provided to resolve texture source")
+            texture_path = resolve_asset_path(
+                str(texture_src), job_dir, project_root, asset_base_url, asset_dir, warnings
+            )
+            with Image.open(texture_path) as source_image:
+                image = source_image.convert("RGB").copy()
 
-        try:
-            roughness = float(mat_def.get("roughness", 0.5))
-        except (TypeError, ValueError):
-            warnings.append(f"Element {context_id}: invalid 'roughness' value, defaulting to 0.5.")
-            roughness = 0.5
-        roughness = max(0.0, min(1.0, roughness))
+            repeat = _texture_repeats(mat_def, warnings, context_id)
+            existing_uv = getattr(mesh.visual, "uv", None)
+            if (isinstance(existing_uv, np.ndarray) and existing_uv.ndim == 2 and
+                    len(existing_uv) == len(mesh.vertices) and
+                    not np.allclose(existing_uv, 0.0, atol=1e-9)):
+                uv = np.asarray(existing_uv, dtype=np.float64).copy()
+                uv[:, 0] *= repeat[0]
+                uv[:, 1] *= repeat[1]
+            else:
+                uv = _generate_planar_uv(mesh, repeat)
 
-        try:
-            metalness = float(mat_def.get("metalness", 0.0))
-        except (TypeError, ValueError):
-            warnings.append(f"Element {context_id}: invalid 'metalness' value, defaulting to 0.0.")
-            metalness = 0.0
-        metalness = max(0.0, min(1.0, metalness))
+            material = trimesh.visual.material.SimpleMaterial(
+                image=image,
+                diffuse=[255, 255, 255, 255],
+                ambient=[255, 255, 255, 255],
+                specular=[40, 40, 40, 255],
+                glossiness=max(0.0, min(1.0, 1.0 - float(mat_def.get("roughness", 0.8)))),
+                name=str(mat_def.get("name") or f"hci_texture_{context_id}"),
+            )
+            mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
+            return mesh
 
-        # SimpleMaterial's "glossiness" is roughly the inverse of roughness; OBJ/
-        # MTL has no native roughness/metalness channel, so this is the closest
-        # approximation the format supports (via Ns).
-        glossiness = max(0.0, min(1.0, 1.0 - roughness))
-        specular_level = int(round(255 * metalness))
-
-        material = trimesh.visual.material.SimpleMaterial(
-            image=None,  # <-- forces a clean `Kd r g b` line, no map_Kd/PNG
-            diffuse=rgba,
-            ambient=rgba,
-            specular=[specular_level, specular_level, specular_level, 255],
-            glossiness=glossiness,
-        )
-
-        # A texture-mode visual still wants a UV array of the right length,
-        # even with no image behind it; the values themselves are irrelevant
-        # since there's no texture to sample.
-        uv = np.zeros((len(mesh.vertices), 2), dtype=np.float64)
-
-        mesh.visual = trimesh.visual.TextureVisuals(material=material, uv=uv)
+        # Solid-color definitions deliberately replace a model's base texture,
+        # matching the editor's color-apply operation.
+        if "color" in mat_def or "rgb" in mat_def or kind == "color":
+            rgba = _material_rgb_from_definition(mat_def)
+            try:
+                roughness = max(0.0, min(1.0, float(mat_def.get("roughness", 0.5))))
+            except (TypeError, ValueError):
+                roughness = 0.5
+            try:
+                metalness = max(0.0, min(1.0, float(mat_def.get("metallic", mat_def.get("metalness", 0.0)))))
+            except (TypeError, ValueError):
+                metalness = 0.0
+            uv = getattr(mesh.visual, "uv", None)
+            if not (isinstance(uv, np.ndarray) and uv.ndim == 2 and len(uv) == len(mesh.vertices)):
+                uv = np.zeros((len(mesh.vertices), 2), dtype=np.float64)
+            material = trimesh.visual.material.SimpleMaterial(
+                image=None,
+                diffuse=rgba,
+                ambient=rgba,
+                specular=[int(round(255 * metalness))] * 3 + [255],
+                glossiness=max(0.0, min(1.0, 1.0 - roughness)),
+                name=str(mat_def.get("name") or f"hci_color_{context_id}"),
+            )
+            mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
     except Exception as e:
-        warnings.append(f"Element {context_id}: material override failed ({e}); left unmodified.")
-
+        warnings.append(f"Element {context_id}: material override failed ({e}); left existing material/color in place.")
     return mesh
-
 
 # --------------------------------------------------------------------------
 # Merging: a trimesh.Scene, NOT trimesh.util.concatenate().
@@ -520,12 +809,19 @@ def _http_download(url, warnings):
 def resolve_asset_path(url_or_path, job_dir, project_root, asset_base_url,asset_dir, warnings):
     parsed = urlparse(url_or_path)
 
-# DIRECT OVERRIDE: Check the explicit asset folder directly
+# DIRECT OVERRIDE: only map URLs rooted under /assets/ into asset_dir.
+    # Catalogue model URLs live under /uploads/catalog/models and must retain
+    # their subpath under project_root; basename-only lookup could pick an
+    # unrelated same-named file from assets/.
     if asset_dir:
-        filename = os.path.basename(parsed.path)
-        direct_path = os.path.join(asset_dir, filename)
-        if os.path.exists(direct_path):
-            return direct_path
+        clean_path = parsed.path.lstrip("/\\")
+        if clean_path == "assets" or clean_path.startswith("assets/"):
+            relative_asset = clean_path[len("assets/"):] if clean_path.startswith("assets/") else ""
+            direct_path = os.path.abspath(os.path.join(asset_dir, relative_asset))
+            asset_root = os.path.abspath(asset_dir)
+            if direct_path == asset_root or direct_path.startswith(asset_root + os.sep):
+                if os.path.exists(direct_path):
+                    return direct_path
     # --- Bare relative / rooted path: purely local, no network involved. ---
     if parsed.scheme not in ("http", "https"):
         for candidate in _local_candidates(parsed.path, job_dir, project_root):
@@ -533,7 +829,7 @@ def resolve_asset_path(url_or_path, job_dir, project_root, asset_base_url,asset_
                 return candidate
         if asset_base_url:
             full_url = asset_base_url.rstrip("/") + "/" + parsed.path.lstrip("/")
-            return resolve_asset_path(full_url, job_dir, project_root, None, warnings)
+            return resolve_asset_path(full_url, job_dir, project_root, asset_base_url, asset_dir, warnings)
         raise FileNotFoundError(f"Could not resolve furniture asset locally: {url_or_path}")
 
     # --- Absolute http(s) URL. ---
@@ -551,11 +847,10 @@ def resolve_asset_path(url_or_path, job_dir, project_root, asset_base_url,asset_
         for candidate in _local_candidates(parsed.path, job_dir, project_root):
             if os.path.exists(candidate):
                 return candidate
-        warnings.append(
-            f"Asset URL '{url_or_path}' looked local (host={host!r}) but no "
-            f"matching file was found under {job_dir} or {project_root}; "
-            f"falling back to an HTTP fetch, which may hang or fail if this "
-            f"process was itself spawned by that same server."
+        raise FileNotFoundError(
+            f"Local asset URL could not be mapped to disk: {url_or_path}. "
+            f"Checked job directory {job_dir}, project root {project_root}, and asset folder {asset_dir}. "
+            "Refusing an HTTP hairpin request back into the render server."
         )
 
     return _http_download(url_or_path, warnings)
@@ -740,7 +1035,7 @@ def apply_structural_edit(mesh, edit_def, warnings, global_id):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Merge IFC + furniture + materials into one Y-up OBJ.")
+    parser = argparse.ArgumentParser(description="Merge IFC + placed assets + materials/textures into one Y-up OBJ scene package.")
     parser.add_argument("--ifc", required=True)
     parser.add_argument("--state", required=True)
     parser.add_argument("--output", required=True)
@@ -779,20 +1074,16 @@ def main():
         structural_edits_applied = 0
         structural_named = []
         used_names = set()  # trimesh.Scene node/geom names must stay unique
+        hidden_structural_count = 0
         for idx, (global_id, ifc_type, mesh) in enumerate(structural_pieces):
+            edit_def = structural_edits.get(global_id)
+            if isinstance(edit_def, dict) and (edit_def.get("visible") is False or edit_def.get("hidden") is True):
+                hidden_structural_count += 1
+                continue
+
             # 1. Delta-Based structural edit (resize/move), applied to the
             #    pristine per-element mesh BEFORE it joins the scene.
             #    input.ifc itself is never touched.
-            edit_def = structural_edits.get(global_id) or {}
-
-            # Visibility is an authored editor state. A deleted/hidden native
-            # element must not enter the static-render scene at all; keeping it
-            # in the OBJ and hiding it only in the editor would make the static
-            # render disagree with the user's canvas.
-            if edit_def.get("visible") is False:
-                log(f"[scene_merger] Skipping hidden structural element {global_id}.")
-                continue
-
             if edit_def:
                 apply_structural_edit(mesh, edit_def, warnings, global_id)
                 structural_edits_applied += 1
@@ -812,9 +1103,33 @@ def main():
             mat_def = materials.get(global_id)
             if mat_def:
                 warnings_before = len(warnings)
-                apply_material_override(mesh, mat_def, warnings, global_id)
+                apply_material_override(mesh, mat_def, warnings, global_id, job_dir=job_dir, project_root=project_root, asset_base_url=args.asset_base_url, asset_dir=args.asset_dir)
                 if len(warnings) == warnings_before:
                     materials_applied += 1
+            else:
+                # 2026-07-13 fix -- an element with no override used to be
+                # left with trimesh's bare default visual (no material,
+                # no uv), so the OBJ exporter wrote it with NO `usemtl`
+                # line at all. OBJ's `usemtl` is parser STATE, not a
+                # per-object property -- it stays in effect across `o`
+                # boundaries until the next `usemtl`. So every one of
+                # these no-material elements silently inherited whichever
+                # override color happened to be declared most recently
+                # before it in the file, instead of a sane default. Give
+                # every non-overridden mesh its own explicit default
+                # architectural material so it always re-asserts its own
+                # `usemtl` and never inherits a neighbor's color.
+                default_rgba = mesh.metadata.get("native_rgba", [200, 200, 200, 255])
+                default_material = trimesh.visual.material.SimpleMaterial(
+                    image=None,
+                    diffuse=default_rgba,
+                    ambient=[0, 0, 0, 255],  # see ambient!=diffuse note above
+                    specular=[0, 0, 0, 255],
+                    glossiness=0.5,
+                    name="mat_default_arch",
+                )
+                uv = np.zeros((len(mesh.vertices), 2), dtype=np.float64)
+                mesh.visual = trimesh.visual.TextureVisuals(material=default_material, uv=uv)
 
             # 3. Axis fix: Z-up (raw IFC) -> Y-up (app/Xeokit runtime), applied
             #    ONLY to structural geometry, and ONLY here -- BEFORE this
@@ -848,9 +1163,10 @@ def main():
             used_names.add(name)
             structural_named.append((name, mesh))
 
-        log(f"[scene_merger] {len(structural_named)} structural element(s), "
+        log(f"[scene_merger] {len(structural_named)} structural element(s) included, "
+            f"{hidden_structural_count} hidden source element(s) omitted, "
             f"{materials_applied} material override(s), "
-            f"{structural_edits_applied} structural edit(s) applied.")
+            f"{structural_edits_applied} structural transform edit(s) applied.")
 
         # --- 2. Furniture ---
         furniture_named = []
@@ -885,30 +1201,43 @@ def main():
                     for piece in pieces:
                         piece.apply_transform(z_up_to_y_up_matrix())
 
-                # The live Xeokit model.matrix is the authoritative transform
-                # after drag/resize operations. It is stored column-major (the
-                # same convention used by Xeokit/gl-matrix), while trimesh
-                # expects a conventional row-major NumPy matrix. Prefer the
-                # persisted matrix when valid so the static render reproduces
-                # the exact editor transform, including stretch operations;
-                # fall back to the semantic TRS fields for legacy states.
-                persisted_matrix = item.get("matrix")
-                transform = None
-                if (isinstance(persisted_matrix, (list, tuple)) and
-                    len(persisted_matrix) == 16):
-                    try:
-                        matrix_values = [float(value) for value in persisted_matrix]
-                        if all(np.isfinite(value) for value in matrix_values):
-                            transform = np.array(matrix_values, dtype=float).reshape((4, 4)).T
-                    except (TypeError, ValueError):
-                        transform = None
-
-                if transform is None:
-                    transform = build_transform(
-                        item.get("position"), item.get("rotation"), item.get("scale"),
-                    )
+                # IFC assets extracted here carry a native_rgba hint from the
+                # IFC style table. Convert it to an explicit MTL material so a
+                # 3ds Max OBJ import does not depend on vertex-color support.
+                if source_ext == ".ifc":
+                    for piece in pieces:
+                        native_rgba = piece.metadata.get("native_rgba")
+                        if isinstance(native_rgba, (list, tuple)) and len(native_rgba) >= 3:
+                            rgba = list(native_rgba[:4])
+                            if len(rgba) == 3:
+                                rgba.append(255)
+                            uv = np.zeros((len(piece.vertices), 2), dtype=np.float64)
+                            material = trimesh.visual.material.SimpleMaterial(
+                                image=None, diffuse=rgba, ambient=rgba, specular=[0, 0, 0, 255],
+                                glossiness=0.5, name=f"ifc_native_{item.get('instanceId') or i}"
+                            )
+                            piece.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
 
                 item_id = item.get("instanceId") or item.get("globalId") or item.get("id") or f"furniture_{i}"
+                transform = build_transform(
+                    item.get("position"), item.get("rotation"), item.get("scale"),
+                )
+
+                # The editor persists GLB position as the semantic normalized
+                # pivot (normally bottom-center), not the file's authored origin.
+                # Shift the source geometry to that pivot before scale/rotation.
+                # Hosted GLB doors are the exception: their position is the exact
+                # host-opening insertion point and must not receive this pivot shift.
+                if source_ext in (".glb", ".gltf") and not item.get("doorHostWallId"):
+                    normalization = item.get("glbNormalization") if isinstance(item.get("glbNormalization"), dict) else {}
+                    pivot_local = normalization.get("pivotLocal")
+                    if isinstance(pivot_local, (list, tuple)) and len(pivot_local) == 3:
+                        try:
+                            pivot = np.asarray([float(v) for v in pivot_local], dtype=np.float64)
+                            if np.all(np.isfinite(pivot)):
+                                transform = transform @ trimesh.transformations.translation_matrix(-pivot)
+                        except Exception as pivot_error:
+                            warnings.append(f"Furniture item {item_id}: ignored malformed GLB pivot metadata ({pivot_error}).")
                 # This is the EXACT key apply_material_override looks up below,
                 # and therefore also the exact name a piece needs on the JS
                 # side for the direct JSON color lookup to find it.
@@ -917,41 +1246,31 @@ def main():
 
                 for p_idx, piece in enumerate(pieces):
                     piece.apply_transform(transform)
+                    
+                    # FIX: Check if the outer instance was painted, OR if the inner IFC element was painted
+                    mat_def = materials.get(materials_key)
+                    inner_id = piece.metadata.get("global_id")
+                    
+                    if not mat_def and inner_id:
+                        mat_def = materials.get(inner_id)
+
                     if mat_def:
-                        # A material override on a furniture instance recolors
-                        # the WHOLE piece uniformly, same as the frontend does.
-                        apply_material_override(piece, mat_def, warnings, item_id)
+                        # Apply the custom color (e.g., the Blue Sofa)
+                        apply_material_override(piece, mat_def, warnings, item_id, job_dir=job_dir, project_root=project_root, asset_base_url=args.asset_base_url, asset_dir=args.asset_dir)
 
                     if materials_key:
-                        # Give part 0 the bare materials_key so it matches
-                        # project_state.json["materials"] exactly on the JS
-                        # side; later parts of a multi-part asset (e.g. a
-                        # sofa's legs + cushions) get a numeric suffix since
-                        # they'd otherwise collide, but that means only part
-                        # 0 will pick up the override color there -- a known
-                        # limitation of exact-name matching for multi-part
-                        # furniture, not something project_state.json alone
-                        # can resolve (it only stores one color per item).
                         base_name = _obj_safe_name(materials_key, f"furn_{i:04d}_{p_idx:02d}")
                         name = base_name if p_idx == 0 else f"{base_name}_{p_idx:02d}"
                     else:
                         name = _obj_safe_name(f"furn_{i:04d}_{p_idx:02d}_{item_id}", f"furn_{i:04d}_{p_idx:02d}")
 
                     if name in used_names:
-                        # Two placed instances of the same catalog asset
-                        # (same materials_key) -- disambiguate with the
-                        # instance id so the scene graph stays valid. Only
-                        # the first-placed instance's exact name will match
-                        # project_state.json["materials"]; later instances
-                        # of a shared catalog id keep archMat's default color
-                        # in the viewer instead of gray, which is still an
-                        # improvement over the old shared-material_0 bug.
                         name = f"{name}__{item_id}"
                         if name in used_names:
                             name = f"{name}_{p_idx:04d}"
                     used_names.add(name)
                     furniture_named.append((name, piece))
-
+                    
                 if mat_def:
                     materials_applied += 1
                 furniture_merged_count += 1
@@ -981,24 +1300,92 @@ def main():
         bbox_center = merged_scene.centroid.tolist() if len(merged_scene.geometry) else [0, 0, 0]
         bbox_size = (bounds[1] - bounds[0]).tolist()
 
-        # --- 5. Export merged OBJ (+ MTL). mtl_name is pinned to match the
-        #        output file's own basename instead of trimesh's default
-        #        "material.mtl", so concurrent render jobs writing into a
-        #        shared directory can't clobber each other's materials. ---
-        output_path = os.path.abspath(args.output)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        mtl_name = os.path.splitext(os.path.basename(output_path))[0] + ".mtl"
-        merged_scene.export(output_path, file_type="obj", mtl_name=mtl_name)
+        # --- 5. Export OBJ + MTL + texture resources, then package them together.
+        # The deployed Autodesk Activity has a stable legacy contract: input.obj
+        # plus an optional MaterialFile slot. The updated render.ms recognizes a
+        # ZIP in that slot, extracts this self-contained package, then imports
+        # the contained OBJ/MTL/textures. This avoids needing extra Activity args
+        # for every map image and supports GLB base-color/fabric maps in Max.
+        from trimesh.exchange.obj import export_obj
 
-        # Strip any texture-map references trimesh's default material may
-        # have written and guarantee a plain Kd line per material -- see
-        # sanitize_mtl_file() docstring above.
-        mtl_output_path = os.path.join(os.path.dirname(output_path), mtl_name)
-        sanitize_mtl_file(mtl_output_path, warnings)
+        output_path = os.path.abspath(args.output)
+        if not output_path.lower().endswith(".obj"):
+            output_path = os.path.splitext(output_path)[0] + ".obj"
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        output_dir = os.path.dirname(output_path)
+        mtl_path = os.path.join(output_dir, "input.mtl")
+        package_path = os.path.join(output_dir, "scene_package.zip")
+
+        # Give each node/material a stable distinct identity before OBJ's MTL
+        # exporter hashes materials. Some furniture GLBs reuse material names
+        # across different maps; unique names prevent one fabric image from
+        # incorrectly replacing another in the exported package.
+        for geom_idx, node_name in enumerate(merged_scene.graph.nodes_geometry):
+            try:
+                _node_transform, geometry_name = merged_scene.graph[node_name]
+            except Exception:
+                continue
+            geom = merged_scene.geometry.get(geometry_name)
+            if not isinstance(geom, trimesh.Trimesh):
+                continue
+            safe_material_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(node_name))[:48] or f"mesh_{geom_idx:04d}"
+            geom.metadata["name"] = str(node_name)
+            if getattr(geom.visual, "kind", None) == "texture" and getattr(geom.visual, "material", None) is not None:
+                try:
+                    material = copy.copy(geom.visual.material)
+                    material.name = f"{safe_material_name}_mat"
+                    uv = np.asarray(getattr(geom.visual, "uv", np.zeros((len(geom.vertices), 2))), dtype=np.float64)
+                    if uv.shape != (len(geom.vertices), 2):
+                        uv = _generate_planar_uv(geom)
+                    geom.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
+                except Exception as material_name_error:
+                    warnings.append(f"Could not assign a unique exported material name to {node_name}: {material_name_error}")
+
+        obj_text, resource_files = export_obj(
+            merged_scene,
+            include_normals=True,
+            include_color=True,
+            include_texture=True,
+            return_texture=True,
+            write_texture=False,
+            mtl_name="input.mtl",
+        )
+        if isinstance(obj_text, bytes):
+            obj_bytes = obj_text
+        else:
+            obj_bytes = obj_text.encode("utf-8")
+        with open(output_path, "wb") as f:
+            f.write(obj_bytes)
+
+        package_entries = {"input.obj": obj_bytes}
+        texture_file_names = []
+        for file_name, file_data in resource_files.items():
+            safe_name = os.path.basename(str(file_name).replace("\\", "/"))
+            if not safe_name:
+                continue
+            data = file_data if isinstance(file_data, bytes) else str(file_data).encode("utf-8")
+            if safe_name.lower() == "input.mtl":
+                mtl_bytes = data
+                package_entries["input.mtl"] = mtl_bytes
+            else:
+                package_entries[safe_name] = data
+                texture_file_names.append(safe_name)
+
+        # MTL is intentionally kept intact: dropping map_Kd would erase fabrics
+        # and source GLB base-color maps from the Autodesk render.
+        mtl_bytes = package_entries.get("input.mtl", b"")
+        with open(mtl_path, "wb") as f:
+            f.write(mtl_bytes)
+
+        with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            for name, data in package_entries.items():
+                archive.writestr(name, data)
 
         result = {
             "success": True,
             "output": output_path,
+            "scene_package": package_path,
+            "texture_count": len(texture_file_names),
             "bbox": {
                 "min": bbox_min,
                 "max": bbox_max,
@@ -1008,6 +1395,7 @@ def main():
             "furniture_count": furniture_merged_count,
             "materials_applied": materials_applied,
             "structural_edits_applied": structural_edits_applied,
+            "hidden_structural_count": hidden_structural_count,
             "warnings": warnings,
         }
         print(json.dumps(result))

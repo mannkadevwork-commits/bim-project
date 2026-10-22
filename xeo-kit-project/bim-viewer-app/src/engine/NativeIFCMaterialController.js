@@ -345,6 +345,7 @@ export class NativeIFCMaterialController {
         magFilter: LinearFilter,
       });
       material = new PhongMaterial(this.viewer.scene, {
+        // Keep the diffuse map neutral; its texels define the visible base color.
         diffuse: [1, 1, 1],
         diffuseMap: texture,
         emissive: [0, 0, 0],

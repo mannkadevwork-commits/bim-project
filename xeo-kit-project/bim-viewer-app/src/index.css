@@ -277,3 +277,86 @@ button.bg-indigo-600:hover, button.bg-cyan-600:hover, a.bg-indigo-600:hover, a.b
 .hci-transform-action--move:not(:disabled) { border-color: rgba(52,211,153,0.08); }
 .hci-transform-action--rotate:not(:disabled) { border-color: rgba(96,165,250,0.08); }
 .hci-transform-action--resize:not(:disabled) { border-color: rgba(255,181,94,0.08); }
+
+
+/* ===== Beginner-friendly editor experience foundation ===== */
+:root {
+  --hci-surface: #ffffff;
+  --hci-surface-soft: #f8fafc;
+  --hci-panel-border: rgba(148, 163, 184, 0.24);
+  --hci-focus-ring: rgba(255, 145, 77, 0.72);
+  --hci-radius-card: 14px;
+  --hci-motion-standard: cubic-bezier(0.2, 0.72, 0.2, 1);
+}
+
+html {
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed !important;
+}
+
+input,
+select,
+textarea {
+  accent-color: var(--hci-orange);
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--hci-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Subtle, consistent scrollbars in long side panels and settings dialogs. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.42) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.34);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.58);
+  background-clip: padding-box;
+}
+
+.hci-help-card {
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.045);
+}
+
+.hci-help-card button,
+.hci-editor-tabs button,
+.hci-toolbar-action {
+  transition-timing-function: var(--hci-motion-standard);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

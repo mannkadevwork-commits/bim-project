@@ -6,6 +6,7 @@ import {
   RotateCcw, RotateCw, Settings2, Target, View, X,
 } from 'lucide-react';
 import { useWalkthroughEngine } from '../hooks/useWalkthroughEngine';
+import { DEFAULT_PRESENTATION_SETTINGS, loadPresentationSettings, mergePresentationSettings, normalizePresentationSettings, savePresentationSettings } from '../hooks/walkthrough/presentationSettings.js';
 
 function IconButton({ title, onClick, children, active = false, disabled = false }) {
   return (
@@ -29,8 +30,11 @@ export default function WalkthroughPage() {
   const viewportRef = useRef(null);
   const [railOpen, setRailOpen] = useState(false);
   const [touring, setTouring] = useState(false);
-  const [heightOffset, setHeightOffset] = useState(0.35);
-  const [sensitivity, setSensitivity] = useState(0.0042);
+  const [heightOffset, setHeightOffset] = useState(DEFAULT_PRESENTATION_SETTINGS.camera.heightOffsetMeters);
+  const [sensitivity, setSensitivity] = useState(DEFAULT_PRESENTATION_SETTINGS.camera.lookSensitivity);
+  const [presentationSettings, setPresentationSettings] = useState(DEFAULT_PRESENTATION_SETTINGS);
+  const [settingsReady, setSettingsReady] = useState(false);
+  const lastPresentationLightingRef = useRef(DEFAULT_PRESENTATION_SETTINGS.appearance.lightingPreset);
   const [viewMode, setViewMode] = useState('overview');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [viewsOpen, setViewsOpen] = useState(false);
@@ -39,7 +43,6 @@ export default function WalkthroughPage() {
   const lockToastTimer = useRef(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [autoRotate, setAutoRotate] = useState(false);
-  const [fov, setFov] = useState(78);
   const [walkMode, setWalkMode] = useState('guided');
   const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
   const [displayName, setDisplayName] = useState('');
@@ -50,6 +53,24 @@ export default function WalkthroughPage() {
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSettingsReady(false);
+    loadPresentationSettings(jobId, API_BASE_URL).then(({ settings, manifest, source }) => {
+      if (cancelled) return;
+      const normalized = normalizePresentationSettings(settings);
+      setPresentationSettings(normalized);
+      setHeightOffset(normalized.camera.heightOffsetMeters);
+      setSensitivity(normalized.camera.lookSensitivity);
+      setSettingsReady(true);
+      console.info(`[HCI Presentation] Settings loaded from ${source}${manifest?.schemaVersion ? ` (manifest v${manifest.schemaVersion})` : ''}.`);
+    }).catch((error) => {
+      console.warn('[HCI Presentation] Could not load presentation settings; defaults will be used.', error);
+      if (!cancelled) setSettingsReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [jobId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -129,6 +150,32 @@ export default function WalkthroughPage() {
   const effectiveWalkMode = walkthrough.walkMode || walkMode;
 
   useEffect(() => {
+    if (!settingsReady) return;
+    walkthrough.applyPresentationSettings(presentationSettings);
+  }, [settingsReady, presentationSettings, walkthrough.applyPresentationSettings]);
+
+  useEffect(() => {
+    if (!settingsReady || !jobId) return;
+    savePresentationSettings(jobId, presentationSettings);
+  }, [jobId, settingsReady, presentationSettings]);
+
+  useEffect(() => {
+    const mode = walkthrough.lightingMode;
+    if (!settingsReady || !['day', 'evening', 'night'].includes(mode)) return;
+    if (mode === presentationSettings.appearance.lightingPreset) {
+      lastPresentationLightingRef.current = mode;
+      return;
+    }
+    // Ignore stale runtime state while a saved manifest preference is first being applied.
+    // Only persist a runtime-driven mode change when the runtime itself has moved from
+    // the last known presentation selection (for example, the L keyboard shortcut).
+    if (mode !== lastPresentationLightingRef.current) {
+      lastPresentationLightingRef.current = mode;
+      setPresentationSettings((previous) => mergePresentationSettings(previous, { appearance: { lightingPreset: mode } }));
+    }
+  }, [walkthrough.lightingMode, settingsReady, presentationSettings.appearance.lightingPreset]);
+
+  useEffect(() => {
     if (walkthrough.immersivePresentationActive) {
       setRailOpen(false);
       setSettingsOpen(false);
@@ -172,22 +219,38 @@ export default function WalkthroughPage() {
       : 'Explore · move with W/A/S/D · move mouse to look';
   }, [walkthrough.status, walkthrough.message, viewMode, effectiveWalkMode, walkthrough.lookLocked, walkthrough.immersive360Active, walkthrough.immersive360OfferAvailable, walkthrough.smart720Active, walkthrough.smart720OfferAvailable, walkthrough.smart720CurrentLabel]);
 
-  const applyFov = (value) => {
-    const next = Number(value);
-    setFov(next);
-    walkthrough.setFov(next);
+  const updatePresentationSettings = (patch) => {
+    setPresentationSettings((previous) => mergePresentationSettings(previous, patch));
   };
+
+  const setLightingPreset = (mode) => {
+    if (!['day', 'evening', 'night'].includes(mode)) return;
+    updatePresentationSettings({ appearance: { lightingPreset: mode } });
+    walkthrough.setLightingMode(mode);
+  };
+
+  const setQualityMode = (mode) => updatePresentationSettings({ quality: { mode } });
 
   const applySensitivity = (value) => {
     const next = Number(value);
     setSensitivity(next);
+    updatePresentationSettings({ camera: { lookSensitivity: next } });
     walkthrough.setSensitivity(next);
   };
 
   const applyHeight = (value) => {
     const next = Number(value);
     setHeightOffset(next);
+    updatePresentationSettings({ camera: { heightOffsetMeters: next } });
     walkthrough.setHeightOffset(next);
+  };
+
+  const resetPresentationSettings = () => {
+    const defaults = normalizePresentationSettings(DEFAULT_PRESENTATION_SETTINGS);
+    setPresentationSettings(defaults);
+    setHeightOffset(defaults.camera.heightOffsetMeters);
+    setSensitivity(defaults.camera.lookSensitivity);
+    walkthrough.applyPresentationSettings(defaults);
   };
 
   const openImmersive360 = () => {
@@ -303,7 +366,7 @@ export default function WalkthroughPage() {
         </div>
       )} */}
 
-      {viewMode === 'walk' && walkthrough.immersivePresentationActive && !railOpen && (
+      {viewMode === 'walk' && presentationSettings.interface.showFloorMap && walkthrough.immersivePresentationActive && !railOpen && (
         <button
           type="button"
           onClick={() => setRailOpen(true)}
@@ -319,7 +382,7 @@ export default function WalkthroughPage() {
         </button>
       )}
 
-      {viewMode === 'walk' && (
+      {viewMode === 'walk' && presentationSettings.interface.showFloorMap && (
         <div className="absolute left-4 top-20 z-30 w-[300px] overflow-hidden rounded-[24px] border border-white/10 bg-slate-950/54 shadow-[0_28px_90px_rgba(0,0,0,.32)] backdrop-blur-2xl sm:w-[310px]">
           <button
             type="button"
@@ -424,32 +487,108 @@ export default function WalkthroughPage() {
         </div>
       )}
 
+      <div className="pointer-events-auto absolute bottom-5 right-5 z-30 flex items-center gap-1 rounded-2xl border border-white/10 bg-slate-950/78 p-1.5 text-white shadow-xl backdrop-blur-2xl">
+        <span className="px-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Light</span>
+        {[
+          ['day', 'Day'], ['evening', 'Evening'], ['night', 'Night'],
+        ].map(([mode, label]) => (
+          <button key={mode} type="button" onClick={() => setLightingPreset(mode)} aria-pressed={presentationSettings.appearance.lightingPreset === mode} className={`h-8 rounded-xl px-2.5 text-[11px] font-semibold transition ${presentationSettings.appearance.lightingPreset === mode ? 'bg-[#ff914d]/20 text-[#ffd1b3]' : 'text-slate-300 hover:bg-white/[0.08]'}`}>{label}</button>
+        ))}
+        <span className="mx-1 h-5 w-px bg-white/10" />
+        <button type="button" title="Presentation settings" aria-label="Presentation settings" onClick={() => setSettingsOpen((open) => !open)} className={`flex h-8 w-8 items-center justify-center rounded-xl transition ${settingsOpen ? 'bg-[#ff914d]/20 text-[#ffd1b3]' : 'text-slate-300 hover:bg-white/[0.08]'}`}><Settings2 className="h-4 w-4" /></button>
+      </div>
+
       {settingsOpen && (
-        <div className="absolute bottom-24 left-1/2 z-40 w-[340px] -translate-x-1/2 rounded-2xl border border-white/10 bg-slate-950/92 p-4 shadow-2xl backdrop-blur-2xl">
-          <div className="mb-4 flex items-center justify-between">
+        <div className="absolute bottom-24 right-5 z-40 max-h-[72vh] w-[min(92vw,420px)] overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/94 p-4 text-white shadow-2xl backdrop-blur-2xl">
+          <div className="mb-4 flex items-start justify-between gap-3">
             <div>
-              <div className="text-sm font-semibold">Walk Controls</div>
-              <div className="text-[11px] text-slate-300">Fine-tune how the camera feels.</div>
+              <div className="text-sm font-semibold">Presentation settings</div>
+              <div className="mt-1 text-[11px] leading-4 text-slate-400">One visual profile shared by Overview, Guided, Explore and 360.</div>
             </div>
-            <IconButton title="Close controls" onClick={() => setSettingsOpen(false)}><X className="h-4 w-4" /></IconButton>
+            <IconButton title="Close presentation settings" onClick={() => setSettingsOpen(false)}><X className="h-4 w-4" /></IconButton>
           </div>
-          <div className="space-y-4">
+
+          <section className="space-y-2">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Lighting & atmosphere</div>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                ['day', '☀', 'Daylight'], ['evening', '◐', 'Evening'], ['night', '☾', 'Night'],
+              ].map(([mode, icon, label]) => (
+                <button key={mode} type="button" onClick={() => setLightingPreset(mode)} aria-pressed={presentationSettings.appearance.lightingPreset === mode} className={`flex h-10 items-center justify-center gap-1.5 rounded-xl border text-xs font-semibold transition ${presentationSettings.appearance.lightingPreset === mode ? 'border-[#ff914d]/50 bg-[#ff914d]/16 text-[#ffd1b3]' : 'border-white/10 bg-white/[0.035] text-slate-300 hover:bg-white/[0.08]'}`}>
+                  <span aria-hidden="true">{icon}</span>{label}
+                </button>
+              ))}
+            </div>
+            <label className="block pt-1">
+              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Exposure</span><span className="font-mono text-slate-400">{presentationSettings.appearance.exposureMultiplier.toFixed(2)}×</span></div>
+              <input aria-label="Exposure multiplier" className="w-full accent-[#ff914d]" type="range" min="0.75" max="1.25" step="0.05" value={presentationSettings.appearance.exposureMultiplier} onChange={(e) => updatePresentationSettings({ appearance: { exposureMultiplier: Number(e.target.value) } })} />
+            </label>
             <label className="block">
-              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Field of view (FOV)</span><span className="font-mono text-slate-500">{fov}°</span></div>
-              <input className="w-full accent-[#ff914d]" type="range" min="45" max="100" step="1" value={fov} onChange={(e) => applyFov(e.target.value)} />
-              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Narrow</span><span>Presentation</span><span>Wide</span></div>
+              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Environment fill</span><span className="font-mono text-slate-400">{presentationSettings.appearance.environmentMultiplier.toFixed(2)}×</span></div>
+              <input aria-label="Environment fill multiplier" className="w-full accent-[#ff914d]" type="range" min="0.5" max="1.5" step="0.05" value={presentationSettings.appearance.environmentMultiplier} onChange={(e) => updatePresentationSettings({ appearance: { environmentMultiplier: Number(e.target.value) } })} />
             </label>
-            <label className={`block ${''}`}>
-              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Mouse sensitivity</span><span className="font-mono text-slate-500">{sensitivity.toFixed(4)}</span></div>
-              <input disabled={effectiveWalkMode === 'guided'} className="w-full accent-[#ff914d]" type="range" min="0.0015" max="0.009" step="0.0001" value={sensitivity} onChange={(e) => applySensitivity(e.target.value)} />
-              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Precise</span><span>Fast</span></div>
+            <label className="block text-xs text-slate-300">
+              <span className="mb-1.5 block">Color rendering</span>
+              <select value={presentationSettings.appearance.toneMapping} onChange={(e) => updatePresentationSettings({ appearance: { toneMapping: e.target.value } })} className="w-full rounded-xl border border-white/10 bg-slate-900 px-3 py-2 text-xs text-white outline-none focus:border-[#ff914d]/50">
+                <option value="agx">AgX · Balanced architectural color</option>
+                <option value="aces">ACES · Filmic highlights</option>
+                <option value="neutral">Neutral · Minimal tone curve</option>
+              </select>
+            </label>
+          </section>
+
+          <div className="my-4 h-px bg-white/10" />
+          <section className="space-y-2">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Rendering quality</div>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                ['auto', 'Automatic', 'Based on device capability'],
+                ['performance', 'Performance', 'Lower resolution, shadows off'],
+                ['balanced', 'Balanced', 'Recommended default'],
+                ['high', 'High detail', 'Higher resolution, shadows on'],
+              ].map(([mode, label, description]) => (
+                <button key={mode} type="button" onClick={() => setQualityMode(mode)} aria-pressed={presentationSettings.quality.mode === mode} className={`rounded-xl border px-3 py-2 text-left transition ${presentationSettings.quality.mode === mode ? 'border-[#ff914d]/50 bg-[#ff914d]/12' : 'border-white/10 bg-white/[0.035] hover:bg-white/[0.07]'}`}>
+                  <span className="block text-xs font-semibold text-white">{label}</span>
+                  <span className="mt-1 block text-[10px] leading-4 text-slate-400">{description}</span>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <div className="my-4 h-px bg-white/10" />
+          <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+            <span>
+              <span className="block text-xs font-semibold text-white">Show floor map</span>
+              <span className="mt-0.5 block text-[10px] text-slate-400">Keep room destinations available while walking.</span>
+            </span>
+            <input type="checkbox" checked={presentationSettings.interface.showFloorMap} onChange={(e) => updatePresentationSettings({ interface: { showFloorMap: e.target.checked } })} className="h-4 w-4 accent-[#ff914d]" />
+          </label>
+          <div className="my-4 h-px bg-white/10" />
+          <section className="space-y-3">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Camera</div>
+            {[
+              ['Guided field of view', 'guidedFov', 50, 88, 1],
+              ['Explore field of view', 'exploreFov', 55, 95, 1],
+              ['360 field of view', 'immersiveFov', 50, 88, 1],
+            ].map(([label, key, min, max, step]) => (
+              <label key={key} className="block">
+                <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>{label}</span><span className="font-mono text-slate-400">{presentationSettings.camera[key]}°</span></div>
+                <input aria-label={label} className="w-full accent-[#ff914d]" type="range" min={min} max={max} step={step} value={presentationSettings.camera[key]} onChange={(e) => updatePresentationSettings({ camera: { [key]: Number(e.target.value) } })} />
+              </label>
+            ))}
+            <label className="block">
+              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Camera height offset</span><span className="font-mono text-slate-400">{heightOffset.toFixed(2)} m</span></div>
+              <input aria-label="Camera height offset" className="w-full accent-[#ff914d]" type="range" min="-0.15" max="0.35" step="0.01" value={heightOffset} onChange={(e) => applyHeight(e.target.value)} />
             </label>
             <label className="block">
-              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Camera height</span><span className="font-mono text-slate-500">{heightOffset.toFixed(2)}m</span></div>
-              <input className="w-full accent-[#ff914d]" type="range" min="-0.15" max="0.35" step="0.01" value={heightOffset} onChange={(e) => applyHeight(e.target.value)} />
-              <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>Lower</span><span>Neutral</span><span>Higher</span></div>
+              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-300"><span>Mouse sensitivity</span><span className="font-mono text-slate-400">{sensitivity.toFixed(4)}</span></div>
+              <input disabled={effectiveWalkMode === 'guided'} aria-label="Mouse sensitivity" className="w-full accent-[#ff914d] disabled:opacity-40" type="range" min="0.0015" max="0.009" step="0.0001" value={sensitivity} onChange={(e) => applySensitivity(e.target.value)} />
             </label>
-            <button type="button" onClick={() => { applyHeight(0.35); applyFov(78); }} className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-200 hover:bg-white/[0.08]"><RotateCcw className="h-3.5 w-3.5" /> Reset camera height &amp; FOV</button>
+          </section>
+
+          <div className="mt-4 flex items-center justify-between gap-3 border-t border-white/10 pt-3">
+            <span className="text-[10px] leading-4 text-slate-500">Saved in this browser for this render.</span>
+            <button type="button" onClick={resetPresentationSettings} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold text-slate-200 hover:bg-white/[0.09]"><RotateCcw className="h-3.5 w-3.5" /> Reset</button>
           </div>
         </div>
       )}
@@ -605,7 +744,7 @@ export default function WalkthroughPage() {
         </div>
       </div>
 
-      {walkthrough.immersivePresentationActive && (
+      {walkthrough.immersivePresentationActive && !settingsOpen && (
         <div className="absolute bottom-28 right-6 z-30 w-[270px] rounded-2xl border border-white/10 bg-slate-950/82 p-3 text-white shadow-2xl backdrop-blur-2xl">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">

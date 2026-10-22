@@ -10,8 +10,57 @@ import {
   projectStatesEqual,
 } from './projectHistory';
 import { applyGLBPlacementTransform, getGLBPlacementTarget, getGLBRotation, getGLBScale, isGLBModel } from '../engine/assets/GLBAssetTransform';
+import { markAssetTransformApplied } from '../engine/assets/assetTransformIdentity';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
+const projectRecoveryKey = (jobId) => `hci_recovery_${jobId}`;
+
+const readProjectRecovery = (jobId) => {
+  if (!jobId) return null;
+  try {
+    const raw = localStorage.getItem(projectRecoveryKey(jobId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed?.version === 1 && parsed?.state && typeof parsed.state === 'object'
+      ? parsed
+      : null;
+  } catch (error) {
+    console.warn('[ProjectSync] Could not read the local project recovery journal:', error);
+    return null;
+  }
+};
+
+const writeProjectRecovery = (jobId, state, error) => {
+  if (!jobId || !state) return false;
+  try {
+    localStorage.setItem(projectRecoveryKey(jobId), JSON.stringify({
+      version: 1,
+      updatedAt: Date.now(),
+      state: cloneProjectState(state),
+      error: error?.message || String(error || 'Project save was not confirmed.'),
+    }));
+    return true;
+  } catch (storageError) {
+    console.error('[ProjectSync] Unable to write a local recovery journal:', storageError);
+    return false;
+  }
+};
+
+const clearProjectRecoveryIfMatches = (jobId, savedState) => {
+  const recovery = readProjectRecovery(jobId);
+  if (!recovery) return;
+  if (!projectStatesEqual(recovery.state, savedState)) return;
+  try { localStorage.removeItem(projectRecoveryKey(jobId)); }
+  catch (error) { console.warn('[ProjectSync] Could not clear confirmed recovery journal:', error); }
+};
+
+const normalizeProjectStatePayload = (value) => ({
+  materials: value?.materials || {},
+  furniture: sanitizePersistedFurniture(value?.furniture || []),
+  structural_edits: value?.structural_edits || {},
+  scene_calibration: value?.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
+});
 
 const inferFileType = (url, explicitType) => {
   if (explicitType) return String(explicitType).toLowerCase();
@@ -170,6 +219,9 @@ export const useProjectSync = (activeProject) => {
       before: cloneProjectState(projectStateRef.current),
     };
     lastHistoryMutationRef.current = null;
+    // Re-render toolbar consumers so Undo/Redo are visibly disabled for the
+    // duration of an async composite edit (door insertion, grouped deletion, etc.).
+    bumpHistoryRevision();
   };
 
   const endHistoryTransaction = () => {
@@ -180,6 +232,7 @@ export const useProjectSync = (activeProject) => {
     if (active.depth > 0) return active.changed;
 
     historyTransactionRef.current = null;
+    bumpHistoryRevision();
     if (!active.changed || projectStatesEqual(active.before, projectStateRef.current)) {
       return false;
     }
@@ -190,7 +243,6 @@ export const useProjectSync = (activeProject) => {
     }
     historyFutureRef.current = [];
     lastHistoryMutationRef.current = null;
-    bumpHistoryRevision();
     return true;
   };
 
@@ -295,36 +347,65 @@ export const useProjectSync = (activeProject) => {
             structuralEdits: Object.keys(data?.structural_edits || {}).length,
           });
           if (data) {
+            const serverState = normalizeProjectStatePayload(data);
+            const recovery = readProjectRecovery(jobId);
+            let stateToHydrate = serverState;
+
+            if (recovery?.state) {
+              const recoveredState = normalizeProjectStatePayload(recovery.state);
+              if (!projectStatesEqual(recoveredState, serverState)) {
+                // A previous save was not acknowledged by the server. Prefer the
+                // preserved local recovery snapshot instead of silently replacing
+                // the user's latest edit with the older server snapshot.
+                stateToHydrate = recoveredState;
+                setToastMessage('Recovered your last unconfirmed local edits. Syncing them to the server again.');
+              } else {
+                try { localStorage.removeItem(projectRecoveryKey(jobId)); } catch (_) {}
+              }
+            }
+
             projectStateLoadCommitPerfRef.current = performance.now();
-            setProjectStateTracked({
-              materials: data.materials || {},
-              furniture: sanitizePersistedFurniture(data.furniture || []),
-              structural_edits: data.structural_edits || {},
-              scene_calibration: data.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
-            }, { history: false });
+            setProjectStateTracked(stateToHydrate, { history: false });
             resetHistory();
             projectStateHydratedRef.current = true;
           }
         })
-        .catch(() => {
-          const localState = localStorage.getItem(`hci_state_${jobId}`);
-          if (localState) {
+        .catch((loadError) => {
+          console.error('[ProjectSync] Server project load failed; attempting local recovery:', loadError);
+          const recovery = readProjectRecovery(jobId);
+          let localState = null;
+          if (!recovery?.state) {
             try {
-              const parsed = JSON.parse(localState);
-              setProjectStateTracked({
-                materials: parsed.materials || {},
-                furniture: sanitizePersistedFurniture(parsed.furniture || []),
-                structural_edits: parsed.structural_edits || {},
-                scene_calibration: parsed.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
-              }, { history: false });
+              localState = localStorage.getItem(`hci_state_${jobId}`);
+            } catch (storageError) {
+              // Some browser privacy modes disable localStorage entirely. Do not
+              // let a failed recovery read strand the editor in an unhydrated state.
+              console.warn('[ProjectSync] Browser storage is unavailable during recovery:', storageError);
+            }
+          }
+
+          if (recovery?.state || localState) {
+            try {
+              const parsed = recovery?.state ? recovery.state : JSON.parse(localState);
+              setProjectStateTracked(normalizeProjectStatePayload(parsed), { history: false });
+              if (recovery?.state) {
+                setToastMessage('Restored your last local recovery snapshot because the server project could not be loaded.');
+              } else {
+                setToastMessage('Server project could not be loaded. Restored the last browser-saved project state.');
+              }
               resetHistory();
               projectStateHydratedRef.current = true;
             } catch (e) {
-              console.warn('[ProjectSync] Failed to parse local state, starting fresh.');
+              console.warn('[ProjectSync] Failed to parse local state, starting fresh:', e);
               projectStateHydratedRef.current = true;
             }
           } else {
+            // Always allow the editor to hydrate even if both remote loading and
+            // browser recovery fail. The UI can now expose the save error instead
+            // of remaining indefinitely in a loading state.
             projectStateHydratedRef.current = true;
+            setSaveStatus('error');
+            setToastMessage('Could not load this project or access a local recovery snapshot. Check the backend before making new edits.');
           }
         });
     } else {
@@ -395,16 +476,34 @@ export const useProjectSync = (activeProject) => {
     setSaveStatus('saving');
 
     try {
-      localStorage.setItem(`hci_state_${targetJobId}`, JSON.stringify(state));
-      await fetch(`${API_BASE_URL}/api/projects/${targetJobId}/save`, {
+      try {
+        localStorage.setItem(`hci_state_${targetJobId}`, JSON.stringify(state));
+      } catch (storageError) {
+        // Local recovery is best-effort. Storage quota/private-mode errors must
+        // not prevent the canonical server save from being attempted.
+        console.warn('[ProjectSync] Local recovery snapshot could not be written:', storageError);
+      }
+
+      const response = await fetch(`${API_BASE_URL}/api/projects/${targetJobId}/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(state),
       });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(`Project auto-save failed (${response.status})${detail ? `: ${detail}` : ''}`);
+      }
       setSaveStatus('saved');
       setLastSavedTime(new Date());
+      if (!pendingSaveRef.current && projectStatesEqual(state, projectStateRef.current)) {
+        clearProjectRecoveryIfMatches(targetJobId, state);
+      }
     } catch (err) {
-      console.error('[ProjectSync] Cloud auto-save failed:', err);
+      const recoveryState = pendingSaveRef.current?.targetJobId === targetJobId
+        ? pendingSaveRef.current.state
+        : state;
+      writeProjectRecovery(targetJobId, recoveryState, err);
+      console.error('[ProjectSync] Cloud auto-save failed; recovery snapshot preserved when browser storage permits:', err);
       setSaveStatus('error');
     } finally {
       isSavingRef.current = false;
@@ -427,16 +526,28 @@ export const useProjectSync = (activeProject) => {
     const stateToSave = stateOverride || projectStateRef.current;
     setSaveStatus('saving');
     try {
-      localStorage.setItem(`hci_state_${jobId}`, JSON.stringify(stateToSave));
-      await fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
+      try {
+        localStorage.setItem(`hci_state_${jobId}`, JSON.stringify(stateToSave));
+      } catch (storageError) {
+        console.warn('[ProjectSync] Local recovery snapshot could not be written:', storageError);
+      }
+      const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(stateToSave),
       });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(`Manual project save failed (${response.status})${detail ? `: ${detail}` : ''}`);
+      }
       setSaveStatus('saved');
       setLastSavedTime(new Date());
+      if (projectStatesEqual(stateToSave, projectStateRef.current)) {
+        clearProjectRecoveryIfMatches(jobId, stateToSave);
+      }
     } catch (err) {
-      console.error('[ProjectSync] Manual save failed:', err);
+      writeProjectRecovery(jobId, projectStateRef.current || stateToSave, err);
+      console.error('[ProjectSync] Manual save failed; local recovery snapshot preserved when possible:', err);
       setSaveStatus('error');
     }
   };
@@ -636,16 +747,55 @@ export const useProjectSync = (activeProject) => {
     surfaceScope: ['interior', 'exterior', 'both'].includes(surfaceScope) ? surfaceScope : 'both',
   });
 
-  const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray, surfaceScope = 'both') => {
+  // Convert both the current scoped state and legacy one-sided/full-wall entries
+  // into a pair of side definitions. This prevents applying a finish to the
+  // opposite side from silently discarding a finish saved by an older editor.
+  const getExistingWallSurfaces = (previous) => {
+    if (!previous || typeof previous !== 'object') {
+      return { interior: null, exterior: null };
+    }
+
+    if (previous.surfaces && typeof previous.surfaces === 'object') {
+      return {
+        interior: previous.surfaces.interior || null,
+        exterior: previous.surfaces.exterior || null,
+      };
+    }
+
+    if (Object.prototype.hasOwnProperty.call(previous, 'interior') ||
+        Object.prototype.hasOwnProperty.call(previous, 'exterior')) {
+      return {
+        interior: previous.interior || null,
+        exterior: previous.exterior || null,
+      };
+    }
+
+    const legacyDefinition = { ...previous, surfaceScope: null };
+    if (previous.surfaceScope === 'interior') {
+      return { interior: legacyDefinition, exterior: null };
+    }
+    if (previous.surfaceScope === 'exterior') {
+      return { interior: null, exterior: legacyDefinition };
+    }
+    if (previous.surfaceScope === 'scoped') {
+      return { interior: null, exterior: null };
+    }
+
+    // 'both' and legacy unscoped material definitions represented one finish
+    // applied to the complete wall, so preserve it on both physical surfaces.
+    return { interior: legacyDefinition, exterior: legacyDefinition };
+  };
+
+  const applyMaterial = (viewerRef, selectedObject, hexColor, rgbArray, surfaceScope = 'both', historyOptions = {}) => {
     if (!selectedObject || !viewerRef.current) return 0;
     const definition = withWallSurfaceScope({ kind: 'color', color: hexColor, rgb: rgbArray }, surfaceScope);
-    applyMaterialDefinition(viewerRef, selectedObject, definition);
+    applyMaterialDefinition(viewerRef, selectedObject, definition, historyOptions);
     return 1;
   };
 
-  const applyMaterialDefinition = (viewerRef, selectedObject, definition) => {
+  const applyMaterialDefinition = (viewerRef, selectedObject, definition, historyOptions = {}) => {
     if (!selectedObject || !viewerRef.current || !definition) return 0;
-    const isWall = String(selectedObject.type || '').toLowerCase().includes('ifcwall');
+    const isWall = !!selectedObject.isWall || String(selectedObject.type || '').toLowerCase().includes('ifcwall');
     const normalized = normalizeMaterialDefinition(
       isWall ? { ...definition, surfaceScope: definition.surfaceScope || 'both' } : definition
     );
@@ -655,8 +805,7 @@ export const useProjectSync = (activeProject) => {
     let nextWallState = null;
 
     if (isWall && normalized.surfaceScope) {
-      const currentInterior = previous?.surfaces?.interior || previous?.interior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
-      const currentExterior = previous?.surfaces?.exterior || previous?.exterior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+      const { interior: currentInterior, exterior: currentExterior } = getExistingWallSurfaces(previous);
       const nextInterior = normalized.surfaceScope === 'exterior' ? currentInterior : { ...normalized, surfaceScope: null };
       const nextExterior = normalized.surfaceScope === 'interior' ? currentExterior : { ...normalized, surfaceScope: null };
 
@@ -677,7 +826,7 @@ export const useProjectSync = (activeProject) => {
       const nextMaterials = { ...(prev.materials || {}) };
       nextMaterials[selectedObject.id] = nextWallState || normalized;
       return { ...prev, materials: nextMaterials };
-    });
+    }, historyOptions);
     return 1;
   };
 
@@ -704,8 +853,7 @@ export const useProjectSync = (activeProject) => {
     const stateBeforeApply = projectStateRef.current;
     wallIds.forEach(id => {
       const previous = stateBeforeApply?.materials?.[id];
-      const currentInterior = previous?.surfaces?.interior || previous?.interior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
-      const currentExterior = previous?.surfaces?.exterior || previous?.exterior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+      const { interior: currentInterior, exterior: currentExterior } = getExistingWallSurfaces(previous);
       const nextInterior = normalized.surfaceScope === 'exterior' ? currentInterior : { ...normalized, surfaceScope: null };
       const nextExterior = normalized.surfaceScope === 'interior' ? currentExterior : { ...normalized, surfaceScope: null };
       const sceneDefinition = {
@@ -721,8 +869,7 @@ export const useProjectSync = (activeProject) => {
       const nextMaterials = { ...(prev.materials || {}) };
       wallIds.forEach(id => {
         const previous = nextMaterials[id];
-        const currentInterior = previous?.surfaces?.interior || previous?.interior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
-        const currentExterior = previous?.surfaces?.exterior || previous?.exterior || (previous && !['interior', 'exterior', 'both', 'scoped'].includes(previous.surfaceScope) ? previous : null);
+        const { interior: currentInterior, exterior: currentExterior } = getExistingWallSurfaces(previous);
         nextMaterials[id] = {
           ...normalized,
           surfaceScope: 'scoped',
@@ -775,7 +922,9 @@ export const useProjectSync = (activeProject) => {
           currentGLBRotation,
           updatedScale
         );
-      } else {
+      } else if (!transformOptions.preserveRuntimeTransform && !transformOptions.matrixOverride) {
+        // Matrix-authored IFC gizmo resizes must not be overwritten by a TRS
+        // setter immediately after their pivot-correct matrix was committed.
         assetModel.scale = updatedScale;
       }
     } else if (isRotation) {
@@ -828,7 +977,10 @@ export const useProjectSync = (activeProject) => {
     //   current post-transform AABB. Persisting it on rotation/scale prevents
     //   restoreProjectStateToScene() from recomputing a new position from a
     //   stale pre-transform target and visibly jumping the model.
-    const hasRuntimeMatrixOverride = !isGLB && (transformOptions.preserveRuntimeTransform || transformOptions.matrixOverride);
+    // Only native-isolated IFCs use a persisted full matrix. Catalogue IFCs
+    // and hosted doors use semantic AABB target + rotation + scale; persisting
+    // their model-origin matrix mixes coordinate contracts and causes teleports.
+    const hasRuntimeMatrixOverride = isNativeIsolation && (transformOptions.preserveRuntimeTransform || transformOptions.matrixOverride);
     const runtimeMatrix = hasRuntimeMatrixOverride
       ? normalizeMatrix(transformOptions.matrixOverride || assetModel.matrix)
       : null;
@@ -849,18 +1001,27 @@ export const useProjectSync = (activeProject) => {
 
     setProjectStateTracked(prev => ({
       ...prev,
-      furniture: (prev.furniture || []).map(f =>
-        f.instanceId === selectedAssetId
-          ? {
-              ...f,
-              position: persistedPosition || f.position || [0, 0, 0],
-              rotation: updatedRot || f.rotation || [0, 0, 0],
-              scale: updatedScale || f.scale || [1, 1, 1],
-              ...(glbNormalization ? { glbNormalization } : {}),
-              ...(persistedMatrix ? { matrix: persistedMatrix } : {}),
-            }
-          : f
-      ),
+      furniture: (prev.furniture || []).map(f => {
+        if (f.instanceId !== selectedAssetId) return f;
+
+        const nextItem = {
+          ...f,
+          position: persistedPosition || f.position || [0, 0, 0],
+          rotation: updatedRot || f.rotation || [0, 0, 0],
+          scale: updatedScale || f.scale || [1, 1, 1],
+          ...(glbNormalization ? { glbNormalization } : {}),
+        };
+
+        if (persistedMatrix) {
+          nextItem.matrix = persistedMatrix;
+        } else if (!isGLB && !isNativeIsolation) {
+          // Remove obsolete raw matrices from regular IFC items written by an
+          // older editor version. These items must keep semantic target TRS.
+          delete nextItem.matrix;
+        }
+
+        return nextItem;
+      }),
     }), { coalesceKey: `asset-transform:${selectedAssetId}:${isScale ? 'scale' : isRotation ? 'rotation' : 'position'}` });
   };
 
@@ -956,14 +1117,19 @@ export const useProjectSync = (activeProject) => {
     return [s.x, s.y, s.z];
   };
 
+  // Xeokit model AABBs are world-space bounds. The semantic target used by
+  // placed IFC furniture/doors is therefore the world AABB's horizontal center
+  // and bottom elevation directly. Adding model.position here double-counts
+  // the model translation and causes a different location to be persisted after
+  // a gizmo edit, undo/redo, or any later project-state reconciliation.
   const assetModelToTargetPosition = (assetModel) => {
     const aabb = assetModel?.aabb;
     const pos = Array.isArray(assetModel?.position) ? assetModel.position : [0, 0, 0];
-    if (!aabb || aabb.length < 6) return [...pos];
+    if (!aabb || aabb.length < 6 || !Array.from(aabb).slice(0, 6).every(Number.isFinite)) return [...pos];
     return [
-      pos[0] + (aabb[0] + aabb[3]) / 2,
-      pos[1] + aabb[1],
-      pos[2] + (aabb[2] + aabb[5]) / 2,
+      (aabb[0] + aabb[3]) / 2,
+      aabb[1],
+      (aabb[2] + aabb[5]) / 2,
     ];
   };
 
@@ -1022,20 +1188,36 @@ export const useProjectSync = (activeProject) => {
       const semanticPosition = isGLB
         ? getGLBPlacementTarget(model)
         : (Array.isArray(finalPosition) ? [...finalPosition] : null);
+      let persistedItemForModel = null;
+
       // Persist semantic transforms only; runtime IFC matrices are not part of
-      // the durable state contract.
-      setProjectStateTracked(prev => ({
-        ...prev,
-        furniture: (prev.furniture || []).map(item =>
-          item.instanceId === instanceId
-            ? {
-                ...item,
-                position: item.doorHostWallId ? item.position : (semanticPosition || item.position),
-                ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
-              }
-            : item
-        ),
-      }), { history: false });
+      // the durable state contract. The loader has already positioned the live
+      // model before it calls onPlaced, so record which state that model now
+      // represents. Without this marker, the first unrelated project-state edit
+      // runs the scene reconciler against the already-placed door and applies the
+      // same saved target a second time.
+      setProjectStateTracked(prev => {
+        let foundItem = false;
+        const furniture = (prev.furniture || []).map(item => {
+          if (item.instanceId !== instanceId) return item;
+          foundItem = true;
+          persistedItemForModel = {
+            ...item,
+            position: item.doorHostWallId ? item.position : (semanticPosition || item.position),
+            ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
+          };
+          return persistedItemForModel;
+        });
+        return foundItem ? { ...prev, furniture } : prev;
+      }, { history: false });
+
+      if (persistedItemForModel) {
+        markAssetTransformApplied(model, persistedItemForModel);
+      } else {
+        // An asset can finish loading after its placement was undone. Do not let
+        // the completed asynchronous load leave an orphan in the live scene.
+        try { model?.destroy?.(); } catch (_) {}
+      }
     };
 
     const placementPromise = Promise.resolve()
@@ -1044,7 +1226,7 @@ export const useProjectSync = (activeProject) => {
         fullAssetUrl,
         position,
         safeRotation,
-        { fileType, scale: effectiveScale, onPlaced }
+        { fileType, scale: effectiveScale, doorHostWallId, onPlaced }
       ))
       .catch(error => {
         console.error('[ProjectSync] Failed to load placed asset:', error);
@@ -1341,8 +1523,8 @@ export const useProjectSync = (activeProject) => {
     endHistoryTransaction,
     resetHistory,
     cancelHistoryTransaction,
-    canUndo: historyPastRef.current.length > 0,
-    canRedo: historyFutureRef.current.length > 0,
+    canUndo: !historyApplyingRef.current && !historyTransactionRef.current && historyPastRef.current.length > 0,
+    canRedo: !historyApplyingRef.current && !historyTransactionRef.current && historyFutureRef.current.length > 0,
     saveNow,
     refreshSavedLayouts,
     saveRenderedLayout,

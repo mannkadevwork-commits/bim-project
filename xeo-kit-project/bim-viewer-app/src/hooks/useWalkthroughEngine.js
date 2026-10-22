@@ -9,8 +9,12 @@ import { immersive360DirectorMethods } from './walkthrough/immersive360Director.
 import { immersivePresentationDirectorMethods } from './walkthrough/immersivePresentationDirector.js';
 import { immersiveSceneDirectorMethods } from './walkthrough/immersiveSceneDirector.js';
 import { smart720TourDirectorMethods } from './walkthrough/smart720TourDirector.js';
+import { WalkthroughPerformanceMonitor } from './walkthrough/WalkthroughPerformanceMonitor.js';
+import { DEFAULT_PRESENTATION_SETTINGS, normalizePresentationSettings, resolveQualityProfile } from './walkthrough/presentationSettings.js';
 
 const DEFAULT_SPEEDS = { walk: 1.65, run: 3.2 };
+const GUIDED_AUTO_TRAVEL_SPEED_SCALE = 0.70; // ~1.15 m/s at the default physical scale.
+const GUIDED_ARRIVAL_FOV_BOOST_DEGREES = 3;
 const DEFAULT_EYE_HEIGHT_METERS = 1.68;
 const DEFAULT_HEIGHT_OFFSET_METERS = 0.0;
 const MIN_HEIGHT_OFFSET_METERS = -0.45;
@@ -30,17 +34,20 @@ class WalkRuntime {
   constructor({ canvas, onState }) {
     this.canvas = canvas;
     this.onState = onState;
+    this.presentationSettings = normalizePresentationSettings(DEFAULT_PRESENTATION_SETTINGS);
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0xf4f6f8);
     this.camera = new THREE.PerspectiveCamera(DEFAULT_FOV_DEGREES, 1, 0.05, 5000);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+    const initialQuality = resolveQualityProfile(this.presentationSettings.quality.mode);
+    this.renderer.setPixelRatio(initialQuality.effectivePixelRatio);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.AgXToneMapping ?? THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 0.96;
-    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.enabled = initialQuality.shadowsEnabled;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     canvas.appendChild(this.renderer.domElement);
+    this.performanceMonitor = new WalkthroughPerformanceMonitor(this.renderer, canvas);
     this.orbitControls = new OrbitControls(this.camera, this.renderer.domElement);
     this.orbitControls.enabled = true;
     this.orbitControls.enableDamping = true;
@@ -75,6 +82,7 @@ class WalkRuntime {
     this.presentationPortalById = new Map();
     this.path = null;
     this.pathIndex = 0;
+    this.pathReplanAttempts = 0;
     this.pathVelocity = new THREE.Vector3();
     this.travelTotalDistance = 0;
     this.travelElapsed = 0;
@@ -88,8 +96,10 @@ class WalkRuntime {
     this.guidedApproachStartYaw = 0;
     this.guidedArrivalStartYaw = 0;
     this.guidedArrivalTargetYaw = 0;
+    this.guidedArrivalStartPitch = -0.05;
+    this.guidedArrivalTargetPitch = -0.05;
     this.guidedArrivalSettleStartedAt = 0;
-    this.guidedArrivalSettleDurationMs = 1250;
+    this.guidedArrivalSettleDurationMs = 1650;
     // Phase 9: transition-aware choreography. Different architectural transitions
     // get slightly different approach/settle characteristics without changing the
     // physical NavMesh movement itself.
@@ -109,7 +119,7 @@ class WalkRuntime {
     this.velocity = new THREE.Vector3();
     this.yaw = 0;
     this.pitch = -0.05;
-    this.eyeHeight = DEFAULT_EYE_HEIGHT_METERS;
+    this.eyeHeight = this.presentationSettings.camera.eyeHeightMeters;
     this.radius = 0.15;
     this.walkSpeed = DEFAULT_SPEEDS.walk;
     this.runSpeed = DEFAULT_SPEEDS.run;
@@ -142,6 +152,9 @@ class WalkRuntime {
     this.guidedYawVelocity = 0;
     this.guidedManualResumeDelayMs = 2400;
     this.guidedManualVelocityDamping = 7.5;
+    // Explore-mode mouse-look remains user-owned briefly, then automated
+    // destination travel gently re-aligns the view with the actual path tangent.
+    this.exploreManualLookUntil = 0;
     // Guided camera composition state.  The heading is chosen from actual
     // nearby destinations/open-space checks instead of a blind perpetual spin.
     this.guidedCompositionYaw = 0;
@@ -162,6 +175,10 @@ class WalkRuntime {
     // It helps the Guided camera favor actual design content (furniture, fixtures,
     // doors/windows) instead of treating every visible ray as equally interesting.
     this.presentationSubjects = [];
+    // Static structural meshes are enough for camera visibility / wall guards.
+    // Raycasting every ray against the complete production GLB can stall the
+    // Guided camera when it evaluates a group of candidate headings.
+    this.presentationOccluders = [];
     // Phase 13: lock the Guided presentation onto one meaningful visual subject
     // during the arrival shot so the camera behaves like a deliberate architectural
     // composition instead of continually re-solving the frame.
@@ -217,7 +234,7 @@ class WalkRuntime {
 
     this.viewTarget = new THREE.Vector3();
     this.viewDistance = 1;
-    this.fov = DEFAULT_FOV_DEGREES;
+    this.fov = this.presentationSettings.camera.overviewFov;
     this.overviewPanSpeed = 1;
     this.keys = new Set();
     this.lastPointer = { x: 0, y: 0 };
@@ -242,93 +259,11 @@ class WalkRuntime {
     this._tick();
   }
 
-  _createLightingControl() {
-    if (this.lightingControl) return;
+  // Lighting controls are rendered by WalkthroughPage so all modes share one
+  // accessible React settings surface. The runtime only owns the lighting state.
+  _createLightingControl() {}
 
-    const host = this.canvas;
-    if (!host) return;
-    const computed = window.getComputedStyle?.(host);
-    if (computed?.position === 'static') host.style.position = 'relative';
-
-    const root = document.createElement('div');
-    root.className = 'hci-walkthrough-lighting-control';
-    root.setAttribute('aria-label', 'Lighting mode');
-    root.style.cssText = [
-      'position:absolute',
-      'right:24px',
-      'bottom:78px',
-      'display:flex',
-      'align-items:center',
-      'gap:6px',
-      'padding:6px',
-      'border:1px solid rgba(255,255,255,.16)',
-      'border-radius:14px',
-      'background:rgba(16,23,36,.78)',
-      'box-shadow:0 10px 30px rgba(0,0,0,.22)',
-      'backdrop-filter:blur(14px)',
-      '-webkit-backdrop-filter:blur(14px)',
-      'z-index:30',
-      'font:600 11px/1 Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
-      'pointer-events:auto',
-      'user-select:none',
-    ].join(';');
-
-    const title = document.createElement('span');
-    title.textContent = 'Lighting';
-    title.style.cssText = 'padding:0 5px 0 7px;color:rgba(255,255,255,.64);letter-spacing:.02em;';
-    root.appendChild(title);
-
-    const buttons = new Map();
-    const entries = [
-      ['day', '☀', 'Day'],
-      ['evening', '◐', 'Evening'],
-      ['night', '☾', 'Night'],
-    ];
-
-    entries.forEach(([mode, icon, label]) => {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.dataset.mode = mode;
-      button.title = label;
-      button.setAttribute('aria-label', label);
-      button.innerHTML = `<span aria-hidden="true">${icon}</span><span>${label}</span>`;
-      button.style.cssText = [
-        'border:0',
-        'border-radius:9px',
-        'padding:7px 9px',
-        'background:transparent',
-        'color:rgba(255,255,255,.68)',
-        'font:600 11px/1 Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
-        'cursor:pointer',
-        'transition:background .18s ease,color .18s ease,transform .18s ease',
-        'white-space:nowrap',
-      ].join(';');
-      button.addEventListener('pointerdown', (event) => event.stopPropagation());
-      button.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        this.setLightingMode(mode);
-      });
-      root.appendChild(button);
-      buttons.set(mode, button);
-    });
-
-    host.appendChild(root);
-    this.lightingControl = { root, buttons };
-  }
-
-  _updateLightingControl(state) {
-    const control = this.lightingControl;
-    if (!control) return;
-    const active = state?.targetMode || state?.mode || 'day';
-    control.buttons.forEach((button, mode) => {
-      const selected = mode === active;
-      button.style.background = selected ? 'rgba(255,170,96,.18)' : 'transparent';
-      button.style.color = selected ? '#fff' : 'rgba(255,255,255,.68)';
-      button.style.transform = selected ? 'translateY(-1px)' : 'translateY(0)';
-      button.setAttribute('aria-pressed', selected ? 'true' : 'false');
-    });
-  }
+  _updateLightingControl() {}
 
   _bind() {
     this.onKeyDown = (e) => {
@@ -480,6 +415,7 @@ class WalkRuntime {
       // Cursor-driven free look with damping. Movement remains independent of
       // the camera destination, so clicking a floor target never reorients view.
       this.targetYaw -= dx * this.lookSensitivity;
+      this.exploreManualLookUntil = performance.now() + 1600;
       this.targetPitch = THREE.MathUtils.clamp(
         this.targetPitch - dy * (this.lookSensitivity * 0.82),
         -Math.PI * 0.43,
@@ -528,10 +464,11 @@ class WalkRuntime {
   };
 
   async load(jobId, baseUrl) {
+    const loadStartedAt = performance.now();
     const jobBase = `${baseUrl.replace(/\/$/, '')}/jobs/${encodeURIComponent(jobId)}`;
     this.onState?.({ type: 'loading', value: true });
 
-    const [surfacePayload, hotspotsPayload, topologyPayload, navBuffer, gltf] = await Promise.all([
+    const [surfacePayload, hotspotsPayload, topologyPayload, navBuffer, gltf, projectStatePayload] = await Promise.all([
       fetch(`${jobBase}/navigation_surface.json`, { cache: 'no-store' }).then(this._assertJson('navigation_surface.json')),
       fetch(`${jobBase}/walk_hotspots.json`, { cache: 'no-store' }).then(this._assertJson('walk_hotspots.json')).catch((error) => {
         console.warn('[Walkthrough] walk_hotspots.json unavailable; no destinations will be shown.', error);
@@ -546,6 +483,16 @@ class WalkRuntime {
         return new Uint8Array(await r.arrayBuffer());
       }),
       new Promise((resolve, reject) => new GLTFLoader().load(`${jobBase}/output.glb`, resolve, undefined, reject)),
+      fetch(`${jobBase}/project_state.json`, { cache: 'no-store' })
+        .then(async (response) => {
+          if (!response.ok) throw new Error(`project_state.json returned ${response.status}`);
+          return response.json();
+        })
+        .catch((error) => {
+          // Optional metadata: existing projects still work if their state file is not exposed.
+          console.warn('[Walkthrough] project_state.json unavailable; using visible mesh names for arrival framing.', error);
+          return null;
+        }),
     ]);
 
     await initRecast();
@@ -570,16 +517,9 @@ class WalkRuntime {
     // Keep the visual camera independently tuned from the navigation agent.
     // The NavMesh can remain authored around its 1.6m agent clearance while the
     // customer-facing camera sits slightly higher for architectural presentation.
-    this.eyeHeight = DEFAULT_EYE_HEIGHT_METERS;
-    // Guided presentation uses a dedicated architectural eye height instead of
-    // the Explore slider maximum. This prevents the camera from feeling like a
-    // drone while still giving a slightly elevated view over furniture.
-    this.heightOffset = this.walkMode === 'guided'
-      ? GUIDED_CAMERA_HEIGHT_METERS - this.eyeHeight
-      : DEFAULT_HEIGHT_OFFSET_METERS;
-    this.fov = this.walkMode === 'guided' ? 72 : 78;
-    this.camera.fov = this.fov;
-    this.camera.updateProjectionMatrix();
+    this.eyeHeight = this.presentationSettings.camera.eyeHeightMeters;
+    // Guided and Explore use their own manifest-controlled eye-line and FOV.
+    this._applyCurrentCameraSettings({ updateHeight: true, notify: false });
     this.radius = Number(surfacePayload?.metadata?.agentRadiusMeters) > 0 ? Number(surfacePayload.metadata.agentRadiusMeters) : 0.15;
     this.walkSpeed = DEFAULT_SPEEDS.walk * this.metersPerUnit;
     this.runSpeed = DEFAULT_SPEEDS.run * this.metersPerUnit;
@@ -600,9 +540,19 @@ class WalkRuntime {
     this.model = gltf.scene;
     this.model.updateMatrixWorld(true);
     this.scene.add(this.model);
+    this.performanceMonitor?.setLoadInfo({
+      jobId,
+      navigationMeshBytes: navBuffer.byteLength,
+      navigationHotspotCount: rawHotspots.length,
+      navigationAreaCount: semanticAreas.length,
+      roomCount: Array.isArray(topologyPayload?.rooms) ? topologyPayload.rooms.length : 0,
+      navigationSpaceCount: Array.isArray(topologyPayload?.spaces) ? topologyPayload.spaces.length : 0,
+      portalCount: Array.isArray(topologyPayload?.portals) ? topologyPayload.portals.length : 0,
+      parallelAssetLoadMs: Number((performance.now() - loadStartedAt).toFixed(1)),
+    });
     this.lightingDirector.attachModel(this.model);
     this.onState?.({ type: 'lighting', ...this.lightingDirector.getState() });
-    this._buildPresentationSubjectIndex();
+    this._buildPresentationSubjectIndex(projectStatePayload, hotspotsPayload);
 
     this.onState?.({
       type: 'presentation-topology',
@@ -631,6 +581,7 @@ class WalkRuntime {
       obj.frustumCulled = false;
       visibleMeshCount += obj.visible ? 1 : 0;
     });
+    this.performanceMonitor?.setModel(this.model);
 
     const box = new THREE.Box3().setFromObject(this.model);
     const modelSphere = box.getBoundingSphere(new THREE.Sphere());
@@ -1251,6 +1202,202 @@ class WalkRuntime {
     return this._inspectPathEndpoint(result, target, toleranceMeters).complete;
   }
 
+  _isNavMeshCurveSegmentSafe(start, samples) {
+    if (!this.query || !start || !Array.isArray(samples) || samples.length === 0) return false;
+    const unit = Math.max(this.metersPerUnit || 1, 0.000001);
+    const horizontalExtent = Math.max(0.20 * unit, 0.10);
+    const snapTolerance = Math.max(0.10 * unit, 0.05);
+    const sampleTolerance = Math.max(0.085 * unit, 0.045);
+    let snapped = null;
+    try {
+      snapped = this.query.findClosestPoint(start, {
+        halfExtents: {
+          x: horizontalExtent,
+          y: Math.max(0.65 * unit, 0.35),
+          z: horizontalExtent,
+        },
+        filter: this.filter,
+      });
+    } catch (_) {
+      return false;
+    }
+    if (!snapped?.success || !snapped.point) return false;
+    let current = {
+      x: Number(snapped.point.x),
+      y: Number(snapped.point.y),
+      z: Number(snapped.point.z),
+    };
+    const snapDistance = Math.hypot(current.x - start.x, current.y - start.y, current.z - start.z);
+    let polyRef = snapped.polyRef ?? snapped.ref ?? 0;
+    if (!polyRef || snapDistance > snapTolerance) return false;
+
+    for (const sample of samples) {
+      let moved = null;
+      try {
+        moved = this.query.moveAlongSurface(polyRef, current, sample, {
+          filter: this.filter,
+          maxVisitedSize: 128,
+        });
+      } catch (_) {
+        return false;
+      }
+      if (!moved?.success || !moved.resultPosition) return false;
+      const landed = {
+        x: Number(moved.resultPosition.x),
+        y: Number(moved.resultPosition.y),
+        z: Number(moved.resultPosition.z),
+      };
+      if (![landed.x, landed.y, landed.z].every(Number.isFinite)) return false;
+      // Reject a curve if Recast has to clamp its sample back to a boundary.
+      // This prevents corner rounding from cutting through a wall or a narrow door.
+      const error = Math.hypot(landed.x - sample.x, landed.y - sample.y, landed.z - sample.z);
+      if (error > sampleTolerance) return false;
+      current = landed;
+      const visited = Array.isArray(moved.visited) ? moved.visited : [];
+      polyRef = moved.resultPolyRef || visited[visited.length - 1] || polyRef;
+    }
+    return true;
+  }
+
+  _prepareNavPath(points) {
+    if (!Array.isArray(points) || points.length <= 2) return this._simplifyPath(points || []);
+    const unit = Math.max(this.metersPerUnit || 1, 0.000001);
+    const minRadius = Math.max(0.075 * unit, 0.045);
+    const maxRadius = 0.30 * unit;
+    const minTurn = THREE.MathUtils.degToRad(20);
+    const maxTurn = THREE.MathUtils.degToRad(148);
+    const curveSteps = 5;
+    const clean = points.filter((point) => point && [point.x, point.y, point.z].every(Number.isFinite));
+    if (clean.length <= 2) return this._simplifyPath(clean);
+
+    const prepared = [clean[0]];
+    for (let i = 1; i < clean.length - 1; i += 1) {
+      const previous = clean[i - 1];
+      const corner = clean[i];
+      const next = clean[i + 1];
+      const inX = corner.x - previous.x;
+      const inZ = corner.z - previous.z;
+      const outX = next.x - corner.x;
+      const outZ = next.z - corner.z;
+      const inLength = Math.hypot(inX, inZ);
+      const outLength = Math.hypot(outX, outZ);
+      if (inLength < minRadius * 1.5 || outLength < minRadius * 1.5) {
+        prepared.push(corner);
+        continue;
+      }
+
+      const dot = THREE.MathUtils.clamp((inX * outX + inZ * outZ) / (inLength * outLength), -1, 1);
+      const turnAngle = Math.acos(dot);
+      if (turnAngle < minTurn || turnAngle > maxTurn) {
+        prepared.push(corner);
+        continue;
+      }
+
+      // Trim both legs and make a quadratic corner arc. Radius is deliberately
+      // conservative in doorways and tight halls; Recast validates every sample.
+      const radius = Math.min(maxRadius, inLength * 0.30, outLength * 0.30);
+      if (radius < minRadius) {
+        prepared.push(corner);
+        continue;
+      }
+      const inNX = inX / inLength;
+      const inNZ = inZ / inLength;
+      const outNX = outX / outLength;
+      const outNZ = outZ / outLength;
+      const entry = {
+        x: corner.x - inNX * radius,
+        y: previous.y + (corner.y - previous.y) * (1 - radius / inLength),
+        z: corner.z - inNZ * radius,
+      };
+      const exit = {
+        x: corner.x + outNX * radius,
+        y: corner.y + (next.y - corner.y) * (radius / outLength),
+        z: corner.z + outNZ * radius,
+      };
+      const samples = [];
+      for (let step = 1; step <= curveSteps; step += 1) {
+        const t = step / curveSteps;
+        const u = 1 - t;
+        samples.push({
+          x: u * u * entry.x + 2 * u * t * corner.x + t * t * exit.x,
+          y: u * u * entry.y + 2 * u * t * corner.y + t * t * exit.y,
+          z: u * u * entry.z + 2 * u * t * corner.z + t * t * exit.z,
+        });
+      }
+
+      if (!this._isNavMeshCurveSegmentSafe(entry, samples)) {
+        // Preserve the exact NavMesh corner when the arc lacks clearance.
+        prepared.push(corner);
+        continue;
+      }
+      prepared.push(entry, ...samples);
+    }
+    prepared.push(clean[clean.length - 1]);
+    return this._simplifyPath(prepared);
+  }
+
+  _safePathLookAheadDistance(startIndex, requestedDistance) {
+    if (!this.path?.length || this.path.length < 3) return requestedDistance;
+    const unit = Math.max(this.metersPerUnit || 1, 0.000001);
+    const cornerBuffer = 0.14 * unit;
+    const turnThreshold = Math.cos(THREE.MathUtils.degToRad(25));
+    let previous = this.position;
+    let travelled = 0;
+
+    for (let i = Math.max(0, startIndex); i < this.path.length - 1; i += 1) {
+      const corner = this.path[i];
+      const next = this.path[i + 1];
+      const inX = corner.x - previous.x;
+      const inZ = corner.z - previous.z;
+      const outX = next.x - corner.x;
+      const outZ = next.z - corner.z;
+      const inLength = Math.hypot(inX, inZ);
+      const outLength = Math.hypot(outX, outZ);
+      if (inLength < 1e-5 || outLength < 1e-5) {
+        if (inLength >= 1e-5) travelled += inLength;
+        previous = corner;
+        continue;
+      }
+      const dot = THREE.MathUtils.clamp((inX * outX + inZ * outZ) / (inLength * outLength), -1, 1);
+      const distanceToCorner = travelled + inLength;
+      // On an un-smoothed/clearance-rejected sharp corner, do not steer to a
+      // point beyond it: that creates a chord through the inside of the turn.
+      if (dot < turnThreshold && distanceToCorner <= requestedDistance + cornerBuffer) {
+        return distanceToCorner > cornerBuffer
+          ? Math.min(requestedDistance, distanceToCorner - cornerBuffer)
+          : Math.min(requestedDistance, distanceToCorner);
+      }
+      travelled += inLength;
+      previous = corner;
+    }
+    return requestedDistance;
+  }
+
+  _getTravelPathYaw(maxLookAheadMeters = 1.05) {
+    if (!this.path?.length) return null;
+    const unit = Math.max(this.metersPerUnit || 1, 0.000001);
+    const requested = Math.max(0.22 * unit, maxLookAheadMeters * unit);
+    const lookAhead = this._safePathLookAheadDistance(this.pathIndex, requested);
+    const target = this._pointAlongPath(this.pathIndex, Math.max(0.03 * unit, lookAhead));
+    let dx = (target?.x ?? this.position.x) - this.position.x;
+    let dz = (target?.z ?? this.position.z) - this.position.z;
+    if (Math.hypot(dx, dz) < 1e-4) {
+      const waypoint = this.path[Math.min(this.pathIndex, this.path.length - 1)];
+      dx = waypoint.x - this.position.x;
+      dz = waypoint.z - this.position.z;
+    }
+    if (Math.hypot(dx, dz) < 1e-4) return null;
+    return Math.atan2(-dx, -dz);
+  }
+
+  _clampYawToTravelHeading(yaw, maxOffsetDegrees = 38) {
+    const travelYaw = this._getTravelPathYaw();
+    if (!Number.isFinite(travelYaw) || !Number.isFinite(yaw)) return yaw;
+    const delta = Math.atan2(Math.sin(yaw - travelYaw), Math.cos(yaw - travelYaw));
+    const limit = THREE.MathUtils.degToRad(maxOffsetDegrees);
+    return travelYaw + THREE.MathUtils.clamp(delta, -limit, limit);
+  }
+
   _simplifyPath(points) {
     if (!Array.isArray(points) || points.length <= 2) return points || [];
     const minSegment = Math.max(0.06 * this.metersPerUnit, 0.04);
@@ -1577,7 +1724,14 @@ class WalkRuntime {
     };
     const label = hotspot.label || 'Floor destination';
     this.navigateToHotspot(hotspot).then((ok) => {
-      if (!ok) this._startEmergencyRecovery(group.userData.walkTarget, label);
+      if (!ok) {
+        // Keep the user's chosen destination authoritative. A failed route must
+        // not silently send the camera toward a different recovery hotspot.
+        console.warn('[Walkthrough] Destination route was not started; preserving current position.', {
+          hotspotId: hotspot.id || null,
+          label,
+        });
+      }
     });
     return true;
   }
@@ -1641,6 +1795,17 @@ class WalkRuntime {
     // never beds, sofas, walls, or other rendered geometry.
     const floorPoint = this._raycastNavigationSurface(event);
     if (!floorPoint) return;
+    if (this.activeHotspotId) {
+      this.guidedTourLastVisitedHotspotId = this.activeHotspotId;
+    }
+    this.guidedTourArmed = false;
+    this.guidedTourNextAt = 0;
+    this.guidedTourAdvanceLock = false;
+    this.guidedManualActive = false;
+    this.guidedManualYawUntil = 0;
+    this.guidedShotSubject = null;
+    this.guidedShotSubjectId = null;
+    this.guidedShotSubjectUntil = 0;
     this.activeHotspotId = null;
     this.travelTo([floorPoint.x, floorPoint.y, floorPoint.z], 'Floor destination');
   }
@@ -1696,8 +1861,33 @@ class WalkRuntime {
       return false;
     }
 
+    // A map/portal selection is a one-shot navigation request. It must stop any
+    // previously running auto-tour and leave the camera focused on this room on
+    // arrival. The autonomous tour advances only through _advanceGuidedTour().
+    const previousActiveHotspotId = this.activeHotspotId;
+    if (previousActiveHotspotId) {
+      this.guidedTourLastVisitedHotspotId = previousActiveHotspotId;
+    }
+    this.guidedTourArmed = false;
+    this.guidedTourNextAt = 0;
+    this.guidedTourAdvanceLock = false;
+    this.guidedPresentationAreaId = resolvedHotspot.areaId || null;
+    this._configureGuidedTransition(resolvedHotspot);
     this.activeHotspotId = resolvedHotspot.id || null;
-    this._armGuidedTourForHotspot(resolvedHotspot);
+
+    // An explicit destination selection outranks a previous manual yaw override.
+    // Otherwise the arrival-settle branch can be skipped and the camera never
+    // re-frames the destination after a floor-map click.
+    this.guidedManualActive = false;
+    this.guidedManualYawUntil = 0;
+    this.guidedPointerDown = null;
+    this.guidedLastPointer = null;
+    this.guidedPointerDragging = false;
+    this.guidedYawVelocity = 0;
+    this.guidedShotSubject = null;
+    this.guidedShotSubjectId = null;
+    this.guidedShotSubjectUntil = 0;
+
     const label = resolvedHotspot.label || 'Navigation point';
     const start = { x: this.position.x, y: this.position.y, z: this.position.z };
     const result = this.query?.computePath(start, point, {
@@ -1749,8 +1939,9 @@ class WalkRuntime {
       return false;
     }
     this.directTravel = null;
-    this.path = this._simplifyPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
+    this.path = this._prepareNavPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
     this.pathIndex = 0;
+    this.pathReplanAttempts = 0;
     this.pathVelocity.set(0, 0, 0);
     this.travelTotalDistance = this._estimatePathLengthFrom(this.position, 0);
     this.travelElapsed = 0;
@@ -1834,20 +2025,20 @@ class WalkRuntime {
 
     this.guidedTransitionKind = kind;
     this.guidedTransitionApproachDistanceMeters = kind === 'room-entry'
-      ? 3.4
+      ? 4.1
       : kind === 'room-crossing'
-        ? 3.1
+        ? 3.8
         : kind === 'same-space'
-          ? 2.3
-          : 2.8;
+          ? 2.6
+          : 3.0;
 
     this.guidedArrivalSettleDurationMs = kind === 'room-entry'
-      ? 1450
+      ? 1850
       : kind === 'room-crossing'
-        ? 1500
+        ? 1750
         : kind === 'same-space'
-          ? 950
-          : 1250;
+          ? 1250
+          : 1500;
   }
 
   _armGuidedTourForHotspot(hotspot) {
@@ -2058,17 +2249,75 @@ class WalkRuntime {
     });
   }
 
-  _resetWalkCameraDefaults() {
-    this.heightOffset = DEFAULT_HEIGHT_OFFSET_METERS;
-    this.fov = this.walkMode === 'guided' ? 72 : 78;
+  _currentPresentationFovKey() {
+    if (this.immersive360Active) return 'immersiveFov';
+    if (this.viewMode === 'overview') return 'overviewFov';
+    return this.walkMode === 'guided' ? 'guidedFov' : 'exploreFov';
+  }
+
+  _applyCurrentCameraSettings({ updateHeight = false, notify = true } = {}) {
+    const cameraSettings = this.presentationSettings.camera;
+    this.eyeHeight = cameraSettings.eyeHeightMeters;
+    if (updateHeight) {
+      const guidedBaseOffset = (this.viewMode === 'walk' && this.walkMode === 'guided')
+        ? cameraSettings.guidedEyeHeightMeters - this.eyeHeight
+        : 0;
+      this.heightOffset = guidedBaseOffset + cameraSettings.heightOffsetMeters;
+    }
+    this.fov = cameraSettings[this._currentPresentationFovKey()] || DEFAULT_FOV_DEGREES;
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
-    this._notifyCameraSettings();
+    if (notify) this._notifyCameraSettings();
+  }
+
+  _resetWalkCameraDefaults() {
+    this._applyCurrentCameraSettings({ updateHeight: true });
   }
 
   setSensitivity(value) {
     this.lookSensitivity = THREE.MathUtils.clamp(Number(value) || 0.0048, 0.0015, 0.009);
+    this.presentationSettings.camera.lookSensitivity = this.lookSensitivity;
   }
+
+  applyPresentationSettings(settings) {
+    this.presentationSettings = normalizePresentationSettings(settings);
+    const config = this.presentationSettings;
+    this.lookSensitivity = config.camera.lookSensitivity;
+
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    if (config.appearance.toneMapping === 'aces') {
+      this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    } else if (config.appearance.toneMapping === 'neutral') {
+      this.renderer.toneMapping = THREE.NeutralToneMapping ?? THREE.ACESFilmicToneMapping;
+    } else {
+      this.renderer.toneMapping = THREE.AgXToneMapping ?? THREE.ACESFilmicToneMapping;
+    }
+
+    this.lightingDirector?.setPresentationOverrides({
+      exposureMultiplier: config.appearance.exposureMultiplier,
+      environmentMultiplier: config.appearance.environmentMultiplier,
+    });
+    if (this.lightingDirector?.targetMode !== config.appearance.lightingPreset) {
+      this.lightingDirector?.setMode(config.appearance.lightingPreset);
+    }
+
+    const quality = resolveQualityProfile(config.quality.mode);
+    this.renderer.setPixelRatio(quality.effectivePixelRatio);
+    this.renderer.shadowMap.enabled = quality.shadowsEnabled;
+    if (this.lightingDirector?.keyLight) this.lightingDirector.keyLight.castShadow = quality.shadowsEnabled;
+    if (quality.shadowsEnabled && this.lightingDirector?.staticShadowPrepared) {
+      this.renderer.shadowMap.needsUpdate = true;
+    }
+    this.resize();
+    this._applyCurrentCameraSettings({ updateHeight: this.viewMode === 'walk' });
+    this.onState?.({
+      type: 'presentation-settings',
+      settings: config,
+      quality: { requestedMode: config.quality.mode, resolvedMode: quality.mode, pixelRatio: quality.effectivePixelRatio, shadowsEnabled: quality.shadowsEnabled },
+    });
+    return config;
+  }
+
 
   setWalkMode(mode) {
     const next = mode === 'explore' ? 'explore' : 'guided';
@@ -2100,11 +2349,7 @@ class WalkRuntime {
       this.guidedManualActive = false;
       this.guidedPitch = this.currentPitch;
       this.targetPitch = this.currentPitch;
-      this.heightOffset = GUIDED_CAMERA_HEIGHT_METERS - this.eyeHeight;
-      this.fov = 100;
-      this.camera.fov = this.fov;
-      this.camera.updateProjectionMatrix();
-      this._notifyCameraSettings();
+      this._applyCurrentCameraSettings({ updateHeight: true });
       this.lookLocked = true;
       this.onState?.({ type: 'look-lock', locked: true });
     } else {
@@ -2143,6 +2388,7 @@ class WalkRuntime {
       dir.normalize().multiplyScalar(this.viewDistance);
       this.camera.position.copy(this.viewTarget).add(dir);
       this.orbitControls.update();
+      this._applyCurrentCameraSettings();
     } else {
       this.orbitControls.enabled = false;
       this._resetWalkCameraDefaults();
@@ -2251,6 +2497,7 @@ if (name === 'top') {
 }
     const dir = (presets[name] || presets.perspective).normalize().multiplyScalar(distance);
     this.viewMode = 'overview';
+    this._applyCurrentCameraSettings({ notify: false });
     this.orbitControls.enabled = true;
     this.orbitControls.target.copy(target);
     this.camera.position.copy(target).add(dir);
@@ -2269,10 +2516,10 @@ if (name === 'top') {
   }
 
   setFov(value) {
-    this.fov = THREE.MathUtils.clamp(Number(value) || DEFAULT_FOV_DEGREES, 45, 100);
-    this.camera.fov = this.fov;
-    this.camera.updateProjectionMatrix();
-    this._notifyCameraSettings();
+    const key = this._currentPresentationFovKey();
+    this.presentationSettings.camera[key] = THREE.MathUtils.clamp(Number(value) || DEFAULT_FOV_DEGREES, 45, 100);
+    this._applyCurrentCameraSettings();
+    return { key, value: this.fov };
   }
 
   fitView() {
@@ -2286,13 +2533,14 @@ if (name === 'top') {
   }
 
   setHeightOffset(value) {
-    this.heightOffset = THREE.MathUtils.clamp(Number(value) || 0, MIN_HEIGHT_OFFSET_METERS, MAX_HEIGHT_OFFSET_METERS);
-    this._notifyCameraSettings();
+    this.presentationSettings.camera.heightOffsetMeters = THREE.MathUtils.clamp(Number(value) || 0, MIN_HEIGHT_OFFSET_METERS, MAX_HEIGHT_OFFSET_METERS);
+    this._applyCurrentCameraSettings({ updateHeight: true });
   }
 
   stopTravel() {
     this.path = null;
     this.pathIndex = 0;
+    this.pathReplanAttempts = 0;
     this.pathVelocity.set(0, 0, 0);
     this.directTravel = null;
     this.travelTotalDistance = 0;
@@ -2445,18 +2693,26 @@ if (name === 'top') {
 
       // Look farther ahead at higher speed so turns are anticipated rather than
       // followed like a chain of rigid waypoints. The path itself remains intact.
-      const lookAhead = THREE.MathUtils.clamp(
-        (0.42 + this.pathVelocity.length() * 0.22) * this.metersPerUnit,
-        0.35 * this.metersPerUnit,
-        1.25 * this.metersPerUnit,
+      const unit = Math.max(this.metersPerUnit || 1, 0.000001);
+      const desiredLookAhead = THREE.MathUtils.clamp(
+        (0.34 + this.pathVelocity.length() * 0.12) * unit,
+        0.28 * unit,
+        0.62 * unit,
       );
-      const steerTarget = this._pointAlongPath(this.pathIndex, Math.min(lookAhead, Math.max(0.01, remainingDistance)));
+      const requestedLookAhead = Math.min(desiredLookAhead, Math.max(0.025 * unit, remainingDistance));
+      const lookAhead = this._safePathLookAheadDistance(this.pathIndex, requestedLookAhead);
+      const steerTarget = this._pointAlongPath(this.pathIndex, Math.max(0.025 * unit, lookAhead));
       const next = steerTarget || this.path[this.pathIndex];
       const before = this.position.clone();
       this.lastMoveDirection.set(next.x - this.position.x, 0, next.z - this.position.z);
       if (this.lastMoveDirection.lengthSq() > 1e-8) this.lastMoveDirection.normalize();
 
-      const targetSpeed = this.walkSpeed * speedFactor;
+      // Slow slightly as the safe steering horizon contracts before a sharp
+      // corner. Existing velocity smoothing then draws a natural arc without
+      // pushing the agent through the inside of the turn.
+      const cornerSpeedFactor = THREE.MathUtils.clamp(lookAhead / Math.max(desiredLookAhead, 1e-6), 0.42, 1);
+      const guidedSpeedScale = this.walkMode === 'guided' ? GUIDED_AUTO_TRAVEL_SPEED_SCALE : 1;
+      const targetSpeed = this.walkSpeed * guidedSpeedScale * speedFactor * cornerSpeedFactor;
       this._moveToward(next, dt, targetSpeed);
       const moved = before.distanceTo(this.position);
       if (moved > 0.01 * Math.max(this.metersPerUnit, 0.000001)) this._rememberNearestSafeAnchor(this.position, 'travel');
@@ -2480,22 +2736,22 @@ if (name === 'top') {
       if (moved < 0.0002 * Math.max(1, this.metersPerUnit)) {
         this.blockedTime += dt;
         if (this.blockedTime > 0.65) {
-          const recovered = this.recoverToSafeSpot('Recovered walk position');
-          if (recovered) {
-            this.blockedTime = 0;
-            return;
-          }
-          // Recovery cancels the old route. Stop it explicitly rather than
-          // retrying forever or keeping a dead path active.
+          if (this._replanStalledRoute()) return;
+          // Keep the camera at the last valid NavMesh position. Do not silently
+          // divert to another hotspot when the selected path cannot be followed.
           this.path = null;
           this.pathIndex = 0;
           this.pathVelocity.set(0, 0, 0);
           this.velocity.set(0, 0, 0);
+          this.travelTotalDistance = 0;
+          this.travelElapsed = 0;
+          this.travelMode = null;
+          this.blockedTime = 0;
           this.stuck = true;
           this.recoveryAvailable = this.hotspots.length > 0;
           this.onState?.({ type: 'travel', active: false });
           this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
-          this.onState?.({ type: 'error', message: 'Navigation paused because the route stopped making progress. Choose a reachable floor marker or return to the last safe point.' });
+          this.onState?.({ type: 'error', message: 'The selected destination has no continuous walkable route from this position. Navigation stopped at the last safe point; choose another destination or use recovery manually.' });
           return;
         }
       } else {
@@ -2664,8 +2920,9 @@ if (name === 'top') {
       console.warn('[Walkthrough] Rejected incomplete recovery route.', endpointStatus);
       return false;
     }
-    this.path = this._simplifyPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
+    this.path = this._prepareNavPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
     this.pathIndex = 0;
+    this.pathReplanAttempts = 0;
     this.pathVelocity.set(0, 0, 0);
     this.travelTotalDistance = this._estimatePathLengthFrom(this.position, 0);
     this.travelElapsed = 0;
@@ -2695,6 +2952,43 @@ if (name === 'top') {
     }
     this.onState?.({ type: 'stuck', available: false });
     this.onState?.({ type: 'travel', label, active: true, mode, hotspotId: this.activeHotspotId });
+    return true;
+  }
+
+  _replanStalledRoute() {
+    if (!this.query || !this.path?.length || this.pathReplanAttempts >= 1) return false;
+    const finalPoint = this.path[this.path.length - 1];
+    if (!finalPoint || ![finalPoint.x, finalPoint.y, finalPoint.z].every(Number.isFinite)) return false;
+    this.pathReplanAttempts += 1;
+    const start = { x: this.position.x, y: this.position.y, z: this.position.z };
+    const target = { x: finalPoint.x, y: finalPoint.y, z: finalPoint.z };
+    let result = null;
+    try {
+      result = this.query.computePath(start, target, {
+        filter: this.filter,
+        maxStraightPathSize: 256,
+        maxPathSize: 256,
+      });
+    } catch (_) {
+      return false;
+    }
+    if (!this._inspectPathEndpoint(result, target).complete) return false;
+    const repaired = this._prepareNavPath(result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })));
+    if (repaired.length < 2) return false;
+
+    this.path = repaired;
+    this.pathIndex = 0;
+    this.pathVelocity.set(0, 0, 0);
+    this.travelTotalDistance = this._estimatePathLengthFrom(this.position, 0);
+    this.travelElapsed = 0;
+    this.blockedTime = 0;
+    this.cameraClearanceTimer = 0;
+    this.progressWatchTime = 0;
+    this.lastMovementPosition.copy(this.position);
+    this.stuck = false;
+    this.recoveryAvailable = false;
+    this.onState?.({ type: 'travel', active: true, mode: 'route-replan' });
+    console.info('[Walkthrough] Replanned a stalled route once from the current walkable position.');
     return true;
   }
 
@@ -2864,53 +3158,291 @@ if (name === 'top') {
     return null;
   }
 
-  _buildPresentationSubjectIndex() {
+  _buildPresentationSubjectIndex(projectStatePayload = null, hotspotsPayload = null) {
     this.presentationSubjects = [];
-    // Phase 13: lock the Guided presentation onto one meaningful visual subject
-    // during the arrival shot so the camera behaves like a deliberate architectural
-    // composition instead of continually re-solving the frame.
+    this.presentationOccluders = [];
+    // A production GLB optimizer may flatten nodes to "unnamed"/"Geom_*",
+    // so mesh-name classification alone cannot reliably identify the sofa/bed.
+    // Use the job's existing project_state.json as the semantic source of truth.
     this.guidedShotSubject = null;
     this.guidedShotSubjectId = null;
     this.guidedShotSubjectUntil = 0;
     if (!this.model) return;
 
-    const classify = (name = '') => {
-      const lower = String(name).toLowerCase();
-      if (/(sofa|couch|chair|table|desk|bed|cabinet|wardrobe|shelf|shelving|counter|stool|bench|tv|television|coffee)/.test(lower)) return 'furniture';
-      if (/(sink|toilet|bathtub|bath|shower|basin|hob|oven|fridge|refrigerator|appliance)/.test(lower)) return 'fixture';
-      if (/(window|glazing|glass|door|sliding|opening)/.test(lower)) return 'opening';
-      if (/(light|lamp|ceiling|pendant|fan|chandelier)/.test(lower)) return 'lighting';
-      if (/(plant|decor|art|painting|mirror|rug|carpet|curtain)/.test(lower)) return 'decor';
-      if (/(wall|floor|slab|ceiling|roof|column|beam|structural)/.test(lower)) return null;
-      return 'object';
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const meshPriority = { furniture: 5.0, fixture: 4.1, decor: 2.6, lighting: 2.3, object: 1.5 };
+    const genericName = /^(?:unnamed|mesh|node|object|geom(?:etry)?[_\s:-]*[\w-]*|scene|group)[_\s:-]*\d*$/i;
+
+    const classifyNamedSubject = (name = '') => {
+      const lower = String(name).toLowerCase().replace(/[_:/-]+/g, ' ');
+      if (!lower || genericName.test(String(name).trim())) return null;
+      // Structural geometry and openings must not win the hero shot.
+      if (/(wall|floor|slab|ceiling|roof|column|beam|structural|opening|door|window|glazing|glass panel|portal|wall frame|window frame|door frame|trim)/.test(lower)) return null;
+      if (/(sofa|couch|sectional|bed|daybed|armchair|recliner|lounge chair)/.test(lower)) {
+        return { role: 'furniture', heroPriority: 9.6 };
+      }
+      if (/(dining table|coffee table|side table|desk|table|chair|stool|bench|ottoman|wardrobe|closet|dresser|cabinet|bookcase|bookshelf|tv stand|television unit|kitchen island)/.test(lower)) {
+        return { role: 'furniture', heroPriority: 7.3 };
+      }
+      if (/(sink|toilet|bathtub|bath|shower|basin|vanity|hob|oven|fridge|refrigerator|appliance)/.test(lower)) {
+        return { role: 'fixture', heroPriority: 5.8 };
+      }
+      if (/(plant|decor|artwork|painting|mirror|rug|carpet|curtain|lamp|light fixture)/.test(lower)) {
+        return { role: 'decor', heroPriority: 2.8 };
+      }
+      return null;
     };
 
+    const meshRecords = [];
+    const semanticNodes = new Map();
+    this.model.updateMatrixWorld(true);
     this.model.traverse((obj) => {
       if (!obj.isMesh || !obj.visible) return;
-      const role = classify(obj.name || obj.parent?.name || '');
-      if (!role) return;
       const box = new THREE.Box3().setFromObject(obj);
       if (box.isEmpty()) return;
       const size = box.getSize(new THREE.Vector3());
-      const maxDim = Math.max(size.x, size.y, size.z);
-      if (!Number.isFinite(maxDim) || maxDim < 0.08) return;
       const center = box.getCenter(new THREE.Vector3());
-      this.presentationSubjects.push({
-        object: obj,
-        role,
-        center,
-        size,
-        radius: Math.max(maxDim * 0.5, 0.12 * Math.max(this.metersPerUnit, 1e-6)),
-      });
+      const maxDim = Math.max(size.x, size.y, size.z);
+      if (!Number.isFinite(maxDim) || maxDim < 0.06 * unit) return;
+      meshRecords.push({ object: obj, box, size, center, maxDim });
+      const objectName = String(obj.name || '').trim();
+      // In the current production GLB, IFC structure is emitted as Geom_* nodes
+      // and placed catalog assets are generally unnamed. Keep the camera's
+      // occlusion rays on structure / hosted door geometry instead of testing all
+      // furniture triangles on every heading candidate.
+      if (/^(?:geom(?:etry)?[_\s:-]|hci_hosted_door(?:\b|::)|wall\b|floor\b|slab\b|ceiling\b|roof\b|column\b|beam\b|structural\b)/i.test(objectName)) {
+        this.presentationOccluders.push(obj);
+      }
+
+      // Search this mesh and its ancestors for a meaningful semantic name.
+      let cursor = obj;
+      while (cursor && cursor !== this.model) {
+        const data = cursor.userData || {};
+        const metadataName = [
+          cursor.name,
+          data.name,
+          data.label,
+          data.displayName,
+          data.catalogItemName,
+          data.instanceName,
+          data.originalName,
+          data.sourceName,
+          data.category,
+          data.ifcType,
+          data.elementType,
+        ].filter(Boolean).join(' ');
+        const classification = classifyNamedSubject(metadataName);
+        if (classification) {
+          semanticNodes.set(cursor, {
+            object: cursor,
+            ...classification,
+            semanticName: metadataName,
+          });
+          break;
+        }
+        cursor = cursor.parent;
+      }
     });
 
-    // Avoid letting a huge set of decorative meshes dominate the composition.
-    // Keep the most useful subjects by world-space size, with a generous cap.
-    this.presentationSubjects.sort((a, b) => {
-      const priority = { furniture: 5, fixture: 4.5, opening: 3.7, decor: 3.2, lighting: 2.8, object: 2.5 };
-      return (priority[b.role] || 0) * b.radius - (priority[a.role] || 0) * a.radius;
+    // Keep a small name-based fallback for older, unoptimized jobs whose mesh
+    // hierarchy still retains catalog names.
+    for (const entry of semanticNodes.values()) {
+      const box = new THREE.Box3().setFromObject(entry.object);
+      if (box.isEmpty()) continue;
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      if (!Number.isFinite(maxDim) || maxDim < 0.08 * unit || maxDim > 8.0 * unit) continue;
+      const meshObjects = [];
+      entry.object.traverse((child) => {
+        if (child.isMesh && child.visible) meshObjects.push(child);
+      });
+      this.presentationSubjects.push({
+        id: `mesh:${entry.object.uuid}`,
+        object: entry.object,
+        meshObjects,
+        name: entry.semanticName,
+        role: entry.role,
+        heroPriority: entry.heroPriority,
+        center,
+        size,
+        radius: Math.max(maxDim * 0.5, 0.12 * unit),
+        areaId: null,
+        source: 'mesh-name',
+      });
+    }
+
+    const position3 = (value) => {
+      if (Array.isArray(value) && value.length >= 3) {
+        const point = value.slice(0, 3).map(Number);
+        return point.every(Number.isFinite) ? point : null;
+      }
+      if (value && typeof value === 'object') {
+        const point = [Number(value.x), Number(value.y), Number(value.z)];
+        return point.every(Number.isFinite) ? point : null;
+      }
+      return null;
+    };
+
+    const areas = Array.isArray(hotspotsPayload?.areas) ? hotspotsPayload.areas : this.walkAreas;
+    const nearestAreaId = (position) => {
+      let nearest = null;
+      let bestDistance = Infinity;
+      for (const area of areas || []) {
+        const center = position3(area?.center);
+        if (!area?.id || !center) continue;
+        const distance = Math.hypot(center[0] - position[0], center[2] - position[2]);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          nearest = area;
+        }
+      }
+      // If an item is far from every curated room center, don't guess its room.
+      return nearest && bestDistance <= 7.0 * unit ? nearest.id : null;
+    };
+
+    const furniture = Array.isArray(projectStatePayload?.furniture) ? projectStatePayload.furniture : [];
+    const placedSubjects = [];
+    for (let index = 0; index < furniture.length; index += 1) {
+      const item = furniture[index];
+      if (!item || item.doorHostWallId) continue;
+      const itemName = String(item.name || item.label || item.catalogItemName || '').trim();
+      const classification = classifyNamedSubject(itemName);
+      if (!classification) continue;
+      const position = position3(item.position);
+      if (!position) continue;
+      const scale = position3(item.scale) || [1, 1, 1];
+      const dims = position3(item.glbNormalization?.dimensions || item.dimensions);
+      const scaleY = Math.max(0.01, Math.abs(scale[1] || 1));
+      const dimensionHeight = dims && Number.isFinite(dims[1]) && dims[1] > 0.15
+        ? dims[1] * scaleY
+        : null;
+      const nameLower = itemName.toLowerCase();
+      let defaultAimHeight = 0.72;
+      let matchRadiusMeters = 1.05;
+      if (/(bed|daybed|sofa|couch|sectional|armchair|recliner|lounge chair)/.test(nameLower)) {
+        defaultAimHeight = /bed|daybed/.test(nameLower) ? 0.52 : 0.62;
+        matchRadiusMeters = /bed|daybed/.test(nameLower) ? 1.75 : 1.45;
+      } else if (/(wardrobe|closet|bookcase|bookshelf|refrigerator|fridge|cabinet|dresser)/.test(nameLower)) {
+        defaultAimHeight = 1.12;
+        matchRadiusMeters = 1.15;
+      } else if (/(tv|television)/.test(nameLower)) {
+        defaultAimHeight = 1.28;
+        matchRadiusMeters = 0.9;
+      } else if (/(dining table|desk|table|island)/.test(nameLower)) {
+        defaultAimHeight = 0.68;
+        matchRadiusMeters = 1.25;
+      } else if (/(toilet|sink|bathtub|shower|basin|vanity)/.test(nameLower)) {
+        defaultAimHeight = 0.78;
+        matchRadiusMeters = 0.95;
+      } else if (/(plant|mirror|painting|rug|carpet|curtain|lamp)/.test(nameLower)) {
+        defaultAimHeight = 1.1;
+        matchRadiusMeters = 0.9;
+      }
+      const aimHeightMeters = THREE.MathUtils.clamp(dimensionHeight ? dimensionHeight * 0.5 : defaultAimHeight, 0.28, 1.85);
+      const center = new THREE.Vector3(
+        position[0],
+        position[1] + aimHeightMeters * unit,
+        position[2],
+      );
+      const matchRadius = matchRadiusMeters * unit;
+
+      // Optimized GLBs often flatten names, but their mesh bounds still cluster
+      // around the saved instance placement. Associate nearby non-structural
+      // meshes so visibility tests can distinguish the hero item from a wall.
+      const associatedRecords = meshRecords
+        .filter((record) => {
+          const name = String(record.object.name || '');
+          if (/^(?:geom(?:etry)?[_\s:-]|hci_hosted_door|door|wall|floor|slab|ceiling)/i.test(name)) return false;
+          if (record.maxDim > 4.5 * unit || record.size.y > 2.75 * unit) return false;
+          const dx = position[0] < record.box.min.x ? record.box.min.x - position[0]
+            : position[0] > record.box.max.x ? position[0] - record.box.max.x : 0;
+          const dz = position[2] < record.box.min.z ? record.box.min.z - position[2]
+            : position[2] > record.box.max.z ? position[2] - record.box.max.z : 0;
+          const boxGap = Math.hypot(dx, dz);
+          const centerDistance = Math.hypot(record.center.x - position[0], record.center.z - position[2]);
+          return boxGap <= 0.18 * unit || centerDistance <= matchRadius;
+        });
+      const associatedMeshes = associatedRecords.map((record) => record.object);
+
+      // project_state supplies semantic identity, while optimized GLB bounds are
+      // the most reliable final-render coordinates. Aim at actual matched geometry
+      // when it clusters near the saved placement; fall back to the semantic aim
+      // point if the association looks too broad or belongs to another object.
+      if (associatedRecords.length) {
+        const associatedBounds = new THREE.Box3();
+        associatedRecords.forEach((record) => associatedBounds.union(record.box));
+        if (!associatedBounds.isEmpty()) {
+          const boundsSize = associatedBounds.getSize(new THREE.Vector3());
+          const boundsCenter = associatedBounds.getCenter(new THREE.Vector3());
+          const centerOffset = Math.hypot(boundsCenter.x - position[0], boundsCenter.z - position[2]);
+          const plausibleBounds = centerOffset <= matchRadiusMeters * 1.8 * unit
+            && boundsSize.x <= 5.5 * unit
+            && boundsSize.z <= 5.5 * unit
+            && boundsSize.y <= 3.2 * unit;
+          if (plausibleBounds) center.copy(boundsCenter);
+        }
+      }
+
+      const areaId = nearestAreaId(position);
+      placedSubjects.push({
+        id: `asset:${item.instanceId || item.id || index}`,
+        instanceId: item.instanceId || item.id || `asset-${index}`,
+        object: associatedMeshes[0] || null,
+        meshObjects: associatedMeshes,
+        isPlacedAsset: true,
+        visible: true,
+        name: itemName,
+        role: classification.role,
+        heroPriority: classification.heroPriority,
+        center,
+        basePosition: new THREE.Vector3(position[0], position[1], position[2]),
+        size: new THREE.Vector3(matchRadiusMeters * 2 * unit, aimHeightMeters * unit * 2, matchRadiusMeters * 2 * unit),
+        radius: Math.max(matchRadius, aimHeightMeters * unit),
+        areaId,
+        source: 'project-state',
+      });
+    }
+
+    // Prefer semantic, saved placements over generic mesh pieces. Keep the list
+    // bounded so the per-arrival ray tests stay cheap in furnished large models.
+    this.presentationSubjects.sort((a, b) => (b.heroPriority || meshPriority[b.role] || 0) - (a.heroPriority || meshPriority[a.role] || 0));
+    if (this.presentationSubjects.length > 60) this.presentationSubjects.length = 60;
+    placedSubjects.sort((a, b) => b.heroPriority - a.heroPriority);
+    if (placedSubjects.length > 80) placedSubjects.length = 80;
+    this.presentationSubjects.push(...placedSubjects);
+
+    console.info('[Walkthrough:camera] Presentation subjects indexed', {
+      namedMeshes: this.presentationSubjects.filter((subject) => subject.source === 'mesh-name').length,
+      placedAssets: placedSubjects.length,
+      occluderMeshes: this.presentationOccluders.length,
+      labels: placedSubjects.slice(0, 12).map((subject) => ({ name: subject.name, areaId: subject.areaId, center: subject.center.toArray() })),
     });
-    if (this.presentationSubjects.length > 80) this.presentationSubjects.length = 80;
+  }
+
+  _raycastPresentationOccluder(origin, direction, maxDistance = Infinity) {
+    if (!this.model || !origin || !direction) return null;
+
+    const raycaster = this.raycaster;
+    const previousNear = raycaster.near;
+    const previousFar = raycaster.far;
+    let hit = null;
+    try {
+      raycaster.near = 0;
+      raycaster.far = Number.isFinite(maxDistance) ? Math.max(0, maxDistance) : Infinity;
+      raycaster.set(origin, direction);
+      if (this.presentationOccluders?.length) {
+        hit = raycaster.intersectObjects(this.presentationOccluders, false)[0] || null;
+      } else {
+        // Keep compatibility with older / unusual models whose structural nodes
+        // do not use the production naming convention.
+        hit = raycaster.intersectObject(this.model, true)[0] || null;
+      }
+    } finally {
+      raycaster.near = previousNear;
+      raycaster.far = previousFar;
+    }
+    return hit;
   }
 
   _chooseGuidedShotSubject(referencePosition = this.position, candidateYaw = this.currentYaw) {
@@ -2919,50 +3451,57 @@ if (name === 'top') {
     const areaId = this._getGuidedPresentationAreaId();
     const eye = new THREE.Vector3(
       referencePosition.x,
-      referencePosition.y + this.eyeHeight * unit + this.heightOffset * unit,
+      referencePosition.y + (this.eyeHeight + this.heightOffset) * unit,
       referencePosition.z,
     );
     const forward = new THREE.Vector3(-Math.sin(candidateYaw), 0, -Math.cos(candidateYaw));
     const maxDistance = 8.5 * unit;
-    const avoidId = this.guidedShotSubjectId;
-    const priority = { furniture: 5.0, fixture: 4.6, opening: 3.9, decor: 3.4, lighting: 2.7, object: 2.4 };
     const candidates = [];
+    const rolePriority = { furniture: 6.0, fixture: 4.0, opening: 1.5, decor: 2.5, lighting: 2.0, object: 1.0 };
 
     for (const subject of this.presentationSubjects) {
-      if (!subject?.object || !subject.object.visible) continue;
-      if (avoidId && subject.object.uuid === avoidId) continue;
-      const to = subject.center.clone().sub(referencePosition);
+      if (!subject || subject.visible === false || (subject.object && !subject.object.visible)) continue;
+      // areaId is inferred from sampled NavMesh centers, not a true room polygon.
+      // Prefer the current area, but don't categorically exclude a visible bed or
+      // sofa when those approximate centers assigned it to a neighboring area.
+
+      const target = subject.center?.clone?.();
+      if (!target) continue;
+      const to = target.clone().sub(referencePosition);
       to.y = 0;
       const distance = to.length();
-      if (!Number.isFinite(distance) || distance < 0.85 * unit || distance > maxDistance) continue;
+      if (!Number.isFinite(distance) || distance < 0.65 * unit || distance > maxDistance) continue;
 
-      const direction = to.normalize();
+      const direction = to.clone().normalize();
       const angle = Math.acos(THREE.MathUtils.clamp(forward.dot(direction), -1, 1));
-      if (angle > THREE.MathUtils.degToRad(72)) continue;
+      // A hero can be to the side or behind the entry heading. Arrival framing
+      // is allowed to deliberately turn toward it, provided it is visible.
+      if (angle > THREE.MathUtils.degToRad(155)) continue;
 
-      // Subject must belong to the active semantic area when the current shot has one.
-      // This keeps the focus from leaking through a wall into another room.
-      if (areaId && subject.object.userData?.walkAreaId && subject.object.userData.walkAreaId !== areaId) continue;
-
-      const target = subject.center.clone();
-      target.y = THREE.MathUtils.clamp(
-        target.y,
-        referencePosition.y + 0.35 * unit,
-        referencePosition.y + 2.5 * unit,
-      );
-      const toTarget = target.clone().sub(eye);
+      const targetForVisibility = target.clone();
+      const toTarget = targetForVisibility.sub(eye);
       const targetDistance = toTarget.length();
       if (this.model && targetDistance > 1e-6) {
-        this.raycaster.set(eye, toTarget.normalize());
-        const hit = this.raycaster.intersectObject(this.model, true)[0];
-        if (hit && hit.object !== subject.object && hit.distance < targetDistance - 0.08 * unit) continue;
+        const hit = this._raycastPresentationOccluder(eye, toTarget.normalize(), targetDistance);
+        const hitBelongsToSubject = Boolean(hit && (
+          hit.object === subject.object ||
+          subject.meshObjects?.includes(hit.object)
+        ));
+        const occlusionTolerance = Math.max(0.38 * unit, targetDistance * 0.12);
+        // For a placed asset, the target point is inside the furniture, so the
+        // first legitimate hit should be one of its associated meshes.
+        if (hit && !hitBelongsToSubject && hit.distance < targetDistance - occlusionTolerance) continue;
       }
 
-      const angleQuality = 1 - angle / THREE.MathUtils.degToRad(72);
-      const distanceQuality = THREE.MathUtils.clamp(1 - distance / maxDistance, 0, 1);
-      const sizeQuality = THREE.MathUtils.clamp(Math.log1p(subject.radius / unit * 3) * 0.55, 0, 1.3);
-      const roleWeight = priority[subject.role] || 2.0;
-      const score = roleWeight * (0.65 + angleQuality * 1.75 + distanceQuality * 0.85 + sizeQuality * 0.55);
+      const angleQuality = 1 - angle / THREE.MathUtils.degToRad(155);
+      const preferredDistance = 2.7 * unit;
+      const distanceQuality = THREE.MathUtils.clamp(1 - Math.abs(distance - preferredDistance) / (5.2 * unit), 0, 1);
+      const sizeQuality = THREE.MathUtils.clamp(Math.log1p((subject.radius || unit * 0.5) / unit * 3) * 0.5, 0, 1.2);
+      const roleWeight = subject.heroPriority || rolePriority[subject.role] || 1.0;
+      // Area membership is a soft preference because the NavMesh's six sampled
+      // spaces do not map one-to-one to this job's three detected rooms.
+      const sameAreaBonus = areaId && subject.areaId === areaId ? 2.6 : 0;
+      const score = roleWeight * 1.3 + sameAreaBonus + angleQuality * 1.25 + distanceQuality * 2.0 + sizeQuality * 0.25;
       candidates.push({ subject, score, angle, distance, target });
     }
 
@@ -2976,6 +3515,25 @@ if (name === 'top') {
     const dz = subject.center.z - referencePosition.z;
     if (Math.hypot(dx, dz) < 0.15 * Math.max(this.metersPerUnit, 0.000001)) return null;
     return Math.atan2(-dx, -dz);
+  }
+
+  _pitchToGuidedSubject(referencePosition = this.position, subject = this.guidedShotSubject) {
+    if (!subject?.center) return null;
+    const unit = Math.max(this.metersPerUnit, 0.000001);
+    const eyeY = referencePosition.y + (this.eyeHeight + this.heightOffset) * unit;
+    const dx = subject.center.x - referencePosition.x;
+    const dz = subject.center.z - referencePosition.z;
+    const horizontalDistance = Math.hypot(dx, dz);
+    if (!Number.isFinite(horizontalDistance) || horizontalDistance < 0.18 * unit) return null;
+    const dy = subject.center.y - eyeY;
+    // Keep the look-down angle architectural rather than game-like/top-down.
+    return THREE.MathUtils.clamp(
+      Math.atan2(dy, horizontalDistance),
+      // Keep the hero in frame while retaining enough ceiling/floor context to
+      // read the whole interior; very steep bed-level aim looks cramped.
+      THREE.MathUtils.degToRad(-27),
+      THREE.MathUtils.degToRad(10),
+    );
   }
 
   _visualSubjectScore(referencePosition = this.position, candidateYaw = this.currentYaw) {
@@ -3010,20 +3568,24 @@ if (name === 'top') {
       const toTarget = target.clone().sub(eye);
       const targetDistance = toTarget.length();
       if (this.model && targetDistance > 1e-6) {
-        this.raycaster.set(eye, toTarget.normalize());
-        const hit = this.raycaster.intersectObject(this.model, true)[0];
-        if (hit && hit.object !== subject.object && hit.distance < targetDistance - 0.08 * unit) continue;
+        const hit = this._raycastPresentationOccluder(eye, toTarget.normalize(), targetDistance);
+        const hitBelongsToSubject = Boolean(hit && (
+          hit.object === subject.object ||
+          subject.meshObjects?.includes(hit.object)
+        ));
+        const occlusionTolerance = Math.max(0.38 * unit, targetDistance * 0.12);
+        if (hit && !hitBelongsToSubject && hit.distance < targetDistance - occlusionTolerance) continue;
       }
 
       const angleQuality = 1 - angle / THREE.MathUtils.degToRad(68);
       const distanceQuality = THREE.MathUtils.clamp(1 - distance / maxDistance, 0, 1);
       const sizeQuality = THREE.MathUtils.clamp(Math.log1p(subject.radius / unit * 3) * 0.55, 0, 1.3);
-      const roleWeight = subject.role === 'furniture' ? 1.35
+      const roleWeight = subject.heroPriority || (subject.role === 'furniture' ? 1.35
         : subject.role === 'fixture' ? 1.2
         : subject.role === 'opening' ? 0.95
         : subject.role === 'decor' ? 0.82
         : subject.role === 'lighting' ? 0.65
-        : 0.55;
+        : 0.55);
 
       score += roleWeight * (0.7 + angleQuality * 1.7 + distanceQuality * 0.8 + sizeQuality * 0.5);
       visibleSubjects += 1;
@@ -3046,8 +3608,7 @@ if (name === 'top') {
     for (const offsetDeg of offsets) {
       const yaw = candidateYaw + THREE.MathUtils.degToRad(offsetDeg);
       const dir = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-      this.raycaster.set(origin, dir);
-      const hit = this.raycaster.intersectObject(this.model, true)[0];
+      const hit = this._raycastPresentationOccluder(origin, dir, 2.5 * unit);
       const distance = hit?.distance ?? Infinity;
       if (distance < 0.55 * unit) score -= 2.2;
       else if (distance < this.guidedPanWallGuardMeters * unit) score -= 1.5;
@@ -3080,8 +3641,9 @@ if (name === 'top') {
       const distance = to.length();
       if (!Number.isFinite(distance) || distance < 0.65 * unit || distance > maxDistanceMeters * unit) continue;
       if (presentationAreaId && hotspot.areaId && hotspot.areaId !== presentationAreaId && !allowCrossArea) continue;
-      if (!this._hasCameraClearance([target.x, target.y, target.z])) continue;
-
+      // Every hotspot is clearance-validated once when navigation data is loaded.
+      // Repeating the 9-ray full-scene test for every candidate heading caused
+      // large synchronous spikes in Guided mode without changing the result.
       const direction = to.normalize();
       const angle = Math.acos(THREE.MathUtils.clamp(forward.dot(direction), -1, 1));
       if (angle > THREE.MathUtils.degToRad(82)) continue;
@@ -3091,8 +3653,7 @@ if (name === 'top') {
         const toTarget = target.clone().sub(eye);
         const targetDistance = toTarget.length();
         if (targetDistance > 1e-6) {
-          this.raycaster.set(eye, toTarget.normalize());
-          const hit = this.raycaster.intersectObject(this.model, true)[0];
+          const hit = this._raycastPresentationOccluder(eye, toTarget.normalize(), targetDistance);
           occluded = Boolean(hit && hit.distance < targetDistance - 0.06 * unit);
         }
       }
@@ -3132,9 +3693,9 @@ if (name === 'top') {
     const eye = new THREE.Vector3(referencePosition.x, referencePosition.y + this.eyeHeight * unit + this.heightOffset * unit, referencePosition.z);
     const lookDir = new THREE.Vector3(-Math.sin(candidateYaw), 0, -Math.cos(candidateYaw));
     if (this.model) {
+      // These thresholds all inspect the same heading, so share one bounded ray.
+      const hit = this._raycastPresentationOccluder(eye, lookDir, 7.0 * unit);
       for (const meters of [2.0, 4.0, 7.0]) {
-        this.raycaster.set(eye, lookDir);
-        const hit = this.raycaster.intersectObject(this.model, true)[0];
         if (!hit || hit.distance > meters * unit) score += 0.9;
       }
     }
@@ -3149,14 +3710,19 @@ if (name === 'top') {
       return { yaw, ...this._scoreGuidedHeading(referencePosition, yaw, incomingDirection) };
     });
 
-    candidates.sort((a, b) => b.score - a.score);
-    const best = candidates[0];
+    const best = candidates.reduce((selected, candidate) => (
+      !selected || candidate.score > selected.score ? candidate : selected
+    ), null);
     if (!best) return null;
 
-    // If there are no same-space presentation subjects, preserve the current
-    // composition rather than inventing a view through a wall into another room.
-    const bestEvaluation = this._scoreGuidedHeading(referencePosition, best.yaw, incomingDirection);
-    const currentEvaluation = this._scoreGuidedHeading(referencePosition, preferredYaw, incomingDirection);
+    const angleDelta = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+    const current = candidates
+      .filter((candidate) => angleDelta(candidate.yaw, preferredYaw) <= THREE.MathUtils.degToRad(8))
+      .sort((a, b) => b.score - a.score)[0];
+    // Each candidate already contains its full visibility evaluation. Reuse those
+    // results instead of raycasting the winning/current heading a second time.
+    const bestEvaluation = best;
+    const currentEvaluation = current || best;
     const hasSameSpaceSubject = bestEvaluation.visible.some((item) => {
       const areaId = this._getGuidedPresentationAreaId();
       return !areaId || !item.hotspot.areaId || item.hotspot.areaId === areaId;
@@ -3164,11 +3730,6 @@ if (name === 'top') {
     if (!hasSameSpaceSubject && currentEvaluation.score >= best.score - 0.45) {
       return { yaw: preferredYaw, score: currentEvaluation.score };
     }
-
-    const angleDelta = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
-    const current = candidates
-      .filter((candidate) => angleDelta(candidate.yaw, preferredYaw) <= THREE.MathUtils.degToRad(8))
-      .sort((a, b) => b.score - a.score)[0];
 
     // Stability rule: don't rotate to a dramatically different composition for
     // a negligible gain in quality.
@@ -3219,9 +3780,10 @@ if (name === 'top') {
       const headingScore = this._scoreGuidedHeading(referencePosition, yaw, incomingDirection)?.score || 0;
       let clearanceScore = 0;
       if (this.model) {
+        // One ray gives the nearest obstacle distance for all three clearance
+        // thresholds; the previous code repeated the identical ray three times.
+        const hit = this._raycastPresentationOccluder(eye, dir, 4.5 * unit);
         for (const meters of [1.6, 2.8, 4.5]) {
-          this.raycaster.set(eye, dir);
-          const hit = this.raycaster.intersectObject(this.model, true)[0];
           if (!hit || hit.distance > meters * unit) clearanceScore += 0.7;
         }
       }
@@ -3277,9 +3839,35 @@ if (name === 'top') {
 
   _prepareGuidedArrivalView(referencePosition = this.position, incomingDirection = this.lastMoveDirection) {
     if (this.walkMode !== 'guided') return;
+    let resolvedAreaId = null;
     if (this.activeHotspotId) {
       const active = this.hotspots.find((hotspot) => hotspot?.id === this.activeHotspotId);
-      if (active?.areaId) this.guidedPresentationAreaId = active.areaId;
+      if (active?.areaId) resolvedAreaId = active.areaId;
+    }
+    if (!resolvedAreaId && this.walkAreas?.length) {
+      let nearestArea = null;
+      let nearestDistance = Infinity;
+      for (const area of this.walkAreas) {
+        const center = Array.isArray(area?.center) ? area.center : null;
+        if (!center || center.length < 3) continue;
+        const distance = Math.hypot(Number(center[0]) - referencePosition.x, Number(center[2]) - referencePosition.z);
+        if (Number.isFinite(distance) && distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestArea = area;
+        }
+      }
+      if (nearestArea && nearestDistance <= 7.0 * Math.max(this.metersPerUnit, 0.000001)) {
+        resolvedAreaId = nearestArea.id;
+      }
+    }
+    if (resolvedAreaId) {
+      this.guidedPresentationAreaId = resolvedAreaId;
+      this.guidedTourLastAreaId = resolvedAreaId;
+    } else {
+      this.guidedPresentationAreaId = null;
+    }
+    if (this.activeHotspotId) {
+      this.guidedTourLastVisitedHotspotId = this.activeHotspotId;
     }
 
     const preferredYaw = Number.isFinite(this.currentYaw)
@@ -3296,30 +3884,42 @@ if (name === 'top') {
     // settle toward it. If no trustworthy subject exists, keep the Phase 11/12
     // composition instead of forcing a synthetic focus.
     this.guidedShotSubject = this._chooseGuidedShotSubject(referencePosition, baseArrivalYaw);
-    this.guidedShotSubjectId = this.guidedShotSubject?.object?.uuid || null;
+    this.guidedShotSubjectId = this.guidedShotSubject?.id || this.guidedShotSubject?.object?.uuid || null;
     const subjectYaw = this._yawToGuidedSubject(referencePosition, this.guidedShotSubject);
-    const arrivalYaw = Number.isFinite(subjectYaw)
-      ? this._angleLerp(baseArrivalYaw, subjectYaw, 0.62)
-      : baseArrivalYaw;
+    const subjectPitch = this._pitchToGuidedSubject(referencePosition, this.guidedShotSubject);
+    // A selected hero is the intended final composition, not a weak suggestion:
+    // center it in both azimuth and elevation, then ease into that shot.
+    const arrivalYaw = Number.isFinite(subjectYaw) ? subjectYaw : baseArrivalYaw;
+    const arrivalPitch = Number.isFinite(subjectPitch) ? subjectPitch : this.guidedPitch;
 
-    // Phase 8: do not snap on arrival. Freeze the current heading, then settle
-    // smoothly into the final architectural composition over ~1.25 seconds.
     const now = performance.now();
     this.guidedApproachActive = false;
     this.guidedRevealActive = false;
     this.guidedArrivalStartYaw = this.currentYaw;
     this.guidedArrivalTargetYaw = arrivalYaw;
+    this.guidedArrivalStartPitch = this.currentPitch;
+    this.guidedArrivalTargetPitch = arrivalPitch;
     this.guidedArrivalSettleStartedAt = now;
     this.arrivalSettleUntil = now + this.guidedArrivalSettleDurationMs;
-    this.guidedShotSubjectUntil = now + this.guidedArrivalSettleDurationMs + this.guidedTourHoldMs;
+    this.guidedShotSubjectUntil = this.guidedTourArmed
+      ? now + this.guidedArrivalSettleDurationMs + this.guidedTourHoldMs
+      : Number.POSITIVE_INFINITY;
     this.guidedCompositionYaw = this.currentYaw;
     this.guidedCompositionTargetYaw = arrivalYaw;
     this.guidedYawCenter = this.currentYaw;
     this.targetYaw = this.currentYaw;
-    this.targetPitch = this.guidedPitch;
+    this.targetPitch = this.currentPitch;
     this.guidedLastCompositionAt = now;
     this.guidedPanPhase = 0;
     this._refreshPresentationDestinations(referencePosition, arrivalYaw);
+    console.info('[Walkthrough:camera] Arrival composition', {
+      areaId: this.guidedPresentationAreaId,
+      subject: this.guidedShotSubject?.name || null,
+      subjectSource: this.guidedShotSubject?.source || null,
+      subjectId: this.guidedShotSubjectId,
+      yawTarget: Number(arrivalYaw.toFixed(3)),
+      pitchTarget: Number(arrivalPitch.toFixed(3)),
+    });
   }
 
   _refreshPresentationDestinations(referencePosition = this.position, yaw = this.currentYaw) {
@@ -3338,8 +3938,9 @@ if (name === 'top') {
       const dz = Number(hotspot.position[2]) - origin.z;
       const distance = Math.hypot(dx, dz);
       if (!Number.isFinite(distance) || distance < 0.5 * unit || distance > this.presentationMaxDistanceMeters * unit) continue;
-      if (!this._hasCameraClearance(hotspot.position)) continue;
-
+      // this.hotspots is pre-filtered through _hasCameraClearance during load.
+      // Rechecking here duplicates 9 full-scene raycasts for each hotspot on
+      // every arrival, so visibility is handled by the bounded occlusion ray below.
       const direction = new THREE.Vector3(dx, 0, dz).normalize();
       const dot = forward.dot(direction);
       const angle = Math.acos(THREE.MathUtils.clamp(dot, -1, 1));
@@ -3352,8 +3953,7 @@ if (name === 'top') {
         const toTarget = target.sub(eye);
         const targetDistance = toTarget.length();
         if (targetDistance > 1e-6) {
-          this.raycaster.set(eye, toTarget.normalize());
-          const hit = this.raycaster.intersectObject(this.model, true)[0];
+          const hit = this._raycastPresentationOccluder(eye, toTarget.normalize(), targetDistance);
           visible = !hit || hit.distance >= targetDistance - 0.05 * unit;
         }
       }
@@ -3407,10 +4007,11 @@ if (name === 'top') {
         const t = THREE.MathUtils.clamp(elapsedMs / totalMs, 0, 1);
         const eased = t * t * (3 - 2 * t);
         const settleYaw = this._angleLerp(this.guidedArrivalStartYaw, this.guidedArrivalTargetYaw, eased);
+        const settlePitch = THREE.MathUtils.lerp(this.guidedArrivalStartPitch, this.guidedArrivalTargetPitch, eased);
         this.guidedCompositionYaw = settleYaw;
         this.guidedCompositionTargetYaw = this.guidedArrivalTargetYaw;
         this.targetYaw = settleYaw;
-        this.targetPitch = this.guidedPitch;
+        this.targetPitch = settlePitch;
         this.guidedPanPhase = 0;
       } else if (!this.guidedManualActive && this.guidedApproachActive && isTravelling) {
         let approachYaw = this.guidedApproachTargetYaw;
@@ -3432,6 +4033,9 @@ if (name === 'top') {
             this.guidedRevealActive = false;
           }
         }
+        // A destination reveal may glance sideways, but it must not point the
+        // camera through a wall while the body is following a different corridor.
+        approachYaw = this._clampYawToTravelHeading(approachYaw, this.guidedTransitionKind === 'room-entry' || this.guidedTransitionKind === 'room-crossing' ? 42 : 32);
         this.guidedCompositionYaw = this._angleLerp(
           this.guidedCompositionYaw,
           approachYaw,
@@ -3440,6 +4044,21 @@ if (name === 'top') {
         this.guidedCompositionTargetYaw = approachYaw;
         this.targetYaw = this.guidedCompositionYaw;
         this.targetPitch = this.guidedPitch;
+      } else if (!this.guidedManualActive && isTravelling && this.path?.length) {
+        // During the actual walk, face the route tangent rather than scanning
+        // scenic subjects. Camera composition resumes at the final approach/arrival.
+        const travelYaw = this._getTravelPathYaw();
+        if (Number.isFinite(travelYaw)) {
+          this.guidedCompositionTargetYaw = travelYaw;
+          this.guidedCompositionYaw = this._angleLerp(
+            this.guidedCompositionYaw,
+            travelYaw,
+            1 - Math.exp(-2.8 * dt),
+          );
+          this.targetYaw = this.guidedCompositionYaw;
+        }
+        this.targetPitch = this.guidedPitch;
+        this.guidedPanPhase = 0;
       } else if (this.guidedManualActive) {
         this.targetPitch = this.guidedPitch;
 
@@ -3471,18 +4090,29 @@ if (name === 'top') {
         // Phase 13: while the current architectural shot is still being presented,
         // preserve its chosen subject instead of letting periodic composition search
         // pull the camera toward another room/object.
-        const subjectLockActive = this.guidedShotSubject && now < this.guidedShotSubjectUntil && !isTravelling;
+        const subjectLockActive = Boolean(
+          this.guidedShotSubject
+          && !isTravelling
+          && !this.guidedManualActive
+          && now < this.guidedShotSubjectUntil
+        );
         if (subjectLockActive) {
           const subjectYaw = this._yawToGuidedSubject(this.position, this.guidedShotSubject);
+          const subjectPitch = this._pitchToGuidedSubject(this.position, this.guidedShotSubject);
           if (Number.isFinite(subjectYaw)) {
-            this.guidedCompositionTargetYaw = this._angleLerp(this.guidedCompositionTargetYaw, subjectYaw, 0.16);
-            this.guidedCompositionYaw = this._angleLerp(this.guidedCompositionYaw, this.guidedCompositionTargetYaw, 1 - Math.exp(-1.8 * dt));
+            this.guidedCompositionTargetYaw = subjectYaw;
+            this.guidedCompositionYaw = this._angleLerp(
+              this.guidedCompositionYaw,
+              this.guidedCompositionTargetYaw,
+              1 - Math.exp(-1.8 * dt),
+            );
           }
+          if (Number.isFinite(subjectPitch)) this.targetPitch = subjectPitch;
         }
 
         // Phase 8B: continue the guided architectural story after the current shot
-        // has had time to settle. The user can interrupt at any time by dragging
-        // or clicking another destination.
+        // has had time to settle. The user can interrupt the shot by dragging or
+        // clicking another destination; the tour still advances on its own timer.
         this._advanceGuidedTour(now);
 
         const due = now - this.guidedLastCompositionAt >= this.guidedCompositionIntervalMs;
@@ -3499,32 +4129,67 @@ if (name === 'top') {
           this.guidedLastCompositionAt = now;
         }
 
-        this.guidedCompositionYaw = THREE.MathUtils.lerp(
-          this.guidedCompositionYaw,
-          this.guidedCompositionTargetYaw,
-          1 - Math.exp(-1.8 * dt),
-        );
+        if (subjectLockActive) {
+          // Hold a real design feature in the center instead of panning off it.
+          this.guidedPanPhase = 0;
+          this.targetYaw = this.guidedCompositionYaw;
+          const subjectPitch = this._pitchToGuidedSubject(this.position, this.guidedShotSubject);
+          this.targetPitch = Number.isFinite(subjectPitch) ? subjectPitch : this.guidedPitch;
+        } else {
+          this.guidedCompositionYaw = THREE.MathUtils.lerp(
+            this.guidedCompositionYaw,
+            this.guidedCompositionTargetYaw,
+            1 - Math.exp(-1.8 * dt),
+          );
 
-        // Very small cinematic drift around the chosen composition. This is no
-        // longer a one-direction spin: the selected composition is the anchor.
-        this.guidedPanPhase += dt * this.guidedYawRate;
-        let microSweep = Math.sin(this.guidedPanPhase) * THREE.MathUtils.degToRad(this.guidedCompositionSweepDeg) * 0.12;
-        const sweepYaw = this.guidedCompositionYaw + microSweep;
-        if (this._headingWallGuardScore(this.position, sweepYaw) < -this.guidedWallDominancePenalty) {
-          microSweep *= 0.18;
+          // Very small cinematic drift around the chosen composition.
+          this.guidedPanPhase += dt * this.guidedYawRate;
+          let microSweep = Math.sin(this.guidedPanPhase) * THREE.MathUtils.degToRad(this.guidedCompositionSweepDeg) * 0.12;
+          const sweepYaw = this.guidedCompositionYaw + microSweep;
+          if (this._headingWallGuardScore(this.position, sweepYaw) < -this.guidedWallDominancePenalty) {
+            microSweep *= 0.18;
+          }
+          this.targetYaw = this.guidedCompositionYaw + microSweep;
+          this.targetPitch = this.guidedPitch;
         }
-        this.targetYaw = this.guidedCompositionYaw + microSweep;
-        this.targetPitch = this.guidedPitch;
       }
       this.guidedTravelRotating = !this.guidedManualActive;
     } else if (!isTravelling) {
       this.guidedTravelRotating = false;
     }
 
+    if (this.walkMode === 'explore' && this.path?.length && performance.now() >= this.exploreManualLookUntil) {
+      const travelYaw = this._getTravelPathYaw();
+      if (Number.isFinite(travelYaw)) {
+        this.targetYaw = this._angleLerp(this.targetYaw, travelYaw, 1 - Math.exp(-1.7 * dt));
+      }
+    }
+
     this.currentYaw = THREE.MathUtils.lerp(this.currentYaw, this.targetYaw, smoothing);
     this.currentPitch = THREE.MathUtils.lerp(this.currentPitch, this.targetPitch, smoothing);
     this.yaw = this.currentYaw;
     this.pitch = this.currentPitch;
+
+    const fovKey = this._currentPresentationFovKey();
+    const configuredFov = Number(this.presentationSettings?.camera?.[fovKey]) || this.fov || DEFAULT_FOV_DEGREES;
+    const settledGuidedDestination = this.viewMode === 'walk'
+      && this.walkMode === 'guided'
+      && !this.immersive360Active
+      && !isTravelling
+      && Boolean(this.activeHotspotId || this.guidedShotSubject);
+    const targetFov = Math.min(
+      88,
+      configuredFov + (settledGuidedDestination ? GUIDED_ARRIVAL_FOV_BOOST_DEGREES : 0),
+    );
+    const nextFov = THREE.MathUtils.lerp(
+      this.camera.fov || configuredFov,
+      targetFov,
+      1 - Math.exp(-2.0 * dt),
+    );
+    if (Math.abs(nextFov - this.camera.fov) > 0.025) {
+      this.camera.fov = nextFov;
+      this.camera.updateProjectionMatrix();
+    }
 
     const baseH = this.eyeHeight * this.metersPerUnit + this.heightOffset * this.metersPerUnit;
     // Interior-design walkthroughs should feel like a stabilized architectural
@@ -3643,9 +4308,11 @@ if (name === 'top') {
   _tick = () => {
     if (!this.running) return;
     const now = performance.now();
-    const dt = Math.min(0.05, Math.max(0.001, (now - this.lastFrameTime) / 1000));
+    const actualFrameTimeMs = Math.max(0, now - this.lastFrameTime);
+    const dt = Math.min(0.05, Math.max(0.001, actualFrameTimeMs / 1000));
     this.lastFrameTime = now;
     this._lastDt = dt;
+    this._lastFrameElapsedMs = actualFrameTimeMs;
     this.lightingDirector?.update(dt);
     this._updateImmersive360?.(now, dt);
     this._updateSmart720Tour?.(now);
@@ -3661,6 +4328,7 @@ if (name === 'top') {
     }
     this._updatePortals();
     this.renderer.render(this.scene, this.camera);
+    this.performanceMonitor?.recordFrame(this._lastFrameElapsedMs ?? (dt * 1000));
     this.animationFrame = requestAnimationFrame(this._tick);
   };
 
@@ -3674,6 +4342,7 @@ if (name === 'top') {
 
   dispose() {
     this.running = false;
+    this.performanceMonitor?.dispose();
     cancelAnimationFrame(this.animationFrame);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
@@ -3867,6 +4536,7 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
   const setWalkMode = useCallback((value) => runtimeRef.current?.setWalkMode(value), []);
   const setLookLocked = useCallback((value) => runtimeRef.current?.setLookLocked(value), []);
   const setFov = useCallback((value) => runtimeRef.current?.setFov(value), []);
+  const applyPresentationSettings = useCallback((settings) => runtimeRef.current?.applyPresentationSettings(settings), []);
   const setLightingMode = useCallback((value) => runtimeRef.current?.setLightingMode(value), []);
   const cycleLighting = useCallback(() => runtimeRef.current?.cycleLighting(), []);
   const setViewMode = useCallback((value) => runtimeRef.current?.setViewMode(value), []);
@@ -3875,8 +4545,18 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
   const zoom = useCallback((value) => runtimeRef.current?.zoom(value), []);
   const fitView = useCallback(() => runtimeRef.current?.fitView(), []);
   const recoverToSafeSpot = useCallback(() => runtimeRef.current?.recoverToSafeSpot(), []);
-  const enterImmersivePresentation = useCallback((options = {}) => runtimeRef.current?.enterImmersivePresentation(options), []);
-  const exitImmersivePresentation = useCallback(() => runtimeRef.current?.exitImmersivePresentation(), []);
+  const enterImmersivePresentation = useCallback((options = {}) => {
+    const runtime = runtimeRef.current;
+    const result = runtime?.enterImmersivePresentation(options);
+    runtime?._applyCurrentCameraSettings?.();
+    return result;
+  }, []);
+  const exitImmersivePresentation = useCallback(() => {
+    const runtime = runtimeRef.current;
+    const result = runtime?.exitImmersivePresentation();
+    runtime?._applyCurrentCameraSettings?.();
+    return result;
+  }, []);
   const resetImmersivePresentationView = useCallback(() => runtimeRef.current?.resetImmersivePresentationView(), []);
   const setImmersive360AutoRotate = useCallback((value) => runtimeRef.current?.setImmersive360AutoRotate(value), []);
   const switchImmersiveScene = useCallback((direction) => runtimeRef.current?.switchImmersiveScene(direction), []);
@@ -3898,6 +4578,7 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
     zoom,
     fitView,
     setFov,
+    applyPresentationSettings,
     setLightingMode,
     cycleLighting,
     enterImmersivePresentation,

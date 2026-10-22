@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { PanelLeftClose, Loader2, Layout, Orbit, ExternalLink, Box, Pencil, Trash2, X, AlertTriangle ,FolderOpen} from 'lucide-react';
+import { PanelLeftClose, Loader2, Layout, Orbit, ExternalLink, Box, Pencil, Trash2, X, AlertTriangle, FolderOpen, Layers, PackagePlus, PanelsTopLeft, Sparkles, ArrowRight } from 'lucide-react';
 import { LayoutMetadataForm } from './LayoutMetadataForm';
 import { CatalogTree } from './CatalogTree'; //[cite: 1]
 
@@ -19,8 +19,24 @@ export const LeftPanel = ({
   homeTemplates, onApplyTemplate, availableLayouts, layoutsLoading, layoutsError, onSelectLayout, fileName,
   savedLayouts = [], savedLayoutsLoading = false, savedLayoutsError = null, onOpenSavedLayout,
   onEditSavedLayout, onDeleteSavedLayout, fileNameForLayoutMetadata, activeSavedLayout = null,
+  activeTab = null, onActiveTabChange = null,
 }) => {
-  const [leftTab, setLeftTab] = useState('explorer');
+  const [internalLeftTab, setInternalLeftTab] = useState('explorer');
+  const leftTab = activeTab ?? internalLeftTab;
+  const setLeftTab = onActiveTabChange ?? setInternalLeftTab;
+  const [showQuickStart, setShowQuickStart] = useState(() => {
+    try { return localStorage.getItem('hci_editor_quick_start_dismissed') !== '1'; }
+    catch { return true; }
+  });
+
+  const dismissQuickStart = () => {
+    setShowQuickStart(false);
+    try { localStorage.setItem('hci_editor_quick_start_dismissed', '1'); } catch { /* Storage can be disabled in private/restricted contexts. */ }
+  };
+  const restoreQuickStart = () => {
+    setShowQuickStart(true);
+    try { localStorage.removeItem('hci_editor_quick_start_dismissed'); } catch { /* Best-effort preference only. */ }
+  };
   const [layoutPath, setLayoutPath] = useState({ level: 'root', type: null, category: null, subCategory: null });
   const [editingLayout, setEditingLayout] = useState(null);
   const [deletingLayout, setDeletingLayout] = useState(null);
@@ -76,7 +92,7 @@ export const LeftPanel = ({
   const selectedSubCategories = selectedCategory?.subCategories || [];
 
   const breadcrumb = () => {
-    if (layoutPath.level === 'root') return 'Layouts';
+    if (layoutPath.level === 'root') return 'Saved designs';
     if (layoutPath.level === 'categories') return layoutPath.type === 'project' ? 'Projects' : 'Floor Plans';
     if (layoutPath.level === 'subcategories') return layoutPath.category;
     return `${layoutPath.category} / ${layoutPath.subCategory}`;
@@ -108,8 +124,8 @@ export const LeftPanel = ({
       <div className="px-3 py-2.5">
         <p className="truncate text-[10px] font-semibold uppercase tracking-[0.12em] text-indigo-500 dark:text-indigo-300">{layoutPath.subCategory}</p>
         <div className="mt-2 grid grid-cols-[1fr_auto_auto] gap-2">
-          <button type="button" onClick={() => onOpenSavedLayout?.(layout)} className="rounded-lg bg-[#ff914d] px-3 py-2 text-[11px] font-bold text-white transition hover:bg-[#ff7a28]">Use Layout</button>
-          <a href={layout.walkthroughUrl ? resolveBackendUrl(layout.walkthroughUrl) : '#'} target="_blank" rel="noreferrer" className="rounded-lg border border-indigo-200 px-3 py-2 text-[11px] font-bold text-indigo-600 hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 dark:hover:bg-indigo-900/30" title="Preview in 360°"><Orbit className="h-3.5 w-3.5" /></a>
+          <button type="button" onClick={() => onOpenSavedLayout?.(layout)} className="rounded-lg bg-[#ff914d] px-3 py-2 text-[11px] font-semibold text-white transition hover:bg-[#ff7a28]">Open design</button>
+          <a href={layout.walkthroughUrl ? resolveBackendUrl(layout.walkthroughUrl) : '#'} target="_blank" rel="noreferrer" className="rounded-lg border border-indigo-200 px-3 py-2 text-[11px] font-bold text-indigo-600 hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 dark:hover:bg-indigo-900/30" title="Preview this design in a 360° walkthrough"><Orbit className="h-3.5 w-3.5" /></a>
           <button type="button" onClick={() => { setLayoutMutationError(null); setEditingLayout(layout); }} className="rounded-lg border border-slate-200 px-2.5 py-2 text-slate-500 hover:border-indigo-300 hover:text-indigo-500 dark:border-slate-700" aria-label={`Edit ${layout.name}`}><Pencil className="h-3.5 w-3.5" /></button>
           <button type="button" onClick={() => { setLayoutMutationError(null); setDeletingLayout(layout); }} className="rounded-lg border border-rose-200 px-2.5 py-2 text-rose-500 hover:bg-rose-50 dark:border-rose-900/60 dark:hover:bg-rose-900/20" aria-label={`Delete ${layout.name}`}><Trash2 className="h-3.5 w-3.5" /></button>
         </div>
@@ -128,7 +144,7 @@ export const LeftPanel = ({
               className="min-w-0"
               title={`${activeSavedLayout.categoryName || 'Project'} → ${activeSavedLayout.subCategory || 'Sub-Category'} → ${activeSavedLayout.name || 'Layout'}`}
             >
-              <p className="text-[9px] font-bold uppercase tracking-[0.16em] text-indigo-500 dark:text-indigo-300">Active Layout</p>
+              <p className="text-[9px] font-bold uppercase tracking-[0.14em] text-[#d96b25] dark:text-orange-300">Editing saved design</p>
               <p className="mt-0.5 break-words text-[11px] font-bold leading-4 text-slate-700 dark:text-slate-200">
                 {activeSavedLayout.categoryName || 'Project'} → {activeSavedLayout.subCategory || 'Sub-Category'} → {activeSavedLayout.name || 'Layout'}
               </p>
@@ -140,18 +156,57 @@ export const LeftPanel = ({
         <button onClick={onClose} className="shrink-0 rounded p-1.5 text-slate-400 transition-colors hover:text-indigo-600 dark:hover:text-indigo-400" title="Close Panel"><PanelLeftClose className="h-4 w-4" /></button>
       </div>
 
-      <div className="flex shrink-0 border-b border-slate-200 dark:border-slate-800">
+      <div className="grid shrink-0 grid-cols-3 border-b border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900" role="tablist" aria-label="Project tools">
         {[
-          ['explorer', 'Explorer'],
-          ['assets', 'Catalog'],
-          ['templates', 'Layouts'],
-        ].map(([id, label]) => (
-          <button key={id} onClick={() => { setLeftTab(id); if (id !== 'templates') resetLayoutNavigation(); }} className={`flex-1 py-3 text-[11px] font-bold uppercase tracking-wider transition-colors ${leftTab === id ? 'border-b-2 border-[#ff914d] bg-indigo-50/50 text-indigo-600 dark:bg-indigo-900/20 dark:text-indigo-400' : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}>{label}</button>
+          ['explorer', 'Model', Layers, 'Browse walls, doors and building elements'],
+          ['assets', 'Add items', PackagePlus, 'Browse furniture and building items'],
+          ['templates', 'Designs', PanelsTopLeft, 'Open saved designs and starter layouts'],
+        ].map(([id, label, Icon, description]) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={leftTab === id}
+            title={description}
+            onClick={() => { setLeftTab(id); if (id !== 'templates') resetLayoutNavigation(); }}
+            className={`group relative flex min-w-0 items-center justify-center gap-1.5 px-1.5 py-3 text-[11px] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#ff914d] ${leftTab === id ? 'bg-orange-50/80 text-slate-900 dark:bg-orange-500/10 dark:text-white' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800/70 dark:hover:text-white'}`}
+          >
+            {leftTab === id && <span className="absolute inset-x-3 bottom-0 h-[2px] rounded-full bg-[#ff914d]" />}
+            <Icon className={`h-4 w-4 shrink-0 ${leftTab === id ? 'text-[#ff914d]' : 'text-slate-400 group-hover:text-slate-600 dark:group-hover:text-slate-300'}`} />
+            <span className="truncate">{label}</span>
+          </button>
         ))}
       </div>
 
       <div className={`flex-1 overflow-y-auto ${leftTab === 'explorer' ? 'block' : 'hidden'}`}>
-        <div ref={treeRef} className="p-4 text-sm text-slate-700 dark:text-slate-300" />
+        <div className="px-3 pt-3">
+          {showQuickStart ? (
+            <section className="hci-help-card rounded-2xl border border-orange-200/80 bg-gradient-to-br from-orange-50 via-white to-amber-50/70 p-3.5 shadow-sm dark:border-orange-500/20 dark:from-orange-500/10 dark:via-slate-900 dark:to-slate-900" aria-label="Quick start guide">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#ff914d]/15 text-[#ff914d]"><Sparkles className="h-4 w-4" /></span>
+                  Your first steps
+                </div>
+                <button type="button" onClick={dismissQuickStart} className="rounded-md p-1 text-slate-400 transition hover:bg-black/5 hover:text-slate-700 dark:hover:bg-white/10 dark:hover:text-white" title="Hide quick-start guide" aria-label="Hide quick-start guide"><X className="h-4 w-4" /></button>
+              </div>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-slate-600 dark:text-slate-300">You can explore the building without changing it. To start designing:</p>
+              <ol className="mt-3 space-y-2.5">
+                <li className="flex items-start gap-2.5">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#ff914d] text-[10px] font-bold text-white">1</span>
+                  <div className="min-w-0 flex-1"><p className="text-[11px] font-semibold text-slate-800 dark:text-slate-100">Add furniture or a door</p><p className="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Browse items, then click or drag one into the model.</p><button type="button" onClick={() => setLeftTab('assets')} className="mt-1 inline-flex items-center gap-1 text-[10px] font-bold text-[#d96b25] hover:text-[#b84e0e] dark:text-orange-300 dark:hover:text-orange-200">Browse items <ArrowRight className="h-3 w-3" /></button></div>
+                </li>
+                <li className="flex items-start gap-2.5"><span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-slate-200 text-[10px] font-bold text-slate-600 dark:bg-slate-700 dark:text-slate-200">2</span><div><p className="text-[11px] font-semibold text-slate-800 dark:text-slate-100">Make it yours</p><p className="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Select an item to change its position, size or finish.</p></div></li>
+                <li className="flex items-start gap-2.5"><span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-slate-200 text-[10px] font-bold text-slate-600 dark:bg-slate-700 dark:text-slate-200">3</span><div><p className="text-[11px] font-semibold text-slate-800 dark:text-slate-100">Save a design</p><p className="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Use Save design to keep a version you can reopen.</p></div></li>
+              </ol>
+            </section>
+          ) : (
+            <button type="button" onClick={restoreQuickStart} className="mb-2 inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[10px] font-semibold text-slate-500 shadow-sm transition hover:border-orange-200 hover:text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-orange-500/40 dark:hover:text-white"><Sparkles className="h-3.5 w-3.5 text-[#ff914d]" /> Show getting-started tips</button>
+          )}
+        </div>
+        <div className="px-1 pb-3 pt-1">
+          <div className="mx-3 mb-1 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Building parts</span><span className="text-[10px] text-slate-400">Choose one to edit</span></div>
+          <div ref={treeRef} className="p-3 text-sm text-slate-700 dark:text-slate-300" />
+        </div>
       </div>
 
       <div className={`flex-1 overflow-hidden ${leftTab === 'assets' ? 'flex' : 'hidden'}`}>
@@ -162,12 +217,12 @@ export const LeftPanel = ({
         <div className="border-b border-slate-200 px-4 py-4 dark:border-slate-800">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-400">Layout Library</p>
+              <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-400">Saved designs</p>
               <h3 className="mt-1 text-lg font-bold text-slate-900 dark:text-white">{breadcrumb()}</h3>
             </div>
             {layoutPath.level !== 'root' && <button type="button" onClick={goBack} className="rounded-lg border border-slate-200 px-3 py-2 text-[11px] font-bold text-slate-500 hover:border-indigo-300 hover:text-indigo-600 dark:border-slate-700 dark:text-slate-300"><span className="mr-1">←</span> Back</button>}
           </div>
-          {layoutPath.level === 'root' && <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">Choose a project first. Layouts appear only after you drill into their category.</p>}
+          {layoutPath.level === 'root' && <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">Choose a saved design to reuse a previous layout, or start from one of the starter designs below.</p>}
         </div>
 
         {savedLayoutsLoading ? (
@@ -183,7 +238,7 @@ export const LeftPanel = ({
               <div className="flex min-w-0 items-center gap-3"><div className="flex h-11 w-11 items-center justify-center rounded-xl bg-orange-50 text-orange-500 dark:bg-orange-950/30 dark:text-orange-300"><Layout className="h-5 w-5" /></div><div><p className="font-bold text-sm text-slate-900 dark:text-white">Floor Plans</p><p className="mt-0.5 text-[11px] text-slate-400">{floorplanGroups.length} floor plan categor{floorplanGroups.length === 1 ? 'y' : 'ies'}</p></div></div><span className="text-xl text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-indigo-500">›</span>
             </button> */}
             <div className="pt-3">
-              <div className="mb-3 flex items-center justify-between"><p className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-400">Starter Layouts</p><span className="text-[10px] text-slate-400">{availableLayouts?.length || 0} available</span></div>
+              <div className="mb-3 flex items-center justify-between"><p className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-400">Starter designs</p><span className="text-[10px] text-slate-400">{availableLayouts?.length || 0} available</span></div>
               {layoutsLoading ? <div className="rounded-xl border border-slate-200 p-4 text-center text-xs text-slate-400 dark:border-slate-700">Loading starters…</div> : layoutsError ? <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-600 dark:border-rose-900/50 dark:bg-rose-900/10">{layoutsError}</div> : availableLayouts?.length ? <div className="space-y-2">{availableLayouts.map(layout => <button key={layout.id} type="button" onClick={() => onSelectLayout?.(layout)} disabled={layout.available === false} className="flex w-full items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-3 text-left transition hover:border-indigo-300 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800/50"><span><span className="block text-xs font-bold text-slate-800 dark:text-white">{layout.name}</span><span className="mt-0.5 block text-[10px] text-slate-400">{layout.description}</span></span><span className="text-lg text-slate-300">›</span></button>)}</div> : <div className="rounded-xl border border-dashed border-slate-200 p-4 text-center text-xs text-slate-400 dark:border-slate-700">No starter layouts available.</div>}
             </div>
           </div>

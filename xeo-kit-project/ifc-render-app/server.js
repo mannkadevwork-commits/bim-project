@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
+const sharp = require('sharp');
 const db = require('./db');
 const catalogRoutes = require('./catalog-routes');
 const adminRoutes = require('./admin-routes');
@@ -24,6 +25,7 @@ if (!fs.existsSync(jobsDir)) fs.mkdirSync(jobsDir);
 if (!fs.existsSync(assetsDir)) fs.mkdirSync(assetsDir, { recursive: true });
 const materialAssetsDir = path.join(assetsDir, 'materials');
 if (!fs.existsSync(materialAssetsDir)) fs.mkdirSync(materialAssetsDir, { recursive: true });
+const materialLibraryPath = path.join(__dirname, 'material-library.json');
 
 // Global saved-layout index. Saved layouts belong to the Layouts left panel,
 // not to whichever base project is currently active.
@@ -191,6 +193,135 @@ app.use('/jobs', (req, res, next) => {
     return express.static(jobsDir)(req, res, next);
 });
 app.use('/assets', express.static(assetsDir));
+
+// User-uploaded tile and fabric textures are stored in assets/materials so
+// both the editor and the GLB compiler can access the same durable file.
+const MAX_MATERIAL_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MATERIAL_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp']);
+const materialUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_MATERIAL_UPLOAD_BYTES, files: 1 },
+  fileFilter: (_req, file, callback) => {
+    if (!MATERIAL_IMAGE_MIMES.has(file.mimetype)) {
+      return callback(new Error('Only PNG, JPG and WebP texture images are supported.'));
+    }
+    callback(null, true);
+  },
+});
+
+function readMaterialLibraryRecords() {
+  if (!fs.existsSync(materialLibraryPath)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(materialLibraryPath, 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    console.warn('[Materials] Could not read the uploaded material catalog:', error.message);
+    return [];
+  }
+}
+
+function writeMaterialLibraryRecords(records) {
+  const temporaryPath = `${materialLibraryPath}.tmp`;
+  fs.writeFileSync(temporaryPath, JSON.stringify(records, null, 2), 'utf8');
+  fs.renameSync(temporaryPath, materialLibraryPath);
+}
+
+function serializeUploadedMaterial(record) {
+  return {
+    id: record.id,
+    name: record.name,
+    category: record.category,
+    kind: record.kind,
+    texturePath: record.texturePath,
+    color: record.color || '#FFFFFF',
+    rgb: Array.isArray(record.rgb) ? record.rgb : [1, 1, 1],
+    repeat: Array.isArray(record.repeat) ? record.repeat : (record.kind === 'fabric' ? [5, 5] : [2, 2]),
+    roughness: Number.isFinite(record.roughness) ? record.roughness : (record.kind === 'fabric' ? 0.92 : 0.78),
+    metallic: Number.isFinite(record.metallic) ? record.metallic : 0,
+    createdAt: record.createdAt,
+  };
+}
+
+app.get('/api/materials', (_req, res) => {
+  try {
+    const materials = readMaterialLibraryRecords()
+      .filter((record) => record?.fileName && fs.existsSync(path.join(materialAssetsDir, record.fileName)))
+      .map(serializeUploadedMaterial);
+    res.json({ materials });
+  } catch (error) {
+    console.error('[Materials] Failed to list uploaded materials:', error);
+    res.status(500).json({ error: 'Failed to load uploaded materials.' });
+  }
+});
+
+app.post('/api/materials/upload', (req, res, next) => {
+  materialUpload.single('texture')(req, res, (error) => {
+    if (!error) return next();
+    const status = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+    const message = error.code === 'LIMIT_FILE_SIZE'
+      ? 'Texture images must be 10 MB or smaller.'
+      : (error.message || 'Invalid texture upload.');
+    res.status(status).json({ error: message });
+  });
+}, async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Choose a texture image to upload.' });
+
+  const name = String(req.body?.name || '').trim();
+  const kind = String(req.body?.kind || '').trim().toLowerCase();
+  if (!name || name.length > 80) {
+    return res.status(400).json({ error: 'Material name is required and must be 80 characters or fewer.' });
+  }
+  if (!['fabric', 'texture'].includes(kind)) {
+    return res.status(400).json({ error: 'Material type must be fabric or texture.' });
+  }
+
+  let outputPath = null;
+  try {
+    const metadata = await sharp(req.file.buffer, { limitInputPixels: 64000000 }).metadata();
+    const extensionByFormat = { png: 'png', jpeg: 'jpg', webp: 'webp' };
+    const extension = extensionByFormat[metadata.format];
+    if (!extension || !MATERIAL_IMAGE_MIMES.has(req.file.mimetype)) {
+      return res.status(400).json({ error: 'The uploaded file is not a supported PNG, JPG or WebP image.' });
+    }
+    if (!metadata.width || !metadata.height || metadata.width > 8192 || metadata.height > 8192 || metadata.width * metadata.height > 64000000) {
+      return res.status(400).json({ error: 'Texture dimensions must be at most 8192 × 8192 pixels.' });
+    }
+    if (Number(metadata.pages || 1) > 1) {
+      return res.status(400).json({ error: 'Animated images cannot be used as material textures.' });
+    }
+
+    const fileName = `uploaded_${crypto.randomBytes(10).toString('hex')}.${extension}`;
+    outputPath = path.join(materialAssetsDir, fileName);
+    fs.writeFileSync(outputPath, req.file.buffer, { flag: 'wx' });
+
+    const record = {
+      id: `uploaded-${crypto.randomBytes(8).toString('hex')}`,
+      name,
+      category: kind === 'fabric' ? 'Uploaded Fabric' : 'Uploaded Texture',
+      kind,
+      fileName,
+      texturePath: `/assets/materials/${fileName}`,
+      color: '#FFFFFF',
+      rgb: [1, 1, 1],
+      repeat: kind === 'fabric' ? [5, 5] : [2, 2],
+      roughness: kind === 'fabric' ? 0.92 : 0.78,
+      metallic: 0,
+      createdAt: new Date().toISOString(),
+    };
+
+    const records = readMaterialLibraryRecords();
+    records.unshift(record);
+    writeMaterialLibraryRecords(records);
+
+    res.status(201).json({ success: true, material: serializeUploadedMaterial(record) });
+  } catch (error) {
+    if (outputPath && fs.existsSync(outputPath)) {
+      try { fs.unlinkSync(outputPath); } catch (_) {}
+    }
+    console.error('[Materials] Texture upload failed:', error);
+    res.status(400).json({ error: 'Could not process this image. Use a valid PNG, JPG or WebP texture.' });
+  }
+});
 
 // Serve uploaded catalog files
 const uploadsDir = path.join(__dirname, 'uploads');

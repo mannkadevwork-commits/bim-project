@@ -8,6 +8,7 @@ import {
   Node as GltfNode,
   Texture,
 } from "@gltf-transform/core";
+import { ALL_EXTENSIONS, KHRTextureTransform } from "@gltf-transform/extensions";
 
 import { extractGeometry } from "./geometry";
 import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
@@ -16,6 +17,8 @@ import { spawnSync } from "child_process";
 import { WalkNavigationPipeline } from "./navigation/WalkNavigationPipeline";
 import { RoomDetector } from "./navigation/RoomDetector";
 import { optimizeGlb } from "./glb-optimizer";
+import { collectNodePerformanceMetrics, readJsonIfPresent, writePerformanceReport } from "./performanceReport";
+import { writePresentationManifest } from "./presentationManifest";
 
 enum AssetType {
   STRUCTURAL_REPLACEMENT = "structural_replacement",
@@ -63,6 +66,15 @@ interface FurnitureItem {
     height?: number;
     thickness?: number;
   };
+  /**
+   * The editor persists GLB positions as semantic pivot targets. Reuse the
+   * same pivot descriptor during compilation when it is available.
+   */
+  glbNormalization?: {
+    version?: number;
+    pivotLocal?: [number, number, number];
+    pivotMode?: string;
+  };
 }
 
 interface StructuralEditEntry {
@@ -81,6 +93,9 @@ interface MaterialEntry {
     src?: string;
     repeat?: [number, number];
   };
+  // Backwards-compatible fields for projects saved before nested texture metadata was standardized.
+  textureSrc?: string;
+  repeat?: [number, number];
   roughness?: number;
   metallic?: number;
 }
@@ -169,26 +184,37 @@ function resolveMaterialTexturePath(
 ): string | null {
   if (!src) return null;
 
-  const clean = String(src).split("?")[0].split("#")[0];
-  const compilerMaterials = path.join(ROOT_DIR, "materials");
+  let clean = String(src).split("?")[0].split("#")[0];
+  // Projects saved by older editor builds sometimes persisted the browser's full
+  // API URL. Resolve only local /assets paths; never fetch or read arbitrary URLs.
+  if (/^https?:\/\//i.test(clean)) {
+    try {
+      const parsed = new URL(clean);
+      if (!parsed.pathname.startsWith("/assets/")) return null;
+      clean = parsed.pathname;
+    } catch {
+      return null;
+    }
+  }
 
+  const resolveWithin = (baseDirectory: string, relativePath: string): string | null => {
+    const base = path.resolve(baseDirectory);
+    const candidate = path.resolve(base, relativePath);
+    if (candidate !== base && !candidate.startsWith(`${base}${path.sep}`)) return null;
+    return fs.existsSync(candidate) ? candidate : null;
+  };
+
+  const compilerMaterials = path.join(ROOT_DIR, "materials");
   if (clean.startsWith("/materials/")) {
-    const candidate = path.resolve(
-      compilerMaterials,
-      clean.slice("/materials/".length),
-    );
-    if (fs.existsSync(candidate)) return candidate;
+    return resolveWithin(compilerMaterials, clean.slice("/materials/".length));
   }
 
   if (clean.startsWith("/assets/")) {
-    const candidate = path.resolve(
-      assetsDirectory,
-      clean.slice("/assets/".length),
-    );
-    if (fs.existsSync(candidate)) return candidate;
+    return resolveWithin(assetsDirectory, clean.slice("/assets/".length));
   }
 
-  return fs.existsSync(clean) ? clean : null;
+  // Legacy absolute paths remain supported for existing local projects only.
+  return path.isAbsolute(clean) && fs.existsSync(clean) ? clean : null;
 }
 
 function mimeForTexture(filePath: string): string {
@@ -196,6 +222,35 @@ function mimeForTexture(filePath: string): string {
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
   if (ext === ".webp") return "image/webp";
   return "image/png";
+}
+
+const textureTransformExtensions = new WeakMap<Document, KHRTextureTransform>();
+
+function getTextureTransformExtension(doc: Document): KHRTextureTransform {
+  let extension = textureTransformExtensions.get(doc);
+  if (!extension) {
+    extension = doc.createExtension(KHRTextureTransform);
+    extension.setRequired(false);
+    textureTransformExtensions.set(doc, extension);
+  }
+  return extension;
+}
+
+function applyBaseColorTextureRepeat(
+  doc: Document,
+  material: ReturnType<Document["createMaterial"]>,
+  repeat: [number, number] | undefined,
+): void {
+  const textureInfo = material.getBaseColorTextureInfo();
+  if (!textureInfo) return;
+  const scale: [number, number] = [
+    Math.max(0.05, Math.min(100, Number(repeat?.[0]) || 1)),
+    Math.max(0.05, Math.min(100, Number(repeat?.[1]) || 1)),
+  ];
+  textureInfo.setExtension(
+    "KHR_texture_transform",
+    getTextureTransformExtension(doc).createTransform().setScale(scale),
+  );
 }
 
 function applyMaterialToSubtree(
@@ -209,20 +264,22 @@ function applyMaterialToSubtree(
   const [r, g, b] = materialOverride.rgb;
   let sharedTexture: Texture | null = null;
 
+  const textureSource = materialOverride.texture?.src || materialOverride.textureSrc;
+  const textureRepeat = materialOverride.texture?.repeat || materialOverride.repeat || [1, 1];
   if (
     (materialOverride.kind === "fabric" ||
       materialOverride.kind === "texture") &&
-    materialOverride.texture?.src
+    textureSource
   ) {
     const texturePath = resolveMaterialTexturePath(
-      materialOverride.texture.src,
+      textureSource,
       assetsDirectory,
     );
 
     if (texturePath) {
       sharedTexture = doc
         .createTexture(
-          `Tex_${materialOverride.texture.id || "material"}`,
+          `Tex_${materialOverride.texture?.id || "material"}`,
         )
         .setMimeType(mimeForTexture(texturePath))
         .setImage(fs.readFileSync(texturePath));
@@ -260,6 +317,7 @@ function applyMaterialToSubtree(
 
         if (sharedTexture) {
           material = material.setBaseColorTexture(sharedTexture);
+          applyBaseColorTextureRepeat(doc, material, textureRepeat);
         }
 
         primitive.setMaterial(material);
@@ -291,7 +349,8 @@ function computeScaledFurniturePivotTranslation(
  * Computes the wrapper translation for an imported asset whose geometry has
  * not been normalized around the placement pivot. Transform order in glTF is
  * T * R * S, so the scaled local pivot must be rotated before it is subtracted
- * from the target world position. Used only for hosted IFC catalog doors.
+ * from the target world position. Used for unnormalized catalog GLBs and
+ * hosted IFC catalog doors that retain their source geometry frame.
  */
 function computeRotatedFurniturePivotTranslation(
   pivot: [number, number, number],
@@ -499,6 +558,39 @@ function measureGlbDoorBounds(document: Document): GlbDoorBounds | null {
   };
 }
 
+/**
+ * Resolve the pivot used by the editor for a catalog GLB.
+ *
+ * GLBAssetTransform uses a semantic pivot (normally bottom-center) rather than
+ * the raw exporter origin. Applying item.position directly to an unnormalized
+ * GLB moves assets whose source scene contains baked-in offsets. Prefer the
+ * persisted v3 pivot when available; otherwise measure the scene bounds and
+ * derive the same bottom-center pivot as the frontend.
+ */
+function getCatalogFurniturePivot(
+  sourceDocument: Document,
+  item: FurnitureItem,
+): [number, number, number] | null {
+  const savedPivot = item.glbNormalization?.pivotLocal;
+  if (
+    item.glbNormalization?.version === 3 &&
+    Array.isArray(savedPivot) &&
+    savedPivot.length === 3 &&
+    savedPivot.every(Number.isFinite)
+  ) {
+    return [savedPivot[0], savedPivot[1], savedPivot[2]];
+  }
+
+  const bounds = measureGlbDoorBounds(sourceDocument);
+  if (!bounds) return null;
+
+  return [
+    (bounds.min[0] + bounds.max[0]) / 2,
+    bounds.min[1],
+    (bounds.min[2] + bounds.max[2]) / 2,
+  ];
+}
+
 async function resolveHostedDoorDimensions(
   item: FurnitureItem,
   resolveGlbPath: (src: string) => string,
@@ -701,7 +793,7 @@ async function prepareStructuralIfcForHostedDoors(
   furniture: FurnitureItem[],
   resolveGlbPath: (src: string) => string,
 ): Promise<{ inputPath: string; hostedDoors: HostedDoorSpec[]; appliedDoors: any[] }> {
-  const hostedDoors = await collectHostedGlbDoors(furniture, resolveGlbPath, new NodeIO());
+  const hostedDoors = await collectHostedGlbDoors(furniture, resolveGlbPath, new NodeIO().registerExtensions(ALL_EXTENSIONS));
   if (!hostedDoors.length) return { inputPath: inputIfcPath, hostedDoors, appliedDoors: [] };
 
   const editorScript = path.join(ROOT_DIR, "..", "ifc_element_editor.py");
@@ -952,6 +1044,18 @@ export async function compileScene(
   options: CompileSceneOptions,
 ): Promise<void> {
   const { jobDirectory, assetsDirectory } = options;
+  const performanceStartedAt = Date.now();
+  const performanceStages: Record<string, number> = {};
+  let performanceStageStartedAt = Date.now();
+  const sourceAssetInfoByInstance = new Map<string, {
+    name: string;
+    assetId: string;
+    sourceFormat: string;
+    sourceFile: string;
+    sourcePath: string;
+    sourceBytes: number;
+  }>();
+  const assetProcessingMsByInstance = new Map<string, number>();
 
   const INPUT_IFC_PATH = path.join(jobDirectory, "input.ifc");
   const PROJECT_STATE_PATH = path.join(jobDirectory, "project_state.json");
@@ -1077,6 +1181,8 @@ export async function compileScene(
       "Fatal: project_state.json is malformed - 'furniture' must be an array.",
     );
   }
+  performanceStages.projectStateReadMs = Date.now() - performanceStageStartedAt;
+  performanceStageStartedAt = Date.now();
 
   const structuralEdits =
     projectState.structural_edits ?? {};
@@ -1091,6 +1197,8 @@ export async function compileScene(
     projectState.furniture,
     resolveGlbPath,
   );
+  performanceStages.structuralIfcAndHostedDoorPreparationMs = Date.now() - performanceStageStartedAt;
+  performanceStageStartedAt = Date.now();
   const structuralIfcBytes = readFileAsUint8Array(hostedDoorBuild.inputPath);
 
   // Presentation room topology is generated from the same physical IFC that
@@ -1098,6 +1206,7 @@ export async function compileScene(
   // openings therefore share the same room/portal model. A failure here must
   // not prevent the visual render, but the artifact is strongly preferred for
   // a room-aware presentation runtime.
+  const roomTopologyStartedAt = Date.now();
   try {
     const roomArtifact = await RoomDetector.run({
       jobDirectory,
@@ -1126,6 +1235,8 @@ export async function compileScene(
       JSON.stringify(buildPresentationPortalManifest({ rooms: [], portals: [] }, hostedDoorBuild.hostedDoors, hostedDoorBuild.appliedDoors), null, 2),
       "utf8",
     );
+  } finally {
+    performanceStages.roomTopologyMs = Date.now() - roomTopologyStartedAt;
   }
 
   if (
@@ -1138,6 +1249,7 @@ export async function compileScene(
     );
   }
 
+  performanceStageStartedAt = Date.now();
   const ifcApi = new IfcAPI();
   await ifcApi.Init();
 
@@ -1234,7 +1346,7 @@ export async function compileScene(
       scene.addChild(structureNode);
     }
 
-    const io = new NodeIO();
+    const io = new NodeIO().registerExtensions(ALL_EXTENSIONS);
     const appliedHostedDoorByInstance = new Map<string, any>(
       hostedDoorBuild.appliedDoors
         .filter((entry: any) => entry?.instanceId)
@@ -1242,6 +1354,7 @@ export async function compileScene(
     );
 
     for (const persistedItem of projectState.furniture) {
+      const assetProcessingStartedAt = Date.now();
       const appliedHostedDoor = persistedItem.doorHostWallId
         ? appliedHostedDoorByInstance.get(String(persistedItem.instanceId))
         : null;
@@ -1287,6 +1400,14 @@ export async function compileScene(
             );
             continue;
           }
+          sourceAssetInfoByInstance.set(String(item.instanceId), {
+            name: item.name || String(item.instanceId),
+            assetId: String(item.id || ""),
+            sourceFormat: "glb",
+            sourceFile: path.basename(assetPath),
+            sourcePath: path.resolve(assetPath),
+            sourceBytes: fs.statSync(assetPath).size,
+          });
 
           let glbDoc: Document;
 
@@ -1310,6 +1431,17 @@ export async function compileScene(
           }
 
           const isHostedDoor = Boolean(item.doorHostWallId);
+          // Hosted doors keep their dedicated wall-opening normalization.
+          // Regular catalog GLBs must use the same semantic pivot contract as
+          // GLBAssetTransform in the editor.
+          const catalogFurniturePivot = isHostedDoor
+            ? null
+            : getCatalogFurniturePivot(glbDoc, item);
+          if (!isHostedDoor && !catalogFurniturePivot) {
+            console.warn(
+              `[compiler:glb-transform] ${item.instanceId}: source bounds unavailable; retaining the GLB source origin.`,
+            );
+          }
           const clonedRoot = doc.createNode(
             `${item.instanceId}_geometry`,
           );
@@ -1476,12 +1608,14 @@ export async function compileScene(
             applyAuthoredTransform(
               instanceWrapper,
               placementItem,
-              null,
+              isHostedDoor ? null : catalogFurniturePivot,
               isHostedDoor,
+              !isHostedDoor,
             );
           }
 
           scene.addChild(instanceWrapper);
+          assetProcessingMsByInstance.set(String(item.instanceId), Date.now() - assetProcessingStartedAt);
 
           debugLog(
             `[compiler] Mounted GLB "${item.instanceId}" (${item.name})`,
@@ -1516,6 +1650,14 @@ export async function compileScene(
             );
             continue;
           }
+          sourceAssetInfoByInstance.set(String(item.instanceId), {
+            name: item.name || String(item.instanceId),
+            assetId: String(item.id || ""),
+            sourceFormat: "ifc",
+            sourceFile: path.basename(assetPath),
+            sourcePath: path.resolve(assetPath),
+            sourceBytes: fs.statSync(assetPath).size,
+          });
 
           let assetBytes: Uint8Array;
 
@@ -1630,6 +1772,7 @@ export async function compileScene(
           );
 
           scene.addChild(instanceWrapper);
+          assetProcessingMsByInstance.set(String(item.instanceId), Date.now() - assetProcessingStartedAt);
 
           debugLog(
             `[compiler] Mounted IFC "${item.instanceId}" (${item.name}) [${assetType}]`,
@@ -1663,6 +1806,24 @@ export async function compileScene(
     // BUILD RAW GLB
     // -----------------------------------------------------------
 
+    let rawSceneMetrics: any = null;
+    let sceneMetricCollectionError: string | null = null;
+    const compiledAssetMetricsByInstance = new Map<string, any>();
+    let topLevelSceneMetrics: Array<{ name: string; metrics: any }> = [];
+    try {
+      rawSceneMetrics = collectNodePerformanceMetrics(scene as any);
+      topLevelSceneMetrics = scene.listChildren().map((node) => {
+        const name = node.getName() || "unnamed";
+        const metrics = collectNodePerformanceMetrics(node as any);
+        if (name && name !== "IFC_Structure" && name !== "IFC_Structure_Frame") {
+          compiledAssetMetricsByInstance.set(name, metrics);
+        }
+        return { name, metrics };
+      });
+    } catch (metricsError) {
+      sceneMetricCollectionError = (metricsError as Error).message;
+      console.warn(`[compiler:perf] Scene metric collection failed; continuing render - ${sceneMetricCollectionError}`);
+    }
     const glbBuffer = await io.writeBinary(doc);
 
     fs.writeFileSync(
@@ -1673,6 +1834,8 @@ export async function compileScene(
     console.log(
       `[compiler] Wrote raw build GLB ${RAW_GLB_PATH} (${glbBuffer.byteLength} bytes)`,
     );
+    performanceStages.sceneAssemblyAndRawExportMs = Date.now() - performanceStageStartedAt;
+    performanceStageStartedAt = Date.now();
 
     if (hostedDoorBuild.hostedDoors.length) {
       fs.writeFileSync(
@@ -1690,6 +1853,7 @@ export async function compileScene(
     // NAVIGATION FROM EXACT COMPILED GEOMETRY
     // -----------------------------------------------------------
 
+    const navigationStartedAt = Date.now();
     try {
       await WalkNavigationPipeline.run(
         RAW_GLB_PATH,
@@ -1702,13 +1866,16 @@ export async function compileScene(
         }`,
       );
     }
+    performanceStages.navigationBuildMs = Date.now() - navigationStartedAt;
 
     // -----------------------------------------------------------
     // PRODUCTION VISUAL GLB
     // -----------------------------------------------------------
 
+    const optimizationStartedAt = Date.now();
+    let optimizationStats: any = null;
     try {
-      await optimizeGlb({
+      optimizationStats = await optimizeGlb({
         inputPath: RAW_GLB_PATH,
         outputPath: OUTPUT_GLB_PATH,
         reportPath: OPTIMIZATION_REPORT_PATH,
@@ -1745,11 +1912,130 @@ export async function compileScene(
         );
       }
     }
+    performanceStages.visualOptimizationMs = Date.now() - optimizationStartedAt;
 
     if (!fs.existsSync(OUTPUT_GLB_PATH)) {
       throw new Error(
         `Production optimization completed without output.glb: ${OUTPUT_GLB_PATH}`,
       );
+    }
+
+    const structuralNode = topLevelSceneMetrics.find((entry) =>
+      entry.name === "IFC_Structure" || entry.name === "IFC_Structure_Frame",
+    );
+    const assetReports = projectState.furniture.map((item) => {
+      const instanceId = String(item.instanceId || "unknown");
+      const source = sourceAssetInfoByInstance.get(instanceId) ?? null;
+      const metrics = compiledAssetMetricsByInstance.get(instanceId) ?? null;
+      const triangleCount = Number(metrics?.triangleCount ?? 0);
+      const vertexCount = Number(metrics?.vertexCount ?? 0);
+      const primitiveCount = Number(metrics?.primitiveCount ?? 0);
+      const sourceBytes = Number(source?.sourceBytes ?? 0);
+      const complexityTier = triangleCount >= 300000 || vertexCount >= 500000 || primitiveCount >= 250 || sourceBytes >= 20 * 1024 * 1024
+        ? "heavy"
+        : triangleCount >= 75000 || vertexCount >= 150000 || primitiveCount >= 80 || sourceBytes >= 5 * 1024 * 1024
+          ? "medium"
+          : "light";
+      return {
+        instanceId,
+        name: item.name || instanceId,
+        assetId: String(item.id || ""),
+        sourceFormat: source?.sourceFormat ?? (String(item.src || "").toLowerCase().endsWith(".glb") ? "glb" : "ifc"),
+        sourceFile: source?.sourceFile ?? path.basename(String(item.src || "")),
+        sourceBytes: source?.sourceBytes ?? null,
+        sourceAssetUniqueKey: source?.sourcePath ?? null,
+        includedInScene: Boolean(metrics),
+        status: metrics ? "mounted" : (source ? "source-found-but-not-mounted" : "source-not-resolved"),
+        compileDurationMs: assetProcessingMsByInstance.get(instanceId) ?? null,
+        complexityTier,
+        metrics,
+        scale: Array.isArray(item.scale) ? item.scale : null,
+        doorHostWallId: item.doorHostWallId ?? null,
+      };
+    });
+    const uniqueSourceFiles = new Map<string, number>();
+    for (const asset of assetReports) {
+      if (asset.sourceAssetUniqueKey && asset.sourceBytes != null && !uniqueSourceFiles.has(asset.sourceAssetUniqueKey)) {
+        uniqueSourceFiles.set(asset.sourceAssetUniqueKey, asset.sourceBytes);
+      }
+    }
+    const finalBytes = fs.statSync(OUTPUT_GLB_PATH).size;
+    const navMeshPath = path.join(jobDirectory, "navigation_navmesh.bin");
+    const report = {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      jobId: path.basename(jobDirectory),
+      purpose: "Phase 0 performance baseline; observational only, does not alter scene quality or navigation.",
+      environment: {
+        nodeVersion: process.version,
+        platform: process.platform,
+        architecture: process.arch,
+        glbSimplifyRatioRequested: Number(process.env.HCI_GLB_SIMPLIFY_RATIO) || 0.70,
+        glbSimplifyErrorRequested: Number(process.env.HCI_GLB_SIMPLIFY_ERROR) || 0.001,
+        glbMaxTextureSizeRequested: Number(process.env.HCI_GLB_MAX_TEXTURE_SIZE) || 2048,
+        glbTextureQualityRequested: Number(process.env.HCI_GLB_TEXTURE_QUALITY) || 86,
+      },
+      sceneMetricCollectionError,
+      totalCompileMs: Date.now() - performanceStartedAt,
+      stageDurationsMs: performanceStages,
+      sourceScene: {
+        rawGlbBytes: glbBuffer.byteLength,
+        rawGlbMiB: Number((glbBuffer.byteLength / (1024 * 1024)).toFixed(3)),
+        metrics: rawSceneMetrics,
+        structuralIfc: {
+          sourceFile: path.basename(hostedDoorBuild.inputPath),
+          sourceBytes: fs.existsSync(hostedDoorBuild.inputPath) ? fs.statSync(hostedDoorBuild.inputPath).size : null,
+          compiledMetrics: structuralNode?.metrics ?? null,
+        },
+        mountedAssetInstances: assetReports.filter((asset) => asset.includedInScene).length,
+        totalAssetInstancesInState: assetReports.length,
+        missingAssetInstances: assetReports.filter((asset) => !asset.includedInScene).map((asset) => ({ instanceId: asset.instanceId, name: asset.name, status: asset.status })),
+        uniqueSourceAssetCount: uniqueSourceFiles.size,
+        uniqueSourceAssetBytes: Array.from(uniqueSourceFiles.values()).reduce((sum, bytes) => sum + bytes, 0),
+      },
+      productionGlb: {
+        fileBytes: finalBytes,
+        fileMiB: Number((finalBytes / (1024 * 1024)).toFixed(3)),
+        optimizer: optimizationStats ?? readJsonIfPresent(OPTIMIZATION_REPORT_PATH),
+      },
+      navigation: {
+        navMeshBytes: fs.existsSync(navMeshPath) ? fs.statSync(navMeshPath).size : null,
+        metadata: readJsonIfPresent(path.join(jobDirectory, "navigation_meta.json")),
+        connectivity: readJsonIfPresent(path.join(jobDirectory, "room_connectivity.json")),
+        doorwayTraversability: readJsonIfPresent(path.join(jobDirectory, "doorway_traversability.json")),
+      },
+      assets: assetReports.map(({ sourceAssetUniqueKey, ...asset }) => asset),
+      topAssetsByTriangleCount: assetReports
+        .filter((asset) => asset.metrics)
+        .sort((a, b) => Number(b.metrics?.triangleCount || 0) - Number(a.metrics?.triangleCount || 0))
+        .slice(0, 10)
+        .map((asset) => ({
+          instanceId: asset.instanceId,
+          name: asset.name,
+          triangleCount: asset.metrics?.triangleCount ?? 0,
+          vertexCount: asset.metrics?.vertexCount ?? 0,
+          primitiveCount: asset.metrics?.primitiveCount ?? 0,
+          materialCount: asset.metrics?.materialCount ?? 0,
+          textureCount: asset.metrics?.textureCount ?? 0,
+          sourceBytes: asset.sourceBytes,
+          compileDurationMs: asset.compileDurationMs,
+        })),
+    };
+    try {
+      const performanceReportPath = writePerformanceReport(jobDirectory, report);
+      console.log(`[compiler:perf] Wrote performance_report.json (${assetReports.length} asset instances; raw ${(glbBuffer.byteLength / (1024 * 1024)).toFixed(2)} MiB; final ${(finalBytes / (1024 * 1024)).toFixed(2)} MiB).`);
+      console.log(`[compiler:perf] Report: ${performanceReportPath}`);
+    } catch (reportError) {
+      // Performance instrumentation must never fail a render.
+      console.warn(`[compiler:perf] Failed to write optional performance report: ${(reportError as Error).message}`);
+    }
+
+    try {
+      const presentationManifestPath = writePresentationManifest(jobDirectory);
+      console.log(`[compiler:manifest] Wrote presentation_manifest.json: ${presentationManifestPath}`);
+    } catch (manifestError) {
+      // Presentation settings are defaults/metadata; they must never fail an otherwise valid render.
+      console.warn(`[compiler:manifest] Could not write optional presentation manifest: ${(manifestError as Error).message}`);
     }
 
     console.log(

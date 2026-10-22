@@ -9,11 +9,11 @@ import { RenderStudioModal } from './components/RenderStudioModal';
 import { MeasurementPanel } from './components/MeasurementPanel';
 import { StretchTooltipOverlay } from './components/StretchTooltipOverlay';
 import { TransformModeTooltip } from './components/TransformModeTooltip';
-import { MousePointerClick, X, Ruler, Hexagon, Loader2 } from 'lucide-react';
+import { MousePointerClick, X, Ruler, Hexagon, Loader2, RotateCcw, PanelLeftOpen, PanelRightOpen } from 'lucide-react';
 import { ViewportToolbar } from './components/ViewportToolbar';
 import { TransformModesHelp } from './components/TransformModesHelp';
 import { AssetContextMenu } from './components/AssetContextMenu';
-import { MATERIAL_LIBRARY, COLOR_LIBRARY, FABRIC_LIBRARY, TEXTURE_LIBRARY } from './utils/materialCatalog';
+import { useMaterialLibrary } from './hooks/useMaterialLibrary';
 import { clearNativeIFCMaterialOverride } from './utils/materialScene';
 import { useCatalog } from './hooks/useCatalog';
 import * as THREE from 'three';
@@ -123,8 +123,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const { file, jobId, fileName } = activeProject || {};
   const containerRef = useRef(null);
   const tooltipRef = useRef(null);
+  const doorInsertionInFlightRef = useRef(false);
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(true);
   const [isRightPanelOpen, setIsRightPanelOpen] = useState(true);
+  const [leftTab, setLeftTab] = useState('explorer');
   const [isMaxView, setIsMaxView] = useState(false);
   const [rightTab, setRightTab] = useState('properties');
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -137,6 +139,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
 
   // Add the useCatalog hook call[cite: 1]
   const { tree: catalogTree, loading: catalogLoading, error: catalogError } = useCatalog();
+  const { materialLibrary, loading: materialLibraryLoading, error: materialLibraryError } = useMaterialLibrary();
   
   const [isDarkMode, setIsDarkMode] = useState(document.documentElement.classList.contains('dark'));
   const toggleTheme = () => {
@@ -160,20 +163,42 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   } = useProjectSync(activeProject);
 
   const insertDoor = async (asset, wallSnapData) => {
-    if (!file || !jobId) return;
-    
-    const { position, rotation, wallGlobalId } = wallSnapData;
-    // Send the actual picked world point. The backend now owns the host-wall
-    // frame and derives the wall-center/base position from the IFC itself.
+    if (!file || !jobId || doorInsertionInFlightRef.current) return;
+
+    const { position, rotation, wallGlobalId } = wallSnapData || {};
+    if (!wallGlobalId || !Array.isArray(position) || position.length !== 3 ||
+        !position.every(Number.isFinite) || !Array.isArray(rotation) || rotation.length !== 3 ||
+        !rotation.every(Number.isFinite)) {
+      setToastMessage('Could not place door: valid wall and placement coordinates are required.');
+      return;
+    }
+
+    const alreadyHasHostedDoor = (projectStateRef.current?.furniture || []).some((item) => (
+      item?.doorHostWallId === wallGlobalId
+    ));
+    if (alreadyHasHostedDoor) {
+      setToastMessage('This wall already has a hosted door. Undo the previous placement before adding another; multi-door wall updates need a cumulative backend opening operation.');
+      return;
+    }
+
     const doorSurfacePosition = [...position];
+    const hostWallAlreadyHidden = projectStateRef.current?.structural_edits?.[wallGlobalId]?.visible === false;
     const catalogAssetId = asset.catalogId ?? (
       typeof asset.id === 'string' && asset.id.startsWith('cat_')
         ? asset.id.slice(4)
         : asset.id
     );
-    
+
+    // Start before the first await. This makes door placement one atomic history
+    // transaction and prevents Ctrl+Z from undoing an unrelated edit while the
+    // backend is still calculating the opening.
+    doorInsertionInFlightRef.current = true;
+    let historyTransactionOpen = false;
+    let hostWallVisibilityChangedByThisOperation = false;
+    beginHistoryTransaction('Insert door');
+    historyTransactionOpen = true;
     engineActions.setIsLoading(true);
-    setToastMessage(`Measuring door and cutting wall opening...`);
+    setToastMessage('Measuring door and cutting wall opening...');
 
     try {
       const doorDims = await resolveDoorDimensionsForPlacement(asset, catalogAssetId, projectStateRef.current);
@@ -181,52 +206,77 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${wallGlobalId}/insert-door`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           assetId: catalogAssetId,
           position: doorSurfacePosition,
           rotation,
-          ...doorDims 
-        })
+          ...doorDims,
+        }),
       });
-      const data = await response.json();
-      if (!response.ok || data.error) throw new Error(data.error || 'Failed to insert door');
-      
-      // The modified wall IFC (data.fileUrl) is the full building IFC with the
-      // opening baked in — it has its own IFC placement, so we load it with
-      // targetPosition=null and let the IFC coordinates place it correctly.
-      beginHistoryTransaction('Insert door');
-      const wallEntity = refs.viewerRef.current?.scene.objects[wallGlobalId];
-      clearNativeIFCMaterialOverride(refs.viewerRef.current, wallGlobalId);
-      if (wallEntity) {
-        if (typeof wallEntity.__hciDoorOriginalVisible !== 'boolean') {
-          wallEntity.__hciDoorOriginalVisible = wallEntity.visible !== false;
-        }
-        wallEntity.visible = false;
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.error) throw new Error(data.error || `Failed to insert door (${response.status})`);
+
+      // `fileUrl` is the full building IFC. Never silently load it as a wall
+      // replacement: that duplicates every building element and makes undo,
+      // picking and visibility reconciliation ambiguous. Require the wall-only
+      // preview produced by the current backend route.
+      if (!data.previewFileUrl) {
+        throw new Error('The backend did not return a wall-only previewFileUrl. Update the IFC editor backend before placing doors.');
       }
+      if (!data.doorPlacement || !Array.isArray(data.doorPlacement.position) ||
+          data.doorPlacement.position.length !== 3 || !data.doorPlacement.position.every(Number.isFinite) ||
+          !Array.isArray(data.doorPlacement.rotation) || data.doorPlacement.rotation.length !== 3 ||
+          !data.doorPlacement.rotation.every(Number.isFinite)) {
+        throw new Error('The backend returned no valid door placement. The wall was not modified in the viewport.');
+      }
+
+      // Capture the original main-IFC entity BEFORE loading the replacement IFC.
+      // Both IFCs contain the same GlobalId; the replacement can shadow the native
+      // entity in xeokit's scene.objects map, but this direct reference survives.
+      if (!engineActions.rememberNativeEntity(wallGlobalId)) {
+        throw new Error('Could not safely identify the original host wall. No wall visibility was changed.');
+      }
+      if (!engineActions.setNativeEntityVisibleForEdit(wallGlobalId, false)) {
+        throw new Error('Could not hide the original host wall safely. Door placement was cancelled.');
+      }
+      hostWallVisibilityChangedByThisOperation = !hostWallAlreadyHidden;
       updateStructuralEdit(wallGlobalId, 'visible', false, false);
-      
+      clearNativeIFCMaterialOverride(refs.viewerRef.current, wallGlobalId);
+
       const modifiedWallId = `${wallGlobalId}_cut_${Date.now()}`;
-      // IMPORTANT: do not load the full building IFC as a replacement wall model.
-      // Each door insertion must add only the edited host wall; loading another full
-      // building copy makes every subsequent pick ambiguous and causes wrong-wall hits.
-      const previewWallUrl = data.previewFileUrl || data.fileUrl;
-      await engineActions.loadIFCAssetIntoScene(modifiedWallId, previewWallUrl, null, null);
-      adoptIsolatedAsset(wallGlobalId, modifiedWallId, previewWallUrl, 'Wall with Void', [0, 0, 0]);
-      
-      if (!data.doorPlacement) {
-        throw new Error('Backend did not return doorPlacement check ifc_element_editor.py version.');
-      }
-      // Do not mutate the shared catalog asset object. A catalog item can be
-      // reused for another wall later; hostWallId is placement-specific state.
+      await engineActions.loadIFCAssetIntoScene(
+        modifiedWallId,
+        data.previewFileUrl,
+        null,
+        null,
+        { fileType: 'ifc', isNativeIsolation: true, nativeSourceId: wallGlobalId, sourceJobId: jobId }
+      );
+      adoptIsolatedAsset(wallGlobalId, modifiedWallId, data.previewFileUrl, 'Wall with Void', [0, 0, 0], [0, 0, 0], [1, 1, 1], {
+        nativeSourceId: wallGlobalId,
+        isNativeIsolation: true,
+      });
+
+      // Keep placement metadata on the per-instance object, never on the shared
+      // catalog record. The door and cut-wall state commit together as one action.
       const placedDoorAsset = { ...asset, hostWallId: wallGlobalId, doorDimensions: doorDims };
       await spawnAsset(placedDoorAsset, data.doorPlacement.position, engineActions.loadIFCAssetIntoScene, data.doorPlacement.rotation);
       endHistoryTransaction();
-      
+      historyTransactionOpen = false;
     } catch (error) {
       console.error('[BIMViewer] Door insertion failed:', error);
-      cancelHistoryTransaction();
-      setToastMessage(`Error: ${error.message}`);
+      if (historyTransactionOpen) {
+        cancelHistoryTransaction();
+        historyTransactionOpen = false;
+      }
+      // State rollback is asynchronous from React's perspective. Restore the
+      // native entity immediately as well, so a failed insertion never strands
+      // the original wall hidden behind a missing/failed preview model.
+      if (hostWallVisibilityChangedByThisOperation) {
+        engineActions.restoreNativeEntityVisibility(wallGlobalId);
+      }
+      setToastMessage(`Door placement cancelled: ${error.message}`);
     } finally {
+      doorInsertionInFlightRef.current = false;
       engineActions.setIsLoading(false);
     }
   };
@@ -338,6 +388,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     setIsRightPanelOpen(!nextState);
   };
 
+  const openLeftPanelTab = (tab) => {
+    setLeftTab(tab);
+    setIsLeftPanelOpen(true);
+    setIsMaxView(false);
+  };
+
   const getSelectionTargets = () => {
     const records = Array.isArray(engineState.selectedElements)
       ? engineState.selectedElements.filter(item => item?.id && item.id !== '__multi_selection__')
@@ -361,7 +417,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     return [];
   };
 
-  const applyMaterialToSelection = (materialDefinition, surfaceScope = wallSurfaceScope, label = 'Apply material') => {
+  const applyMaterialToSelection = (materialDefinition, surfaceScope = wallSurfaceScope, label = 'Apply material', historyOptions = {}) => {
     const targets = getSelectionTargets();
     if (!targets.length || !materialDefinition) return 0;
 
@@ -372,10 +428,17 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         ...materialDefinition,
         surfaceScope: isWall ? surfaceScope : undefined,
       };
-      return applyMaterialDefinition(refs.viewerRef, target, definition);
+      return applyMaterialDefinition(refs.viewerRef, target, definition, historyOptions);
     };
 
     if (targets.length === 1) return applyToTarget(targets[0]);
+
+    // Continuous color-picker changes share a coalescing key. Applying the same
+    // edit to multiple targets this way keeps one history entry rather than one
+    // undo per selected object for each intermediate picker color.
+    if (historyOptions?.coalesceKey) {
+      return targets.reduce((total, target) => total + applyToTarget(target), 0);
+    }
 
     beginHistoryTransaction(label);
     try {
@@ -388,7 +451,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     }
   };
 
-  const applyColorToSelection = (hex, surfaceScope = wallSurfaceScope) => {
+  const applyColorToSelection = (hex, surfaceScope = wallSurfaceScope, historyOptions = {}) => {
     if (!/^#[0-9a-fA-F]{6}$/.test(hex)) return 0;
 
     const r = parseInt(hex.substring(1, 3), 16) / 255;
@@ -401,6 +464,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       { kind: 'color', color: hex, rgb: [r, g, b] },
       surfaceScope,
       targets.length > 1 ? `Apply color to ${targets.length} elements` : 'Apply color',
+      historyOptions,
     );
 
     if (setCustomColor) setCustomColor(hex);
@@ -408,7 +472,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   };
 
   const handleCustomColorChange = (e, surfaceScope = wallSurfaceScope) => {
-    applyColorToSelection(e.target.value, surfaceScope);
+    const targetKey = getSelectionTargets().map(target => target?.id).filter(Boolean).sort().join('|');
+    applyColorToSelection(e.target.value, surfaceScope, {
+      coalesceKey: `material-color-picker:${surfaceScope}:${targetKey}`,
+    });
   };
 
   const handleApplyColorToAllWalls = (hexColor = customColor, surfaceScope = wallSurfaceScope) => {
@@ -431,7 +498,27 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const firstSelectedMaterial = selectionTargets.length === 1
     ? projectState.materials?.[selectionTargets[0].id] || null
     : null;
-  const selectedMaterial = firstSelectedMaterial || null;
+  const materialIdentity = (definition) => definition ? JSON.stringify({
+    kind: definition.kind || 'color',
+    id: definition.id || definition.texture?.id || null,
+    src: definition.texture?.src || definition.textureSrc || null,
+    color: String(definition.color || '').toUpperCase(),
+    rgb: definition.rgb || null,
+    repeat: definition.repeat || definition.texture?.repeat || null,
+  }) : null;
+  const selectedMaterial = (() => {
+    if (!firstSelectedMaterial) return null;
+    if (firstSelectedMaterial.surfaceScope !== 'scoped' || !firstSelectedMaterial.surfaces) {
+      return firstSelectedMaterial;
+    }
+    if (wallSurfaceScope === 'interior') return firstSelectedMaterial.surfaces.interior || null;
+    if (wallSurfaceScope === 'exterior') return firstSelectedMaterial.surfaces.exterior || null;
+    const interior = firstSelectedMaterial.surfaces.interior || null;
+    const exterior = firstSelectedMaterial.surfaces.exterior || null;
+    return interior && exterior && materialIdentity(interior) === materialIdentity(exterior)
+      ? interior
+      : null;
+  })();
 
   const applyLibraryMaterial = (material, surfaceScope = wallSurfaceScope) => {
     if (!material) return;
@@ -460,8 +547,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   };
 
 
-  const activeAsset = engineState.selectedAssetId && refs.viewerRef.current
-    ? refs.viewerRef.current.scene.models[engineState.selectedAssetId]
+  // The viewer can be between scene lifecycles while an isolated IFC is loaded or
+  // when WebGL reports a lost context. Never let a transiently destroyed Scene
+  // turn a harmless selection update into a React render crash.
+  const activeAsset = engineState.selectedAssetId
+    ? refs.viewerRef.current?.scene?.models?.[engineState.selectedAssetId] || null
     : null;
 
   const activeSavedLayout = activeProject?.savedLayoutId
@@ -489,10 +579,15 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           return;
         }
 
+        // Capture the native entity reference before visibility/history changes.
+        // Isolated IFCs may later shadow this GlobalId in scene.objects.
+        engineActions.rememberNativeEntity(target.id);
         clearNativeIFCMaterialOverride(refs.viewerRef.current, target.id);
         updateStructuralEdit(target.id, 'visible', false, false);
-        const nativeEntity = refs.viewerRef.current?.scene?.objects?.[target.id];
-        if (nativeEntity) nativeEntity.visible = false;
+        // Never use scene.objects[id] after isolated IFCs have been loaded: a
+        // duplicate IFC GlobalId can point at the replacement model. Hide the
+        // captured native entity through the direct-reference history helper.
+        engineActions.setNativeEntityVisibleForEdit(target.id, false);
       });
 
       endHistoryTransaction();
@@ -536,9 +631,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   }, [engineState.selectedObject?.id, engineState.selectedAssetId]);
 
   const updateCursorTooltip = (clientX, clientY, offsetX, offsetY) => {
-    if (!tooltipRef.current || !engineActions.getCursorWorldPosition) return;
+    if (!tooltipRef.current || !engineActions.getCursorWorldPosition || !refs.viewerRef.current?.scene?.models) return;
     const canvasPos = [offsetX, offsetY];
-    const worldPos = engineActions.getCursorWorldPosition(canvasPos);
+    let worldPos = null;
+    try { worldPos = engineActions.getCursorWorldPosition(canvasPos); } catch (_) { worldPos = null; }
     
     if (worldPos) {
       tooltipRef.current.style.display = 'flex';
@@ -560,11 +656,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     refs.canvasRef.current?.focus();
 
     const canvas = refs.canvasRef.current;
-    if (!canvas || !refs.viewerRef.current) return;
+    const viewer = refs.viewerRef.current;
+    if (!canvas || !viewer?.scene?.models) return;
 
     const rect = canvas.getBoundingClientRect();
     const canvasPos = [e.clientX - rect.left, e.clientY - rect.top];
-    const picked = refs.viewerRef.current.scene.pick({ canvasPos, pickSurface: false });
+    let picked = null;
+    try { picked = viewer.scene.pick({ canvasPos, pickSurface: false }); } catch (_) { return; }
 
     // Do not move the contextual toolbar when interacting with a transform gizmo.
     if (picked?.entity?._stretchMeta?.isStretchHandle) return;
@@ -723,7 +821,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           <div
             className={`absolute top-[64px] z-[45] transition-all duration-200 ${isLeftPanelOpen ? 'left-[336px]' : 'left-4'}`}
           >
-            <TransformModesHelp isDarkMode={isDarkMode} />
+            <TransformModesHelp
+              isDarkMode={isDarkMode}
+              onOpenModel={() => openLeftPanelTab('explorer')}
+              onOpenItems={() => openLeftPanelTab('assets')}
+              onOpenDesigns={() => openLeftPanelTab('templates')}
+            />
           </div>
 
           <ViewportToolbar
@@ -765,8 +868,34 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           onUndo={undo}
           onRedo={redo}
           onSaveLayout={handleOpenSaveLayout}
+          isDarkMode={isDarkMode}
           />
         </>
+      )}
+
+      {!isLeftPanelOpen && file && (
+        <button
+          type="button"
+          onClick={() => { setIsLeftPanelOpen(true); setIsMaxView(false); }}
+          className={`absolute left-3 top-1/2 z-[55] flex h-11 -translate-y-1/2 items-center justify-center gap-2 rounded-xl border px-3 shadow-lg backdrop-blur-xl transition hover:scale-[1.02] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ff914d] ${isDarkMode ? 'border-slate-700 bg-[#0b1322]/92 text-slate-200 hover:bg-slate-800' : 'border-slate-200 bg-white/95 text-slate-700 hover:bg-slate-50'}`}
+          title="Show model and item library"
+          aria-label="Reopen model and item library"
+        >
+          <PanelLeftOpen className="h-4 w-4 text-[#ff914d]" />
+          <span className="hidden 2xl:inline text-[11px] font-semibold">Library</span>
+        </button>
+      )}
+      {!isRightPanelOpen && file && (
+        <button
+          type="button"
+          onClick={() => { setIsRightPanelOpen(true); setIsMaxView(false); }}
+          className={`absolute right-3 top-1/2 z-[55] flex h-11 -translate-y-1/2 items-center justify-center gap-2 rounded-xl border px-3 shadow-lg backdrop-blur-xl transition hover:scale-[1.02] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ff914d] ${isDarkMode ? 'border-slate-700 bg-[#0b1322]/92 text-slate-200 hover:bg-slate-800' : 'border-slate-200 bg-white/95 text-slate-700 hover:bg-slate-50'}`}
+          title="Show properties and settings"
+          aria-label="Reopen properties and settings"
+        >
+          <PanelRightOpen className="h-4 w-4 text-[#ff914d]" />
+          <span className="hidden 2xl:inline text-[11px] font-semibold">Properties</span>
+        </button>
       )}
 
       <div 
@@ -821,7 +950,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
               setTimeout(() => setToastMessage(null), 3500);
             }
           }}
-          materialLibrary={MATERIAL_LIBRARY}
+          materialLibrary={materialLibrary}
           selectedMaterial={selectedMaterial}
           onMaterialSelect={applyLibraryMaterial}
           canApplyToAllWalls={!!engineState.selectedObject && String(engineState.selectedObject.type || '').toLowerCase().includes('ifcwall')}
@@ -829,7 +958,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           onWallSurfaceScopeChange={setWallSurfaceScope}
           onApplyMaterialToAllWalls={applyLibraryMaterialToAllWalls}
           onColorChange={(hex, surfaceScope = wallSurfaceScope) => {
-            applyColorToSelection(hex, surfaceScope);
+            const targetKey = getSelectionTargets().map(target => target?.id).filter(Boolean).sort().join('|');
+            applyColorToSelection(hex, surfaceScope, {
+              coalesceKey: `material-color-picker:${surfaceScope}:${targetKey}`,
+            });
           }}
           currentColor={customColor}
           onDelete={handleDeleteSelection}
@@ -924,6 +1056,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         <div className={`absolute inset-y-0 left-0 w-80 z-30 transition-transform duration-300 ${isLeftPanelOpen ? 'translate-x-0' : '-translate-x-full'}`}>
           <LeftPanel
             isOpen={isLeftPanelOpen}
+            activeTab={leftTab}
+            onActiveTabChange={setLeftTab}
             onClose={() => { setIsLeftPanelOpen(false); setIsMaxView(false); }}
             treeRef={refs.treeContainerRef}
             availableAssets={availableAssets}
@@ -972,10 +1106,14 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             customColor={customColor}
             handleCustomColorChange={handleCustomColorChange}
             onApplyToAllWalls={handleApplyColorToAllWalls}
-            materialLibrary={MATERIAL_LIBRARY}
+            materialLibrary={materialLibrary}
+            materialLibraryLoading={materialLibraryLoading}
+            materialLibraryError={materialLibraryError}
             selectedMaterial={selectedMaterial}
             onApplyMaterial={applyLibraryMaterial}
             onApplyMaterialToAllWalls={applyLibraryMaterialToAllWalls}
+            wallSurfaceScope={wallSurfaceScope}
+            onWallSurfaceScopeChange={setWallSurfaceScope}
             updateSelectedAsset={(axis, val, rot) =>
               updateAsset(refs.viewerRef, engineState.selectedAssetId, axis, val, rot)
             }
@@ -1005,7 +1143,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       )}
 
       {file && (
-        <div className="absolute bottom-0 left-1/2 -translate-x-1/2 z-40 pb-4">
+        <div className="pointer-events-none absolute inset-x-0 bottom-4 z-40 flex justify-center px-3">
           <BottomDock
             onAdd={onAdd}
             onDelete={onDelete}
@@ -1016,6 +1154,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             toggleBrowserFullscreen={toggleBrowserFullscreen}
             isMeasuring={engineState.isMeasuring}
             toggleMeasurementMode={engineActions.toggleMeasurementMode}
+            isDarkMode={isDarkMode}
           />
         </div>
       )}
@@ -1042,6 +1181,17 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         existingSavedLayouts={savedLayouts}
       />
       
+      {engineState.isWebGLContextLost && (
+        <div className="absolute inset-0 z-[400] flex items-center justify-center bg-slate-950/75 px-4 backdrop-blur-md" role="alertdialog" aria-modal="true" aria-labelledby="webgl-context-title">
+          <div className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl ${isDarkMode ? 'border-slate-700 bg-[#0b1322] text-white' : 'border-slate-200 bg-white text-slate-900'}`}>
+            <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-orange-500/15 text-[#ff914d]"><Hexagon className="h-6 w-6" /></div>
+            <h2 id="webgl-context-title" className="text-lg font-bold">The 3D view was interrupted</h2>
+            <p className={`mt-2 text-sm leading-6 ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>Your browser stopped the graphics session, so the model can no longer be edited safely in this tab. Reload the workspace to start a fresh 3D session. Any unsaved changes may not be recoverable.</p>
+            <button type="button" onClick={() => window.location.reload()} className="mt-5 inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl bg-[#ff914d] px-4 text-sm font-bold text-white transition hover:bg-[#f17b33]"><RotateCcw className="h-4 w-4" /> Reload 3D workspace</button>
+          </div>
+        </div>
+      )}
+
       {engineState.isLoading && (
         <div className="absolute inset-0 z-[200] flex flex-col items-center justify-center bg-slate-900/60 backdrop-blur-md animate-in fade-in duration-300">
           <div className="relative flex flex-col items-center">
