@@ -69,9 +69,9 @@ jobs:
           tar -czf "$RUNNER_TEMP/hci-deploy-bundle/backend-source.tar.gz" \
             --exclude='.env' \
             --exclude='node_modules' \
-            --exclude='assets' \
-            --exclude='uploads' \
-            --exclude='jobs' \
+            --exclude='./assets' \
+            --exclude='./uploads' \
+            --exclude='./jobs' \
             --exclude='material-library.json' \
             --exclude='hci_catalog_db.dump' \
             --exclude='*.log' \
@@ -82,6 +82,28 @@ jobs:
           tar -czf "$RUNNER_TEMP/hci-deploy-bundle/frontend-dist.tar.gz" \
             -C xeo-kit-project/bim-viewer-app/dist .
 
+      - name: Verify backend archive boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/hci-deploy-bundle/backend-source.tar.gz"
+          listing="$RUNNER_TEMP/hci-backend-archive-list.txt"
+          tar -tzf "$archive" > "$listing"
+
+          if grep -Eq '^\./(assets|uploads|jobs)(/|$)' "$listing"; then
+            echo "::error::Server-managed root assets/uploads/jobs were included in the archive."
+            exit 1
+          fi
+
+          if ! grep -Eq '^\./latest_interior_v2/assets/[^/]+$' "$listing"; then
+            echo "::error::Repository-owned latest_interior_v2/assets files are missing."
+            exit 1
+          fi
+
+          echo "Archive check passed: root runtime data excluded; nested Python assets included."
+
+      - name: Validate deployment script
+        run: bash -n xeo-kit-project/ifc-render-app/ops/hci-deploy.sh
       - name: Upload tested deployment bundle
         uses: actions/upload-artifact@v7
         with:
