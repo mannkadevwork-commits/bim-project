@@ -153,7 +153,7 @@ fi
 # Back up only deployable code and frontend. Persistent runtime data is intentionally excluded.
 mkdir -p "$BACKUP"
 tar -czf "$BACKUP/backend-code.tar.gz" \
-  --exclude='assets' --exclude='uploads' --exclude='jobs' \
+  --exclude='./assets' --exclude='./uploads' --exclude='./jobs' \
   --exclude='node_modules' --exclude='.env*' \
   --exclude='material-library.json' --exclude='hci_catalog_db.dump' \
   -C "$BACKEND" .
