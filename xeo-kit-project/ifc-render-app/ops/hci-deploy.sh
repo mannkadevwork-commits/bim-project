@@ -102,11 +102,11 @@ done
 # and is never printed. Existing manual migrations are safe to re-run if not tracked yet.
 if [[ -d "$STAGE_BACKEND/migrations" ]]; then
   BACKEND_ENV_FILE="$BACKEND/.env" \
-  STAGE_BACKEND="$STAGE_BACKEND" \
+  HCI_STAGE_BACKEND="$STAGE_BACKEND" \
   node <<'NODE'
 const fs = require('fs');
 const path = require('path');
-const base = process.env.STAGE_BACKEND;
+const base = process.env.HCI_STAGE_BACKEND;
 const dotenv = require(path.join(base, 'node_modules', 'dotenv'));
 dotenv.config({ path: process.env.BACKEND_ENV_FILE, override: true });
 const { Pool } = require(path.join(base, 'node_modules', 'pg'));
