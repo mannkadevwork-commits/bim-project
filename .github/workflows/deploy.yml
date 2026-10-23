@@ -35,7 +35,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: xeo-kit-project/bim-viewer-app
-        run: npm ci
+        run: npm install --include=optional --no-audit --no-fund
 
       - name: Build frontend
         working-directory: xeo-kit-project/bim-viewer-app
