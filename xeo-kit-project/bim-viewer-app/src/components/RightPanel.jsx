@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { 
   PanelRightClose, Component, Settings2, Eye, EyeOff, Scissors, 
   Footprints, Orbit, Info, Palette, Maximize2, Move, Ruler,
-  Sun, Moon, Trash2, CloudCog, Loader2, Clock, Layers3, X, MousePointer2  
+  Sun, Moon, Trash2, CloudCog, Loader2, Clock, Layers3, X, MousePointer2, ChevronDown  
 } from 'lucide-react';
 import { LayoutMetadataForm } from './LayoutMetadataForm';
 
@@ -39,10 +39,12 @@ export const RightPanel = ({
   onDeleteProject, isDarkMode, toggleTheme, activeSavedLayout = null, onSaveLayout, isLayoutSaving = false,
   fileNameForLayoutMetadata = '', existingSavedLayouts = [], saveStatus, onApplyToAllWalls,
   materialLibrary = [], materialLibraryLoading = false, materialLibraryError = '', selectedMaterial = null, onApplyMaterial, onApplyMaterialToAllWalls,
-  wallSurfaceScope = 'both', onWallSurfaceScopeChange = () => {}
+  wallSurfaceScope = 'both', onWallSurfaceScopeChange = () => {}, onBrowseItems = null,
+  isSelectedLightFixture = false, selectedLightEnabled = false, selectedLightIntensity = 0.30, selectedLightTemperature = 4000, onToggleSelectedLight = null, onSetSelectedLightIntensity = null
 }) => {
   const [propertySubTab, setPropertySubTab] = useState('design');
   const [materialMode, setMaterialMode] = useState('color');
+  const [showMaterialPicker, setShowMaterialPicker] = useState(true);
   const [paletteSearch, setPaletteSearch] = useState('');
   const [paletteBrandFilter, setPaletteBrandFilter] = useState('all');
   const [showSaveLayoutForm, setShowSaveLayoutForm] = useState(false);
@@ -58,6 +60,13 @@ export const RightPanel = ({
     const matchesBrand = paletteBrandFilter === 'all' || (material.brand || 'General colours') === paletteBrandFilter;
     const haystack = [material.name, material.color, material.category, material.brand, material.collection, material.shadeCode, material.shade_code].filter(Boolean).join(' ').toLowerCase();
     return matchesBrand && (!query || haystack.includes(query));
+  });
+
+  const filteredSurfaceMaterials = materialLibrary.filter((material) => {
+    if (material.kind !== materialMode || materialMode === 'color') return false;
+    const query = paletteSearch.trim().toLowerCase();
+    const haystack = [material.name, material.category, material.brand, material.collection, material.shadeCode, material.shade_code].filter(Boolean).join(' ').toLowerCase();
+    return !query || haystack.includes(query);
   });
 
   // Unified State for Transform
@@ -277,6 +286,16 @@ export const RightPanel = ({
                             <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-orange-50 text-[#ff914d] dark:bg-orange-500/10"><Palette className="h-4 w-4" /></span>
                             <div><p className="text-xs font-semibold text-slate-800 dark:text-slate-100">Make it yours</p><p className="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Change its look, position or size from the tabs above.</p></div>
                         </div>
+                        {onBrowseItems && (
+                          <button
+                            type="button"
+                            onClick={onBrowseItems}
+                            className="flex w-full items-center justify-between gap-3 rounded-xl border border-[#ff914d]/25 bg-[#ff914d]/10 px-3 py-2.5 text-left text-xs font-bold text-[#e97831] transition hover:border-[#ff914d]/45 hover:bg-[#ff914d]/15 dark:text-orange-200"
+                          >
+                            <span>Browse furniture & accessories</span>
+                            <span aria-hidden="true">→</span>
+                          </button>
+                        )}
                         <p className="px-1 text-center text-[10px] leading-4 text-slate-400">Your changes can be reversed with Undo at the top of the canvas.</p>
                     </div>
                 </div>
@@ -324,12 +343,27 @@ export const RightPanel = ({
                                     Stretching — release mouse to apply
                                   </div>
                                 )}
+                                {isSelectedLightFixture && (
+                                  <section className="rounded-xl border border-amber-200 bg-amber-50/70 p-3 dark:border-amber-500/25 dark:bg-amber-500/5">
+                                    <div className="flex items-center justify-between gap-3">
+                                      <div><h4 className="text-xs font-bold text-slate-800 dark:text-slate-100">Fixture lighting</h4><p className="mt-0.5 text-[10px] text-slate-500 dark:text-slate-400">Controls this selected light only.</p></div>
+                                      <button type="button" onClick={onToggleSelectedLight} className={`rounded-lg px-3 py-2 text-[10px] font-bold transition ${selectedLightEnabled ? 'bg-slate-800 text-white hover:bg-slate-700 dark:bg-slate-700' : 'bg-amber-400 text-amber-950 hover:bg-amber-300'}`}>{selectedLightEnabled ? 'Turn off' : 'Turn on'}</button>
+                                    </div>
+                                    <label className="mt-3 block text-[10px] font-semibold text-slate-600 dark:text-slate-300">Brightness <span className="float-right tabular-nums">{Math.round(Number(selectedLightIntensity) * 100)}%</span><input type="range" min="0.02" max="0.55" step="0.01" value={Number(selectedLightIntensity) || 0.30} onChange={(event) => onSetSelectedLightIntensity?.(Number(event.target.value), Number(selectedLightTemperature) || 4000)} className="mt-2 w-full accent-amber-500" /></label>
+                                    <label className="mt-3 block text-[10px] font-semibold text-slate-600 dark:text-slate-300">Colour temperature <span className="float-right tabular-nums">{Math.round(Number(selectedLightTemperature) || 4000)} K</span><input type="range" min="2700" max="6500" step="100" value={Number(selectedLightTemperature) || 4000} onChange={(event) => onSetSelectedLightIntensity?.(Number(selectedLightIntensity) || 0.30, Number(event.target.value))} className="mt-2 w-full accent-amber-500" /></label>
+                                    <p className="mt-2 text-[9px] leading-4 text-slate-500 dark:text-slate-400">The light is an editor preview. Matching 360/4K render illumination still requires renderer integration.</p>
+                                  </section>
+                                )}
                                 {/* Material Library */}
-                                <div>
-                                  <div className="flex items-center justify-between mb-3">
-                                    <div><h4 className="text-xs font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5"><Palette className="w-3.5 h-3.5 text-[#ff914d]"/> Appearance</h4><p className="mt-1 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Choose a color, fabric or texture for the selected surface.</p></div>
-                                    <span className="text-[9px] text-slate-400 dark:text-slate-500">Separate color, fabric and texture</span>
+                                <div id="hci-surface-finish-section" className="scroll-mt-4">
+                                  <div className="mb-3 flex items-center justify-between gap-2">
+                                    <button type="button" onClick={() => setShowMaterialPicker((open) => !open)} aria-expanded={showMaterialPicker} className="flex min-w-0 items-start gap-2 rounded-lg text-left outline-none focus-visible:ring-2 focus-visible:ring-[#ff914d]/60">
+                                      <div className="min-w-0"><h4 className="flex items-center gap-1.5 text-xs font-bold text-slate-800 dark:text-slate-100"><Palette className="h-3.5 w-3.5 text-[#ff914d]"/> Appearance <ChevronDown className={`ml-1 h-3.5 w-3.5 text-slate-400 transition-transform ${showMaterialPicker ? 'rotate-180' : ''}`} /></h4><p className="mt-1 text-[10px] leading-4 text-slate-500 dark:text-slate-400">Choose a color, fabric or texture for the selected surface.</p></div>
+                                    </button>
+                                    <span className="shrink-0 text-[9px] text-slate-400 dark:text-slate-500">Finish library</span>
                                   </div>
+                                  {showMaterialPicker && (
+                                  <div className="space-y-3">
                                   {!activeAsset && hasWallSelection && (
                                     <div className="mb-3 rounded-xl border border-indigo-200/80 bg-indigo-50/70 p-2.5 dark:border-indigo-500/20 dark:bg-indigo-500/5">
                                       <div className="flex items-center justify-between gap-3">
@@ -351,7 +385,7 @@ export const RightPanel = ({
                                   )}
                                   <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 mb-3">
                                     {['color','fabric','texture'].map(tab => (
-                                      <button key={tab} type="button" onClick={() => setMaterialMode(tab)} className={`flex-1 py-1.5 rounded-lg text-[9px] font-bold transition-colors ${materialMode === tab ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>{tab === 'color' ? 'Palette' : tab === 'fabric' ? 'Fabric' : 'Texture'}</button>
+                                      <button key={tab} type="button" onClick={() => { setMaterialMode(tab); setPaletteSearch(''); }} className={`flex-1 py-1.5 rounded-lg text-[9px] font-bold transition-colors ${materialMode === tab ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}>{tab === 'color' ? 'Palette' : tab === 'fabric' ? 'Fabric' : 'Texture'}</button>
                                     ))}
                                   </div>
                                   {materialMode === 'color' && (
@@ -384,23 +418,28 @@ export const RightPanel = ({
                                     </div>
                                   )}
                                   {materialMode !== 'color' && (
-                                    <div className="grid grid-cols-2 gap-2">
-                                      {materialLibrary.filter(m => m.kind === materialMode).map(material => (
-                                        <button key={material.id} type="button" onClick={() => onApplyMaterial?.(material, wallSurfaceScope)} className={`group flex items-center gap-2 p-2 rounded-xl border text-left transition-all ${selectedMaterial?.kind === material.kind && (selectedMaterial?.id === material.id || selectedMaterial?.texture?.id === material.slug || selectedMaterial?.texture?.id === material.id) ? 'border-[#ff914d] bg-orange-50 dark:bg-orange-500/10 ring-1 ring-[#ff914d]/30' : 'border-slate-200/80 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600'}`}>
-                                          <span className="w-10 h-10 rounded-lg border border-black/10 dark:border-white/10 shrink-0 overflow-hidden shadow-sm bg-cover bg-center" style={{ backgroundColor: material.color, backgroundImage: material.textureSrc ? `url(${material.textureSrc})` : 'none' }} />
-                                          <span className="min-w-0"><span className="block text-[9px] font-semibold text-slate-700 dark:text-slate-200 truncate">{material.name}</span><span className="block text-[8px] text-slate-400 mt-0.5">{material.category}</span></span>
-                                        </button>
-                                      ))}
+                                    <div>
+                                      <input value={paletteSearch} onChange={(event) => setPaletteSearch(event.target.value)} placeholder={`Search ${materialMode === 'fabric' ? 'fabrics' : 'textures'}…`} aria-label={`Search ${materialMode} library`} className="mb-2 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[10px] text-slate-700 outline-none focus:border-indigo-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200" />
+                                      <div className="max-h-64 overflow-y-auto overscroll-contain pr-1">
+                                        <div className="grid grid-cols-2 gap-2">
+                                          {filteredSurfaceMaterials.map((material) => (
+                                            <button key={material.id} type="button" onClick={() => onApplyMaterial?.(material, wallSurfaceScope)} className={`group flex min-w-0 items-center gap-2 rounded-xl border p-2 text-left transition-all ${selectedMaterial?.kind === material.kind && (selectedMaterial?.id === material.id || selectedMaterial?.materialAssetId === material.materialAssetId || selectedMaterial?.slug === material.slug || selectedMaterial?.texture?.id === material.slug || selectedMaterial?.texture?.id === material.id) ? 'border-[#ff914d] bg-orange-50 dark:bg-orange-500/10 ring-1 ring-[#ff914d]/30' : 'border-slate-200/80 dark:border-slate-700/70 hover:border-slate-300 dark:hover:border-slate-600'}`}>
+                                              <span className="h-9 w-9 shrink-0 overflow-hidden rounded-lg border border-black/10 bg-cover bg-center shadow-sm dark:border-white/10" style={{ backgroundColor: material.color || '#FFFFFF', backgroundImage: (material.textureSrc || material.texture?.src) ? `url(${material.textureSrc || material.texture.src})` : 'none' }} />
+                                              <span className="min-w-0 flex-1"><span className="block truncate text-[9px] font-semibold text-slate-700 dark:text-slate-200">{material.name}</span><span className="mt-0.5 block truncate text-[8px] text-slate-400">{material.category || material.brand || 'Surface finish'}</span></span>
+                                            </button>
+                                          ))}
+                                        </div>
+                                      </div>
+                                      {!filteredSurfaceMaterials.length && !materialLibraryLoading && (
+                                        <div className="rounded-xl border border-dashed border-slate-300 px-3 py-4 text-center dark:border-slate-700">
+                                          <p className="text-[10px] font-semibold text-slate-600 dark:text-slate-300">{materialLibraryError ? 'Material library unavailable' : paletteSearch.trim() ? 'No matching finishes' : `No ${materialMode === 'fabric' ? 'fabrics' : 'textures'} uploaded yet`}</p>
+                                          <p className="mt-1 text-[9px] leading-4 text-slate-400">{materialLibraryError || (paletteSearch.trim() ? 'Try another search term.' : 'Open Admin → Surface Materials to upload and manage reusable finishes.')}</p>
+                                        </div>
+                                      )}
+                                      {materialLibraryLoading && (
+                                        <div className="mt-2 flex items-center justify-center gap-2 rounded-xl border border-slate-200 px-3 py-4 text-[10px] text-slate-400 dark:border-slate-700"><span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-indigo-500" /> Loading surface materials…</div>
+                                      )}
                                     </div>
-                                  )}
-                                  {materialMode !== 'color' && !materialLibraryLoading && !materialLibrary.filter(material => material.kind === materialMode).length && (
-                                    <div className="rounded-xl border border-dashed border-slate-300 px-3 py-4 text-center dark:border-slate-700">
-                                      <p className="text-[10px] font-semibold text-slate-600 dark:text-slate-300">{materialLibraryError ? 'Material library unavailable' : `No ${materialMode === 'fabric' ? 'fabrics' : 'textures'} uploaded yet`}</p>
-                                      <p className="mt-1 text-[9px] leading-4 text-slate-400">{materialLibraryError || 'Open Admin → Surface Materials to upload and manage reusable finishes.'}</p>
-                                    </div>
-                                  )}
-                                  {materialMode !== 'color' && materialLibraryLoading && (
-                                    <div className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 px-3 py-4 text-[10px] text-slate-400 dark:border-slate-700"><span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-indigo-500" /> Loading surface materials…</div>
                                   )}
                                   {onApplyMaterialToAllWalls && hasWallSelection && (selectedMaterial || materialMode === 'color') && (selectedMaterial || customColor) && (
                                     <div className="pt-3 mt-3 border-t border-slate-200 dark:border-slate-700/50">
@@ -409,6 +448,8 @@ export const RightPanel = ({
                                         <span className="text-[9px] font-bold uppercase tracking-wider">Apply →</span>
                                       </button>
                                     </div>
+                                  )}
+                                  </div>
                                   )}
                                 </div>
 

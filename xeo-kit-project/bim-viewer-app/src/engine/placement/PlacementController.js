@@ -59,9 +59,20 @@ export const getWallSnapData = (viewerRef, canvasPos) => {
 export const getDropPosition = (viewerRef, projectStateRef, canvasPos, assetType = null) => {
   const viewer = viewerRef.current;
   if (!viewer) {
+    if (assetType === 'surface') return null;
     return assetType === 'door'
       ? { position: [0, 0, 0], rotation: [0, 0, 0], wallGlobalId: null, snapped: false }
       : [0, 0, 0];
+  }
+
+  if (assetType === 'surface') {
+    const surfacePick = viewer.scene.pick({ canvasPos, pickSurface: true });
+    const normal = surfacePick?.worldNormal;
+    const worldPos = surfacePick?.worldPos;
+    const hasVec3 = worldPos && typeof worldPos.length === 'number' && worldPos.length >= 3;
+    const hasNormal = normal && typeof normal.length === 'number' && normal.length >= 3;
+    const isCeilingUnderside = hasNormal && Number(normal[1]) <= -0.65;
+    return hasVec3 && isCeilingUnderside ? Array.from(worldPos).slice(0, 3).map(Number) : null;
   }
 
   if (assetType === 'door') {

@@ -312,20 +312,28 @@ function createMaterialFromDefinition(
 ): { material: any; texture: Texture | null } {
     const [r, g, b] = Array.isArray(definition.rgb) ? definition.rgb : [sourceColor[0], sourceColor[1], sourceColor[2]];
     const alpha = sourceColor[3] === 0 || sourceColor[3] === undefined ? 1 : sourceColor[3];
-    const material = doc.createMaterial(idPrefix)
-        .setBaseColorFactor([r, g, b, alpha])
-        .setDoubleSided(true)
-        .setRoughnessFactor(definition.roughness ?? 0.8)
-        .setMetallicFactor(definition.metallic ?? 0.0);
 
     let texture: Texture | null = null;
     if ((definition.kind === 'fabric' || definition.kind === 'texture') && getMaterialTextureSource(definition)) {
         const texturePath = resolveTexturePath(getMaterialTextureSource(definition), assetsDirectory);
         if (texturePath) {
             texture = createTexture(doc, texturePath, `Tex_${idPrefix}_${definition.texture?.id || 'material'}`);
-            material.setBaseColorTexture(texture);
         }
     }
+
+    // An image-based fabric/tile already carries its base color. Use white as
+    // the factor (as NativeIFCMaterialController does in the editor) rather than
+    // multiplying by the catalog's sampled HEX value a second time.
+    const baseFactor: [number, number, number, number] = texture
+        ? [1, 1, 1, alpha]
+        : [r, g, b, alpha];
+    const material = doc.createMaterial(idPrefix)
+        .setBaseColorFactor(baseFactor)
+        .setDoubleSided(true)
+        .setRoughnessFactor(definition.roughness ?? 0.8)
+        .setMetallicFactor(definition.metallic ?? 0.0);
+
+    if (texture) material.setBaseColorTexture(texture);
     return { material, texture };
 }
 

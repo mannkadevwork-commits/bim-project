@@ -31,8 +31,33 @@ export interface RoomPortal {
   associationMethod?: "ifc-rel-fills" | "ifc-rel-voids" | "door-name" | "door-geometry-match" | "opening-only" | "hosted-door-side-sampling";
 }
 
+export interface RoomBoundaryLoops {
+  outer: RoomPolygonPoint[];
+  holes: RoomPolygonPoint[][];
+}
+
+export interface DetectedCeilingCandidate {
+  id: string;
+  sourceFile: string;
+  expressId: number;
+  globalId: string | null;
+  ifcType: string;
+  predefinedType: string;
+  name: string;
+  elevationY: number;
+  verticalSpanY: number;
+  flatCeilingCompatible: boolean;
+  overlapRatio: number;
+  confidence: number;
+}
+
 export interface DetectedRoom {
   id: string;
+  /** Stable geometry-derived identity for authored ceiling designs; navigation id remains unchanged. */
+  stableId?: string;
+  levelId?: string;
+  boundary?: RoomBoundaryLoops;
+  ceilingCandidates?: DetectedCeilingCandidate[];
   label: string;
   source: RoomSource;
   area: number;
@@ -42,6 +67,11 @@ export interface DetectedRoom {
   portals: string[];
   touchesFloorBoundary: boolean;
   confidence: number;
+  /** Estimated top-of-room elevation in the existing Y-up scene frame. */
+  floorElevation?: number;
+  ceilingElevation?: number;
+  ceilingElevationSource?: "ifc-overhead-surface" | "boundary-wall-top" | "fallback-estimate";
+  ceilingConfidence?: number;
 }
 
 export interface RoomComponentDiagnostic {
@@ -90,11 +120,17 @@ export interface RoomDoorDiagnostic {
 
 export interface RoomDebugArtifact {
   version: 1;
+  units?: {
+    sourceLengthUnit: string;
+    toMeters: number;
+    confidence: "ifc-unit-assignment" | "assumed-metre";
+  };
   status: "diagnostic";
   coordinateSystem: "web-ifc-world-y-up";
   frontendMapping: "[x, y, z] — no second axis conversion";
   cellSize: number;
   floorElevation: number;
+  floorLevelElevations?: number[];
   sourceFiles: string[];
   /** Generated per-door preview IFCs excluded because the canonical structural IFC already contains cumulative wall cuts. */
   excludedDuplicatePreviewSources: string[];
@@ -109,6 +145,8 @@ export interface RoomDebugArtifact {
     blockedCellCount: number;
     componentCount: number;
     retainedRoomCount: number;
+    floorLevelGroupCount?: number;
+    analysedFloorLevelCount?: number;
     sealedDoorCount: number;
     portalCount: number;
   };

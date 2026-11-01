@@ -109,8 +109,8 @@ export const RenderStudioModal = ({
     <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex flex-col items-center justify-center text-white">
       <Loader2 className="w-16 h-16 animate-spin text-indigo-500 mb-6" />
       <h2 className="text-3xl font-bold mb-2">Preparing Interactive Home Presentation...</h2>
-      <p className="text-slate-300">Compiling the final GLB and navigation data for the walkthrough.</p>
-      <p className="text-slate-400 text-sm mt-2">This may take a little while depending on scene complexity.</p>
+      <p className="text-slate-300">Preparing the walkthrough scene and reusing valid cached assets where possible.</p>
+      <p className="text-slate-400 text-sm mt-2">Unchanged scenes can be reused; finish-only edits can reuse navigation data. Geometry changes still need a fresh navigation build.</p>
     </div>
   );
 
@@ -129,6 +129,12 @@ export const RenderStudioModal = ({
               </p>
             </div>
             <span className="text-sm text-emerald-600 dark:text-emerald-400 flex items-center gap-1 bg-emerald-50 dark:bg-emerald-500/10 px-3 py-1 rounded-full"><Clock className="w-4 h-4"/> {renderTime}s</span>
+            {renderResult?.cacheHit && (
+              <span title="The exact scene inputs were unchanged; the previous compiled presentation was reused." className="rounded-full bg-sky-50 px-3 py-1 text-xs font-semibold text-sky-700 dark:bg-sky-500/10 dark:text-sky-300">Instant cached build</span>
+            )}
+            {!renderResult?.cacheHit && renderResult?.navigationCacheHit && (
+              <span title="Furniture/materials were recompiled, but the scene geometry was unchanged so navigation data was reused." className="rounded-full bg-violet-50 px-3 py-1 text-xs font-semibold text-violet-700 dark:bg-violet-500/10 dark:text-violet-300">Navigation reused</span>
+            )}
           </div>
           <button onClick={() => setRenderResult(null)} className="p-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 dark:text-slate-400"><X className="w-6 h-6" /></button>
         </div>

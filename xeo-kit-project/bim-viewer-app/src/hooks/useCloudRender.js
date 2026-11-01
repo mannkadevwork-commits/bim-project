@@ -35,6 +35,17 @@ export const useCloudRender = (activeProject, projectStateRef) => {
     formData.append('quality', renderConfig.quality);
     const renderedProjectState = JSON.parse(JSON.stringify(projectStateRef.current || {}));
     formData.append('projectState', JSON.stringify(renderedProjectState));
+    // Match the scene snapshot to the local project revision so an old render
+    // request cannot overwrite a newer autosave on the backend.
+    try {
+      const stateMeta = JSON.parse(localStorage.getItem(`hci_state_meta_${jobId}`) || 'null');
+      const renderRevision = Number(stateMeta?.updatedAt) || Number(stateMeta?.serverRevision) || 0;
+      if (renderRevision > 0) {
+        formData.append('projectRevision', String(renderRevision));
+      }
+    } catch (_) {
+      // The render can still use the current in-memory state if storage is disabled.
+    }
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/render`, { method: 'POST', body: formData });

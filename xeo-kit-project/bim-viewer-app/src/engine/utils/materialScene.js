@@ -1,6 +1,6 @@
 import { Texture } from '@xeokit/xeokit-sdk/src/viewer/scene/materials/Texture';
 import { PhongMaterial } from '@xeokit/xeokit-sdk/src/viewer/scene/materials/PhongMaterial';
-import { NativeIFCMaterialController } from '../engine/NativeIFCMaterialController';
+import { NativeIFCMaterialController } from '../NativeIFCMaterialController';
 
 const nativeControllers = new WeakMap();
 const rgbFallback = [1, 1, 1];

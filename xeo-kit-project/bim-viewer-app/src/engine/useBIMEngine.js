@@ -28,6 +28,10 @@ import { beginIFCRotation, updateIFCRotation, commitIFCRotationState, projectWor
 import { beginIFCResize, updateIFCResize, commitIFCResize, isIFCModel } from './stretch/IFCResizeController';
 import { applyMaterialDefinitionToSceneTarget, reconcileMaterialDefinitionsToScene, configureNativeIFCMaterialController, disposeNativeIFCMaterialController } from '../utils/materialScene';
 import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
+import { installGLBStudioLighting } from './utils/glbStudioLighting';
+import { createLightFixtureController } from './assets/LightFixtureController';
+import { createRoomCeilingController } from './assets/RoomCeilingController';
+import { findCeilingEntities } from './utils/ceilingVisibility';
 
 const getNavCubeTheme = (isDarkMode) => ({
   color: isDarkMode ? '#1a2435' : '#eef2f7',
@@ -41,7 +45,7 @@ const getNavCubeTheme = (isDarkMode) => ({
 });
 
 
-export const useBIMEngine = (activeProject, projectStateRef, projectState, onAssetPlaced, setIsRightPanelOpen, setRightTab, transformFurnitureForCalibration, repairLegacyCalibrationState, isDarkMode = true) => {
+export const useBIMEngine = (activeProject, projectStateRef, projectState, onAssetPlaced, setIsRightPanelOpen, setRightTab, transformFurnitureForCalibration, repairLegacyCalibrationState, isDarkMode = true, projectStateHydratedRef = null) => {
   const { file, jobId, fileName } = activeProject || {};
 
   const canvasRef = useRef(null);
@@ -49,6 +53,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const navCubeCanvasRef = useRef(null);
   const navCubeRef = useRef(null);
   const viewerRef = useRef(null);
+  const lightFixtureControllerRef = useRef(null);
+  const roomCeilingControllerRef = useRef(null);
   const loadersRef = useRef({});
   const ifcLoaderOwnerRef = useRef(null);
   const ifcAPIRef = useRef(null);
@@ -194,6 +200,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     if (!viewer || !model) return;
 
     const modelObjects = getEditableModelObjects(viewer, model);
+    const isGLBSceneModel = ['glb', 'gltf'].includes(String(
+      model?._assetMeta?.assetFormat || model?._assetMeta?.fileType || model?._assetMeta?.file_type || ''
+    ).toLowerCase());
 
     // Editable asset models must never participate in Xeokit's filled selection
     // emphasis. This also clears stale emphasis that may have been left behind
@@ -207,6 +216,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
       modelObjects.forEach((object) => {
         if (!object) return;
+        // Material-preview overlays are the visible replacement surfaces for
+        // GLB meshes. Do not tint/fade/edge them as selection decoration, or
+        // the user cannot judge the finish that was just applied.
+        if (object._hciMaterialOverlay) return;
 
         if (!object._hciSelectionVisualBackup) {
           let colorize = null;
@@ -226,9 +239,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         try { object.highlighted = false; } catch (_) {}
         try { object.xrayed = false; } catch (_) {}
 
-        // Modern editor treatment: readable original material + gentle
-        // translucency + a restrained cool tint + enhanced edges. It makes the
-        // gizmo the primary affordance without hiding the furniture itself.
+        if (isGLBSceneModel) {
+          // Product furniture must retain its authored appearance while selected.
+          // Forcing object.edges=true draws every qualifying mesh edge and turns
+          // high-poly/UV furniture into a technical wireframe; lowering opacity
+          // also makes textures look washed-out or unnaturally dark against the
+          // viewport. The contextual toolbar + transform gizmo already indicate
+          // selection, so leave GLB materials fully opaque and disable edges.
+          const baseline = object._hciSelectionVisualBackup;
+          try { object.opacity = Number.isFinite(baseline?.opacity) ? baseline.opacity : 1; } catch (_) {}
+          try { object.edges = false; } catch (_) {}
+          // GLB colorize is used for live solid-finish behavior; never tint it
+          // from the selection state.
+          return;
+        }
+
+        // Keep the existing technical selection treatment for IFC/native objects.
         try {
           const baseOpacity = object._hciSelectionVisualBackup.opacity;
           object.opacity = Math.max(0.64, Math.min(0.78, baseOpacity * 0.78));
@@ -242,6 +268,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     modelObjects.forEach((object) => {
       if (!object) return;
+      if (object._hciMaterialOverlay) return;
 
       try { object.selected = false; } catch (_) {}
       try { object.highlighted = false; } catch (_) {}
@@ -249,10 +276,23 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
       const backup = object._hciSelectionVisualBackup;
       if (backup) {
-        try { object.opacity = backup.opacity; } catch (_) {}
-        try { object.edges = backup.edges; } catch (_) {}
-        try { object.colorize = backup.colorize ?? null; } catch (_) {}
+        const isGLBSceneModel = ['glb', 'gltf'].includes(String(
+          model?._assetMeta?.assetFormat || model?._assetMeta?.fileType || model?._assetMeta?.file_type || ''
+        ).toLowerCase());
+        try { object.opacity = isGLBSceneModel ? (Number.isFinite(backup.opacity) ? backup.opacity : 1) : backup.opacity; } catch (_) {}
+        // GLB product models should never acquire technical edge emphasis simply
+        // because they were selected. Restore a clean render on deselection too.
+        try { object.edges = isGLBSceneModel ? false : backup.edges; } catch (_) {}
+        // Preserve GLB material colorize across deselection instead of restoring
+        // an obsolete selection-time snapshot. IFC retains its established path.
+        if (!isGLBSceneModel) {
+          try { object.colorize = backup.colorize ?? null; } catch (_) {}
+        }
         try { delete object._hciSelectionVisualBackup; } catch (_) {}
+      } else if (['glb', 'gltf'].includes(String(
+        model?._assetMeta?.assetFormat || model?._assetMeta?.fileType || model?._assetMeta?.file_type || ''
+      ).toLowerCase())) {
+        try { object.edges = false; } catch (_) {}
       }
     });
 
@@ -494,6 +534,23 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const applyFurnitureStateToExistingModel = (model, item) => {
     if (!model || !item) return;
 
+    const isLightFixture = item.isLightFixture === true || item.assetCategory === 'lighting';
+    if (isLightFixture) {
+      model._assetMeta = {
+        ...(model._assetMeta || {}),
+        isLightFixture: true,
+        assetCategory: 'lighting',
+        lightEnabled: item.lightEnabled === true,
+        lightIntensity: item.lightIntensity ?? 0.30,
+        lightTemperature: item.lightTemperature ?? 4000,
+      };
+      lightFixtureControllerRef.current?.setSettings(model, {
+        intensity: item.lightIntensity ?? 0.30,
+        temperature: item.lightTemperature ?? 4000,
+      });
+      lightFixtureControllerRef.current?.setEnabled(model, item.lightEnabled === true);
+    }
+
     const isNativeIsolation = !!item.isNativeIsolation;
     const transformKey = assetTransformSignature(item);
 
@@ -611,6 +668,19 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       });
     }
 
+    // Ceiling visibility is a project-level presentation choice. Reapply it
+    // after native IFC visibility edits so the persisted ceiling state wins.
+    const hiddenCeilingIds = new Set(
+      Array.isArray(state.ceiling_hidden_entity_ids) ? state.ceiling_hidden_entity_ids.map(String) : []
+    );
+    if (hiddenCeilingIds.size) {
+      findCeilingEntities(viewerRef.current, currentModelRef.current).forEach((entity) => {
+        if (hiddenCeilingIds.has(String(entity.id))) {
+          try { entity.visible = false; } catch (_) {}
+        }
+      });
+    }
+
     // Reconcile separately loaded editable assets. Existing SceneModels must be
     // updated in place for undo/redo; they must not simply be skipped because
     // the model already exists. Models that no longer belong to projectState are
@@ -698,6 +768,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             nativeSourceId: item.nativeSourceId || item.id || null,
             isNativeIsolation,
             doorHostWallId: item.doorHostWallId || null,
+            pivotMode: item.pivotMode || null,
+            assetCategory: item.assetCategory || null,
+            isLightFixture: item.isLightFixture === true || item.assetCategory === 'lighting',
+            lightEnabled: item.lightEnabled === true,
             persistedMatrix: (isGLBAsset || hasPersistedNativeIFCMatrix) && hasPersistedMatrix ? item.matrix : null,
             glbNormalization: isGLBAsset ? item.glbNormalization : null,
             onLoaded: (model) => {
@@ -744,25 +818,33 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           throw error;
         });
 
-        restorePromises.push(restorePromise);
+        restorePromises.push({ instanceId: item.instanceId, promise: restorePromise });
       });
     }
 
-    return Promise.all(restorePromises)
-      .then((models) => {
+    return Promise.allSettled(restorePromises.map((entry) => entry.promise))
+      .then((results) => {
+        const models = results.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+        const failures = results
+          .map((result, index) => result.status === 'rejected'
+            ? { instanceId: restorePromises[index]?.instanceId || null, error: result.reason?.message || String(result.reason) }
+            : null)
+          .filter(Boolean);
         restoreEnd({
           restoredModels: models.length,
+          failedModels: failures.length,
+          failures,
           sceneModels: Object.keys(viewerRef.current?.scene?.models || {}).length,
         });
+        if (failures.length) {
+          console.error('[BIM Engine] Some saved furniture could not be restored; saved state was retained for retry:', failures);
+          try {
+            window.dispatchEvent(new CustomEvent('hci:assets-restore-warning', {
+              detail: { jobId, failures },
+            }));
+          } catch (_) {}
+        }
         return models;
-      })
-      .catch((error) => {
-        restoreEnd({
-          failed: true,
-          error: error?.message || String(error),
-          sceneModels: Object.keys(viewerRef.current?.scene?.models || {}).length,
-        });
-        throw error;
       });
   };
 
@@ -770,13 +852,15 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   // This physically prevents race conditions where the state load finishes slightly before the 
   // geometry finishes being instantiated into `viewerRef.current.scene.objects`.
   useEffect(() => {
-    if (isModelLoadedRef.current) {
+    if (isModelLoadedRef.current && (!projectStateHydratedRef || projectStateHydratedRef.current)) {
       perfLog('BIM_ENGINE', 'projectState changed after model load; restoring scene', {
         jobId,
         furniture: Array.isArray(projectState?.furniture) ? projectState.furniture.length : 0,
         materials: Object.keys(projectState?.materials || {}).length,
       });
-      restoreProjectStateToScene(projectState).catch(error => {
+      restoreProjectStateToScene(projectState).then(() => {
+        roomCeilingControllerRef.current?.sync(projectState?.ceilingDesigns || projectState?.ceilings || []);
+      }).catch(error => {
         console.error('[BIM Engine] Failed to restore persisted project state:', error);
       });
     }
@@ -1103,6 +1187,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       transparent: true,
       antialias: true,
     });
+
+    // Enable the same PBR/base-color texture path used by the final GLB render.
+    // The default editor scene had scene-level PBR disabled, so material
+    // overrides could be saved for compilation without previewing consistently.
+    // IFC entities still use their existing Phong/native material path.
+    try {
+      viewer.scene.pbrEnabled = true;
+      viewer.scene.colorTextureEnabled = true;
+    } catch (error) {
+      console.warn('[BIM Engine] Could not enable scene PBR/color textures:', error?.message || error);
+    }
+
+    // Match the studio-style environment used by the admin GLB thumbnail and
+    // final presentation renderer. Metallic/roughness glTF materials need a
+    // reflection environment to avoid appearing nearly black in a BIM viewport.
+    installGLBStudioLighting(viewer);
     
     viewer.cameraControl.navMode = 'orbit';
     viewer.cameraControl.followPointer = true;
@@ -1268,6 +1368,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     };
 
     viewerRef.current = viewer;
+    lightFixtureControllerRef.current = createLightFixtureController(viewer);
+    roomCeilingControllerRef.current = createRoomCeilingController(viewer);
     initializeIFCEngine();
 
     // GLTF/GLB picks are not guaranteed to have the same entity shape: depending
@@ -1276,6 +1378,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     // converting the pick into React selection state.
     const resolvePickedAssetModel = (entity) => {
       if (!entity) return null;
+
+      // Textured GLB previews are legacy Xeokit Meshes paired with a hidden
+      // GLTFLoaderPlugin SceneModel. Route overlay picks back to the original
+      // placed asset so selection, Properties, transforms, and saved identity
+      // continue to use the same instanceId.
+      const materialTargetId = entity?._hciMaterialTargetId
+        || entity?.parent?._hciMaterialTargetId
+        || entity?._hciSourceModel?._assetMeta?.instanceId;
+      if (materialTargetId) {
+        const materialModel = viewer.scene.models?.[materialTargetId]
+          || viewer.scene.objects?.[materialTargetId]?.model
+          || null;
+        if (materialModel?._assetMeta?.instanceId || materialModel?._assetMeta?.assetFormat === 'glb') {
+          return materialModel;
+        }
+      }
 
       if (entity?.model) return entity.model;
 
@@ -1430,13 +1548,33 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           setPlacementMode(null);
           return;
         }
-        onAssetPlaced(placementModeRef.current, pickResult.worldPos || [0, 0, 0]);
+        const activePlacement = placementModeRef.current;
+        let pickedWorldPos = pickResult.worldPos && typeof pickResult.worldPos.length === 'number' && pickResult.worldPos.length >= 3
+          ? Array.from(pickResult.worldPos).slice(0, 3).map(Number)
+          : null;
+        if (activePlacement.placementSurface === 'surface') {
+          // Request an explicit surface pick here instead of relying on the
+          // cameraControl picked event to include a face normal in every build.
+          const surfacePick = viewer.scene.pick({ canvasPos: pickResult.canvasPos, pickSurface: true });
+          const normal = surfacePick?.worldNormal;
+          const worldPos = surfacePick?.worldPos;
+          const hasWorldPos = worldPos && typeof worldPos.length === 'number' && worldPos.length >= 3;
+          const hasNormal = normal && typeof normal.length === 'number' && normal.length >= 3;
+          // Ceiling-mounted fixtures must attach to the underside of a horizontal
+          // ceiling face. Reject floors, vertical walls and empty-space picks.
+          if (!hasWorldPos || !hasNormal || Number(normal[1]) > -0.65) return;
+          pickedWorldPos = Array.from(worldPos).slice(0, 3).map(Number);
+        }
+        onAssetPlaced(activePlacement, pickedWorldPos || [0, 0, 0]);
         setPlacementMode(null);
         return;
       }
       if (!pickResult.entity) return;
 
       const entity = pickResult.entity;
+      // Generated room ceilings remain pickable for surface placement of lights,
+      // but are not selectable as ordinary furniture/IFC objects.
+      if (entity?._hciRoomCeiling) return;
       setIsRightPanelOpen(true);
       setRightTab('properties');
       const isPlacedAsset = isPlacedAssetEntity(entity);
@@ -2265,6 +2403,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       ifcAPIRef.current = null;
       loadersRef.current = {};
       cameraManagerRef.current = null;
+      try { lightFixtureControllerRef.current?.destroy(); } catch (_) {}
+      lightFixtureControllerRef.current = null;
+      try { roomCeilingControllerRef.current?.destroy(); } catch (_) {}
+      roomCeilingControllerRef.current = null;
       viewerRef.current = null;
       try { viewer.destroy(); } catch (e) {}
     };
@@ -2434,7 +2576,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         currentModelRef.current = loadersRef.current.gltf.load({
           id: 'main_structure',
           src: objectUrl,
-          edges: true,
+          // GLB furniture/visual models should retain their designed silhouette;
+          // wire/edge emphasis remains available for IFC technical models.
+          edges: false,
+          // Follow glTF's doubleSided flag instead of showing every backface.
+          backfaces: false,
           pbrEnabled: true,
           colorTextureEnabled: true,
         });
@@ -2463,17 +2609,29 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           return;
         }
 
-        viewerRef.current.cameraFlight.flyTo(currentModelRef.current);
-        
-        setIsLoading(false);
-        
-        // IMPORTANT: Unlocking the hard rendering boundary.
-        // We know for a fact that the viewer scene has all initial native elements now.
-        isModelLoadedRef.current = true;
-        
-        // Only safely trigger state logic exactly when model becomes ready
+        // Do not reconcile the scene until the server/local project state has
+        // finished hydrating. Earlier versions could restore the initial empty state
+        // first, then race a second restore against GLB loads when saved furniture
+        // arrived a moment later. This is the core "Continue project lost assets"
+        // regression.
         try {
+          if (projectStateHydratedRef) {
+            let attempts = 0;
+            while (!projectStateHydratedRef.current && attempts < 300 && isCurrentLoad()) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+              attempts += 1;
+            }
+            if (!projectStateHydratedRef.current) {
+              throw new Error('Timed out waiting for saved project state hydration. The scene was not restored from an empty snapshot.');
+            }
+          }
+
+          if (!isCurrentLoad()) return;
+          isModelLoadedRef.current = true;
           await restoreProjectStateToScene(projectStateRef.current);
+          roomCeilingControllerRef.current?.sync(projectStateRef.current?.ceilingDesigns || projectStateRef.current?.ceilings || []);
+          if (!isCurrentLoad()) return;
+
           mainLoadEnd({
             completed: true,
             finalModelId: currentModelRef.current?.id || null,
@@ -2487,8 +2645,17 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             sceneObjects: Object.keys(loadViewer.scene.objects || {}).length,
           });
         } catch (error) {
+          if (!isCurrentLoad()) return;
           mainLoadEnd({ completed: false, error: error?.message || String(error) });
           console.error('[BIM Engine] Failed while restoring layout state:', error);
+        } finally {
+          if (isCurrentLoad()) {
+            // Frame native structure and restored catalogue furniture together.
+            // Use a three-quarter overview rather than the default front elevation.
+            const framed = cameraManagerRef.current?.overview(0.9);
+            if (!framed) cameraManagerRef.current?.fitScene(0.9);
+            setIsLoading(false);
+          }
         }
       });
     };
@@ -2628,6 +2795,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       setPlacementMode,
       camera: {
         fitScene: () => cameraManagerRef.current?.fitScene(),
+        overview: (duration) => cameraManagerRef.current?.overview(duration),
         focusSelected: () => {
           const selectedAsset = selectedAssetIdRef.current;
           if (selectedAsset) return cameraManagerRef.current?.focus(selectedAsset, true);
@@ -2661,6 +2829,30 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       ),
       getDropPosition: (c, a) => getDropPosition(viewerRef, projectStateRef, c, a),
       getWallSnapData: (c) => getWallSnapData(viewerRef, c),
+      setLightFixtureEnabled: (instanceId, enabled) => {
+        const model = viewerRef.current?.scene?.models?.[instanceId];
+        if (!model?._assetMeta?.isLightFixture) return false;
+        model._assetMeta.lightEnabled = !!enabled;
+        return lightFixtureControllerRef.current?.setEnabled(model, !!enabled) ?? false;
+      },
+      setLightFixtureSettings: (instanceId, settings) => {
+        const model = viewerRef.current?.scene?.models?.[instanceId];
+        if (!model?._assetMeta?.isLightFixture) return false;
+        return lightFixtureControllerRef.current?.setSettings(model, settings) ?? false;
+      },
+      previewRoomCeiling: (design) => roomCeilingControllerRef.current?.preview(design) ?? false,
+      clearRoomCeilingPreview: () => roomCeilingControllerRef.current?.clearPreview(),
+      getCeilingEntityIds: () => findCeilingEntities(viewerRef.current, currentModelRef.current).map((entity) => entity.id),
+      setCeilingEntityVisibility: (entityIds, visible) => {
+        const ids = new Set((Array.isArray(entityIds) ? entityIds : []).map(String));
+        const entities = findCeilingEntities(viewerRef.current, currentModelRef.current)
+          .filter((entity) => ids.has(String(entity.id)));
+        entities.forEach((entity) => {
+          const structurallyHidden = projectStateRef.current?.structural_edits?.[entity.id]?.visible === false;
+          try { entity.visible = !!visible && !structurallyHidden; } catch (_) {}
+        });
+        return entities.length;
+      },
       toggleMeasurementMode: () => toggleMeasurementMode(isMeasuring, setIsMeasuring, setPlacementMode, setSelectedObject, setSelectedAssetId, viewerRef),
       setMeasurementMode: setMeasurementInteractionMode,
       orthogonalConstraint,

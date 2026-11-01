@@ -31,11 +31,67 @@ const upload = multer({
   storage,
   limits: { fileSize: 400 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['.ifc', '.glb', '.jpg', '.jpeg', '.png', '.webp'];
-    const ext = path.extname(file.originalname).toLowerCase();
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    // Model and thumbnail fields have different file types. Previously, image
+    // files were also accepted as `model` and then misclassified as IFC.
+    const allowed = file.fieldname === 'model'
+      ? ['.ifc', '.glb']
+      : file.fieldname === 'thumbnail'
+        ? ['.jpg', '.jpeg', '.png', '.webp']
+        : [];
     cb(null, allowed.includes(ext));
   },
 });
+
+function catalogueColorRgbJson(value, fallback = [0.8, 0.8, 0.8]) {
+  if (value === undefined || value === null || value === '') return JSON.stringify(fallback);
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch (_) {
+    throw new Error('Display color must be a JSON RGB array.');
+  }
+  if (!Array.isArray(parsed) || parsed.length !== 3 || !parsed.every((channel) => (
+    Number.isFinite(Number(channel)) && Number(channel) >= 0 && Number(channel) <= 1
+  ))) {
+    throw new Error('Display color must contain three RGB values between 0 and 1.');
+  }
+  return JSON.stringify(parsed.map(Number));
+}
+
+async function validateCatalogueModelFile(file) {
+  if (!file?.path) throw new Error('Model file (.ifc or .glb) is required.');
+  const ext = path.extname(file.originalname || file.filename || '').toLowerCase();
+  if (ext !== '.glb' && ext !== '.ifc') {
+    throw new Error('Model file must be a valid .glb or .ifc file.');
+  }
+
+  if (ext === '.glb') {
+    const handle = await fs.promises.open(file.path, 'r');
+    try {
+      const header = Buffer.alloc(12);
+      const { bytesRead } = await handle.read(header, 0, header.length, 0);
+      const stat = await fs.promises.stat(file.path);
+      const magic = header.subarray(0, 4).toString('ascii');
+      const version = header.readUInt32LE(4);
+      const declaredLength = header.readUInt32LE(8);
+      if (bytesRead < 12 || magic !== 'glTF' || version !== 2 || declaredLength < 12 || declaredLength > stat.size) {
+        throw new Error('The selected .glb is not a valid, complete binary glTF 2.0 file. Re-export the model as GLB and try again.');
+      }
+    } finally {
+      await handle.close();
+    }
+  }
+
+  return ext.slice(1);
+}
+
+async function removeUploadedFiles(files) {
+  const allFiles = Object.values(files || {}).flat();
+  await Promise.all(allFiles.map((file) => (
+    file?.path ? fs.promises.unlink(file.path).catch(() => {}) : Promise.resolve()
+  )));
+}
 
 // ── CATEGORY ROUTES ──────────────────────────────────────────
 
@@ -126,12 +182,18 @@ router.post('/items', upload.fields([
     const { category_id, name, slug, description, color_rgb, attributes, sort_order, is_active } = req.body;
 
     if (!req.files?.model?.[0]) {
-      return res.status(400).json({ error: 'model file (.ifc or .glb) is required' });
+      await removeUploadedFiles(req.files);
+      return res.status(400).json({ error: 'A model file (.ifc or .glb) is required. Images belong in the thumbnail field.' });
     }
 
     const modelFile = req.files.model[0];
-    const ext = path.extname(modelFile.originalname).toLowerCase().replace('.', '');
-    const file_type = ext === 'glb' ? 'glb' : 'ifc';
+    let file_type;
+    try {
+      file_type = await validateCatalogueModelFile(modelFile);
+    } catch (validationError) {
+      await removeUploadedFiles(req.files);
+      return res.status(400).json({ error: validationError.message });
+    }
     const model_url = `/uploads/catalog/models/${modelFile.filename}`;
     const thumbnail_url = req.files?.thumbnail?.[0]
       ? `/uploads/catalog/thumbnails/${req.files.thumbnail[0].filename}`
@@ -144,7 +206,10 @@ router.post('/items', upload.fields([
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [
         category_id, name, slug, description || null,
-        color_rgb ? JSON.stringify(JSON.parse(color_rgb)) : JSON.stringify([0.8, 0.8, 0.8]),
+        // Keep the legacy column populated for schema compatibility, but never
+        // accept a display-color override for GLBs. The model's authored glTF
+        // material/texture data remains authoritative.
+        file_type === 'glb' ? JSON.stringify([1, 1, 1]) : catalogueColorRgbJson(color_rgb),
         thumbnail_url, model_url, file_type,
         attributes ? JSON.stringify(JSON.parse(attributes)) : JSON.stringify({}),
         sort_order || 0, active,
@@ -164,19 +229,38 @@ router.put('/items/:id', upload.fields([
 ]), async (req, res) => {
   try {
     const { name, slug, description, color_rgb, attributes, sort_order, category_id, is_active } = req.body;
+    const existingResult = await db.query('SELECT file_type FROM catalog_items WHERE id = $1', [req.params.id]);
+    if (!existingResult.rows.length) {
+      await removeUploadedFiles(req.files);
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
     const updates = { name, slug, description, sort_order, category_id };
     if (is_active !== undefined) updates.is_active = is_active === 'true' || is_active === true;
-
-    if (color_rgb) updates.color_rgb = JSON.stringify(JSON.parse(color_rgb));
     if (attributes) updates.attributes = JSON.stringify(JSON.parse(attributes));
     if (req.files?.thumbnail?.[0]) {
       updates.thumbnail_url = `/uploads/catalog/thumbnails/${req.files.thumbnail[0].filename}`;
     }
+
+    let nextFileType = String(existingResult.rows[0].file_type || '').toLowerCase();
     if (req.files?.model?.[0]) {
       const modelFile = req.files.model[0];
-      const ext = path.extname(modelFile.originalname).toLowerCase().replace('.', '');
-      updates.file_type = ext === 'glb' ? 'glb' : 'ifc';
+      try {
+        nextFileType = await validateCatalogueModelFile(modelFile);
+      } catch (validationError) {
+        await removeUploadedFiles(req.files);
+        return res.status(400).json({ error: validationError.message });
+      }
+      updates.file_type = nextFileType;
       updates.model_url = `/uploads/catalog/models/${modelFile.filename}`;
+    }
+
+    // GLB material appearance comes from the GLB itself. Older UI clients may
+    // still submit color_rgb, so the server explicitly ignores it for GLBs.
+    if (nextFileType === 'glb' || nextFileType === 'gltf') {
+      updates.color_rgb = JSON.stringify([1, 1, 1]);
+    } else if (color_rgb) {
+      updates.color_rgb = catalogueColorRgbJson(color_rgb);
     }
 
     const fields = Object.keys(updates).filter(k => updates[k] !== undefined);
