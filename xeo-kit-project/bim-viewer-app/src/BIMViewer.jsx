@@ -1,18 +1,19 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { useBIMEngine } from './engine/useBIMEngine';
 import { useProjectSync } from './hooks/useProjectSync';
 import { useCloudRender } from './hooks/useCloudRender';
 import { LeftPanel } from './components/LeftPanel';
 import { RightPanel } from './components/RightPanel';
+import { CeilingDesignerModal } from './components/CeilingDesignerModal';
 import { BottomDock } from './components/BottomDock';
 import { RenderStudioModal } from './components/RenderStudioModal';
+import { ReplaceAssetModal } from './components/ReplaceAssetModal';
 import { MeasurementPanel } from './components/MeasurementPanel';
 import { StretchTooltipOverlay } from './components/StretchTooltipOverlay';
 import { TransformModeTooltip } from './components/TransformModeTooltip';
-import { MousePointerClick, X, Ruler, Hexagon, Loader2, RotateCcw, PanelLeftOpen, PanelRightOpen } from 'lucide-react';
+import { MousePointerClick, X, Ruler, Hexagon, Loader2, RotateCcw, PanelLeftOpen, PanelRightOpen, Lightbulb } from 'lucide-react';
 import { ViewportToolbar } from './components/ViewportToolbar';
 import { TransformModesHelp } from './components/TransformModesHelp';
-import { AssetContextMenu } from './components/AssetContextMenu';
 import { useMaterialLibrary } from './hooks/useMaterialLibrary';
 import { clearNativeIFCMaterialOverride } from './utils/materialScene';
 import { useCatalog } from './hooks/useCatalog';
@@ -131,9 +132,19 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const [rightTab, setRightTab] = useState('properties');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showRenderStudio, setShowRenderStudio] = useState(false);
+  const [showReplaceAssetModal, setShowReplaceAssetModal] = useState(false);
+  const [showCeilingDesigner, setShowCeilingDesigner] = useState(false);
+  const [replaceTargetId, setReplaceTargetId] = useState(null);
+  const [replaceTargetItem, setReplaceTargetItem] = useState(null);
   const [isLayoutSaving, setIsLayoutSaving] = useState(false);
   const [lastClickPos, setLastClickPos] = useState({ x: 0, y: 0 });
   const [cameraProjection, setCameraProjection] = useState('perspective');
+
+  // A new project always opens in the architectural perspective overview. Keep
+  // the toolbar indicator in sync if the previous project ended in flat view.
+  useEffect(() => {
+    setCameraProjection('perspective');
+  }, [file, jobId]);
   const [savedCameraViews, setSavedCameraViews] = useState([]);
   const [wallSurfaceScope, setWallSurfaceScope] = useState('both');
 
@@ -153,12 +164,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   };
 
   const {
-    projectState, projectStateRef, saveStatus, lastSavedTime,
+    projectState, projectStateRef, projectStateHydratedRef, saveStatus, lastSavedTime,
     availableAssets, availableLayouts, layoutsLoading, layoutsError, homeTemplates,
     savedLayouts, savedLayoutsLoading, savedLayoutsError, saveRenderedLayout, updateSavedLayout, updateSavedLayoutSnapshot, deleteSavedLayout,
     toastMessage, customColor, applyMaterial, applyMaterialToAllWalls, applyMaterialDefinition, applyMaterialDefinitionToAllWalls, updateAsset,
-    deleteAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
-    updateStructuralEdit, transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage,
+    deleteAsset, replaceAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
+    updateStructuralEdit, setAssetLightEnabled, setAssetLightIntensity, setRoomCeilingDesigns, setCeilingHiddenEntityIds,
+    transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage,
     undo, redo, canUndo, canRedo, beginHistoryTransaction, endHistoryTransaction, cancelHistoryTransaction
   } = useProjectSync(activeProject);
 
@@ -298,8 +310,23 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     setRightTab,
     transformFurnitureForCalibration,
     repairLegacyCalibrationState,
-    isDarkMode
+    isDarkMode,
+    projectStateHydratedRef
   );
+
+  useEffect(() => {
+    const handleAssetRestoreWarning = (event) => {
+      const failures = Array.isArray(event?.detail?.failures) ? event.detail.failures : [];
+      if (!failures.length) return;
+      const names = failures.map((item) => item.instanceId).filter(Boolean).slice(0, 3);
+      const suffix = failures.length > names.length ? ` and ${failures.length - names.length} more` : '';
+      setToastMessage(
+        `${failures.length} saved asset${failures.length === 1 ? '' : 's'} could not be loaded. Your saved placements were kept; check the console/network errors${names.length ? ` (${names.join(', ')}${suffix})` : ''}.`
+      );
+    };
+    window.addEventListener('hci:assets-restore-warning', handleAssetRestoreWarning);
+    return () => window.removeEventListener('hci:assets-restore-warning', handleAssetRestoreWarning);
+  }, [setToastMessage]);
 
   useEffect(() => {
     const handleHistoryShortcut = (event) => {
@@ -554,6 +581,145 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     ? refs.viewerRef.current?.scene?.models?.[engineState.selectedAssetId] || null
     : null;
 
+  const selectedFurnitureItem = engineState.selectedAssetId
+    ? (projectState.furniture || []).find((item) => item?.instanceId === engineState.selectedAssetId) || null
+    : null;
+  const selectedIsLightFixture = selectedFurnitureItem?.isLightFixture === true || selectedFurnitureItem?.assetCategory === 'lighting';
+  const designedCeilings = projectState.ceilingDesigns || projectState.ceilings || [];
+
+  const handleToggleSelectedLight = () => {
+    if (!selectedIsLightFixture || !engineState.selectedAssetId) return;
+    const nextEnabled = selectedFurnitureItem.lightEnabled !== true;
+    const applied = engineActions.setLightFixtureEnabled(engineState.selectedAssetId, nextEnabled);
+    if (!applied && nextEnabled) {
+      setToastMessage('Could not create the light in the current scene. Check the fixture model and WebGL console.');
+      return;
+    }
+    setAssetLightEnabled(engineState.selectedAssetId, nextEnabled);
+    setToastMessage(nextEnabled ? 'Light turned on.' : 'Light turned off.');
+    setTimeout(() => setToastMessage(null), 1800);
+  };
+
+  const handleSetSelectedLightIntensity = (intensity, temperature = 4000) => {
+    if (!selectedIsLightFixture || !engineState.selectedAssetId) return;
+    engineActions.setLightFixtureSettings(engineState.selectedAssetId, { intensity, temperature });
+    setAssetLightIntensity(engineState.selectedAssetId, intensity, temperature);
+  };
+
+  const handleApplyRoomCeilings = (ceilings) => {
+    setRoomCeilingDesigns(ceilings);
+    engineActions.clearRoomCeilingPreview?.();
+    setToastMessage(`Created ${ceilings.length} room ceiling${ceilings.length === 1 ? '' : 's'}.`);
+    setTimeout(() => setToastMessage(null), 2200);
+  };
+
+  const handlePreviewRoomCeiling = useCallback((design) => {
+    if (!design) {
+      engineActions.clearRoomCeilingPreview?.();
+      return;
+    }
+    return engineActions.previewRoomCeiling?.(design) ?? false;
+  }, [engineActions]);
+
+  const handleToggleDesignedCeilings = () => {
+    if (!designedCeilings.length) return;
+    const show = designedCeilings.every((ceiling) => ceiling.visible === false);
+    setRoomCeilingDesigns(designedCeilings.map((ceiling) => ({ ...ceiling, visible: show })));
+  };
+
+  const handleToggleCeiling = () => {
+    const ids = engineActions.getCeilingEntityIds();
+    if (!ids.length) {
+      setToastMessage('No IFC ceiling or roof elements were detected in this model.');
+      setTimeout(() => setToastMessage(null), 2600);
+      return;
+    }
+    const currentHidden = new Set((projectState.ceiling_hidden_entity_ids || []).map(String));
+    const showCeiling = ids.every((id) => currentHidden.has(String(id)));
+    const nextHiddenIds = showCeiling ? [] : ids;
+    engineActions.setCeilingEntityVisibility(ids, showCeiling);
+    setCeilingHiddenEntityIds(nextHiddenIds);
+    setToastMessage(showCeiling ? 'Ceiling shown.' : `Hid ${ids.length} ceiling/roof elements.`);
+    setTimeout(() => setToastMessage(null), 2200);
+  };
+
+  const nativeReplaceDescriptor = (() => {
+    const object = engineState.selectedObject;
+    if (!object?.id || activeAsset || (engineState.selectedElements?.length || 0) > 1) return null;
+    const name = String(object.name || '').toLowerCase();
+    const type = String(object.type || object.ifcType || object.ifcClass || '').toLowerCase();
+    // Only furniture-like IFC entities are eligible. Structural and hosted
+    // elements must never be replaced through this catalogue workflow.
+    const excluded = /door|window|wall|slab|beam|column|stair|railing|roof|opening|curtainwall|distribution|pipe|duct|space|site|building|storey/;
+    const furnitureType = /furniture|furnishingelement|systemfurniture|chair|sofa|table|bed|cabinet|desk|wardrobe|shelf/;
+    const furnitureName = /sofa|couch|chair|armchair|table|bed|cabinet|desk|wardrobe|shelf|stool|dresser|nightstand|ottoman/;
+    if (excluded.test(type) || excluded.test(name)) return null;
+    if (!furnitureType.test(type) && !furnitureName.test(name)) return null;
+    return { ...object, isNativeIfcElement: true, nativeEntityId: object.id };
+  })();
+  const canReplaceSelectedAsset = Boolean(
+    (activeAsset && selectedFurnitureItem &&
+      !selectedFurnitureItem.doorHostWallId &&
+      !selectedFurnitureItem.isNativeIsolation && !selectedFurnitureItem.nativeSourceId &&
+      !activeAsset?._assetMeta?.isNativeIsolation) || nativeReplaceDescriptor
+  ) && (engineState.selectedElements?.length || 0) <= 1;
+
+  const openReplaceAssetModal = () => {
+    if (!canReplaceSelectedAsset) return;
+    if (activeAsset && engineState.selectedAssetId && selectedFurnitureItem) {
+      setReplaceTargetId(engineState.selectedAssetId);
+      setReplaceTargetItem({ ...selectedFurnitureItem });
+    } else if (nativeReplaceDescriptor) {
+      setReplaceTargetId(null);
+      setReplaceTargetItem({ ...nativeReplaceDescriptor, name: nativeReplaceDescriptor.name || 'IFC furniture' });
+    } else {
+      return;
+    }
+    setShowReplaceAssetModal(true);
+  };
+
+  const closeReplaceAssetModal = () => {
+    setShowReplaceAssetModal(false);
+    setReplaceTargetId(null);
+    setReplaceTargetItem(null);
+  };
+
+  const handleReplaceAsset = async (catalogItem, preserveFinish) => {
+    let targetId = replaceTargetId;
+    const replacingNative = Boolean(replaceTargetItem?.isNativeIfcElement);
+    if (replacingNative) {
+      const entityId = replaceTargetItem.nativeEntityId || replaceTargetItem.id;
+      if (!entityId) throw new Error('The selected IFC furniture element could not be identified.');
+      beginHistoryTransaction(`Replace IFC furniture: ${replaceTargetItem.name || 'Furniture'}`);
+      try {
+        // Isolate the exact IFC entity first. This preserves the original IFC
+        // source and records its visibility override, then the isolated copy can
+        // be replaced as a normal editable catalogue asset.
+        targetId = await engineActions.isolateAndMakeMoveable(
+          entityId,
+          adoptIsolatedAsset,
+          updateStructuralEdit
+        );
+        if (!targetId) throw new Error('Could not isolate this IFC element safely.');
+        const replacement = replaceAsset(targetId, catalogItem, preserveFinish, true);
+        endHistoryTransaction();
+        engineActions.clearSelection();
+        setToastMessage(`IFC furniture replaced with ${replacement.name}. The original IFC remains intact; use Undo to restore it.`);
+        setTimeout(() => setToastMessage(null), 3600);
+        return replacement;
+      } catch (error) {
+        cancelHistoryTransaction();
+        throw error;
+      }
+    }
+    if (!targetId) throw new Error('The selected item is no longer available. Close this panel and select it again.');
+    const replacement = replaceAsset(targetId, catalogItem, preserveFinish);
+    engineActions.clearSelection();
+    setToastMessage(`Replaced with ${replacement.name}. Position, rotation and scale were kept; use Undo to restore the previous item.`);
+    setTimeout(() => setToastMessage(null), 3200);
+    return replacement;
+  };
+
   const activeSavedLayout = activeProject?.savedLayoutId
     ? savedLayouts.find((layout) => layout.id === activeProject.savedLayoutId || layout.renderJobId === activeProject.savedLayoutId) || {
         id: activeProject.savedLayoutId,
@@ -699,7 +865,14 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         }
         await insertDoor(asset, dropData);
       } else {
-        const worldPos = engineActions.getDropPosition(canvasPos);
+        const placementSurface = asset.placementSurface === 'surface' ? 'surface' : null;
+        const worldPos = engineActions.getDropPosition(canvasPos, placementSurface);
+        if (!Array.isArray(worldPos) || worldPos.length !== 3) {
+          setToastMessage(placementSurface === 'surface'
+            ? 'Drop this light onto a visible horizontal ceiling surface.'
+            : 'Could not determine a valid placement point.');
+          return;
+        }
         await spawnAsset(asset, worldPos, engineActions.loadIFCAssetIntoScene);
       }
       setIsRightPanelOpen(true);
@@ -804,9 +977,23 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   }, [engineActions, updateAsset]);
 
 
-  const handleOpenSaveLayout = () => {
+  const handleOpen360Walkthrough = () => {
+    // This action opens the dedicated 360° render studio, not a live viewport preview.
     setRenderConfig((previous) => ({ ...previous, type: '360' }));
     setShowRenderStudio(true);
+  };
+
+  const openSelectionAppearance = () => {
+    setIsRightPanelOpen(true);
+    setIsMaxView(false);
+    setRightTab('properties');
+    // Wait for the panel to be visible before scrolling to the finish controls.
+    window.setTimeout(() => {
+      const section = document.getElementById('hci-surface-finish-section');
+      section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      const collapsedPicker = section?.querySelector('button[aria-expanded="false"]');
+      collapsedPicker?.click();
+    }, 140);
   };
 
   return (
@@ -826,6 +1013,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
               onOpenModel={() => openLeftPanelTab('explorer')}
               onOpenItems={() => openLeftPanelTab('assets')}
               onOpenDesigns={() => openLeftPanelTab('templates')}
+              onShowOverview={() => { engineActions.camera.overview?.(0.85); setCameraProjection('perspective'); }}
+              onOpenRender={handleOpen360Walkthrough}
+              hasSelection={!!(engineState.selectedAssetId || engineState.selectedObject)}
+              selectedName={activeAsset?.name || (projectState?.furniture || []).find((item) => item.instanceId === engineState.selectedAssetId)?.name || engineState.selectedObject?.name || 'Selected element'}
+              onShowAppearance={openSelectionAppearance}
+              onFocusSelection={() => engineActions.camera.focusSelected()}
             />
           </div>
 
@@ -862,12 +1055,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           onSaveView={saveCameraView}
           onRestoreView={restoreCameraView}
           onDeleteView={deleteCameraView}
-          onResetCamera={() => engineActions.camera.reset()}
+          onResetCamera={() => { engineActions.camera.reset(); setCameraProjection('perspective'); }}
           canUndo={canUndo}
           canRedo={canRedo}
           onUndo={undo}
           onRedo={redo}
-          onSaveLayout={handleOpenSaveLayout}
           isDarkMode={isDarkMode}
           />
         </>
@@ -929,6 +1121,11 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           isMultiSelection={(engineState.selectedElements?.length || 0) > 1}
           multiSelectMode={engineState.multiSelectMode}
           onToggleMultiSelect={engineActions.toggleMultiSelectMode}
+          onOpenAppearance={openSelectionAppearance}
+          canReplaceAsset={canReplaceSelectedAsset}
+          onReplaceAsset={openReplaceAssetModal}
+          onFocusSelection={() => engineActions.camera.focusSelected()}
+          onOpen360Walkthrough={handleOpen360Walkthrough}
           isDarkMode={isDarkMode}
           onIsolate={async () => {
             if (!engineState.selectedObject || activeAsset) return;
@@ -1007,10 +1204,25 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         <div className="absolute top-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 px-5 py-2.5 bg-[#ff914d] text-white rounded-full shadow-lg animate-in slide-in-from-top-2 fade-in duration-200">
           <MousePointerClick className="w-4 h-4 animate-pulse" />
           <span className="font-semibold text-sm">
-            Click canvas to place {engineState.placementMode.name}
+            {engineState.placementMode.placementSurface === 'surface'
+              ? `Click a ceiling surface to place ${engineState.placementMode.name}`
+              : `Click canvas to place ${engineState.placementMode.name}`}
           </span>
           <button onClick={() => engineActions.setPlacementMode(null)} className="ml-1 hover:bg-[#ff7a28] p-1 rounded-full cursor-pointer">
             <X className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
+      {selectedIsLightFixture && (
+        <div className={`absolute top-[82px] z-40 ${isRightPanelOpen ? 'right-[360px]' : 'right-5'}`}>
+          <button
+            type="button"
+            onClick={handleToggleSelectedLight}
+            className={`inline-flex items-center gap-2 rounded-full border px-4 py-2.5 text-xs font-bold shadow-xl backdrop-blur-md transition ${selectedFurnitureItem.lightEnabled ? 'border-amber-400/70 bg-amber-300 text-amber-950 hover:bg-amber-200' : 'border-slate-300 bg-white/95 text-slate-700 hover:border-amber-300 hover:text-amber-700 dark:border-slate-600 dark:bg-slate-900/95 dark:text-slate-100 dark:hover:border-amber-400'}`}
+          >
+            <Lightbulb className="h-4 w-4" />
+            {selectedFurnitureItem.lightEnabled ? 'Turn light off' : 'Turn light on'}
           </button>
         </div>
       )}
@@ -1084,7 +1296,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
               engineActions.clearSelection();
             }}
             fileName={fileName}
-            projectState={projectState} 
+            projectState={projectState}
+            isCeilingHidden={(projectState.ceiling_hidden_entity_ids || []).length > 0}
+            onToggleCeiling={handleToggleCeiling}
+            onOpenCeilingDesigner={() => setShowCeilingDesigner(true)}
+            hasDesignedCeilings={designedCeilings.length > 0}
+            areDesignedCeilingsHidden={designedCeilings.length > 0 && designedCeilings.every((ceiling) => ceiling.visible === false)}
+            onToggleDesignedCeilings={handleToggleDesignedCeilings}
           />
         </div>
       )}
@@ -1123,9 +1341,16 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   engineActions.clearSelection();
 }}
             onDeleteSelected={handleDeleteSelection}
+            onBrowseItems={() => openLeftPanelTab('assets')}
             projectState={projectState}
             engineState={engineState}
             engineActions={engineActions}
+            isSelectedLightFixture={selectedIsLightFixture}
+            selectedLightEnabled={selectedFurnitureItem?.lightEnabled === true}
+            selectedLightIntensity={selectedFurnitureItem?.lightIntensity ?? 0.30}
+            selectedLightTemperature={selectedFurnitureItem?.lightTemperature ?? 4000}
+            onToggleSelectedLight={handleToggleSelectedLight}
+            onSetSelectedLightIntensity={handleSetSelectedLightIntensity}
             adoptIsolatedAsset={adoptIsolatedAsset}
             updateStructuralEdit={updateStructuralEdit}
             onDeleteProject={onDelete}
@@ -1164,6 +1389,23 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           {toastMessage}
         </div>
       )}
+
+      <CeilingDesignerModal
+        open={showCeilingDesigner}
+        jobId={jobId}
+        existingCeilings={designedCeilings}
+        onClose={() => { engineActions.clearRoomCeilingPreview?.(); setShowCeilingDesigner(false); }}
+        onApply={handleApplyRoomCeilings}
+        onPreview={handlePreviewRoomCeiling}
+      />
+
+      <ReplaceAssetModal
+        open={showReplaceAssetModal}
+        currentItem={replaceTargetItem}
+        catalogTree={catalogTree}
+        onClose={closeReplaceAssetModal}
+        onReplace={handleReplaceAsset}
+      />
 
       <RenderStudioModal
         show={showRenderStudio}

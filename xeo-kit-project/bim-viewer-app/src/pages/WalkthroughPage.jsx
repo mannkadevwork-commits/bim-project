@@ -201,12 +201,16 @@ export default function WalkthroughPage() {
   const statusText = useMemo(() => {
     if (walkthrough.status === 'loading') return 'Loading walkthrough…';
     if (walkthrough.status === 'error') return walkthrough.message || 'Walkthrough unavailable';
+    // When recovery fails, show its actionable error instead of masking it with
+    // the generic stuck-state label. Successful recovery replaces it with the
+    // runtime's "Recovered walk position." message.
+    if (walkthrough.stuck && walkthrough.message) return walkthrough.message;
     if (walkthrough.stuck) return 'Navigation paused · choose a nearby floor marker or reposition safely';
     if (walkthrough.message) return walkthrough.message;
     if (viewMode === 'overview') return 'Preview · orbit and zoom · click Start Walkthrough';
     if (walkthrough.immersive360Active) {
       if (walkthrough.smart720Active) return `Smart 720 · ${walkthrough.smart720CurrentLabel || 'room presentation'} · full-room presentation`;
-      return `${walkthrough.immersivePresentationLabel || '360° presentation'} · drag horizontally to look around${walkthrough.immersive360AutoRotate ? ' · auto-rotate on' : ' · auto-rotate off'}`;
+      return `${walkthrough.immersivePresentationLabel || '360° presentation'} · drag to look around · click orange markers to move${walkthrough.immersive360AutoRotate ? ' · auto-rotate on' : ' · auto-rotate off'}`;
     }
     if (effectiveWalkMode === 'guided') {
       if (walkthrough.smart720Active) return `Smart 720 · ${walkthrough.smart720CurrentLabel || 'next room'}`;
@@ -395,7 +399,7 @@ export default function WalkthroughPage() {
               </div>
               <div>
                 <div className="text-[13px] font-semibold tracking-tight text-white">Floor map</div>
-                <div className="mt-0.5 text-[10px] text-slate-300">{navigationHotspots.length} curated destinations</div>
+                <div className="mt-0.5 text-[10px] text-slate-300">{navigationHotspots.length} walkable destinations</div>
               </div>
             </div>
             {railOpen ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
@@ -467,8 +471,8 @@ export default function WalkthroughPage() {
       {viewMode === 'walk' && walkthrough.stuck && walkthrough.recoveryAvailable && (
         <div className="absolute bottom-24 left-5 z-40 w-[290px] rounded-2xl border border-[#ff914d]/25 bg-slate-950/88 p-3 shadow-2xl backdrop-blur-xl">
           <div className="text-xs font-semibold text-white">Need a safe position?</div>
-          <div className="mt-1 text-[11px] leading-4 text-slate-400">The current location has limited navigation clearance. Reposition to the nearest safe floor marker.</div>
-          <button type="button" onClick={() => walkthrough.recoverToSafeSpot()} className="mt-3 w-full rounded-xl bg-[#ff914d] px-3 py-2 text-xs font-bold text-slate-950 transition hover:bg-[#ff7a28]">Move to safe position</button>
+          <div className="mt-1 text-[11px] leading-4 text-slate-400">The current location has limited navigation clearance. We’ll try a continuous walkable route first, then return you to a previously validated safe floor marker if needed.</div>
+          <button type="button" aria-label="Move to a validated safe position" onClick={() => walkthrough.recoverToSafeSpot()} className="mt-3 w-full rounded-xl bg-[#ff914d] px-3 py-2 text-xs font-bold text-slate-950 transition hover:bg-[#ff7a28] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ffb27f]">Move to safe position</button>
         </div>
       )}
 
@@ -621,11 +625,11 @@ export default function WalkthroughPage() {
           <div className="mb-3 flex items-center justify-between"><span className="font-semibold text-white">Walkthrough help</span><IconButton title="Close help" onClick={() => setHelpOpen(false)}><X className="h-4 w-4" /></IconButton></div>
           <div className="space-y-2 text-xs leading-5 text-slate-400">
             <div><b className="text-slate-200">Guided:</b> click a circular floor destination to travel with a slow cinematic camera pan.</div>
-            <div><b className="text-slate-200">360°:</b> appears as a contextual presentation action after a Guided destination settles. Explore the full room; slow auto-rotation pauses while you interact and resumes after idle.</div>
+            <div><b className="text-slate-200">360°:</b> drag horizontally or vertically to look around. Click an orange floor marker or choose a point from Rooms to move to another viewpoint; auto-rotation pauses while you interact.</div>
             <div><b className="text-slate-200">Smart 720:</b> presents the curated customer-facing rooms one by one, using real NavMesh travel between them and a full 360° presentation at each stop.</div>
             <div><b className="text-slate-200">Explore:</b> W/A/S/D moves · mouse looks freely · Shift runs. Mouse movement is smoothed.</div>
             <div><b className="text-slate-200">Overview:</b> W/A/S/D pan · Q/E zoom · mouse orbit · wheel zoom · +/- keys zoom.</div>
-            <div><b className="text-slate-200">Floor map:</b> glass map shows every validated navigation destination; click a point to travel there.</div>
+            <div><b className="text-slate-200">Floor map:</b> glass map shows validated, reachable navigation destinations. Select a point to travel there, including while 360° mode is active.</div>
             <div><b className="text-slate-200">Views:</b> Top/Front/Side/Perspective/Isometric presets + Fit model.</div>
             <div><b className="text-slate-200">View lock:</b> available in Explore mode via double-click. Guided mode uses a slow cinematic pan and fixed presentation pitch by design.</div>
           </div>
@@ -750,7 +754,7 @@ export default function WalkthroughPage() {
             <div className="min-w-0">
               <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-orange-200/80">{walkthrough.smart720Active ? 'Smart 720 Tour' : '360° Presentation'}</div>
               <div className="mt-1 truncate text-sm font-semibold text-white">{walkthrough.smart720CurrentLabel || walkthrough.immersivePresentationLabel || 'Architectural view'}</div>
-              <div className="mt-1 text-[11px] leading-4 text-slate-300">{walkthrough.smart720Active ? `Room presentation ${walkthrough.smart720StopIndex || 1} of ${walkthrough.smart720TotalStops || 1}. The next room follows automatically.` : 'Stationary architectural view. Drag to explore the room.'}</div>
+              <div className="mt-1 text-[11px] leading-4 text-slate-300">{walkthrough.smart720Active ? `Room presentation ${walkthrough.smart720StopIndex || 1} of ${walkthrough.smart720TotalStops || 1}. The next room follows automatically.` : 'Drag horizontally or vertically to look around. Click an orange floor marker or choose a point from Rooms to move to another viewpoint.'}</div>
             </div>
           </div>
           {!walkthrough.smart720Active && walkthrough.immersiveSceneTotal > 1 && (

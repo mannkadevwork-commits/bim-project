@@ -1,5 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { NodeIO, Node as GltfNode } from "@gltf-transform/core";
 import * as THREE from "three";
 import {
@@ -118,18 +120,27 @@ function readHostedDoorInstanceIds(jobDirectory: string): Set<string> {
   }
 }
 
-function triNormal(positions: number[], ia: number, ib: number, ic: number): THREE.Vector3 {
-  const a = new THREE.Vector3(positions[ia], positions[ia + 1], positions[ia + 2]);
-  const b = new THREE.Vector3(positions[ib], positions[ib + 1], positions[ib + 2]);
-  const c = new THREE.Vector3(positions[ic], positions[ic + 1], positions[ic + 2]);
-  return new THREE.Vector3().crossVectors(b.sub(a), c.sub(a)).normalize();
-}
-
-function triArea(positions: number[], ia: number, ib: number, ic: number): number {
-  const a = new THREE.Vector3(positions[ia], positions[ia + 1], positions[ia + 2]);
-  const b = new THREE.Vector3(positions[ib], positions[ib + 1], positions[ib + 2]);
-  const c = new THREE.Vector3(positions[ic], positions[ic + 1], positions[ic + 2]);
-  return new THREE.Vector3().crossVectors(b.sub(a), c.sub(a)).length() * 0.5;
+/**
+ * Triangle metrics without allocating temporary THREE.Vector3 instances.
+ * The navigation pass can inspect hundreds of thousands of triangles, so
+ * allocating 6+ vectors per triangle creates avoidable GC pressure.
+ */
+function triangleMetrics(positions: number[], ia: number, ib: number, ic: number): { normalY: number; area: number } {
+  const ax = positions[ia], ay = positions[ia + 1], az = positions[ia + 2];
+  const abx = positions[ib] - ax;
+  const aby = positions[ib + 1] - ay;
+  const abz = positions[ib + 2] - az;
+  const acx = positions[ic] - ax;
+  const acy = positions[ic + 1] - ay;
+  const acz = positions[ic + 2] - az;
+  const nx = aby * acz - abz * acy;
+  const ny = abz * acx - abx * acz;
+  const nz = abx * acy - aby * acx;
+  const length = Math.sqrt(nx * nx + ny * ny + nz * nz);
+  return {
+    normalY: length > 1e-12 ? ny / length : 0,
+    area: length * 0.5,
+  };
 }
 
 function triangleIndicesForPrimitive(primitive: any, mode: number, vertexCount: number): number[] {
@@ -257,10 +268,9 @@ async function extractFinalGlb(glbPath: string, hostedDoorInstanceIds: Set<strin
         const a = (localIndices[t * 3] + vertexOffset) * 3;
         const b = (localIndices[t * 3 + 1] + vertexOffset) * 3;
         const c = (localIndices[t * 3 + 2] + vertexOffset) * 3;
-        const n = triNormal(positions, a, b, c);
-        const area = triArea(positions, a, b, c);
+        const { normalY, area } = triangleMetrics(positions, a, b, c);
         const cy = (positions[a + 1] + positions[b + 1] + positions[c + 1]) / 3;
-        if (n.y > 0.70710678) {
+        if (normalY > 0.70710678) {
           upwardArea += area;
           upwardYSum += cy * area;
           upwardAreaWeight += area;
@@ -325,10 +335,10 @@ function buildFilteredSoup(input: ExtractedGeometry, slopeAngle: number) {
     const ia = input.indices[t * 3] * 3;
     const ib = input.indices[t * 3 + 1] * 3;
     const ic = input.indices[t * 3 + 2] * 3;
-    const n = triNormal(input.positions, ia, ib, ic);
     const slopeCos = Math.cos((slopeAngle * Math.PI) / 180);
-    const isUpward = n.y > slopeCos;
-    const isWalkableOrientation = Math.abs(n.y) > slopeCos;
+    const { normalY } = triangleMetrics(input.positions, ia, ib, ic);
+    const isUpward = normalY > slopeCos;
+    const isWalkableOrientation = Math.abs(normalY) > slopeCos;
     const isFloor = input.labels[t] === "floor_candidate";
 
     if (isFloor) {
@@ -1492,10 +1502,178 @@ function writeDebugObj(filePath: string, positions: Float32Array, indices: Uint3
   fs.writeFileSync(filePath, lines.join("\n") + "\n", "utf8");
 }
 
+const NAV_CACHE_ALGORITHM_VERSION = "hci-walknav-2026-10-29-v1";
+const NAV_PIPELINE_SOURCE_PATH = fileURLToPath(import.meta.url);
+const ROOM_DETECTOR_SOURCE_PATH = path.join(path.dirname(NAV_PIPELINE_SOURCE_PATH), "RoomDetector.ts");
+const NAV_CACHE_REQUIRED_ARTIFACTS = [
+  "navigation_navmesh.bin",
+  "navigation_surface.json",
+  "navigation_meta.json",
+  "walk_hotspots.json",
+  "presentation_room_graph.json",
+] as const;
+
+function readOptionalBytes(filePath: string): Buffer {
+  try {
+    return fs.existsSync(filePath) ? fs.readFileSync(filePath) : Buffer.from("");
+  } catch {
+    return Buffer.from("");
+  }
+}
+
+function navigationGeometrySignature(
+  extracted: ExtractedGeometry,
+  jobDirectory: string,
+  physicalMetersPerUnit: number,
+  hostedDoorInstanceIds: Set<string>,
+): string {
+  const hash = crypto.createHash("sha256");
+  // Navmesh generation uses Float32 geometry; hash that exact precision along
+  // with the transformed indices and semantic mesh/floor classification.
+  const positions = Float32Array.from(extracted.positions);
+  const indices = Uint32Array.from(extracted.indices);
+  hash.update(Buffer.from(positions.buffer, positions.byteOffset, positions.byteLength));
+  hash.update(Buffer.from(indices.buffer, indices.byteOffset, indices.byteLength));
+  hash.update(JSON.stringify({
+    algorithm: NAV_CACHE_ALGORITHM_VERSION,
+    algorithmSources: [NAV_PIPELINE_SOURCE_PATH, ROOM_DETECTOR_SOURCE_PATH].map((sourcePath) => {
+      try {
+        const stat = fs.statSync(sourcePath);
+        return { sourcePath: path.basename(sourcePath), size: stat.size, mtimeMs: Math.trunc(stat.mtimeMs) };
+      } catch {
+        return { sourcePath: path.basename(sourcePath), missing: true };
+      }
+    }),
+    physicalMetersPerUnit,
+    defaultMetres: DEFAULT_METRES,
+    meshMetadata: extracted.meshes.map((mesh) => ({
+      name: mesh.name,
+      triangleStart: mesh.triangleStart,
+      triangleCount: mesh.triangleCount,
+      upwardArea: mesh.upwardArea,
+      upwardMeanY: mesh.upwardMeanY,
+      upwardMinY: mesh.upwardMinY,
+      upwardMaxY: mesh.upwardMaxY,
+    })),
+    floorMeshNames: extracted.floorMeshNames,
+    floorElevation: extracted.floorElevation,
+    hostedDoorInstanceIds: Array.from(hostedDoorInstanceIds).sort(),
+  }));
+  // Semantic room/portal metadata affects the connectivity files generated
+  // from this navmesh. Include it to avoid reusing stale room graph labels.
+  hash.update(readOptionalBytes(path.join(jobDirectory, "presentation_rooms.json")));
+  hash.update(readOptionalBytes(path.join(jobDirectory, "presentation_portals.json")));
+  return hash.digest("hex");
+}
+
+function navigationCacheRoot(jobDirectory: string): string {
+  // Keep reusable artifacts outside /jobs so they are not exposed by Express's
+  // public static job-file route.
+  return path.resolve(jobDirectory, "..", "..", ".hci-presentation-cache", "navigation");
+}
+
+function restoreNavigationCache(jobDirectory: string, signature: string): boolean {
+  const root = navigationCacheRoot(jobDirectory);
+  const cacheDirectory = path.join(root, signature);
+  const manifestPath = path.join(cacheDirectory, "cache-manifest.json");
+  try {
+    if (!fs.existsSync(manifestPath)) return false;
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    if (manifest.signature !== signature || !Array.isArray(manifest.files)) return false;
+    if (!NAV_CACHE_REQUIRED_ARTIFACTS.every((name) => manifest.files.includes(name))) return false;
+    if (!manifest.files.every((name: string) => fs.existsSync(path.join(cacheDirectory, name)))) return false;
+
+    for (const fileName of manifest.files as string[]) {
+      fs.copyFileSync(path.join(cacheDirectory, fileName), path.join(jobDirectory, fileName));
+    }
+    const metadataPath = path.join(jobDirectory, "navigation_meta.json");
+    try {
+      const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+      metadata.cache = { hit: true, geometrySignature: signature };
+      fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2), "utf8");
+    } catch {
+      // Cache correctness does not depend on optional metadata enrichment.
+    }
+    try { fs.utimesSync(cacheDirectory, new Date(), new Date()); } catch {}
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function storeNavigationCache(jobDirectory: string, signature: string): void {
+  const root = navigationCacheRoot(jobDirectory);
+  const temporaryDirectory = path.join(root, `${signature}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+  const cacheDirectory = path.join(root, signature);
+  const candidates = [
+    ...NAV_CACHE_REQUIRED_ARTIFACTS,
+    "room_connectivity.json",
+    "doorway_traversability.json",
+  ];
+  try {
+    fs.mkdirSync(temporaryDirectory, { recursive: true });
+    const files: string[] = [];
+    for (const fileName of candidates) {
+      const source = path.join(jobDirectory, fileName);
+      if (!fs.existsSync(source)) continue;
+      fs.copyFileSync(source, path.join(temporaryDirectory, fileName));
+      files.push(fileName);
+    }
+    if (!NAV_CACHE_REQUIRED_ARTIFACTS.every((name) => files.includes(name))) {
+      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+      return;
+    }
+    fs.writeFileSync(path.join(temporaryDirectory, "cache-manifest.json"), JSON.stringify({
+      version: 1,
+      signature,
+      files,
+      createdAt: new Date().toISOString(),
+    }, null, 2), "utf8");
+
+    let existingCacheIsValid = false;
+    if (fs.existsSync(cacheDirectory)) {
+      try {
+        const existing = JSON.parse(fs.readFileSync(path.join(cacheDirectory, "cache-manifest.json"), "utf8"));
+        existingCacheIsValid =
+          existing.signature === signature &&
+          Array.isArray(existing.files) &&
+          NAV_CACHE_REQUIRED_ARTIFACTS.every((name) => existing.files.includes(name) && fs.existsSync(path.join(cacheDirectory, name)));
+      } catch {
+        existingCacheIsValid = false;
+      }
+    }
+    if (existingCacheIsValid) {
+      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    } else {
+      if (fs.existsSync(cacheDirectory)) fs.rmSync(cacheDirectory, { recursive: true, force: true });
+      fs.renameSync(temporaryDirectory, cacheDirectory);
+    }
+
+    // Bound disk growth. Keep the 24 most recently used geometry caches.
+    const entries = fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name))
+      .map((entry) => {
+        const fullPath = path.join(root, entry.name);
+        return { fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const entry of entries.slice(24)) {
+      fs.rmSync(entry.fullPath, { recursive: true, force: true });
+    }
+  } catch (error) {
+    try { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); } catch {}
+    console.warn(`[WalkNav] Navigation cache write skipped: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+export interface WalkNavigationResult {
+  cacheHit: boolean;
+  geometrySignature: string;
+}
+
 export class WalkNavigationPipeline {
-  static async run(outputGlbPath: string, jobDirectory: string): Promise<void> {
+  static async run(outputGlbPath: string, jobDirectory: string): Promise<WalkNavigationResult> {
     if (!fs.existsSync(outputGlbPath)) throw new Error(`WalkNavigationPipeline: output.glb not found at ${outputGlbPath}`);
-    await ensureRecast();
 
     const physicalMetersPerUnit = readScale(jobDirectory);
     const walkableHeight = DEFAULT_METRES.eyeHeight * physicalMetersPerUnit;
@@ -1508,6 +1686,19 @@ export class WalkNavigationPipeline {
 
     const hostedDoorInstanceIds = readHostedDoorInstanceIds(jobDirectory);
     const extracted = await extractFinalGlb(outputGlbPath, hostedDoorInstanceIds);
+    const geometrySignature = navigationGeometrySignature(extracted, jobDirectory, physicalMetersPerUnit, hostedDoorInstanceIds);
+    if (restoreNavigationCache(jobDirectory, geometrySignature)) {
+      if (process.env.HCI_NAV_DEBUG_OBJ !== "1" && process.env.HCI_NAV_DEBUG_OBJ !== "true") {
+        try {
+          const debugObjPath = path.join(jobDirectory, "walk_nav_input_debug.obj");
+          if (fs.existsSync(debugObjPath)) fs.rmSync(debugObjPath, { force: true });
+        } catch {}
+      }
+      console.log(`[WalkNav] Geometry cache hit: reused navmesh + curated destinations (${geometrySignature.slice(0, 12)}).`);
+      return { cacheHit: true, geometrySignature };
+    }
+    await ensureRecast();
+
     const matchedDoorIds = new Set(extracted.hostedDoorInstanceIdsMatched);
     const unmatchedDoorIds = Array.from(hostedDoorInstanceIds).filter((id) => !matchedDoorIds.has(id));
     console.log(
@@ -1522,7 +1713,15 @@ export class WalkNavigationPipeline {
     if (filtered.soup.indices.length === 0) throw new Error("WalkNavigationPipeline: filtered navigation geometry is empty.");
 
     fs.mkdirSync(jobDirectory, { recursive: true });
-    writeDebugObj(path.join(jobDirectory, "walk_nav_input_debug.obj"), filtered.soup.positions, filtered.soup.indices, filtered.labels);
+    const navDebugObjPath = path.join(jobDirectory, "walk_nav_input_debug.obj");
+    if (process.env.HCI_NAV_DEBUG_OBJ === "1" || process.env.HCI_NAV_DEBUG_OBJ === "true") {
+      writeDebugObj(navDebugObjPath, filtered.soup.positions, filtered.soup.indices, filtered.labels);
+    } else {
+      // This OBJ is only for visual debugging. Writing hundreds of thousands
+      // of text faces on every production render is expensive and not used by
+      // the browser walkthrough.
+      try { if (fs.existsSync(navDebugObjPath)) fs.rmSync(navDebugObjPath, { force: true }); } catch {}
+    }
 
     const generation = generateSoloNavMesh(
       Array.from(filtered.soup.positions),
@@ -1633,8 +1832,12 @@ export class WalkNavigationPipeline {
       },
       navMesh: { serializedBytes: serialized.length },
     };
-    fs.writeFileSync(path.join(jobDirectory, "navigation_meta.json"), JSON.stringify(meta, null, 2), "utf8");
+    fs.writeFileSync(path.join(jobDirectory, "navigation_meta.json"), JSON.stringify({
+      ...meta,
+      cache: { hit: false, geometrySignature },
+    }, null, 2), "utf8");
 
+    storeNavigationCache(jobDirectory, geometrySignature);
     console.log(`[WalkNav] Wrote navigation_navmesh.bin (${serialized.length} bytes)`);
     console.log(`[WalkNav] Semantic candidates: ${candidates.length}`);
     console.log(`[WalkNav] Curated spaces: ${curated.areas.length}`);
@@ -1643,5 +1846,6 @@ export class WalkNavigationPipeline {
     console.log(`[WalkNav] Generated navigation is floor-constrained; destinations are curated semantic hotspots.`);
 
     navMesh.destroy?.();
+    return { cacheHit: false, geometrySignature };
   }
 }

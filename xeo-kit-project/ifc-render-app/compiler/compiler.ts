@@ -7,8 +7,11 @@ import {
   NodeIO,
   Node as GltfNode,
   Texture,
+  Material,
 } from "@gltf-transform/core";
 import { ALL_EXTENSIONS, KHRTextureTransform } from "@gltf-transform/extensions";
+import { copyToDocument, createDefaultPropertyResolver } from "@gltf-transform/functions";
+import { MeshoptDecoder } from "meshoptimizer";
 
 import { extractGeometry } from "./geometry";
 import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
@@ -266,25 +269,37 @@ function applyMaterialToSubtree(
 
   const textureSource = materialOverride.texture?.src || materialOverride.textureSrc;
   const textureRepeat = materialOverride.texture?.repeat || materialOverride.repeat || [1, 1];
-  if (
-    (materialOverride.kind === "fabric" ||
-      materialOverride.kind === "texture") &&
-    textureSource
-  ) {
+  const textureRequested =
+    (materialOverride.kind === "fabric" || materialOverride.kind === "texture") &&
+    Boolean(textureSource);
+
+  if (textureRequested && textureSource) {
     const texturePath = resolveMaterialTexturePath(
       textureSource,
       assetsDirectory,
     );
 
-    if (texturePath) {
+    if (texturePath && fs.existsSync(texturePath)) {
       sharedTexture = doc
         .createTexture(
           `Tex_${materialOverride.texture?.id || "material"}`,
         )
         .setMimeType(mimeForTexture(texturePath))
         .setImage(fs.readFileSync(texturePath));
+    } else {
+      // A broken HCI finish path must not replace a working authored material
+      // with a plain fallback. Leave the source material graph intact instead.
+      console.warn(
+        `[compiler:material] Texture override "${textureSource}" could not be resolved; preserving source material(s).`,
+      );
+      return;
     }
   }
+
+  // Cache one override clone per source material. Materials may be shared by
+  // several primitives; cloning once preserves that sharing without mutating a
+  // material used by a different asset or IFC element.
+  const overriddenMaterials = new Map<Material, Material>();
 
   const visit = (node: GltfNode): void => {
     const mesh = node.getMesh();
@@ -292,31 +307,47 @@ function applyMaterialToSubtree(
     if (mesh) {
       for (const primitive of mesh.listPrimitives()) {
         const source = primitive.getMaterial();
+        let material: Material;
 
-        let material = doc
-          .createMaterial(
-            `${source?.getName() ?? node.getName()}_override`,
-          )
-          .setBaseColorFactor([
-            r,
-            g,
-            b,
-            source ? source.getBaseColorFactor()[3] : 1,
-          ])
-          .setRoughnessFactor(
-            materialOverride.roughness ??
-              source?.getRoughnessFactor() ??
-              0.8,
-          )
-          .setMetallicFactor(
-            materialOverride.metallic ??
-              source?.getMetallicFactor() ??
-              0.1,
-          )
-          .setDoubleSided(source?.getDoubleSided() ?? true);
+        if (source) {
+          const cached = overriddenMaterials.get(source);
+          if (cached) {
+            material = cached;
+          } else {
+            // Material.clone() keeps the authored PBR values, texture slots,
+            // texture transforms and registered material-extension references.
+            // Only the property explicitly overridden below is changed.
+            material = source.clone() as Material;
+            material.setName(`${source.getName() || node.getName()}_hci_override`);
+            overriddenMaterials.set(source, material);
+          }
+        } else {
+          material = doc.createMaterial(`${node.getName()}_hci_override`)
+            .setDoubleSided(true);
+        }
 
+        const alpha = source?.getBaseColorFactor()[3] ?? 1;
+        material.setBaseColorFactor([
+          sharedTexture ? 1 : r,
+          sharedTexture ? 1 : g,
+          sharedTexture ? 1 : b,
+          alpha,
+        ]);
+
+        // Keep existing roughness/metallicity unless the finish explicitly
+        // provides a replacement value.
+        if (Number.isFinite(materialOverride.roughness)) {
+          material.setRoughnessFactor(materialOverride.roughness!);
+        }
+        if (Number.isFinite(materialOverride.metallic)) {
+          material.setMetallicFactor(materialOverride.metallic!);
+        }
+
+        // Preserve non-color maps (normal, occlusion, metallic/roughness and
+        // emissive). A solid HCI color replaces only base color imagery; a
+        // fabric/tile override replaces only the base-color texture.
+        material.setBaseColorTexture(sharedTexture);
         if (sharedTexture) {
-          material = material.setBaseColorTexture(sharedTexture);
           applyBaseColorTextureRepeat(doc, material, textureRepeat);
         }
 
@@ -330,6 +361,55 @@ function applyMaterialToSubtree(
   };
 
   visit(root);
+}
+
+/**
+ * Register material/texture extensions before copying source material graphs.
+ * Geometry decoding extensions (for example EXT_meshopt_compression) belong to
+ * the source asset's buffers and must not be marked required on the combined
+ * output after its geometry has been decoded and copied into ordinary accessors.
+ */
+function registerSourceDocumentExtensions(
+  target: Document,
+  source: Document,
+): void {
+  const targetExtensionsByName = new Map(
+    target.getRoot().listExtensionsUsed().map((extension) => [
+      extension.extensionName,
+      extension,
+    ]),
+  );
+
+  const materialOrTextureExtension = /^(KHR_materials_(?!variants$)|KHR_texture_|EXT_texture_|EXT_materials_)/i;
+  for (const sourceExtension of source.getRoot().listExtensionsUsed()) {
+    if (!materialOrTextureExtension.test(sourceExtension.extensionName)) continue;
+
+    let targetExtension = targetExtensionsByName.get(sourceExtension.extensionName);
+
+    if (!targetExtension) {
+      targetExtension = target.createExtension(
+        sourceExtension.constructor as any,
+      );
+      targetExtensionsByName.set(sourceExtension.extensionName, targetExtension);
+    }
+
+    if (sourceExtension.isRequired()) {
+      targetExtension.setRequired(true);
+    }
+  }
+}
+
+/**
+ * Configure glTF Transform's NodeIO the same way the web editor configures
+ * Three.js GLTFLoader: the frontend decodes Meshopt-compressed source GLBs.
+ * Without this dependency the backend may find the file but fail before its
+ * nodes are mounted into the compiled scene.
+ */
+async function createConfiguredNodeIO(): Promise<NodeIO> {
+  await MeshoptDecoder.ready;
+  return new NodeIO()
+    .registerExtensions(ALL_EXTENSIONS)
+    .registerDependencies({ "meshopt.decoder": MeshoptDecoder });
 }
 
 function computeScaledFurniturePivotTranslation(
@@ -793,7 +873,7 @@ async function prepareStructuralIfcForHostedDoors(
   furniture: FurnitureItem[],
   resolveGlbPath: (src: string) => string,
 ): Promise<{ inputPath: string; hostedDoors: HostedDoorSpec[]; appliedDoors: any[] }> {
-  const hostedDoors = await collectHostedGlbDoors(furniture, resolveGlbPath, new NodeIO().registerExtensions(ALL_EXTENSIONS));
+  const hostedDoors = await collectHostedGlbDoors(furniture, resolveGlbPath, await createConfiguredNodeIO());
   if (!hostedDoors.length) return { inputPath: inputIfcPath, hostedDoors, appliedDoors: [] };
 
   const editorScript = path.join(ROOT_DIR, "..", "ifc_element_editor.py");
@@ -1046,6 +1126,8 @@ export async function compileScene(
   const { jobDirectory, assetsDirectory } = options;
   const performanceStartedAt = Date.now();
   const performanceStages: Record<string, number> = {};
+  let navigationCacheHit = false;
+  let navigationGeometrySignature: string | null = null;
   let performanceStageStartedAt = Date.now();
   const sourceAssetInfoByInstance = new Map<string, {
     name: string;
@@ -1056,6 +1138,7 @@ export async function compileScene(
     sourceBytes: number;
   }>();
   const assetProcessingMsByInstance = new Map<string, number>();
+  const assetProcessingErrorsByInstance = new Map<string, string>();
 
   const INPUT_IFC_PATH = path.join(jobDirectory, "input.ifc");
   const PROJECT_STATE_PATH = path.join(jobDirectory, "project_state.json");
@@ -1346,7 +1429,7 @@ export async function compileScene(
       scene.addChild(structureNode);
     }
 
-    const io = new NodeIO().registerExtensions(ALL_EXTENSIONS);
+    const io = await createConfiguredNodeIO();
     const appliedHostedDoorByInstance = new Map<string, any>(
       hostedDoorBuild.appliedDoors
         .filter((entry: any) => entry?.instanceId)
@@ -1395,8 +1478,10 @@ export async function compileScene(
           );
 
           if (!fs.existsSync(assetPath)) {
+            const detail = `GLB source file not found at ${assetPath}`;
+            assetProcessingErrorsByInstance.set(String(item.instanceId), detail);
             console.warn(
-              `[compiler] Skipping "${item.instanceId}" (${item.name}): GLB not found at ${assetPath}`,
+              `[compiler] Skipping "${item.instanceId}" (${item.name}): ${detail}`,
             );
             continue;
           }
@@ -1422,13 +1507,20 @@ export async function compileScene(
               ),
             );
           } catch (error) {
+            const detail = `Failed to read/decode GLB: ${(error as Error).message}`;
+            assetProcessingErrorsByInstance.set(String(item.instanceId), detail);
             console.warn(
-              `[compiler] Skipping "${item.instanceId}" (${item.name}): failed to read GLB - ${
-                (error as Error).message
-              }`,
+              `[compiler] Skipping "${item.instanceId}" (${item.name}): ${detail}`,
             );
             continue;
           }
+
+          // Preserve complete source PBR material graphs when copying meshes.
+          // Material textures and KHR_materials_* extension properties must be
+          // registered/copied before assigning the copied material to a target primitive.
+          registerSourceDocumentExtensions(doc, glbDoc);
+          const materialCopyResolver = createDefaultPropertyResolver(doc, glbDoc);
+          const copiedMaterials = new Map<Material, Material>();
 
           const isHostedDoor = Boolean(item.doorHostWallId);
           // Hosted doors keep their dedicated wall-opening normalization.
@@ -1503,13 +1595,13 @@ export async function compileScene(
                   const srcArr = srcIdx.getArray();
 
                   if (srcArr) {
-                    dstPrim.setIndices(
-                      doc
-                        .createAccessor()
-                        .setType(srcIdx.getType())
-                        .setArray(srcArr.slice())
-                        .setBuffer(buffer),
-                    );
+                    const dstIndices = doc
+                      .createAccessor(srcIdx.getName())
+                      .setType(srcIdx.getType())
+                      .setArray(srcArr.slice())
+                      .setBuffer(buffer);
+                    dstIndices.setExtras({ ...srcIdx.getExtras() });
+                    dstPrim.setIndices(dstIndices);
                   }
                 }
 
@@ -1519,41 +1611,48 @@ export async function compileScene(
                   const srcArr = srcAttr.getArray();
 
                   if (srcArr) {
-                    dstPrim.setAttribute(
-                      semantic,
-                      doc
-                        .createAccessor()
-                        .setType(srcAttr.getType())
-                        .setArray(srcArr.slice())
-                        .setBuffer(buffer),
-                    );
+                    // Preserve the accessor's normalized flag. Packed integer
+                    // UV/color/normal attributes otherwise become raw 0..65535
+                    // values after re-export, which visibly corrupts texture
+                    // sampling and lighting in the compiled walkthrough.
+                    const dstAccessor = doc
+                      .createAccessor(srcAttr.getName())
+                      .setType(srcAttr.getType())
+                      .setArray(srcArr.slice())
+                      .setBuffer(buffer)
+                      .setNormalized(srcAttr.getNormalized());
+                    dstAccessor.setExtras({ ...srcAttr.getExtras() });
+                    const min = srcAttr.getMin([]);
+                    const max = srcAttr.getMax([]);
+                    if (min.length) dstAccessor.setMin(min);
+                    if (max.length) dstAccessor.setMax(max);
+                    dstPrim.setAttribute(semantic, dstAccessor);
                   }
                 }
 
-                const srcMat =
-                  srcPrim.getMaterial();
+                const srcMat = srcPrim.getMaterial();
 
                 if (srcMat) {
-                  const [r, g, b, a] =
-                    srcMat.getBaseColorFactor();
+                  let dstMat = copiedMaterials.get(srcMat);
 
-                  const dstMat = doc
-                    .createMaterial(srcMat.getName())
-                    .setBaseColorFactor([
-                      r,
-                      g,
-                      b,
-                      a,
-                    ])
-                    .setRoughnessFactor(
-                      srcMat.getRoughnessFactor(),
-                    )
-                    .setMetallicFactor(
-                      srcMat.getMetallicFactor(),
-                    )
-                    .setDoubleSided(
-                      srcMat.getDoubleSided(),
+                  if (!dstMat) {
+                    const copiedProperties = copyToDocument(
+                      doc,
+                      glbDoc,
+                      [srcMat],
+                      materialCopyResolver,
                     );
+                    const copiedMaterial = copiedProperties.get(srcMat);
+
+                    if (!copiedMaterial) {
+                      throw new Error(
+                        `Failed to preserve GLB material "${srcMat.getName() || "unnamed"}" and its texture dependencies.`,
+                      );
+                    }
+
+                    dstMat = copiedMaterial as Material;
+                    copiedMaterials.set(srcMat, dstMat);
+                  }
 
                   dstPrim.setMaterial(dstMat);
                 }
@@ -1793,12 +1892,19 @@ export async function compileScene(
           );
         }
       } catch (error) {
-        console.warn(
-          `[compiler] Unexpected error processing "${
-            item.instanceId ?? "unknown"
-          }": ${(error as Error).message}. Skipping.`,
+        const instanceId = String(item.instanceId ?? "unknown");
+        const detail = `${(error as Error).name || "Error"}: ${(error as Error).message || String(error)}`;
+        assetProcessingErrorsByInstance.set(instanceId, detail);
+        console.error(
+          `[compiler] Unexpected error processing "${instanceId}" (${item.name || "unnamed"}): ${detail}. Skipping.`,
+          error,
         );
         continue;
+      } finally {
+        const instanceId = String(item.instanceId ?? "unknown");
+        if (!assetProcessingMsByInstance.has(instanceId)) {
+          assetProcessingMsByInstance.set(instanceId, Date.now() - assetProcessingStartedAt);
+        }
       }
     }
 
@@ -1855,10 +1961,12 @@ export async function compileScene(
 
     const navigationStartedAt = Date.now();
     try {
-      await WalkNavigationPipeline.run(
+      const navigationResult = await WalkNavigationPipeline.run(
         RAW_GLB_PATH,
         jobDirectory,
       );
+      navigationCacheHit = navigationResult.cacheHit;
+      navigationGeometrySignature = navigationResult.geometrySignature;
     } catch (error) {
       throw new Error(
         `Recast navigation generation failed - ${
@@ -1947,6 +2055,7 @@ export async function compileScene(
         includedInScene: Boolean(metrics),
         status: metrics ? "mounted" : (source ? "source-found-but-not-mounted" : "source-not-resolved"),
         compileDurationMs: assetProcessingMsByInstance.get(instanceId) ?? null,
+        processingError: assetProcessingErrorsByInstance.get(instanceId) ?? null,
         complexityTier,
         metrics,
         scale: Array.isArray(item.scale) ? item.scale : null,
@@ -1965,7 +2074,7 @@ export async function compileScene(
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
       jobId: path.basename(jobDirectory),
-      purpose: "Phase 0 performance baseline; observational only, does not alter scene quality or navigation.",
+      purpose: "Presentation render performance, asset integrity, and navigation-cache diagnostics.",
       environment: {
         nodeVersion: process.version,
         platform: process.platform,
@@ -1999,6 +2108,8 @@ export async function compileScene(
         optimizer: optimizationStats ?? readJsonIfPresent(OPTIMIZATION_REPORT_PATH),
       },
       navigation: {
+        cacheHit: navigationCacheHit,
+        geometrySignature: navigationGeometrySignature,
         navMeshBytes: fs.existsSync(navMeshPath) ? fs.statSync(navMeshPath).size : null,
         metadata: readJsonIfPresent(path.join(jobDirectory, "navigation_meta.json")),
         connectivity: readJsonIfPresent(path.join(jobDirectory, "room_connectivity.json")),

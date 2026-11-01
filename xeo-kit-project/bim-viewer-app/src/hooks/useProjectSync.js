@@ -16,6 +16,100 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
 const projectRecoveryKey = (jobId) => `hci_recovery_${jobId}`;
 
+const projectSnapshotMetaKey = (jobId) => `hci_state_meta_${jobId}`;
+
+const readLocalProjectMetadata = (jobId) => {
+  if (!jobId) return null;
+  try {
+    return JSON.parse(localStorage.getItem(projectSnapshotMetaKey(jobId)) || 'null');
+  } catch (_) {
+    return null;
+  }
+};
+
+const rememberServerProjectRevision = (jobId, serverSavedAt, serverRevision) => {
+  if (!jobId) return;
+  try {
+    const previous = readLocalProjectMetadata(jobId) || {};
+    localStorage.setItem(projectSnapshotMetaKey(jobId), JSON.stringify({
+      version: 2,
+      updatedAt: Number(previous.updatedAt) || 0,
+      serverSavedAt: Number(serverSavedAt) || 0,
+      serverRevision: Number(serverRevision) || 0,
+      confirmed: previous.confirmed === true,
+    }));
+  } catch (error) {
+    console.warn('[ProjectSync] Could not remember server project revision:', error);
+  }
+};
+
+const readLocalProjectSnapshot = (jobId) => {
+  if (!jobId) return null;
+  try {
+    const raw = localStorage.getItem(`hci_state_${jobId}`);
+    if (!raw) return null;
+    const state = JSON.parse(raw);
+    if (!state || typeof state !== 'object') return null;
+    const meta = readLocalProjectMetadata(jobId);
+    return {
+      state,
+      // updatedAt is a monotonic client-side revision, not the server file mtime.
+      updatedAt: Number(meta?.updatedAt) || 0,
+      serverSavedAt: Number(meta?.serverSavedAt) || 0,
+      serverRevision: Number(meta?.serverRevision) || 0,
+      confirmed: meta?.confirmed === true,
+    };
+  } catch (error) {
+    console.warn('[ProjectSync] Local project snapshot is unreadable:', error);
+    return null;
+  }
+};
+
+const writeLocalProjectSnapshot = (jobId, state) => {
+  if (!jobId || !state) return 0;
+  const previous = readLocalProjectSnapshot(jobId);
+  const previousMeta = readLocalProjectMetadata(jobId) || {};
+  const updatedAt = Math.max(
+    Date.now(),
+    (Number(previous?.updatedAt) || Number(previousMeta.updatedAt) || 0) + 1,
+    (Number(previous?.serverRevision) || Number(previousMeta.serverRevision) || 0) + 1,
+  );
+  try {
+    // Keep the raw-state key for compatibility with projects saved by older builds.
+    localStorage.setItem(`hci_state_${jobId}`, JSON.stringify(state));
+    localStorage.setItem(projectSnapshotMetaKey(jobId), JSON.stringify({
+      version: 2,
+      updatedAt,
+      serverSavedAt: Number(previous?.serverSavedAt) || Number(previousMeta.serverSavedAt) || 0,
+      serverRevision: Number(previous?.serverRevision) || Number(previousMeta.serverRevision) || 0,
+      confirmed: false,
+    }));
+  } catch (error) {
+    console.warn('[ProjectSync] Local project snapshot could not be written:', error);
+  }
+  return updatedAt;
+};
+
+const acknowledgeLocalProjectSnapshot = (jobId, state, clientRevision, serverSavedAt, serverRevision) => {
+  if (!jobId || !state || !Number.isFinite(Number(clientRevision))) return;
+  try {
+    const local = readLocalProjectSnapshot(jobId);
+    if (!local?.state || Number(local.updatedAt) !== Number(clientRevision) || !projectStatesEqual(
+      normalizeProjectStatePayload(local.state),
+      normalizeProjectStatePayload(state),
+    )) return;
+    localStorage.setItem(projectSnapshotMetaKey(jobId), JSON.stringify({
+      version: 2,
+      updatedAt: Number(clientRevision),
+      serverSavedAt: Number(serverSavedAt) || 0,
+      serverRevision: Number(serverRevision) || Number(clientRevision) || 0,
+      confirmed: true,
+    }));
+  } catch (error) {
+    console.warn('[ProjectSync] Could not acknowledge local snapshot:', error);
+  }
+};
+
 const readProjectRecovery = (jobId) => {
   if (!jobId) return null;
   try {
@@ -31,12 +125,13 @@ const readProjectRecovery = (jobId) => {
   }
 };
 
-const writeProjectRecovery = (jobId, state, error) => {
+const writeProjectRecovery = (jobId, state, error, clientRevision = 0) => {
   if (!jobId || !state) return false;
   try {
     localStorage.setItem(projectRecoveryKey(jobId), JSON.stringify({
       version: 1,
       updatedAt: Date.now(),
+      clientRevision: Number(clientRevision) || 0,
       state: cloneProjectState(state),
       error: error?.message || String(error || 'Project save was not confirmed.'),
     }));
@@ -59,6 +154,30 @@ const normalizeProjectStatePayload = (value) => ({
   materials: value?.materials || {},
   furniture: sanitizePersistedFurniture(value?.furniture || []),
   structural_edits: value?.structural_edits || {},
+  ceiling_hidden_entity_ids: Array.isArray(value?.ceiling_hidden_entity_ids)
+    ? value.ceiling_hidden_entity_ids.map(String).filter(Boolean)
+    : [],
+  // Canonical V2 field. Legacy `ceilings[]` is retained as a read/write alias
+  // during the migration window so older editor builds can still reopen projects.
+  ceilingDesigns: Array.isArray(value?.ceilingDesigns)
+    ? value.ceilingDesigns.filter((item) => item && typeof item === 'object')
+    : (Array.isArray(value?.ceilings) ? value.ceilings.filter((item) => item && typeof item === 'object').map((item) => ({
+        schemaVersion: 1,
+        id: item.id,
+        roomId: item.roomId,
+        levelId: item.levelId || null,
+        kind: 'flat',
+        boundary: item.boundary || { outer: (item.polygon || []).map((point) => ({ x: Number(point.x), z: Number(point.z) })), holes: [] },
+        elevation: { structuralY: Number(item.structuralY ?? item.elevation ?? 0), drop: Number(item.drop || 0), finishedBottomY: Number(item.finishedBottomY ?? item.elevation ?? 0), thickness: Number(item.thickness) || 0.05, unit: 'm' },
+        parameters: item.parameters || { perimeterInset: 0, profileDepth: 0, coveWidth: 0 },
+        finish: item.finish || { kind: 'color', color: item.color || '#F3F1EB', materialId: null },
+        visible: item.visible !== false,
+        analysis: { elevationSource: item.elevationSource || 'legacy', confidence: Number(item.confidence) || 0 },
+        revision: 1,
+      })) : []),
+  ceilings: Array.isArray(value?.ceilingDesigns)
+    ? value.ceilingDesigns
+    : (Array.isArray(value?.ceilings) ? value.ceilings.filter((item) => item && typeof item === 'object') : []),
   scene_calibration: value?.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
 });
 
@@ -349,21 +468,51 @@ export const useProjectSync = (activeProject) => {
           if (data) {
             const serverState = normalizeProjectStatePayload(data);
             const recovery = readProjectRecovery(jobId);
+            const localSnapshot = readLocalProjectSnapshot(jobId);
+            const serverSavedAt = Number(data?._persistence?.savedAt) || 0;
+            const serverClientRevision = Number(data?._persistence?.clientRevision) || serverSavedAt;
             let stateToHydrate = serverState;
 
             if (recovery?.state) {
               const recoveredState = normalizeProjectStatePayload(recovery.state);
-              if (!projectStatesEqual(recoveredState, serverState)) {
-                // A previous save was not acknowledged by the server. Prefer the
-                // preserved local recovery snapshot instead of silently replacing
-                // the user's latest edit with the older server snapshot.
+              const recoveryRevision = Number(recovery.clientRevision) || Number(recovery.updatedAt) || 0;
+              const recoveryIsNewer = recoveryRevision > serverClientRevision;
+              if (!projectStatesEqual(recoveredState, serverState) && recoveryIsNewer) {
                 stateToHydrate = recoveredState;
-                setToastMessage('Recovered your last unconfirmed local edits. Syncing them to the server again.');
+                setToastMessage('Recovered your latest unsaved edits. Syncing them to the server again.');
               } else {
+                // A recovery journal from an older failed request must not replace
+                // a newer server snapshot. Drop it once the server is authoritative.
                 try { localStorage.removeItem(projectRecoveryKey(jobId)); } catch (_) {}
+              }
+            } else if (localSnapshot?.state) {
+              const localState = normalizeProjectStatePayload(localSnapshot.state);
+              const differs = !projectStatesEqual(localState, serverState);
+              const isNewerLocalSnapshot = localSnapshot.updatedAt > 0 &&
+                localSnapshot.updatedAt > serverClientRevision;
+              // Backwards-compatible recovery for older versions, which wrote
+              // hci_state_<jobId> before awaiting the server but did not timestamp
+              // that snapshot. Recover only the clear data-loss case (server has
+              // zero furniture while local has one or more placed items).
+              const legacyFurnitureRecovery = localSnapshot.updatedAt === 0 &&
+                (serverState.furniture || []).length === 0 &&
+                (localState.furniture || []).length > 0;
+
+              if (differs && (isNewerLocalSnapshot || legacyFurnitureRecovery)) {
+                stateToHydrate = localState;
+                console.warn('[ProjectSync] Recovering a newer local project snapshot over an older server snapshot.', {
+                  jobId,
+                  localFurniture: localState.furniture.length,
+                  serverFurniture: serverState.furniture.length,
+                  localUpdatedAt: localSnapshot.updatedAt,
+                  serverSavedAt,
+                  serverClientRevision,
+                });
+                setToastMessage('Recovered newer local furniture changes and syncing them to the server.');
               }
             }
 
+            rememberServerProjectRevision(jobId, serverSavedAt, serverClientRevision);
             projectStateLoadCommitPerfRef.current = performance.now();
             setProjectStateTracked(stateToHydrate, { history: false });
             resetHistory();
@@ -376,17 +525,15 @@ export const useProjectSync = (activeProject) => {
           let localState = null;
           if (!recovery?.state) {
             try {
-              localState = localStorage.getItem(`hci_state_${jobId}`);
+              localState = readLocalProjectSnapshot(jobId)?.state || null;
             } catch (storageError) {
-              // Some browser privacy modes disable localStorage entirely. Do not
-              // let a failed recovery read strand the editor in an unhydrated state.
               console.warn('[ProjectSync] Browser storage is unavailable during recovery:', storageError);
             }
           }
 
           if (recovery?.state || localState) {
             try {
-              const parsed = recovery?.state ? recovery.state : JSON.parse(localState);
+              const parsed = recovery?.state ? recovery.state : localState;
               setProjectStateTracked(normalizeProjectStatePayload(parsed), { history: false });
               if (recovery?.state) {
                 setToastMessage('Restored your last local recovery snapshot because the server project could not be loaded.');
@@ -466,92 +613,106 @@ export const useProjectSync = (activeProject) => {
     syncEnd({ completed: true });
   }, [file, jobId]);
 
-  // 2. AUTO-SAVE: Safe sequential queue
+  // 2. AUTO-SAVE: serialize autosave, explicit save and calibration snapshots.
+  // Each queued snapshot carries a monotonic client revision. The backend rejects
+  // stale writes, so an old in-flight request cannot overwrite a newer project.
   const processSaveQueue = async () => {
     if (isSavingRef.current || !pendingSaveRef.current) return;
 
-    const { state, targetJobId } = pendingSaveRef.current;
+    const request = pendingSaveRef.current;
+    const { state, targetJobId, waiters = [] } = request;
+    const clientRevision = Number(request.clientRevision) || writeLocalProjectSnapshot(targetJobId, state);
     pendingSaveRef.current = null;
     isSavingRef.current = true;
     setSaveStatus('saving');
+    let savedAt = null;
 
     try {
-      try {
-        localStorage.setItem(`hci_state_${targetJobId}`, JSON.stringify(state));
-      } catch (storageError) {
-        // Local recovery is best-effort. Storage quota/private-mode errors must
-        // not prevent the canonical server save from being attempted.
-        console.warn('[ProjectSync] Local recovery snapshot could not be written:', storageError);
-      }
-
       const response = await fetch(`${API_BASE_URL}/api/projects/${targetJobId}/save`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-HCI-Project-Revision': String(clientRevision),
+        },
         body: JSON.stringify(state),
       });
+      const saveReceipt = await response.json().catch(() => ({}));
       if (!response.ok) {
-        const detail = await response.text().catch(() => '');
-        throw new Error(`Project auto-save failed (${response.status})${detail ? `: ${detail}` : ''}`);
+        const detail = saveReceipt?.error || `Project save failed (${response.status})`;
+        throw new Error(detail);
       }
+      savedAt = saveReceipt?.savedAt;
       setSaveStatus('saved');
       setLastSavedTime(new Date());
       if (!pendingSaveRef.current && projectStatesEqual(state, projectStateRef.current)) {
+        acknowledgeLocalProjectSnapshot(
+          targetJobId,
+          state,
+          clientRevision,
+          savedAt,
+          saveReceipt?.clientRevision,
+        );
         clearProjectRecoveryIfMatches(targetJobId, state);
       }
-    } catch (err) {
-      const recoveryState = pendingSaveRef.current?.targetJobId === targetJobId
-        ? pendingSaveRef.current.state
-        : state;
-      writeProjectRecovery(targetJobId, recoveryState, err);
-      console.error('[ProjectSync] Cloud auto-save failed; recovery snapshot preserved when browser storage permits:', err);
+      waiters.forEach((waiter) => waiter.resolve({
+        success: true,
+        savedAt,
+        clientRevision: saveReceipt?.clientRevision || clientRevision,
+      }));
+    } catch (error) {
+      const pending = pendingSaveRef.current?.targetJobId === targetJobId
+        ? pendingSaveRef.current
+        : null;
+      const local = readLocalProjectSnapshot(targetJobId);
+      const useLocalRecovery = !!local && local.updatedAt > clientRevision && !pending;
+      const recoveryState = pending?.state || (useLocalRecovery ? local.state : state);
+      const recoveryRevision = pending?.clientRevision || (useLocalRecovery ? local.updatedAt : clientRevision);
+      writeProjectRecovery(targetJobId, recoveryState, error, recoveryRevision);
+      console.error('[ProjectSync] Cloud save failed; local recovery snapshot preserved when browser storage permits:', error);
       setSaveStatus('error');
+      waiters.forEach((waiter) => waiter.reject(error));
     } finally {
       isSavingRef.current = false;
-      if (pendingSaveRef.current) {
-        processSaveQueue();
-      }
+      if (pendingSaveRef.current) void processSaveQueue();
     }
   };
 
   useEffect(() => {
     if (!jobId || !projectStateHydratedRef.current) return;
 
+    // Persist locally before any network queue work. A browser refresh during an
+    // in-flight request can recover the latest furniture list and transforms.
+    const clientRevision = writeLocalProjectSnapshot(jobId, projectState);
     setSaveStatus('unsaved');
-    pendingSaveRef.current = { state: projectState, targetJobId: jobId };
-    processSaveQueue();
+    const previousWaiters = pendingSaveRef.current?.targetJobId === jobId
+      ? (pendingSaveRef.current.waiters || [])
+      : [];
+    pendingSaveRef.current = {
+      state: projectState,
+      targetJobId: jobId,
+      clientRevision,
+      waiters: previousWaiters,
+    };
+    void processSaveQueue();
   }, [projectState, jobId]);
 
-  const saveNow = async (stateOverride) => {
-    if (!jobId) return;
+  const saveNow = (stateOverride) => {
+    if (!jobId) return Promise.reject(new Error('No active project is available.'));
     const stateToSave = stateOverride || projectStateRef.current;
-    setSaveStatus('saving');
-    try {
-      try {
-        localStorage.setItem(`hci_state_${jobId}`, JSON.stringify(stateToSave));
-      } catch (storageError) {
-        console.warn('[ProjectSync] Local recovery snapshot could not be written:', storageError);
-      }
-      const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(stateToSave),
-      });
-      if (!response.ok) {
-        const detail = await response.text().catch(() => '');
-        throw new Error(`Manual project save failed (${response.status})${detail ? `: ${detail}` : ''}`);
-      }
-      setSaveStatus('saved');
-      setLastSavedTime(new Date());
-      if (projectStatesEqual(stateToSave, projectStateRef.current)) {
-        clearProjectRecoveryIfMatches(jobId, stateToSave);
-      }
-    } catch (err) {
-      writeProjectRecovery(jobId, projectStateRef.current || stateToSave, err);
-      console.error('[ProjectSync] Manual save failed; local recovery snapshot preserved when possible:', err);
-      setSaveStatus('error');
-    }
+    const clientRevision = writeLocalProjectSnapshot(jobId, stateToSave);
+    return new Promise((resolve, reject) => {
+      const previousPending = pendingSaveRef.current?.targetJobId === jobId
+        ? pendingSaveRef.current
+        : null;
+      pendingSaveRef.current = {
+        state: stateToSave,
+        targetJobId: jobId,
+        clientRevision,
+        waiters: [...(previousPending?.waiters || []), { resolve, reject }],
+      };
+      if (!isSavingRef.current) void processSaveQueue();
+    });
   };
-
 
   const normalizeSavedLayout = (layout) => {
     if (!layout) return layout;
@@ -1045,6 +1206,71 @@ export const useProjectSync = (activeProject) => {
     setTimeout(() => setToastMessage(null), 3000);
   };
 
+  // Replace one placed catalogue asset with another while keeping the rest of the
+  // project untouched. This is one tracked state change, so undo/redo naturally
+  // swaps the original and replacement SceneModels through restoreProjectStateToScene.
+  const replaceAsset = (selectedAssetId, replacementAsset, preserveFinish = true, allowIsolatedNative = false) => {
+    if (!selectedAssetId) throw new Error('Select a placed furniture item first.');
+    if (!replacementAsset || typeof replacementAsset !== 'object') throw new Error('Choose a replacement catalogue item.');
+
+    const currentState = projectStateRef.current || {};
+    const existingItem = (currentState.furniture || []).find((item) => item?.instanceId === selectedAssetId);
+    if (!existingItem) throw new Error('The selected item is no longer in this project. Select it again and retry.');
+    if (existingItem.doorHostWallId) throw new Error('Hosted doors cannot be replaced here because they are connected to a wall opening.');
+    if ((existingItem.isNativeIsolation || existingItem.nativeSourceId) && !allowIsolatedNative) throw new Error('Native IFC elements must be safely isolated before catalogue replacement.');
+
+    const rawUrl = String(replacementAsset.model_url || replacementAsset.url || replacementAsset.src || '').trim();
+    if (!rawUrl) throw new Error('This catalogue item has no model file.');
+
+    const fullAssetUrl = /^https?:\/\//i.test(rawUrl)
+      ? rawUrl
+      : `${API_BASE_URL.replace(/\/$/, '')}/${rawUrl.replace(/^\/+/, '')}`;
+    const fileType = inferFileType(rawUrl, replacementAsset.file_type || replacementAsset.fileType);
+    const newInstanceId = `replace_${String(replacementAsset.id ?? 'asset')}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const safeVector = (value, fallback) => Array.isArray(value) && value.length === 3 && value.every((part) => Number.isFinite(Number(part)))
+      ? value.map(Number)
+      : [...fallback];
+
+    const nextItem = {
+      id: `cat_${String(replacementAsset.id ?? replacementAsset.catalogId ?? 'asset')}`,
+      instanceId: newInstanceId,
+      name: String(replacementAsset.name || 'Replacement item'),
+      src: fullAssetUrl,
+      fileType,
+      position: safeVector(existingItem.position, [0, 0, 0]),
+      rotation: safeVector(existingItem.rotation, [0, 0, 0]),
+      scale: safeVector(existingItem.scale, [1, 1, 1]),
+      ...(replacementAsset.category_id != null ? { categoryId: replacementAsset.category_id } : {}),
+      ...(replacementAsset.thumbnail_url ? { thumbnailUrl: replacementAsset.thumbnail_url } : {}),
+      ...(replacementAsset.attributes ? { catalogAttributes: replacementAsset.attributes } : {}),
+    };
+
+    let didReplace = false;
+    setProjectStateTracked((previous) => {
+      const items = Array.isArray(previous.furniture) ? previous.furniture : [];
+      const index = items.findIndex((item) => item?.instanceId === selectedAssetId);
+      if (index < 0) return previous;
+
+      const oldItem = items[index];
+      if (oldItem?.doorHostWallId || ((oldItem?.isNativeIsolation || oldItem?.nativeSourceId) && !allowIsolatedNative)) {
+        return previous;
+      }
+
+      const materials = { ...(previous.materials || {}) };
+      const previousFinish = materials[selectedAssetId];
+      delete materials[selectedAssetId];
+      if (preserveFinish && previousFinish) materials[newInstanceId] = previousFinish;
+
+      const furniture = [...items];
+      furniture[index] = nextItem;
+      didReplace = true;
+      return { ...previous, furniture, materials };
+    });
+
+    if (!didReplace) throw new Error('The selected item changed before replacement. Please select it again.');
+    return { ...nextItem, previousInstanceId: selectedAssetId };
+  };
+
   const applyTemplate = (templateId, loadIFCAssetIntoScene) => {
     const template = homeTemplates.find(t => t.id === templateId);
     if (!template) return;
@@ -1169,6 +1395,11 @@ export const useProjectSync = (activeProject) => {
       position,
       rotation: safeRotation,
       scale: effectiveScale,
+      assetCategory: asset.assetCategory || null,
+      isLightFixture: asset.isLightFixture === true || asset.assetCategory === 'lighting',
+      lightEnabled: asset.lightEnabled === true,
+      pivotMode: asset.pivotMode || null,
+      placementSurface: asset.placementSurface || null,
       ...(doorHostWallId ? { doorHostWallId } : {}),
       ...(doorHostWallId && doorDimensions && Object.values(doorDimensions).every((value) => Number.isFinite(value) && value > 0)
         ? { doorDimensions }
@@ -1226,7 +1457,16 @@ export const useProjectSync = (activeProject) => {
         fullAssetUrl,
         position,
         safeRotation,
-        { fileType, scale: effectiveScale, doorHostWallId, onPlaced }
+        {
+          fileType,
+          scale: effectiveScale,
+          doorHostWallId,
+          pivotMode: asset.pivotMode || null,
+          assetCategory: asset.assetCategory || null,
+          isLightFixture: asset.isLightFixture === true || asset.assetCategory === 'lighting',
+          lightEnabled: asset.lightEnabled === true,
+          onPlaced,
+        }
       ))
       .catch(error => {
         console.error('[ProjectSync] Failed to load placed asset:', error);
@@ -1280,6 +1520,51 @@ export const useProjectSync = (activeProject) => {
     }, { coalesceKey: `structural:${entityId}:${transformType}` });
   };
 
+  const setAssetLightEnabled = (instanceId, enabled) => {
+    if (!instanceId) return false;
+    setProjectStateTracked(prev => ({
+      ...prev,
+      furniture: (prev.furniture || []).map(item => (
+        item.instanceId === instanceId ? { ...item, lightEnabled: !!enabled } : item
+      )),
+    }), { coalesceKey: `light-fixture:${instanceId}` });
+    return true;
+  };
+
+  const setAssetLightIntensity = (instanceId, intensity, temperature = 4000) => {
+    if (!instanceId) return false;
+    const safeIntensity = Math.max(0, Math.min(0.55, Number(intensity) || 0));
+    const safeTemperature = Math.max(2700, Math.min(6500, Number(temperature) || 4000));
+    setProjectStateTracked(prev => ({
+      ...prev,
+      furniture: (prev.furniture || []).map(item => (
+        item.instanceId === instanceId ? { ...item, lightIntensity: safeIntensity, lightTemperature: safeTemperature } : item
+      )),
+    }), { coalesceKey: `light-settings:${instanceId}` });
+    return true;
+  };
+
+  const setRoomCeilingDesigns = (ceilings) => {
+    const safeCeilings = Array.isArray(ceilings) ? ceilings.filter((item) => (
+      item && item.id && (Array.isArray(item.polygon) || Array.isArray(item.boundary?.outer))
+    )) : [];
+    setProjectStateTracked(prev => ({
+      ...prev,
+      ceilingDesigns: safeCeilings,
+      ceilings: safeCeilings, // Backward-compatible alias for older editor builds.
+    }), { coalesceKey: 'room-ceilings' });
+    return safeCeilings;
+  };
+
+  const setCeilingHiddenEntityIds = (entityIds) => {
+    const uniqueIds = Array.from(new Set((Array.isArray(entityIds) ? entityIds : []).map(String).filter(Boolean)));
+    setProjectStateTracked(prev => ({
+      ...prev,
+      ceiling_hidden_entity_ids: uniqueIds,
+    }), { coalesceKey: 'ceiling-visibility' });
+    return uniqueIds;
+  };
+
   const adoptIsolatedAsset = (
     entityId,
     newInstanceId,
@@ -1323,18 +1608,21 @@ export const useProjectSync = (activeProject) => {
       await new Promise(resolve => setTimeout(resolve, 25));
     }
 
-    localStorage.setItem(`hci_state_${jobId}`, JSON.stringify(state));
+    const clientRevision = writeLocalProjectSnapshot(jobId, state);
     const response = await fetch(`${API_BASE_URL}/api/projects/${jobId}/save`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-HCI-Project-Revision': String(clientRevision),
+      },
       body: JSON.stringify(state),
     });
-
+    const receipt = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`Failed to persist calibrated project state (${response.status})${text ? `: ${text}` : ''}`);
+      throw new Error(receipt?.error || `Failed to persist calibrated project state (${response.status})`);
     }
-
+    acknowledgeLocalProjectSnapshot(jobId, state, clientRevision, receipt?.savedAt, receipt?.clientRevision);
+    clearProjectRecoveryIfMatches(jobId, state);
     return true;
   };
 
@@ -1491,6 +1779,7 @@ export const useProjectSync = (activeProject) => {
   return {
     projectState,
     projectStateRef,
+    projectStateHydratedRef,
     saveStatus,
     lastSavedTime,
     availableAssets,
@@ -1509,10 +1798,15 @@ export const useProjectSync = (activeProject) => {
     applyMaterialDefinitionToAllWalls,
     updateAsset,
     deleteAsset,
+    replaceAsset,
     spawnAsset,
     applyTemplate,
     adoptIsolatedAsset,
     updateStructuralEdit,
+    setAssetLightEnabled,
+    setAssetLightIntensity,
+    setRoomCeilingDesigns,
+    setCeilingHiddenEntityIds,
     transformFurnitureForCalibration,
     repairLegacyCalibrationState,
     setToastMessage,

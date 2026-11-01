@@ -26,5 +26,8 @@ export const createInitialProjectState = () => ({
   materials: {},
   furniture: [],
   structural_edits: {},
+  ceiling_hidden_entity_ids: [],
+  ceilingDesigns: [],
+  ceilings: [],
   scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } },
 });

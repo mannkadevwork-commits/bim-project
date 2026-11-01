@@ -15,6 +15,36 @@ import { ensureIFCResizeMetadata } from '../stretch/IFCResizeController';
 
 const nativeIsolationInFlight = new Set();
 
+const createAssetReadySignal = (instanceId, assetFormat, timeoutMs = 45000) => {
+  let resolve;
+  let reject;
+  let settled = false;
+  let timeoutId = null;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+    timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      rejectPromise(new Error(`${assetFormat.toUpperCase()} asset "${instanceId}" did not finish loading within ${timeoutMs}ms.`));
+    }, timeoutMs);
+  });
+  // Attach a handler immediately so a failed loader doesn't create an
+  // unhandled rejection when a caller only needs the SceneModel handle.
+  promise.catch(() => {});
+  const finish = (callback, value) => {
+    if (settled) return;
+    settled = true;
+    if (timeoutId) clearTimeout(timeoutId);
+    callback(value);
+  };
+  return {
+    promise,
+    resolve: (value) => finish(resolve, value),
+    reject: (error) => finish(reject, error instanceof Error ? error : new Error(String(error || 'Asset load failed.'))),
+  };
+};
+
 // IMPORTANT: loadIFCAssetIntoScene can be called from two independent paths:
 // 1) the live catalog placement path, and
 // 2) projectState restoration.
@@ -91,7 +121,7 @@ export const loadIFCAssetIntoScene = async (
   const registry = getAssetRegistry(loader);
   const existingModel = getLiveRegisteredModel(registry, instanceId);
   if (existingModel) {
-    return existingModel;
+    return existingModel._hciAssetReadyPromise || existingModel;
   }
 
   if (assetFormat === 'glb') {
@@ -100,8 +130,15 @@ export const loadIFCAssetIntoScene = async (
       const assetModel = loader.load({
         id: instanceId,
         src: srcUrl,
-        edges: true,
+        edges: false,
+        // Respect glTF material.doubleSided instead of forcing all backfaces.
+        // This avoids visible interior/back-side triangles on furniture shells.
+        backfaces: false,
+        pbrEnabled: true,
+        colorTextureEnabled: true,
       });
+      const readySignal = createAssetReadySignal(instanceId, 'glb');
+      assetModel._hciAssetReadyPromise = readySignal.promise;
 
       // Register IMMEDIATELY after loader.load(). The model can still be loading;
       // that is exactly the window in which restoreProjectStateToScene may race
@@ -122,6 +159,9 @@ export const loadIFCAssetIntoScene = async (
         fileType: 'glb',
         assetFormat: 'glb',
         srcUrl,
+        assetCategory: options.assetCategory || null,
+        isLightFixture: options.isLightFixture === true || options.assetCategory === 'lighting',
+        lightEnabled: options.lightEnabled === true,
       };
 
       const applyLoadedTransform = async () => {
@@ -181,6 +221,7 @@ export const loadIFCAssetIntoScene = async (
             options.onLoaded(assetModel);
           }
         } catch (error) {
+          readySignal.reject(error);
           registry.delete(instanceId);
           assetLoadEnd({ loaded: false, format: 'glb', error: error?.message || String(error) });
           console.error('[BIM Engine] GLB normalization/placement failure:', {
@@ -188,7 +229,9 @@ export const loadIFCAssetIntoScene = async (
             srcUrl,
             error,
           });
-          throw error;
+          // The readiness promise carries this failure to every awaiting caller;
+          // do not leak a second unhandled rejection from the event callback.
+          return;
         }
 
         assetLoadEnd({ loaded: true, format: 'glb', modelId: assetModel.id });
@@ -198,10 +241,12 @@ export const loadIFCAssetIntoScene = async (
           const persistedTarget = getGLBPlacementTarget(assetModel);
           options.onPlaced(instanceId, persistedTarget, assetModel);
         }
+        readySignal.resolve(assetModel);
       };
 
       assetModel.on('loaded', applyLoadedTransform);
       assetModel.on('error', (error) => {
+        readySignal.reject(error || new Error(`Failed to load GLB asset "${instanceId}".`));
         registry.delete(instanceId);
         assetLoadEnd({ loaded: false, format: 'glb', error: error?.message || String(error) });
         console.error('[BIM Engine] GLB asset load failure:', {
@@ -211,7 +256,7 @@ export const loadIFCAssetIntoScene = async (
         });
       });
 
-      return assetModel;
+      return assetModel._hciAssetReadyPromise;
     } catch (error) {
       registry.delete(instanceId);
       console.error('[BIM Engine] GLB placement failure:', {
@@ -239,6 +284,8 @@ export const loadIFCAssetIntoScene = async (
       edges: true,
       globalizeCoordinates: false,
     });
+    const readySignal = createAssetReadySignal(instanceId, 'ifc');
+    assetModel._hciAssetReadyPromise = readySignal.promise;
 
     // Register immediately, before the IFC model's async `loaded` event.
     registry.set(instanceId, assetModel);
@@ -255,6 +302,7 @@ export const loadIFCAssetIntoScene = async (
     };
 
     assetModel.on('loaded', () => {
+      try {
       // Capture the model's local geometry bounds before any user transform is
       // applied. IFC resize uses these bounds to build a true oriented gizmo and
       // to keep the opposite face anchored during local-axis scaling.
@@ -314,9 +362,15 @@ export const loadIFCAssetIntoScene = async (
           : [...assetModel.position];
         options.onPlaced(instanceId, persistedTarget, assetModel);
       }
+      readySignal.resolve(assetModel);
+      } catch (error) {
+        readySignal.reject(error);
+        console.error('[BIM Engine] IFC asset setup failed after load:', { instanceId, srcUrl, error });
+      }
     });
 
     assetModel.on('error', (error) => {
+      readySignal.reject(error || new Error(`Failed to load IFC asset "${instanceId}".`));
       registry.delete(instanceId);
       assetLoadEnd({ loaded: false, format: 'ifc', error: error?.message || String(error) });
       console.error('[BIM Engine] IFC asset load failure:', {
@@ -326,7 +380,7 @@ export const loadIFCAssetIntoScene = async (
       });
     });
 
-    return assetModel;
+    return assetModel._hciAssetReadyPromise;
   } catch (error) {
     registry.delete(instanceId);
     assetLoadEnd({ loaded: false, format: 'ifc', error: error?.message || String(error) });

@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import { createHash } from "crypto";
 import * as path from "path";
 import {
   IfcAPI,
@@ -7,8 +8,11 @@ import {
   IFCRELVOIDSELEMENT,
   IFCRELFILLSELEMENT,
   IFCSLAB,
+  IFCROOF,
+  IFCCOVERING,
   IFCWALL,
   IFCWALLSTANDARDCASE,
+  IFCPROJECT,
 } from "web-ifc";
 import type { DetectedRoom, RoomDebugArtifact, RoomPortal, RoomPolygonPoint } from "./RoomTypes";
 import { makeComponentDiagnostics, makeDoorDiagnostic, makeRoomBoundaryCandidateDiagnostics } from "./RoomDiagnostics";
@@ -30,6 +34,8 @@ interface ElementFootprint {
   expressId: number;
   globalId: string | null;
   name: string;
+  predefinedType: string;
+  ifcType: string;
   points: Point2[];
   center: Point2;
   minX: number;
@@ -587,12 +593,20 @@ function elementFromLine(ifc: IfcAPI, modelId: number, expressId: number, source
   const name = lineName(line);
   const points: Point2[] = [];
 
+  let ifcType = "UNKNOWN";
+  try {
+    const typeCode = ifc.GetLineType(modelId, expressId);
+    ifcType = String(ifc.GetNameFromTypeCode(typeCode) || "UNKNOWN").toUpperCase();
+  } catch { /* type metadata is diagnostic only */ }
+
   return {
     key: `${prefix}:${expressId}`,
     sourceFile,
     expressId,
     globalId,
     name,
+    predefinedType: String(getWrappedValue(line?.PredefinedType) ?? "").toUpperCase(),
+    ifcType,
     points,
     center: { x: 0, y: 0 },
     minX: Infinity,
@@ -630,29 +644,41 @@ async function bytesFor(filePath: string): Promise<Uint8Array> {
 }
 
 function resolveJobRelativeSource(jobDirectory: string, src: string): string | null {
+  const jobRoot = path.resolve(jobDirectory);
   try {
-    const url = new URL(src);
+    // Use a base URL so root-relative browser paths such as /jobs/<id>/file.ifc
+    // are resolved just like absolute API URLs persisted by older editor builds.
+    const url = new URL(src, "http://hci.local");
     if (url.pathname.startsWith("/jobs/")) {
       const match = url.pathname.match(/^\/jobs\/([^/]+)\/(.+)$/);
       if (!match) return null;
       const jobId = match[1];
-      const relative = match[2];
-      const current = path.join(jobDirectory, relative);
-      if (fs.existsSync(current)) return current;
-      const sibling = path.join(path.dirname(jobDirectory), jobId, relative);
-      return fs.existsSync(sibling) ? sibling : null;
+      const relative = decodeURIComponent(match[2]);
+      const current = path.resolve(jobRoot, relative);
+      if (current.startsWith(`${jobRoot}${path.sep}`) && fs.existsSync(current)) return current;
+      const siblingRoot = path.resolve(path.dirname(jobRoot), jobId);
+      const sibling = path.resolve(siblingRoot, relative);
+      return sibling.startsWith(`${siblingRoot}${path.sep}`) && fs.existsSync(sibling) ? sibling : null;
     }
+    const backendRoot = path.resolve(jobRoot, "..", "..");
     if (url.pathname.startsWith("/assets/")) {
-      const candidate = path.join(path.dirname(jobDirectory), "assets", path.basename(url.pathname));
+      const assetRoot = path.resolve(backendRoot, "assets");
+      const candidate = path.resolve(assetRoot, path.basename(url.pathname));
       return fs.existsSync(candidate) ? candidate : null;
     }
+    if (url.pathname.startsWith("/uploads/")) {
+      const uploadsRoot = path.resolve(backendRoot, "uploads");
+      const relative = decodeURIComponent(url.pathname.slice("/uploads/".length));
+      const candidate = path.resolve(uploadsRoot, relative);
+      return candidate.startsWith(`${uploadsRoot}${path.sep}`) && fs.existsSync(candidate) ? candidate : null;
+    }
   } catch {
-    // Relative paths below are handled directly.
+    // Absolute/local file paths below are handled directly.
   }
 
   if (path.isAbsolute(src) && fs.existsSync(src)) return src;
-  const candidate = path.join(jobDirectory, src.replace(/^\/+/, ""));
-  return fs.existsSync(candidate) ? candidate : null;
+  const candidate = path.resolve(jobRoot, src.replace(/^\/+/, ""));
+  return candidate.startsWith(`${jobRoot}${path.sep}`) && fs.existsSync(candidate) ? candidate : null;
 }
 
 async function collectElements(
@@ -703,11 +729,145 @@ function idsWithType(ifc: IfcAPI, modelId: number, type: number): number[] {
   return Array.from(ifc.GetLineIDsWithType(modelId, type) as any).map(Number);
 }
 
+const SI_PREFIX_TO_METRES: Record<string, number> = {
+  EXA: 1e18, PETA: 1e15, TERA: 1e12, GIGA: 1e9, MEGA: 1e6,
+  KILO: 1e3, HECTO: 1e2, DECA: 1e1, DECI: 1e-1, CENTI: 1e-2,
+  MILLI: 1e-3, MICRO: 1e-6, NANO: 1e-9, PICO: 1e-12,
+};
+
+function asIfcArray(value: any): any[] {
+  const unwrapped = getWrappedValue(value);
+  if (Array.isArray(unwrapped)) return unwrapped;
+  if (unwrapped && typeof unwrapped.size === "function" && typeof unwrapped.get === "function") {
+    const result: any[] = [];
+    for (let index = 0; index < unwrapped.size(); index++) result.push(unwrapped.get(index));
+    return result;
+  }
+  if (unwrapped && typeof unwrapped.length === "number") return Array.from(unwrapped);
+  return [];
+}
+
+function resolveIfcUnitToMeters(ifc: IfcAPI, modelId: number, unitExpressId: number, depth = 0): number | null {
+  if (depth > 8) return null;
+  let unit: any;
+  try { unit = ifc.GetLine(modelId, unitExpressId); } catch { return null; }
+  if (!unit) return null;
+
+  const unitType = String(getWrappedValue(unit?.UnitType) || "").toUpperCase();
+  const name = String(getWrappedValue(unit?.Name) || "").toUpperCase();
+  const prefix = String(getWrappedValue(unit?.Prefix) || "").toUpperCase();
+  if (unitType && unitType !== "LENGTHUNIT") return null;
+
+  if (name === "METRE" || name === "METER") return prefix ? (SI_PREFIX_TO_METRES[prefix] ?? null) : 1;
+  if (name === "FOOT" || name === "FEET") return 0.3048;
+  if (name === "INCH") return 0.0254;
+  if (name === "YARD") return 0.9144;
+  if (name === "MILE") return 1609.344;
+
+  const conversionId = asExpressId(unit?.ConversionFactor);
+  if (conversionId) {
+    let conversion: any;
+    try { conversion = ifc.GetLine(modelId, conversionId); } catch { conversion = null; }
+    const componentValue = Number(getWrappedValue(conversion?.ValueComponent));
+    const baseUnitId = asExpressId(conversion?.UnitComponent);
+    const baseScale = baseUnitId ? resolveIfcUnitToMeters(ifc, modelId, baseUnitId, depth + 1) : null;
+    if (Number.isFinite(componentValue) && componentValue > 0 && baseScale != null) return componentValue * baseScale;
+  }
+  return null;
+}
+
+function readIfcLengthUnitFromModel(ifc: IfcAPI, modelId: number): {
+  sourceLengthUnit: string;
+  toMeters: number;
+  confidence: "ifc-unit-assignment" | "assumed-metre";
+  warning?: string;
+} {
+  for (const projectId of idsWithType(ifc, modelId, IFCPROJECT)) {
+    const project: any = ifc.GetLine(modelId, projectId);
+    const assignmentId = asExpressId(project?.UnitsInContext);
+    if (!assignmentId) continue;
+    const assignment: any = ifc.GetLine(modelId, assignmentId);
+    for (const unitReference of asIfcArray(assignment?.Units)) {
+      const unitId = asExpressId(unitReference);
+      if (!unitId) continue;
+      const unit: any = ifc.GetLine(modelId, unitId);
+      const unitType = String(getWrappedValue(unit?.UnitType) || "").toUpperCase();
+      if (unitType !== "LENGTHUNIT") continue;
+      const toMeters = resolveIfcUnitToMeters(ifc, modelId, unitId);
+      if (!Number.isFinite(toMeters) || toMeters == null || toMeters <= 0) continue;
+      const name = String(getWrappedValue(unit?.Name) || "UNKNOWN").toLowerCase();
+      const prefix = String(getWrappedValue(unit?.Prefix) || "").toLowerCase();
+      return { sourceLengthUnit: `${prefix}${name}`, toMeters, confidence: "ifc-unit-assignment" };
+    }
+  }
+  return {
+    sourceLengthUnit: "unknown (assumed metre)",
+    toMeters: 1,
+    confidence: "assumed-metre",
+    warning: "No supported IFC length unit was found. Scene geometry is treated as metres by the current web-ifc geometry pipeline; confirm model scale before applying ceilings.",
+  };
+}
+
+function pointInsidePolygon(point: Point2, polygon: Point2[]): boolean {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const a = polygon[i];
+    const b = polygon[j];
+    const intersects = ((a.y > point.y) !== (b.y > point.y)) &&
+      (point.x < ((b.x - a.x) * (point.y - a.y)) / ((b.y - a.y) || 1e-12) + a.x);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function canonicalRingSignature(points: Point2[]): string {
+  const ring = points.map((point) => `${Math.round(point.x * 100)}:${Math.round(point.y * 100)}`);
+  if (ring.length > 1 && ring[0] === ring[ring.length - 1]) ring.pop();
+  if (!ring.length) return "empty";
+  const variants: string[] = [];
+  for (const sequence of [ring, [...ring].reverse()]) {
+    for (let offset = 0; offset < sequence.length; offset++) {
+      variants.push([...sequence.slice(offset), ...sequence.slice(0, offset)].join("|"));
+    }
+  }
+  variants.sort();
+  return variants[0];
+}
+
+function stableRoomId(outer: Point2[], floorY: number): string {
+  const signature = `${Math.round(floorY * 100)}|${canonicalRingSignature(outer)}`;
+  return `room_${createHash("sha1").update(signature).digest("hex").slice(0, 16)}`;
+}
+
+function stableLevelId(floorY: number): string {
+  const signature = `floor-y:${Math.round(floorY * 100)}`;
+  return `level_${createHash("sha1").update(signature).digest("hex").slice(0, 12)}`;
+}
+
+function candidateCoverage(component: Component, grid: Grid, polygon: Point2[]): number {
+  if (component.cells.length === 0 || polygon.length < 3) return 0;
+  const maxSamples = 3000;
+  const stride = Math.max(1, Math.ceil(component.cells.length / maxSamples));
+  let tested = 0;
+  let covered = 0;
+  for (let index = 0; index < component.cells.length; index += stride) {
+    const cell = component.cells[index];
+    const i = cell % grid.width;
+    const j = Math.floor(cell / grid.width);
+    const point = gridToWorld(grid, i, j);
+    tested++;
+    if (pointInsidePolygon(point, polygon)) covered++;
+  }
+  return tested ? covered / tested : 0;
+}
+
 function createRoomObjects(
   components: Component[],
   grid: Grid,
   floorY: number,
   boundaryWallsByComponent: Map<number, string[]>,
+  wallTopElevationsById: Map<string, number>,
+  overheadSurfaceElements: ElementFootprint[],
 ): { rooms: DetectedRoom[]; componentToRoom: Map<number, string> } {
   const enclosed = components.filter((component) => !component.touchesBoundary && component.area >= MIN_COMPONENT_AREA);
   const candidates = enclosed.length
@@ -723,6 +883,11 @@ function createRoomObjects(
     const loops = boundaryLoops(grid, component.cells);
     const outer = loops[0] ?? [];
     if (outer.length < 4) continue;
+    const holes = loops.slice(1).filter((loop) => {
+      if (loop.length < 4) return false;
+      const sample = centroid(loop);
+      return pointInsidePolygon(sample, outer);
+    });
 
     let cx = 0;
     let cy = 0;
@@ -737,18 +902,83 @@ function createRoomObjects(
     cy /= component.cells.length;
 
     const id = `room-${String(roomIndex).padStart(3, "0")}`;
+    const stableId = stableRoomId(outer, floorY);
+    const levelId = stableLevelId(floorY);
     componentToRoom.set(component.id, id);
+    const roomBoundaryWallIds = boundaryWallsByComponent.get(component.id) ?? [];
+    const wallTopValues = roomBoundaryWallIds
+      .map((wallId) => wallTopElevationsById.get(wallId))
+      .filter((value): value is number => Number.isFinite(value) && value > floorY + 1.8 && value < floorY + 6.5)
+      .sort((a, b) => a - b);
+    const ceilingCandidates = overheadSurfaceElements
+      .filter((surface) => (
+        surface.points.length >= 3 &&
+        Number.isFinite(surface.minY) &&
+        surface.minY > floorY + 1.8 &&
+        surface.minY < floorY + 6.5
+      ))
+      .map((surface) => {
+        const overlapRatio = candidateCoverage(component, grid, surface.points);
+        const isCeilingCovering = surface.ifcType === "IFCCOVERING" && surface.predefinedType === "CEILING";
+        const isRoof = surface.ifcType === "IFCROOF" || surface.predefinedType === "ROOF";
+        const semanticBonus = isCeilingCovering ? 0.15 : isRoof ? 0.08 : 0;
+        const verticalSpanY = Math.max(0, surface.maxY - surface.minY);
+        // A flat ceiling can use a near-horizontal slab/covering as its reference.
+        // A roof with substantial vertical extent may be pitched; keep it in the
+        // diagnostics, but do not silently flatten it into a guessed ceiling level.
+        const flatCeilingCompatible = verticalSpanY <= 0.35;
+        const slopePenalty = flatCeilingCompatible ? 0 : 0.25;
+        return {
+          id: surface.globalId || `${surface.sourceFile}:${surface.expressId}`,
+          sourceFile: surface.sourceFile,
+          expressId: surface.expressId,
+          globalId: surface.globalId,
+          ifcType: surface.ifcType,
+          predefinedType: surface.predefinedType,
+          name: surface.name,
+          elevationY: Number(surface.minY.toFixed(4)),
+          verticalSpanY: Number(verticalSpanY.toFixed(4)),
+          flatCeilingCompatible,
+          overlapRatio: Number(overlapRatio.toFixed(4)),
+          confidence: Number(Math.max(0, Math.min(0.99, overlapRatio * 0.82 + semanticBonus - slopePenalty)).toFixed(3)),
+          semanticBonus,
+        };
+      })
+      .filter((candidate) => candidate.overlapRatio >= 0.20)
+      .sort((a, b) => b.confidence - a.confidence);
+    const selectedOverhead = ceilingCandidates.find((candidate) => candidate.flatCeilingCompatible && candidate.overlapRatio >= 0.55) ?? null;
+    const wallTopMedian = wallTopValues.length
+      ? wallTopValues[Math.floor(wallTopValues.length / 2)]
+      : null;
+    const ceilingElevation = selectedOverhead?.elevationY ?? wallTopMedian ?? (floorY + 2.7);
+    const ceilingElevationSource = selectedOverhead
+      ? "ifc-overhead-surface"
+      : wallTopMedian == null ? "fallback-estimate" : "boundary-wall-top";
+    const ceilingConfidence = selectedOverhead
+      ? selectedOverhead.confidence
+      : wallTopMedian == null ? 0.25 : Math.min(0.88, 0.55 + wallTopValues.length * 0.06);
     rooms.push({
       id,
+      stableId,
+      levelId,
+      boundary: {
+        outer: outer.map((p) => ifcToFrontend(p, floorY)),
+        holes: holes.map((loop) => loop.map((p) => ifcToFrontend(p, floorY))),
+      },
+      ceilingCandidates: ceilingCandidates.map(({ semanticBonus: _semanticBonus, ...candidate }) => candidate),
       label: `Room ${roomIndex}`,
       source: "wall-topology-grid-v2",
       area: Number(component.area.toFixed(4)),
       center: ifcToFrontend({ x: cx, y: cy }, floorY),
       polygon: outer.map((p) => ifcToFrontend(p, floorY)),
-      boundaryWalls: boundaryWallsByComponent.get(component.id) ?? [],
+      boundaryWalls: roomBoundaryWallIds,
       portals: [],
       touchesFloorBoundary: component.touchesBoundary,
       confidence: component.touchesBoundary ? 0.55 : 0.95,
+      floorElevation: floorY,
+      ceilingElevation,
+      ceilingElevationSource,
+      ceilingConfidence,
     });
     roomIndex++;
   }
@@ -993,6 +1223,7 @@ export class RoomDetector {
     const openingElements: ElementFootprint[] = [];
     const doorElements: ElementFootprint[] = [];
     const slabElements: ElementFootprint[] = [];
+    const overheadSurfaceElements: ElementFootprint[] = [];
   let semanticOpeningCount = 0;
   let semanticDoorCount = 0;
   const semanticBySource: Array<{ sourceFile: string; wallCount: number; openingCount: number; doorCount: number; slabCount: number }> = [];
@@ -1000,6 +1231,8 @@ export class RoomDetector {
     try {
       const baseId = ifc.OpenModel(await bytesFor(inputIfcPath), { COORDINATE_TO_ORIGIN: false });
       openedModelIds.push(baseId);
+      const lengthUnitInfo = readIfcLengthUnitFromModel(ifc, baseId);
+      if (lengthUnitInfo.warning) warnings.push(lengthUnitInfo.warning);
       models.push({ label: path.basename(inputIfcPath), filePath: inputIfcPath, modelId: baseId, hiddenWallGlobalIds: hiddenWallIds });
 
       for (const [replacementPath] of replacementSources) {
@@ -1024,6 +1257,8 @@ export class RoomDetector {
         semanticOpeningCount += openingIds.length;
         semanticDoorCount += doorIds.length;
         const slabIds = model === models[0] ? idsWithType(ifc, model.modelId, IFCSLAB) : [];
+        const roofIds = model === models[0] ? idsWithType(ifc, model.modelId, IFCROOF) : [];
+        const coveringIds = model === models[0] ? idsWithType(ifc, model.modelId, IFCCOVERING) : [];
         semanticBySource.push({ sourceFile: model.label, wallCount: wallIds.length, openingCount: openingIds.length, doorCount: doorIds.length, slabCount: slabIds.length });
 
         const walls = await collectElements(ifc, model.modelId, model.filePath, model.label, new Set(wallIds));
@@ -1041,6 +1276,14 @@ export class RoomDetector {
 
         const slabs = await collectElements(ifc, model.modelId, model.filePath, model.label, new Set(slabIds));
         slabElements.push(...slabs.values());
+        overheadSurfaceElements.push(...slabs.values());
+
+        const roofs = await collectElements(ifc, model.modelId, model.filePath, model.label, new Set(roofIds));
+        overheadSurfaceElements.push(...roofs.values());
+        const coverings = await collectElements(ifc, model.modelId, model.filePath, model.label, new Set(coveringIds));
+        overheadSurfaceElements.push(...Array.from(coverings.values()).filter((element) => (
+          element.predefinedType === "CEILING" || /ceiling|soffit/i.test(element.name)
+        )));
       }
 
       const semanticOpenings: SemanticOpening[] = [];
@@ -1078,28 +1321,45 @@ export class RoomDetector {
       if (semanticOpeningCount === 0) warnings.push("No IFCOPENINGELEMENT semantic entities were discovered in the active IFC sources.");
       if (semanticDoorCount === 0) warnings.push("No IFCDOOR semantic entities were discovered in the active IFC sources.");
 
-      const floorPoints = slabElements.flatMap((s) => s.points);
-      // We need the actual scene-frame vertical coordinate. Web-IFC's flatTransformation
-      // already produces the Y-up coordinates consumed by the compiler.
-      let actualFloorY = 0;
-      const slabIds = Array.from(new Set(idsWithType(ifc, models[0].modelId, IFCSLAB)));
-      if (slabIds.length) {
-        const slabZs: number[] = [];
-        ifc.StreamAllMeshes(models[0].modelId, (flatMesh: any) => {
-          if (!slabIds.includes(Number(flatMesh.expressID))) return;
-          const size = flatMesh.geometries.size();
-          for (let g = 0; g < size; g++) {
-            const placedGeometry = flatMesh.geometries.get(g);
-            const geometry = ifc.GetGeometry(models[0].modelId, placedGeometry.geometryExpressID);
-            const verticesWasm = ifc.GetVertexArray(geometry.GetVertexData(), geometry.GetVertexDataSize());
-            const matrix = Array.from(placedGeometry.flatTransformation) as number[];
-            for (let i = 0; i < verticesWasm.length / 6; i++) {
-              const p = applyIfcMatrix(verticesWasm[i * 6], verticesWasm[i * 6 + 1], verticesWasm[i * 6 + 2], matrix);
-              slabZs.push(p.y);
-            }
-          }
-        });
-        if (slabZs.length) actualFloorY = Math.min(...slabZs);
+      // Build one topology grid from the lowest floor-slab level. Level elevation
+      // is the TOP of the floor slab (maxY), because room floor/ceiling heights
+      // must be measured from the walking surface, not the slab underside (minY).
+      // The navigation detector is currently a single-level solver; merging
+      // projected slabs from every storey caused upper floors to collapse into
+      // the same X/Z raster. We isolate the base level and report the others.
+      const floorLikeSlabs = slabElements.filter((slab) =>
+        ["FLOOR", "BASESLAB", "LANDING"].includes(slab.predefinedType),
+      );
+      const nonRoofSlabs = slabElements.filter((slab) => slab.predefinedType !== "ROOF");
+      const floorCandidates = floorLikeSlabs.length ? floorLikeSlabs : nonRoofSlabs;
+      const levelGroups: Array<{ elevation: number; slabs: ElementFootprint[] }> = [];
+      for (const slab of floorCandidates.filter((item) => Number.isFinite(item.maxY) && item.points.length >= 3)) {
+        const floorTopY = slab.maxY;
+        const existing = levelGroups.find((group) => Math.abs(group.elevation - floorTopY) <= 0.35);
+        if (existing) {
+          existing.slabs.push(slab);
+          existing.elevation = existing.slabs.reduce((sum, item) => sum + item.maxY, 0) / existing.slabs.length;
+        } else {
+          levelGroups.push({ elevation: floorTopY, slabs: [slab] });
+        }
+      }
+      levelGroups.sort((a, b) => a.elevation - b.elevation);
+      const selectedLevel = levelGroups[0] ?? null;
+      const selectedFloorSlabs = selectedLevel?.slabs ?? slabElements;
+      const floorPoints = selectedFloorSlabs.flatMap((slab) => slab.points);
+      const actualFloorY = selectedLevel?.elevation ?? Math.min(...slabElements.map((slab) => slab.maxY).filter(Number.isFinite));
+      if (levelGroups.length > 1) {
+        warnings.push(`Detected ${levelGroups.length} candidate floor levels using floor-slab top elevations. This first ceiling-analysis pass segments the lowest level only (${actualFloorY.toFixed(3)} m); higher levels are reported for follow-up and are not merged into this room grid.`);
+      }
+      if (!Number.isFinite(actualFloorY)) throw new Error("RoomDetector: could not resolve a valid floor elevation.");
+
+      // Walls from other storeys must not be projected into the selected level's
+      // room raster. Keep the full wall set separately for semantic relationships.
+      const activeLevelWalls = wallElements.filter((wall) =>
+        wall.minY <= actualFloorY + 0.45 && wall.maxY >= actualFloorY + 1.5,
+      );
+      if (activeLevelWalls.length) {
+        wallElements.splice(0, wallElements.length, ...activeLevelWalls);
       }
 
       const grid = buildGrid(floorPoints, CELL_SIZE);
@@ -1191,7 +1451,14 @@ export class RoomDetector {
         }
       }
 
-      const { rooms, componentToRoom } = createRoomObjects(components, grid, actualFloorY, boundaryWallsByComponent);
+      const wallTopElevationsById = new Map<string, number>();
+      for (const wall of wallElements) {
+        const wallId = wall.globalId ?? `${wall.sourceFile}:${wall.expressId}`;
+        if (Number.isFinite(wall.maxY)) wallTopElevationsById.set(wallId, wall.maxY);
+      }
+      const { rooms, componentToRoom } = createRoomObjects(
+        components, grid, actualFloorY, boundaryWallsByComponent, wallTopElevationsById, overheadSurfaceElements,
+      );
 
       const portals: RoomPortal[] = [];
       for (const semanticOpening of semanticOpenings) {
@@ -1362,11 +1629,17 @@ export class RoomDetector {
       const floorCellCount = grid.floor.reduce((sum, value) => sum + (value ? 1 : 0), 0);
       const artifact: RoomDebugArtifact = {
         version: 1,
+        units: {
+          sourceLengthUnit: lengthUnitInfo.sourceLengthUnit,
+          toMeters: lengthUnitInfo.toMeters,
+          confidence: lengthUnitInfo.confidence,
+        },
         status: "diagnostic",
         coordinateSystem: "web-ifc-world-y-up",
         frontendMapping: "[x, y, z] — no second axis conversion",
         cellSize: CELL_SIZE,
         floorElevation: actualFloorY,
+        floorLevelElevations: levelGroups.map((group) => Number(group.elevation.toFixed(4))),
         sourceFiles,
         excludedDuplicatePreviewSources,
         rooms,
@@ -1380,6 +1653,8 @@ export class RoomDetector {
           blockedCellCount,
           componentCount: components.length,
           retainedRoomCount: rooms.length,
+          floorLevelGroupCount: levelGroups.length || 1,
+          analysedFloorLevelCount: 1,
           // Count all openings intentionally sealed for room partitioning,
           // including hosted GLB door openings identified by their opening name.
           sealedDoorCount: sealableOpenings.length,

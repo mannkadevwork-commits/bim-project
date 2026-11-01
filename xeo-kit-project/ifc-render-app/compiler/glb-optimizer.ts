@@ -24,6 +24,14 @@ export interface GlbOptimizationOptions {
   textureQuality?: number;
 }
 
+export interface TextureSlotCounts {
+  baseColor: number;
+  metallicRoughness: number;
+  normal: number;
+  occlusion: number;
+  emissive: number;
+}
+
 export interface GlbOptimizationStats {
   inputBytes: number;
   outputBytes: number;
@@ -44,6 +52,10 @@ export interface GlbOptimizationStats {
   materialsAfter: number;
   texturesBefore: number;
   texturesAfter: number;
+  textureSlotsBefore: TextureSlotCounts;
+  textureSlotsAfter: TextureSlotCounts;
+  maxTextureSizeApplied: number;
+  textureQualityApplied: number;
   generatedAt: string;
 }
 
@@ -87,6 +99,35 @@ function countGeometryStats(document: any): GeometryStats {
     materials: document.getRoot().listMaterials().length,
     textures: document.getRoot().listTextures().length,
   };
+}
+
+function countMaterialTextureSlots(document: any): TextureSlotCounts {
+  const counts: TextureSlotCounts = {
+    baseColor: 0,
+    metallicRoughness: 0,
+    normal: 0,
+    occlusion: 0,
+    emissive: 0,
+  };
+  const slots: Array<[keyof TextureSlotCounts, string]> = [
+    ["baseColor", "getBaseColorTexture"],
+    ["metallicRoughness", "getMetallicRoughnessTexture"],
+    ["normal", "getNormalTexture"],
+    ["occlusion", "getOcclusionTexture"],
+    ["emissive", "getEmissiveTexture"],
+  ];
+  for (const mesh of document.getRoot().listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      const material = primitive.getMaterial();
+      if (!material) continue;
+      for (const [slot, getter] of slots) {
+        if (typeof material[getter] === "function" && material[getter]()) {
+          counts[slot] += 1;
+        }
+      }
+    }
+  }
+  return counts;
 }
 
 function reductionPercent(before: number, after: number): number {
@@ -140,6 +181,7 @@ export async function optimizeGlb(
   const inputBytes = fs.statSync(options.inputPath).size;
   const document = await io.read(options.inputPath);
   const before = countGeometryStats(document);
+  const textureSlotsBefore = countMaterialTextureSlots(document);
 
   // Visual Phase 1 favours visible detail over the previous aggressively small
   // output. The caller may request a higher ratio, but quality mode will not
@@ -156,17 +198,21 @@ export async function optimizeGlb(
     Math.min(0.0005, options.simplifyError ?? 0.0005),
   );
 
-  // Preserve high resolution for catalog textures when they exist. Current IFC
-  // jobs may have no textures; this does not synthesize textures that are absent.
-  const maxTextureSize = Math.max(
-    4096,
-    options.maxTextureSize ?? 4096,
-  );
+  // Respect the caller's texture budget. The old Math.max(4096, requested)
+  // expression accidentally forced every texture to allow 4K dimensions, even
+  // when HCI_GLB_MAX_TEXTURE_SIZE requested 2048. A bounded 2K default keeps
+  // uploaded furniture detailed while avoiding unbounded texture memory use.
+  const maxTextureSize = Math.round(Math.max(
+    256,
+    Math.min(4096, options.maxTextureSize ?? 2048),
+  ));
 
-  const textureQuality = Math.min(
-    100,
-    Math.max(92, options.textureQuality ?? 92),
-  );
+  // Honour quality settings instead of silently forcing >=92, which defeated
+  // the deployment's configured value and increased encoded asset size.
+  const textureQuality = Math.round(Math.max(
+    70,
+    Math.min(100, options.textureQuality ?? 88),
+  ));
 
   await document.transform(
     // Remove duplicate buffer/accessor/material data first.
@@ -190,8 +236,11 @@ export async function optimizeGlb(
       lockBorder: true,
     }),
 
-    // The uploaded GLB currently has no textures, but keep this in the
-    // pipeline for furniture/catalog scenes that do.
+    // Lossy WebP is appropriate for color imagery, but normal, occlusion, and
+    // metallic/roughness maps encode numeric surface data. Compressing those
+    // slots as lossy WebP changes the material response and can make furniture
+    // look dull, metallic, or unusually dark. Preserve data-map bytes here;
+    // only resize/convert authored color textures in this pass.
     textureCompress({
       encoder: sharp,
       targetFormat: "webp",
@@ -200,12 +249,14 @@ export async function optimizeGlb(
         maxTextureSize,
       ],
       quality: textureQuality,
+      slots: /^(baseColorTexture|emissiveTexture)$/,
     }),
 
     prune(),
   );
 
   const after = countGeometryStats(document);
+  const textureSlotsAfter = countMaterialTextureSlots(document);
 
   // Compress geometry for network/storage and fast browser decode.
   await document.transform(
@@ -256,6 +307,10 @@ export async function optimizeGlb(
     materialsAfter: after.materials,
     texturesBefore: before.textures,
     texturesAfter: after.textures,
+    textureSlotsBefore,
+    textureSlotsAfter,
+    maxTextureSizeApplied: maxTextureSize,
+    textureQualityApplied: textureQuality,
     generatedAt: new Date().toISOString(),
   };
 

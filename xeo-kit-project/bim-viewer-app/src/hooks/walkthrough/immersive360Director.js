@@ -1,5 +1,8 @@
 import * as THREE from 'three';
 const IMMERSIVE_360_SPEED_RAD_PER_SEC = 0.038;
+const IMMERSIVE_360_DEFAULT_PITCH = -0.19; // ~11° down: reveals furniture and floor instead of over-weighting the ceiling.
+const IMMERSIVE_360_MIN_PITCH = -0.48;
+const IMMERSIVE_360_MAX_PITCH = 0.14;
 const IMMERSIVE_360_MANUAL_RESUME_DELAY_MS = 3200;
 const IMMERSIVE_360_MANUAL_VELOCITY_DAMPING = 6.8;
 
@@ -13,6 +16,7 @@ export const immersive360DirectorMethods = {
     this.immersive360LastPointer = null;
     this.immersive360PointerDragging = false;
     this.immersive360YawVelocity = 0;
+    this.immersive360Pitch = IMMERSIVE_360_DEFAULT_PITCH;
     this.immersive360AutoSpeedRadPerSec = IMMERSIVE_360_SPEED_RAD_PER_SEC;
   },
 
@@ -130,9 +134,12 @@ export const immersive360DirectorMethods = {
       this.guidedCompositionYaw = composedYaw;
       this.guidedCompositionTargetYaw = composedYaw;
       this.guidedYawCenter = composedYaw;
-      this.guidedPitch = Number.isFinite(this.guidedPitch) ? this.guidedPitch : -0.085;
-      this.currentPitch = this.guidedPitch;
-      this.targetPitch = this.guidedPitch;
+      // The walkthrough's Guided camera is intentionally almost level; 360
+      // presentation uses a dedicated downward architectural pitch so viewers
+      // can read the furniture composition and floor depth like a design tour.
+      this.immersive360Pitch = IMMERSIVE_360_DEFAULT_PITCH;
+      this.currentPitch = this.immersive360Pitch;
+      this.targetPitch = this.immersive360Pitch;
       this.guidedPanPhase = 0;
 
       this.immersive360Active = true;
@@ -199,8 +206,9 @@ export const immersive360DirectorMethods = {
     this.guidedCompositionTargetYaw = yaw;
     this.guidedYawCenter = yaw;
     this.guidedPanPhase = 0;
-    this.targetPitch = this.guidedPitch;
-    this.currentPitch = this.guidedPitch;
+    this.immersive360Pitch = IMMERSIVE_360_DEFAULT_PITCH;
+    this.targetPitch = this.immersive360Pitch;
+    this.currentPitch = this.immersive360Pitch;
     this.immersive360ManualActive = false;
     this.immersive360ManualUntil = performance.now() + 500;
     this.immersive360YawVelocity = 0;
@@ -226,6 +234,7 @@ export const immersive360DirectorMethods = {
     const now = performance.now();
     this.immersive360PointerDown = { x: event.clientX, y: event.clientY };
     this.immersive360LastPointer = { x: event.clientX, y: event.clientY, t: now };
+    this.renderer?.domElement?.setPointerCapture?.(event.pointerId);
     this.immersive360PointerDragging = false;
     this.immersive360ManualActive = true;
     this.immersive360ManualUntil = now + IMMERSIVE_360_MANUAL_RESUME_DELAY_MS;
@@ -243,6 +252,7 @@ export const immersive360DirectorMethods = {
 
     this.immersive360PointerDragging = true;
     const dx = event.clientX - this.immersive360LastPointer.x;
+    const dy = event.clientY - this.immersive360LastPointer.y;
     const dtMs = Math.max(8, now - this.immersive360LastPointer.t);
     this.immersive360LastPointer = { x: event.clientX, y: event.clientY, t: now };
 
@@ -253,7 +263,12 @@ export const immersive360DirectorMethods = {
       -1.8,
       1.8,
     );
-    this.targetPitch = this.guidedPitch;
+    this.immersive360Pitch = THREE.MathUtils.clamp(
+      this.immersive360Pitch - dy * (this.lookSensitivity * 0.72),
+      IMMERSIVE_360_MIN_PITCH,
+      IMMERSIVE_360_MAX_PITCH,
+    );
+    this.targetPitch = this.immersive360Pitch;
     this.immersive360ManualUntil = now + IMMERSIVE_360_MANUAL_RESUME_DELAY_MS;
     return true;
   },
@@ -302,6 +317,10 @@ export const immersive360DirectorMethods = {
       this.targetYaw += (this.immersive360AutoSpeedRadPerSec || IMMERSIVE_360_SPEED_RAD_PER_SEC) * dt;
     }
 
-    this.targetPitch = this.guidedPitch;
+    this.targetPitch = THREE.MathUtils.clamp(
+      Number.isFinite(this.immersive360Pitch) ? this.immersive360Pitch : IMMERSIVE_360_DEFAULT_PITCH,
+      IMMERSIVE_360_MIN_PITCH,
+      IMMERSIVE_360_MAX_PITCH,
+    );
   },
 };

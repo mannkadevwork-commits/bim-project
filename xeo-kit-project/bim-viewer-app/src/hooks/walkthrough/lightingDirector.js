@@ -141,6 +141,24 @@ function environmentIntensityFor(kind) {
   }
 }
 
+// GLTFLoader has already decoded and assigned authored PBR maps. Do not then
+// replace their source roughness/metalness factors with name-based heuristics;
+// those factors multiply the texture channels and can materially change the
+// artist-authored finish. Keep the semantic fallback for simple untextured IFC
+// exports, where names and proportions are the only available material clues.
+function hasAuthoredPbrTextures(material) {
+  return [
+    'map',
+    'normalMap',
+    'roughnessMap',
+    'metalnessMap',
+    'aoMap',
+    'emissiveMap',
+    'alphaMap',
+    'lightMap',
+  ].some((key) => material?.[key]?.isTexture === true);
+}
+
 export class LightingDirector {
   constructor({ scene, renderer, onChange }) {
     this.scene = scene;
@@ -227,10 +245,11 @@ export class LightingDirector {
         if ('envMapIntensity' in material) {
           material.envMapIntensity = environmentIntensityFor(materialKind);
         }
-        if ('roughness' in material) {
+        const preserveAuthoredPbr = hasAuthoredPbrTextures(material);
+        if (!preserveAuthoredPbr && 'roughness' in material) {
           material.roughness = roughnessFor(materialKind, material.roughness);
         }
-        if ('metalness' in material) {
+        if (!preserveAuthoredPbr && 'metalness' in material) {
           material.metalness = metalnessFor(materialKind, material.metalness);
         }
         // Respect authored colour maps and base colours; only tune the PBR

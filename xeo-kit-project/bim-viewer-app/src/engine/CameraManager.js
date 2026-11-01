@@ -31,6 +31,18 @@ const getTarget = (viewer, targetId, isAsset = false) => {
   return isAsset ? viewer.scene.models?.[targetId] : viewer.scene.objects?.[targetId];
 };
 
+const getSceneAABB = (viewer) => {
+  if (!viewer?.scene) return null;
+  try {
+    const current = viewer.scene.getAABB?.();
+    if (current && current.length >= 6 && Array.from(current).slice(0, 6).every(Number.isFinite)) return current;
+  } catch (error) {
+    // Fall back to the cached scene bounds for SDK builds without getAABB().
+  }
+  const cached = viewer.scene.aabb;
+  return cached && cached.length >= 6 ? cached : null;
+};
+
 export class CameraManager {
   constructor(viewer) {
     this.viewer = viewer;
@@ -55,11 +67,61 @@ export class CameraManager {
 
   fitScene(duration = this.defaultDuration) {
     if (!this.viewer?.scene || !this.flight) return false;
+    const aabb = getSceneAABB(this.viewer);
+    if (!aabb) return false;
     this.flight.flyTo({
-      aabb: this.viewer.scene.aabb,
-      projection: 'perspective',
+      aabb,
+      projection: this.camera?.projection || 'perspective',
       duration,
       fit: true,
+      fitFOV: 48,
+    });
+    return true;
+  }
+
+  /**
+   * Frame the complete loaded project from a useful architectural three-quarter
+   * angle. Unlike cameraFlight.flyTo(model), this explicitly sets the viewing
+   * direction and computes distance from the whole scene bounds, so IFC geometry
+   * and restored catalogue furniture are framed together instead of defaulting
+   * to a narrow front elevation.
+   */
+  overview(duration = 0.85) {
+    if (!this.viewer?.scene || !this.flight || !this.camera) return false;
+    const fit = getBoundsCenterAndRadius(getSceneAABB(this.viewer));
+    if (!fit) return this.fitScene(duration);
+
+    const fov = 54;
+    try {
+      if (this.camera.perspective) this.camera.perspective.fov = fov;
+    } catch (error) {
+      // The installed SDK may expose FOV through the camera project only.
+    }
+    try {
+      if (this.viewer.scene.camera?.project) this.viewer.scene.camera.project.fov = fov;
+    } catch (error) {
+      // FOV is a visual preference; explicit eye/look framing still works.
+    }
+
+    // A slightly elevated diagonal view reveals roof/floor layout and at least
+    // two sides of the building. The 1.14 padding factor keeps all bounds
+    // inside the view across typical landscape canvas aspect ratios.
+    const direction = normalize([1, 1.16, 1.08]);
+    const fovRadians = (fov * Math.PI) / 180;
+    const distance = Math.max((fit.radius / Math.sin(fovRadians / 2)) * 1.14, 2);
+    const eye = [
+      fit.center[0] + direction[0] * distance,
+      fit.center[1] + direction[1] * distance,
+      fit.center[2] + direction[2] * distance,
+    ];
+
+    this.flight.flyTo({
+      eye,
+      look: fit.center,
+      up: [0, 1, 0],
+      projection: 'perspective',
+      duration,
+      fit: false,
     });
     return true;
   }
@@ -157,10 +219,11 @@ export class CameraManager {
 
   preset(name, duration = 0.55) {
     if (!this.viewer?.scene || !this.flight) return false;
+    if (name === 'iso') return this.overview(duration);
     const preset = PRESETS[name];
     if (!preset) return false;
 
-    const fit = getBoundsCenterAndRadius(this.viewer.scene.aabb);
+    const fit = getBoundsCenterAndRadius(getSceneAABB(this.viewer));
     if (!fit) return false;
 
     const direction = normalize(preset.direction);
@@ -269,7 +332,7 @@ export class CameraManager {
   }
 
   reset(duration = 0.55) {
-    return this.fitScene(duration);
+    return this.overview(duration);
   }
 }
 

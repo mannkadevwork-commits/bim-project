@@ -312,6 +312,7 @@ export const inspectGLBSource = async (srcUrl) => {
       pivotModes: {
         center,
         bottomCenter: [center[0], bounds.min[1], center[2]],
+        topCenter: [center[0], bounds.max[1], center[2]],
       },
       dimensions,
       bytes: buffer.byteLength,

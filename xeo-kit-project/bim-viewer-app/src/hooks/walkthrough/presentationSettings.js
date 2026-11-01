@@ -17,7 +17,7 @@ export const DEFAULT_PRESENTATION_SETTINGS = {
     overviewFov: 60,
     guidedFov: 78,
     exploreFov: 78,
-    immersiveFov: 72,
+    immersiveFov: 78,
     eyeHeightMeters: 1.68,
     guidedEyeHeightMeters: 1.72,
     heightOffsetMeters: 0,
@@ -142,11 +142,17 @@ export async function loadPresentationSettings(jobId, apiBaseUrl) {
   if (!stored && Number(manifestCamera.guidedFov) === 72) {
     fromManifest.camera.guidedFov = DEFAULT_PRESENTATION_SETTINGS.camera.guidedFov;
   }
+  if (!stored && Number(manifestCamera.immersiveFov) === 72) {
+    fromManifest.camera.immersiveFov = DEFAULT_PRESENTATION_SETTINGS.camera.immersiveFov;
+  }
   // This app auto-saved v1 defaults on first load, so older browsers may also
   // have 72 persisted without a deliberate slider change. Upgrade that legacy
   // default only; all other saved preferences remain untouched.
   if (stored && Number(stored?.camera?.guidedFov) === 72) {
     stored.camera.guidedFov = DEFAULT_PRESENTATION_SETTINGS.camera.guidedFov;
+  }
+  if (stored && Number(stored?.camera?.immersiveFov) === 72) {
+    stored.camera.immersiveFov = DEFAULT_PRESENTATION_SETTINGS.camera.immersiveFov;
   }
   const settings = stored ? mergePresentationSettings(fromManifest, stored) : fromManifest;
   return { settings, manifest, source: stored ? 'saved-preferences' : manifest ? 'manifest-defaults' : 'built-in-defaults' };

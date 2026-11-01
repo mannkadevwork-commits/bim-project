@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Move, RotateCw, Scaling, Lock, Unlock, MoreHorizontal, Trash2, Palette, CircleHelp, CopyPlus, Square, Diamond, Box } from 'lucide-react';
+import { Move, RotateCw, Scaling, Lock, Unlock, MoreHorizontal, Trash2, Palette, CircleHelp, CopyPlus, Square, Diamond, Box, Search, X, Check, Eye, Crosshair, RefreshCw } from 'lucide-react';
 
 const QUICK_COLORS = ['#FFFFFF', '#000000', '#E74C3C', '#3498DB', '#F5DEB3', '#7F8C8D'];
 
@@ -25,6 +25,11 @@ export const TransformModeTooltip = ({
   isNative,
   onIsolate,
   onToggleMultiSelect,
+  onOpenAppearance,
+  onReplaceAsset,
+  canReplaceAsset = false,
+  onOpen360Walkthrough,
+  onFocusSelection,
 
   isDarkMode = true,
   resizeSubmode = 'face',
@@ -35,9 +40,12 @@ export const TransformModeTooltip = ({
   const [showMore, setShowMore] = useState(false);
   const [materialMode, setMaterialMode] = useState('color');
   const [showHelp, setShowHelp] = useState(false);
+  const [materialSearch, setMaterialSearch] = useState('');
+  const [lastPickedMaterial, setLastPickedMaterial] = useState(null);
   const [placement, setPlacement] = useState({ left: 0, top: 0, above: true });
   const [helpPlacement, setHelpPlacement] = useState({ left: 0, top: 0, side: 'below' });
   const [morePlacement, setMorePlacement] = useState({ left: 0, top: 0, side: 'below' });
+  const selectionKey = selectedElements.map((item) => item?.id).filter(Boolean).join('|');
   const moreRef = useRef(null);
   const toolbarRef = useRef(null);
   const helpRef = useRef(null);
@@ -176,6 +184,73 @@ export const TransformModeTooltip = ({
     };
   }, [showHelp, showMore, placement]);
 
+  useEffect(() => {
+    setMaterialSearch('');
+    setLastPickedMaterial(null);
+  }, [assetName, selectionCount, isMultiSelection, selectionKey]);
+
+  useEffect(() => {
+    if (selectedMaterial) setLastPickedMaterial(selectedMaterial);
+  }, [selectedMaterial]);
+
+  useEffect(() => {
+    if (!showMore) return undefined;
+    const handleOutsidePointer = (event) => {
+      if (!toolbarRef.current?.contains(event.target)) setShowMore(false);
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') setShowMore(false);
+    };
+    document.addEventListener('pointerdown', handleOutsidePointer);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handleOutsidePointer);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [showMore]);
+
+  const filteredTooltipMaterials = materialLibrary.filter((material) => {
+    if (material.kind !== materialMode) return false;
+    const query = materialSearch.trim().toLowerCase();
+    if (!query) return true;
+    return [material.name, material.category, material.brand, material.collection, material.shadeCode,
+      material.shade_code, material.color, material.slug].filter(Boolean).join(' ').toLowerCase().includes(query);
+  });
+
+  const colorDefinitionFromHex = (hex) => {
+    const safeHex = /^#[0-9a-f]{6}$/i.test(String(hex || '')) ? String(hex).toUpperCase() : '#FFFFFF';
+    const rgb = [1, 3, 5].map((offset) => Number.parseInt(safeHex.slice(offset, offset + 2), 16) / 255);
+    return { id: `custom-${safeHex}`, kind: 'color', name: `Custom ${safeHex}`, color: safeHex, rgb, roughness: 0.8, metallic: 0 };
+  };
+
+  const materialIsSelected = (material) => {
+    if (!selectedMaterial || selectedMaterial.kind !== material.kind) return false;
+    if (material.kind === 'color') return String(selectedMaterial.color || '').toUpperCase() === String(material.color || '').toUpperCase();
+    return [material.id, material.materialAssetId, material.slug].filter(Boolean).some((id) => (
+      id === selectedMaterial.id || id === selectedMaterial.materialAssetId || id === selectedMaterial.slug
+      || id === selectedMaterial.texture?.id
+    ));
+  };
+
+  const currentBulkMaterial = (() => {
+    if (lastPickedMaterial?.kind === materialMode) return lastPickedMaterial;
+    if (selectedMaterial?.kind === materialMode) return selectedMaterial;
+    // Never offer bulk apply with an accidental default white. A finish must
+    // be explicitly selected or customized first.
+    return null;
+  })();
+
+  const handleMaterialPick = (material) => {
+    setLastPickedMaterial(material);
+    onMaterialSelect?.(material, wallSurfaceScope);
+  };
+
+  const handleCustomColorPick = (hex) => {
+    const material = colorDefinitionFromHex(hex);
+    setLastPickedMaterial(material);
+    onColorChange?.(hex, wallSurfaceScope);
+  };
+
   const handleModeClick = (newMode) => {
     if (isNative) return;
     onModeChange(newMode);
@@ -294,6 +369,59 @@ export const TransformModeTooltip = ({
             </span>
           </button>
 
+          {(onOpenAppearance || onReplaceAsset || onFocusSelection || onOpen360Walkthrough) && <div className="w-px h-7 bg-slate-700/70 mx-0.5" />}
+
+          {onReplaceAsset && canReplaceAsset && !isMultiSelection && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); setShowMore(false); onReplaceAsset(); }}
+              className="flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-sky-400/25 bg-sky-500/10 px-2.5 text-sky-200 transition hover:border-sky-300/45 hover:bg-sky-500/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ff914d]"
+              title="Replace this furniture item with another catalogue model"
+              aria-label="Replace selected item"
+            >
+              <RefreshCw className="h-4 w-4" />
+              <span className="hidden 2xl:inline text-[9px] font-bold">Replace</span>
+            </button>
+          )}
+
+          {onOpenAppearance && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); setShowMore(false); onOpenAppearance(); }}
+              className="flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-[#ff914d]/25 bg-[#ff914d]/10 px-2.5 text-[#ffb07a] transition hover:border-[#ff914d]/50 hover:bg-[#ff914d]/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ff914d]"
+              title="Open color, fabric and texture options for the selected element"
+              aria-label="Customize appearance"
+            >
+              <Palette className="h-4 w-4" />
+              <span className="hidden 2xl:inline text-[9px] font-bold">Finish</span>
+            </button>
+          )}
+
+          {onFocusSelection && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onFocusSelection(); }}
+              className="flex h-10 w-9 shrink-0 items-center justify-center rounded-xl border border-transparent text-slate-300 transition hover:border-slate-700 hover:bg-white/5 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ff914d]"
+              title="Center the camera on the selected element"
+              aria-label="Focus selected element"
+            >
+              <Crosshair className="h-4 w-4" />
+            </button>
+          )}
+
+          {onOpen360Walkthrough && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); setShowMore(false); onOpen360Walkthrough(); }}
+              className="flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-emerald-400/20 bg-emerald-500/8 px-2.5 text-emerald-200 transition hover:border-emerald-300/40 hover:bg-emerald-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ff914d]"
+              title="Open the 360° walkthrough render setup"
+              aria-label="Open 360 degree walkthrough"
+            >
+              <Eye className="h-4 w-4" />
+              <span className="hidden 2xl:inline text-[9px] font-bold">360 Tour</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); setShowMore((v) => !v); }}
@@ -408,70 +536,129 @@ export const TransformModeTooltip = ({
         {showMore && (
           <div
             ref={moreRef}
-            className="fixed z-[160] w-56 p-3 rounded-2xl bg-[#0b1322]/98 border border-slate-700 shadow-[0_18px_50px_rgba(0,0,0,0.5)] backdrop-blur-2xl pointer-events-auto"
-            style={{ left: morePlacement.left, top: morePlacement.top }}
+            className="fixed z-[160] flex flex-col overflow-hidden rounded-2xl border border-slate-700 bg-[#0b1322]/[0.98] shadow-[0_18px_50px_rgba(0,0,0,0.5)] backdrop-blur-2xl pointer-events-auto"
+            style={{ left: morePlacement.left, top: morePlacement.top, width: 'min(330px, calc(100vw - 20px))', maxHeight: 'calc(100vh - 20px)' }}
             onPointerDown={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
           >
             {(onColorChange || onMaterialSelect) && (
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <div className="text-[9px] font-bold text-slate-300 uppercase tracking-[0.15em]">Surface finish</div>
-                    <div className="text-[8px] text-slate-600 mt-0.5">{isMultiSelection ? `Apply to ${selectionCount} selected elements` : 'Color, fabric and texture are separate tools'}</div>
-                  </div>
-                  <span className="w-6 h-6 rounded-lg border border-slate-600 shadow-inner bg-cover bg-center" style={{ backgroundColor: selectedMaterial?.color || currentColor, backgroundImage: selectedMaterial?.texture?.src ? `url(${selectedMaterial.texture.src})` : 'none' }} />
-                </div>
-                {canApplyToAllWalls && (
-                  <div className="mb-2 rounded-xl border border-indigo-400/20 bg-indigo-500/8 p-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <div>
-                        <div className="text-[8px] font-bold uppercase tracking-[0.14em] text-indigo-300">Wall side</div>
-                        <div className="text-[7px] text-slate-500">Choose before applying a finish</div>
+              <>
+                <div className="shrink-0 border-b border-slate-800/90 p-3 pb-2.5">
+                  <div className="mb-2.5 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[10px] font-bold uppercase tracking-[0.15em] text-slate-200">Surface finish</div>
+                      <div className="mt-1 text-[9px] leading-4 text-slate-500">
+                        {isMultiSelection ? `Selecting a finish applies it to ${selectionCount} selected elements.` : 'Choose a color, fabric or texture.'}
                       </div>
-                      <select value={wallSurfaceScope} onChange={(e)=>{e.stopPropagation();onWallSurfaceScopeChange?.(e.target.value)}} className="rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-[8px] font-bold text-slate-200 outline-none">
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <span className="h-7 w-7 rounded-lg border border-slate-600 bg-cover bg-center shadow-inner" style={{ backgroundColor: selectedMaterial?.color || currentColor, backgroundImage: selectedMaterial?.textureSrc || selectedMaterial?.texture?.src ? `url(${selectedMaterial?.textureSrc || selectedMaterial?.texture?.src})` : 'none' }} />
+                      <button type="button" onClick={(e) => { e.stopPropagation(); setShowMore(false); }} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white" aria-label="Close surface finish palette" title="Close palette">
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {canApplyToAllWalls && (
+                    <div className="mb-2.5 flex items-center justify-between gap-2 rounded-lg border border-indigo-400/20 bg-indigo-500/8 px-2.5 py-2">
+                      <div className="min-w-0">
+                        <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-indigo-200">Wall side</div>
+                        <div className="mt-0.5 text-[8px] text-slate-500">For wall finishes</div>
+                      </div>
+                      <select value={wallSurfaceScope} onChange={(e) => { e.stopPropagation(); onWallSurfaceScopeChange?.(e.target.value); }} className="max-w-[145px] rounded-md border border-slate-700 bg-slate-900 px-2 py-1.5 text-[9px] font-bold text-slate-200 outline-none">
                         <option value="interior">Interior</option>
                         <option value="exterior">Exterior</option>
                         <option value="both">Both sides</option>
                       </select>
                     </div>
+                  )}
+
+                  <div className="mb-2 flex rounded-lg border border-slate-700 bg-slate-900/80 p-1">
+                    {['color', 'fabric', 'texture'].map((tab) => (
+                      <button key={tab} type="button" onClick={(e) => { e.stopPropagation(); setMaterialMode(tab); setMaterialSearch(''); }} className={`flex-1 rounded-md py-1.5 text-[9px] font-bold capitalize transition-colors ${materialMode === tab ? 'bg-slate-700 text-white shadow-sm' : 'text-slate-500 hover:text-slate-200'}`}>
+                        {tab === 'color' ? 'Color' : tab === 'fabric' ? 'Fabric' : 'Texture'}
+                      </button>
+                    ))}
                   </div>
-                )}
-                <div className="flex p-1 rounded-lg bg-slate-900/80 border border-slate-700 mb-2">
-                  {['color','fabric','texture'].map(tab => <button key={tab} type="button" onClick={(e)=>{e.stopPropagation();setMaterialMode(tab)}} className={`flex-1 py-1.5 rounded-md text-[8px] font-bold capitalize ${materialMode===tab ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>{tab}</button>)}
+
+                  <label className="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900/80 px-2.5 py-2 focus-within:border-slate-500">
+                    <Search className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                    <input value={materialSearch} onChange={(e) => setMaterialSearch(e.target.value)} placeholder={`Search ${materialMode === 'color' ? 'colors' : materialMode === 'fabric' ? 'fabrics' : 'textures'}…`} aria-label={`Search ${materialMode} materials`} className="min-w-0 flex-1 bg-transparent text-[10px] text-slate-100 outline-none placeholder:text-slate-600" />
+                    {materialSearch && <button type="button" onClick={() => setMaterialSearch('')} aria-label="Clear material search" className="text-slate-500 hover:text-white"><X className="h-3 w-3" /></button>}
+                  </label>
+                  <div className="mt-1.5 text-[8px] text-slate-500">{filteredTooltipMaterials.length} {materialMode === 'color' ? 'colors' : materialMode === 'fabric' ? 'fabrics' : 'textures'}</div>
                 </div>
-                {materialMode === 'color' ? (
-                  <div className="grid grid-cols-5 gap-1.5">
-                    {materialLibrary.filter(m => m.kind === 'color').map(material => <button key={material.id} type="button" title={material.name} onClick={(e)=>{e.stopPropagation();onMaterialSelect?.(material, wallSurfaceScope)}} style={{backgroundColor:material.color}} className={`aspect-square rounded-md border ${selectedMaterial?.kind==='color' && selectedMaterial?.color?.toUpperCase()===material.color.toUpperCase() ? 'border-[#ff914d] ring-1 ring-[#ff914d]/40' : 'border-slate-700'}`} />)}
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-2 gap-1.5">
-                    {materialLibrary.filter(m => m.kind === materialMode).map(material => <button key={material.id} type="button" onClick={(e)=>{e.stopPropagation();onMaterialSelect?.(material, wallSurfaceScope)}} className={`flex items-center gap-2 p-1.5 rounded-lg border text-left ${selectedMaterial?.kind===material.kind && selectedMaterial?.texture?.id===material.id ? 'border-[#ff914d] bg-orange-500/10' : 'border-slate-700 bg-slate-900/50'}`}>
-                      <span className="w-7 h-7 rounded-md border border-white/10 bg-cover bg-center" style={{backgroundColor:material.color,backgroundImage:material.textureSrc?`url(${material.textureSrc})`:'none'}} />
-                      <span className="text-[8px] text-slate-200 truncate">{material.name}</span>
-                    </button>)}
-                  </div>
-                )}
-                <div className="flex gap-2 mt-2">
-                  <label className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg border border-slate-700 bg-slate-900/70 text-[9px] font-semibold text-slate-300 hover:border-slate-500 cursor-pointer"><Palette className="w-3 h-3"/> Custom color<input type="color" aria-label="Choose custom color" value={currentColor || '#FFFFFF'} className="sr-only" onChange={(e)=>onColorChange?.(e.target.value, wallSurfaceScope)} /></label>
+
+                <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3 pt-2" style={{ maxHeight: 'min(300px, 34vh)' }}>
+                  {materialMode === 'color' ? (
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {filteredTooltipMaterials.map((material) => (
+                        <button key={material.id} type="button" title={`${material.name} · ${material.color || '#FFFFFF'}`} aria-label={`Apply ${material.name || material.color}`} onClick={(e) => { e.stopPropagation(); handleMaterialPick(material); }} className={`flex min-w-0 flex-col gap-1 rounded-lg border p-1.5 text-left transition-colors ${materialIsSelected(material) ? 'border-[#ff914d] bg-orange-500/10 ring-1 ring-[#ff914d]/30' : 'border-slate-700 bg-slate-900/45 hover:border-slate-500'}`}>
+                          <span className="h-7 w-full rounded-md border border-white/10" style={{ backgroundColor: material.color || '#FFFFFF' }} />
+                          <span className="w-full truncate text-[8px] font-medium text-slate-300">{material.name || material.color}</span>
+                          <span className="font-mono text-[7px] text-slate-500">{String(material.color || '#FFFFFF').toUpperCase()}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {filteredTooltipMaterials.map((material) => (
+                        <button key={material.id} type="button" title={material.name} aria-label={`Apply ${material.name}`} onClick={(e) => { e.stopPropagation(); handleMaterialPick(material); }} className={`flex min-w-0 items-center gap-2 rounded-lg border p-1.5 text-left transition-colors ${materialIsSelected(material) ? 'border-[#ff914d] bg-orange-500/10 ring-1 ring-[#ff914d]/25' : 'border-slate-700 bg-slate-900/45 hover:border-slate-500'}`}>
+                          <span className="h-9 w-9 shrink-0 rounded-md border border-white/10 bg-cover bg-center" style={{ backgroundColor: material.color || '#FFFFFF', backgroundImage: (material.textureSrc || material.texture?.src) ? `url(${material.textureSrc || material.texture.src})` : 'none' }} />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-[9px] font-semibold text-slate-200">{material.name}</span>
+                            <span className="mt-0.5 block truncate text-[8px] text-slate-500">{material.category || material.brand || 'Surface finish'}</span>
+                          </span>
+                          {materialIsSelected(material) && <Check className="h-3 w-3 shrink-0 text-[#ff914d]" />}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {!filteredTooltipMaterials.length && (
+                    <div className="rounded-lg border border-dashed border-slate-700 px-3 py-6 text-center">
+                      <div className="text-[10px] font-semibold text-slate-300">{materialLibrary.some((material) => material.kind === materialMode) ? 'No matching finishes' : `No ${materialMode === 'color' ? 'colors' : materialMode === 'fabric' ? 'fabrics' : 'textures'} available`}</div>
+                      <div className="mt-1 text-[9px] text-slate-500">{materialSearch ? 'Try another search term.' : 'Add materials from Admin → Surface Materials.'}</div>
+                    </div>
+                  )}
                 </div>
-                {canApplyToAllWalls && onApplyMaterialToAllWalls && selectedMaterial && (
-                  <button type="button" onClick={(e)=>{e.stopPropagation();onApplyMaterialToAllWalls(selectedMaterial, wallSurfaceScope)}} className="w-full mt-2.5 flex items-center justify-between px-2.5 py-2 rounded-lg border border-indigo-400/20 bg-indigo-500/8 text-indigo-200 hover:bg-indigo-500/15 hover:border-indigo-300/35 transition-colors"><span className="text-left"><span className="block text-[9px] font-bold">Apply finish to all walls</span><span className="block text-[7px] text-indigo-300/65 mt-0.5">Use the selected finish across every wall</span></span><span className="text-[8px] font-bold uppercase tracking-wider">Apply</span></button>
-                )}
-              </div>
+
+                <div className="shrink-0 space-y-2 border-t border-slate-800 bg-[#0b1322]/98 p-3">
+                  {onColorChange && (
+                    <div className="flex items-center gap-2">
+                      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-lg border border-slate-700 bg-slate-900/70 px-2.5 py-2 text-[9px] font-semibold text-slate-200 transition hover:border-slate-500">
+                        <span className="h-5 w-5 shrink-0 rounded-md border border-white/10" style={{ backgroundColor: currentColor || '#FFFFFF' }} />
+                        <span className="min-w-0 flex-1">Custom color <span className="ml-1 font-mono text-slate-500">{String(currentColor || '#FFFFFF').toUpperCase()}</span></span>
+                        <input type="color" aria-label="Choose custom material color" value={currentColor || '#FFFFFF'} className="sr-only" onChange={(e) => handleCustomColorPick(e.target.value)} />
+                      </label>
+                    </div>
+                  )}
+
+                  {isMultiSelection && currentBulkMaterial && onMaterialSelect && (
+                    <button type="button" onClick={(e) => { e.stopPropagation(); onMaterialSelect(currentBulkMaterial, wallSurfaceScope); }} className="flex w-full items-center justify-between gap-2 rounded-lg border border-emerald-400/25 bg-emerald-500/10 px-3 py-2 text-left text-emerald-100 transition hover:bg-emerald-500/15">
+                      <span><span className="block text-[9px] font-bold">Apply to all {selectionCount} selected</span><span className="mt-0.5 block text-[8px] text-emerald-200/60">Current: {currentBulkMaterial.name || currentBulkMaterial.color || 'selected finish'}</span></span>
+                      <span className="text-[8px] font-bold uppercase tracking-wider">Apply</span>
+                    </button>
+                  )}
+
+                  {canApplyToAllWalls && onApplyMaterialToAllWalls && currentBulkMaterial && (
+                    <button type="button" onClick={(e) => { e.stopPropagation(); onApplyMaterialToAllWalls(currentBulkMaterial, wallSurfaceScope); }} className="flex w-full items-center justify-between gap-2 rounded-lg border border-indigo-400/25 bg-indigo-500/10 px-3 py-2 text-left text-indigo-100 transition hover:bg-indigo-500/15">
+                      <span><span className="block text-[9px] font-bold">Apply to all walls</span><span className="mt-0.5 block text-[8px] text-indigo-200/60">Uses the current finish and wall side</span></span>
+                      <span className="text-[8px] font-bold uppercase tracking-wider">Apply</span>
+                    </button>
+                  )}
+
+                  {onDelete && (
+                    <button type="button" onClick={(e) => { e.stopPropagation(); onDelete(); setShowMore(false); }} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[10px] font-semibold text-rose-400 transition hover:bg-rose-500/10 hover:text-rose-300">
+                      <Trash2 className="h-3.5 w-3.5" />
+                      {isMultiSelection ? `Delete ${selectionCount} elements` : 'Delete element'}
+                    </button>
+                  )}
+                </div>
+              </>
             )}
-            {onColorChange && onDelete && <div className="w-full h-px bg-slate-800 my-3" />}
-            {onDelete && (
-              <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); onDelete(); setShowMore(false); }}
-                className="w-full flex items-center justify-between gap-2 px-2 py-2 rounded-lg text-xs font-semibold text-rose-400 hover:bg-rose-500/10 hover:text-rose-300"
-              >
-                <span className="flex items-center gap-2">
-                  <Trash2 className="w-3.5 h-3.5" />
-                  {isMultiSelection ? `Delete ${selectionCount} elements` : 'Delete Element'}
-                </span>
-                {isMultiSelection && <span className="text-[8px] font-bold uppercase tracking-wider text-rose-500/70">Batch</span>}
+            {!onColorChange && !onMaterialSelect && onDelete && (
+              <button type="button" onClick={(e) => { e.stopPropagation(); onDelete(); setShowMore(false); }} className="flex w-full items-center gap-2 p-3 text-left text-xs font-semibold text-rose-400 hover:bg-rose-500/10">
+                <Trash2 className="h-4 w-4" /> Delete element
               </button>
             )}
           </div>

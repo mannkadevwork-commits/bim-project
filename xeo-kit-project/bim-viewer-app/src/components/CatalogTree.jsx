@@ -143,7 +143,7 @@ function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection
         <ItemThumb url={assetUrl(item.thumbnail_url)} name={item.name} fileType={item.file_type} />
       </div>
       <div className="flex items-center gap-1.5 px-2 py-1.5">
-        <ColorDot rgb={item.color_rgb} />
+        {normalizedFileType !== 'glb' && normalizedFileType !== 'gltf' && <ColorDot rgb={item.color_rgb} />}
         <span className="text-[11px] font-semibold text-slate-800 dark:text-slate-200 truncate leading-tight">
           {item.name}
         </span>
@@ -246,9 +246,9 @@ function CategoryNode({ node, depth, placementMode, setPlacementMode, resetSelec
 
 export function CatalogTree({ tree, loading, error, placementMode, setPlacementMode, resetSelection }) {
   const [searchQuery, setSearchQuery] = useState('');
-  const [openRootId, setOpenRootId] = useState(null);
+  const [openRootId, setOpenRootId] = useState('hci-lighting-fixtures');
 
-  if (loading) {
+  if (loading && !(tree || []).length) {
     return (
       <div className="flex h-40 flex-col items-center justify-center gap-2 px-6 text-center text-sm text-slate-500 dark:text-slate-400">
         <span className="animate-spin w-5 h-5 border-2 border-[#ff914d]/40 border-t-[#ff914d] rounded-full" />
@@ -258,7 +258,7 @@ export function CatalogTree({ tree, loading, error, placementMode, setPlacementM
     );
   }
 
-  if (error) {
+  if (error && !(tree || []).length) {
     return (
       <div className="m-4 rounded-2xl border border-rose-200 bg-rose-50 p-4 text-center text-sm text-rose-700 dark:border-rose-900/50 dark:bg-rose-900/10 dark:text-rose-300">
         <p className="font-semibold">We couldn’t load the item library.</p>
@@ -289,6 +289,14 @@ export function CatalogTree({ tree, loading, error, placementMode, setPlacementM
       <div className="mx-3 my-2 rounded-lg bg-orange-50/80 px-2.5 py-2 dark:bg-orange-500/10">
         <p className="text-[10px] leading-4 text-slate-600 dark:text-slate-300"><span className="font-semibold text-slate-800 dark:text-white">Add to your design:</span> click an item, then click in the model—or drag it into place.</p>
       </div>
+      {error && (
+        <div className="mx-3 mb-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/10 dark:text-amber-200">
+          The online catalogue is unavailable. Bundled lighting fixtures are still ready to use.
+        </div>
+      )}
+      {loading && (tree || []).length > 0 && (
+        <div className="px-3 pb-1 text-[10px] text-slate-400">Loading additional catalogue items…</div>
+      )}
       <div className="flex-1 overflow-y-auto pb-3">
         {!tree.length ? (
           <div className="mx-3 mt-4 rounded-xl border border-dashed border-slate-300 p-5 text-center dark:border-slate-700">

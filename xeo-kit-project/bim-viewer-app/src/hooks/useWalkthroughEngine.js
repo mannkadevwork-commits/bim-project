@@ -337,7 +337,19 @@ class WalkRuntime {
     };
     this.onPointerUp = (e) => {
       if (e.button === 0 && this.immersive360Active && this.viewMode === 'walk') {
+        const down = this.immersive360PointerDown;
+        const wasDragging = this.immersive360PointerDragging;
+        const clickDistance = down
+          ? Math.hypot(e.clientX - down.x, e.clientY - down.y)
+          : Infinity;
+        const isMarkerClick = Boolean(down && !wasDragging && clickDistance < 5);
         this._endImmersive360Pointer(e);
+        // A 360 pointer-up used to always return here, which made camera look
+        // work but made every visible orange destination marker unclickable.
+        // Marker clicks navigate; actual drags remain look-only gestures.
+        if (isMarkerClick && performance.now() >= this.portalClickSuppressedUntil) {
+          this._pickPortal(e);
+        }
         return;
       }
       if (e.button === 0 && this.walkMode === 'guided' && this.viewMode === 'walk') {
@@ -591,39 +603,61 @@ class WalkRuntime {
       this.camera.updateProjectionMatrix();
     }
 
-    // Never expose or spawn on destinations where the presentation camera would
-    // be underneath a low object (e.g. a bed, table, cabinet) even if the
-    // architectural slab is technically walkable beneath it.
-    const safeRenderedHotspots = rawHotspots.filter((hotspot) => this._hasCameraClearance(hotspot.position));
-    // Phase 7: curated backend destinations are already spatially selected and
-    // semantically typed. Do not re-expand them into generic floor markers.
-    // Legacy/older jobs without curated metadata keep the Phase 6 augmentation
-    // fallback so they remain usable.
+    // Do not show a destination merely because the camera has enough headroom
+    // above its authored coordinates. The old flow drew raw hotspot coordinates,
+    // then tried to resolve them against the NavMesh only after a click. That let
+    // users see a perfectly normal-looking orange marker which the click handler
+    // subsequently rejected as "no longer available".
+    const clearanceSafeHotspots = rawHotspots.filter((hotspot) => this._hasCameraClearance(hotspot.position));
+
+    // Curated backend destinations are sampled from Recast itself and must not be
+    // replaced by arbitrary floor samples. Older jobs still get the legacy floor
+    // augmentation fallback.
     const isCuratedDestinationSet = hotspotsPayload?.metadata?.navigationQuality === 'curated-v1'
-      || safeRenderedHotspots.some((hotspot) => hotspot.presentationRole);
-    const augmentedHotspots = isCuratedDestinationSet
-      ? safeRenderedHotspots
-      : this._augmentHotspotsFromFloor(surfacePayload, safeRenderedHotspots, 18);
-    this.hotspots = augmentedHotspots;
+      || rawHotspots.some((hotspot) => hotspot.presentationRole);
+    const candidateHotspots = isCuratedDestinationSet
+      ? rawHotspots
+      : this._augmentHotspotsFromFloor(surfacePayload, clearanceSafeHotspots, 18);
+
+    // Resolve each candidate once against the imported runtime NavMesh. The
+    // validated/snap-adjusted position is used for the visible marker, floor map,
+    // safe-anchor registry and route target, eliminating separate inconsistent
+    // lookups at render time and click time.
+    const rejectedNavigationTargets = [];
+    const validatedHotspots = [];
+    for (const candidate of candidateHotspots) {
+      const validated = this._validateHotspotNavigationTarget(candidate);
+      if (validated) validatedHotspots.push(validated);
+      else rejectedNavigationTargets.push({ id: candidate?.id || null, label: candidate?.label || null });
+    }
+
+    this.hotspots = validatedHotspots;
     if (semanticAreas.length) {
-      const activeAreaIds = new Set(augmentedHotspots.map((hotspot) => hotspot.areaId).filter(Boolean));
+      const activeAreaIds = new Set(validatedHotspots.map((hotspot) => hotspot.areaId).filter(Boolean));
       this.walkAreas = semanticAreas.filter((area) => activeAreaIds.has(area.id));
     }
     this.lightingDirector.setRoomAnchors(this.walkAreas);
     this._assignHotspotRoles();
     this._buildDestinationPresentationIndex();
     this._buildSafeAnchorRegistry();
-    this.navigationPlan = this._buildNavigationPlan(surfacePayload, augmentedHotspots);
-    if (safeRenderedHotspots.length !== rawHotspots.length) {
-      console.info('[Walkthrough] Removed unsafe low-clearance hotspots', {
-        removed: rawHotspots.length - safeRenderedHotspots.length,
-        remaining: augmentedHotspots.length,
+    this.navigationPlan = this._buildNavigationPlan(surfacePayload, validatedHotspots);
+    if (clearanceSafeHotspots.length !== rawHotspots.length) {
+      console.info('[Walkthrough] Hotspots failing the initial camera-clearance probe', {
+        removed: rawHotspots.length - clearanceSafeHotspots.length,
+        remainingAfterNavigationValidation: validatedHotspots.length,
       });
     }
-    if (augmentedHotspots.length > safeRenderedHotspots.length) {
-      console.info('[Walkthrough] Added safe presentation hotspots', {
-        added: augmentedHotspots.length - safeRenderedHotspots.length,
-        total: augmentedHotspots.length,
+    if (rejectedNavigationTargets.length) {
+      console.warn('[Walkthrough] Hid destinations that could not be validated against the runtime NavMesh or camera clearance.', {
+        rejected: rejectedNavigationTargets,
+        acceptedCount: validatedHotspots.length,
+        sourceCount: candidateHotspots.length,
+      });
+    }
+    if (candidateHotspots.length > rawHotspots.length) {
+      console.info('[Walkthrough] Added supplemental floor navigation targets', {
+        added: candidateHotspots.length - rawHotspots.length,
+        totalValidated: validatedHotspots.length,
       });
     }
 
@@ -710,9 +744,100 @@ class WalkRuntime {
         this.position.set(recoveryCandidate.point.x, recoveryCandidate.point.y, recoveryCandidate.point.z);
         this.currentPolyRef = recoveryCandidate.point.polyRef || this.currentPolyRef;
         this.lastMovementPosition.copy(this.position);
-        this._rememberNearestSafeAnchor(this.position, 'spawn-recovery');
       }
     }
+
+    // A point is not a valid customer-facing destination just because it lies on
+    // some NavMesh polygon. Verify a complete route from the actual initial spawn
+    // before publishing the marker. This catches partial-path endpoints up front,
+    // rather than letting the customer click a marker that fails only at runtime.
+    const reachableFromSpawn = [];
+    const unreachableFromSpawn = [];
+    const spawnPoint = { x: this.position.x, y: this.position.y, z: this.position.z };
+    for (const hotspot of this.hotspots) {
+      const target = hotspot.resolvedWalkPoint || {
+        x: hotspot.position[0], y: hotspot.position[1], z: hotspot.position[2],
+      };
+      let route = null;
+      try {
+        route = this.query?.computePath(spawnPoint, target, {
+          filter: this.filter,
+          maxStraightPathSize: 256,
+          maxPathSize: 256,
+        });
+      } catch (_) {
+        route = null;
+      }
+      if (this._inspectPathEndpoint(route, target).complete) reachableFromSpawn.push(hotspot);
+      else unreachableFromSpawn.push({ id: hotspot.id, label: hotspot.label || null });
+    }
+    // Keep the 360 presentation useful even when some authored markers are too
+    // close to furniture or fail the runtime clearance probe. The backend's
+    // connected-space graph validates room centers, but the client still needs
+    // safe viewpoints between them. Fill only the missing slots from the actual
+    // exported floor surface, then require both camera clearance and a complete
+    // runtime NavMesh path from the real spawn before exposing a new point.
+    const desiredPresentationDestinationCount = Math.min(
+      16,
+      Math.max(10, semanticAreas.length * 2),
+    );
+    let supplementalAccepted = 0;
+    if (reachableFromSpawn.length < desiredPresentationDestinationCount) {
+      const floorCandidates = this._augmentHotspotsFromFloor(
+        surfacePayload,
+        reachableFromSpawn,
+        desiredPresentationDestinationCount,
+      );
+      const supplementalCandidates = floorCandidates.slice(reachableFromSpawn.length);
+      const knownIds = new Set(reachableFromSpawn.map((hotspot) => hotspot.id));
+      for (const candidate of supplementalCandidates) {
+        const validated = this._validateHotspotNavigationTarget(candidate);
+        if (!validated || knownIds.has(validated.id)) continue;
+        const target = validated.resolvedWalkPoint || {
+          x: validated.position[0], y: validated.position[1], z: validated.position[2],
+        };
+        let route = null;
+        try {
+          route = this.query?.computePath(spawnPoint, target, {
+            filter: this.filter,
+            maxStraightPathSize: 256,
+            maxPathSize: 256,
+          });
+        } catch (_) {
+          route = null;
+        }
+        if (!this._inspectPathEndpoint(route, target).complete) continue;
+        knownIds.add(validated.id);
+        reachableFromSpawn.push(validated);
+        supplementalAccepted += 1;
+        if (reachableFromSpawn.length >= desiredPresentationDestinationCount) break;
+      }
+      if (supplementalAccepted > 0) {
+        console.info('[Walkthrough] Added safe, reachable presentation viewpoints from the exported floor surface.', {
+          added: supplementalAccepted,
+          targetCount: desiredPresentationDestinationCount,
+          totalReachable: reachableFromSpawn.length,
+        });
+      }
+    }
+
+    if (reachableFromSpawn.length !== this.hotspots.length) {
+      console.warn('[Walkthrough] Hiding destinations that do not have a complete route from the initial spawn.', {
+        hidden: unreachableFromSpawn,
+        reachableCount: reachableFromSpawn.length,
+        validatedCount: this.hotspots.length,
+      });
+      this.hotspots = reachableFromSpawn;
+      const reachableAreaIds = new Set(this.hotspots.map((hotspot) => hotspot.areaId).filter(Boolean));
+      if (semanticAreas.length) this.walkAreas = semanticAreas.filter((area) => reachableAreaIds.has(area.id));
+      this.lightingDirector.setRoomAnchors(this.walkAreas);
+      this._assignHotspotRoles();
+      this._buildDestinationPresentationIndex();
+      this._buildSafeAnchorRegistry();
+      this.navigationPlan = this._buildNavigationPlan(surfacePayload, this.hotspots);
+      this._rememberNearestSafeAnchor(this.position, 'spawn');
+    }
+
     // Prepare the very first Guided view immediately. Without this, the camera
     // could enter the walkthrough carrying the overview heading and stare into a
     // wall/ceiling before the first destination click caused a reframe.
@@ -796,6 +921,8 @@ class WalkRuntime {
 
     candidates.sort((a, b) => b.openness - a.openness);
     const selected = [];
+    const knownIds = new Set(base.map((hotspot) => hotspot?.id).filter(Boolean));
+    let generatedIdIndex = 1;
     const minSpacing = 1.35 * Math.max(this.metersPerUnit, 0.000001);
     for (const candidate of candidates) {
       let tooClose = false;
@@ -807,13 +934,16 @@ class WalkRuntime {
         }
       }
       if (tooClose) continue;
+      let generatedId = `generated-hotspot-${generatedIdIndex++}`;
+      while (knownIds.has(generatedId)) generatedId = `generated-hotspot-${generatedIdIndex++}`;
+      knownIds.add(generatedId);
       selected.push({
-        id: `generated-hotspot-${selected.length + 1}`,
+        id: generatedId,
         position: candidate.point,
         clearanceMeters: candidate.openness,
         score: candidate.openness,
         source: 'navmesh-floor',
-        label: `Navigation point ${base.length + selected.length + 1}`,
+        label: `Additional view ${base.length + selected.length + 1}`,
       });
       if (base.length + selected.length >= targetCount) break;
     }
@@ -894,7 +1024,11 @@ class WalkRuntime {
       .filter((hotspot) => hotspot?.id && Array.isArray(hotspot.position))
       .map((hotspot) => {
         const role = this._getHotspotRole(hotspot);
-        const kind = role === 'room-center' ? 'primary' : role === 'viewpoint' ? 'optional' : 'internal';
+        const isSupplementalFloorView = hotspot.source === 'navmesh-floor';
+        const isPresentationRole = ['viewpoint', 'room-entrance', 'transition'].includes(role);
+        const kind = role === 'room-center'
+          ? 'primary'
+          : (isPresentationRole || isSupplementalFloorView ? 'optional' : 'internal');
         const areaLabel = String(hotspot.areaLabel || '').trim();
         const presentationLabel = kind === 'primary'
           ? (areaLabel || hotspot.label || 'Room')
@@ -917,10 +1051,23 @@ class WalkRuntime {
       if (fallback) fallback.destinationKind = 'primary';
     }
 
+    const presentationHotspots = records
+      .filter((record) => record.destinationKind !== 'internal')
+      .sort((a, b) => {
+        const orderA = Number.isFinite(Number(a.displayOrder)) ? Number(a.displayOrder) : 9999;
+        const orderB = Number.isFinite(Number(b.displayOrder)) ? Number(b.displayOrder) : 9999;
+        if (orderA !== orderB) return orderA - orderB;
+        const kindPriority = { primary: 0, optional: 1 };
+        return (kindPriority[a.destinationKind] ?? 2) - (kindPriority[b.destinationKind] ?? 2)
+          || String(a.areaId || '').localeCompare(String(b.areaId || ''))
+          || String(a.id).localeCompare(String(b.id));
+      })
+      .slice(0, 16);
+
     this.destinationPresentation = {
-      version: 1,
+      version: 2,
       byId: new Map(records.map((record) => [record.id, record])),
-      presentationHotspots: records.filter((record) => record.destinationKind !== 'internal'),
+      presentationHotspots,
     };
     return this.destinationPresentation;
   }
@@ -957,7 +1104,9 @@ class WalkRuntime {
         this._hasCameraClearance(hotspot.position);
       if (!safeForRecovery) continue;
 
-      const point = this._closestWalkPoint(hotspot.position, 0.45);
+      const point = hotspot.resolvedWalkPoint
+        ? { ...hotspot.resolvedWalkPoint }
+        : this._closestWalkPoint(hotspot.position, 0.45);
       if (!point) continue;
       if (!this._hasCameraClearance([point.x, point.y, point.z])) continue;
 
@@ -980,7 +1129,9 @@ class WalkRuntime {
         .filter((entry) => entry.openness > 0)
         .sort((a, b) => b.openness - a.openness)[0];
       if (fallback?.hotspot?.id) {
-        const point = this._closestWalkPoint(fallback.hotspot.position, 0.45);
+        const point = fallback.hotspot.resolvedWalkPoint
+          ? { ...fallback.hotspot.resolvedWalkPoint }
+          : this._closestWalkPoint(fallback.hotspot.position, 0.45);
         if (point && this._hasCameraClearance([point.x, point.y, point.z])) {
           const metadata = {
             hotspot: fallback.hotspot,
@@ -1120,6 +1271,46 @@ class WalkRuntime {
     return async (response) => {
       if (!response.ok) throw new Error(`${name} returned ${response.status}`);
       return response.json();
+    };
+  }
+
+  _validateHotspotNavigationTarget(hotspot) {
+    if (!hotspot?.id || !Array.isArray(hotspot.position) || hotspot.position.length < 3) return null;
+    const requested = hotspot.position.slice(0, 3).map(Number);
+    if (!requested.every(Number.isFinite)) return null;
+
+    const unit = Math.max(Number(this.metersPerUnit) || 1, 0.000001);
+    // Curated points should already lie on the serialized NavMesh. Small retries
+    // account for float precision, but the final accepted snap is bounded so we
+    // cannot silently move a destination through a wall or into another room.
+    let point = null;
+    for (const tolerance of [0.45, 0.6, 0.75]) {
+      const candidate = this._closestWalkPoint(requested, tolerance);
+      if (!candidate) continue;
+      const horizontalDistance = Math.hypot(candidate.x - requested[0], candidate.z - requested[2]);
+      const verticalDistance = Math.abs(candidate.y - requested[1]);
+      if (horizontalDistance > 0.75 * unit || verticalDistance > Math.max(0.35 * unit, 0.2)) continue;
+      point = candidate;
+      break;
+    }
+    if (!point) return null;
+
+    const position = [point.x, point.y, point.z];
+    if (!this._hasCameraClearance(position)) return null;
+
+    return {
+      ...hotspot,
+      // `position` is now the canonical runtime-valid target used by both the
+      // marker and route planner. Keep the resolved point as an explicit cache
+      // so click handling does not perform a second, potentially inconsistent
+      // closest-point query.
+      position,
+      resolvedWalkPoint: {
+        x: point.x,
+        y: point.y,
+        z: point.z,
+        polyRef: point.polyRef || 0,
+      },
     };
   }
 
@@ -1702,6 +1893,9 @@ class WalkRuntime {
         Number(hotspot.position[1]),
         Number(hotspot.position[2]),
       ];
+      group.userData.resolvedWalkPoint = hotspot.resolvedWalkPoint
+        ? { ...hotspot.resolvedWalkPoint }
+        : null;
       group.userData.walkLabel = hotspot.label || 'Floor destination';
       group.userData.hotspotId = hotspot.id;
       group.userData.source = hotspot.source;
@@ -1720,6 +1914,7 @@ class WalkRuntime {
     const hotspot = this.hotspots.find((item) => item?.id === group.userData.hotspotId) || {
       id: group.userData.hotspotId || null,
       position: group.userData.walkTarget,
+      resolvedWalkPoint: group.userData.resolvedWalkPoint || null,
       label: group.userData.walkLabel || 'Floor destination',
     };
     const label = hotspot.label || 'Floor destination';
@@ -1807,6 +2002,9 @@ class WalkRuntime {
     this.guidedShotSubjectId = null;
     this.guidedShotSubjectUntil = 0;
     this.activeHotspotId = null;
+    if (this.immersivePresentationActive || this.immersive360Active) {
+      this.exitImmersivePresentation?.();
+    }
     this.travelTo([floorPoint.x, floorPoint.y, floorPoint.z], 'Floor destination');
   }
 
@@ -1835,29 +2033,26 @@ class WalkRuntime {
     // load. Do not re-run that gate against a re-snapped point: a closest-point
     // query can legally move a few centimeters to a neighbouring polygon and
     // make an already-approved presentation destination look unsafe.
-    const usesCanonicalValidatedHotspot = Boolean(canonical);
-    let point = this._closestWalkPoint(rawPosition, usesCanonicalValidatedHotspot ? 1.0 : 0.6);
-    // Canonical hotspots were validated against the same NavMesh during load.
-    // If the serialized query lands just outside the small lookup envelope
-    // (for example after a raster/coordinate precision difference), retry with
-    // a wider search envelope before declaring the destination unavailable.
-    if (!point && usesCanonicalValidatedHotspot) {
-      point = this._closestWalkPoint(rawPosition, 2.5);
-      if (point) {
-        console.warn('[Walkthrough] Canonical hotspot resolved with relaxed NavMesh lookup.', {
-          hotspotId: resolvedHotspot.id,
-          requested: rawPosition,
-          resolved: [point.x, point.y, point.z],
-        });
-      }
+    const usesValidatedNavigationTarget = Boolean(resolvedHotspot.resolvedWalkPoint);
+    const cachedPoint = usesValidatedNavigationTarget ? resolvedHotspot.resolvedWalkPoint : null;
+    let point = cachedPoint && [cachedPoint.x, cachedPoint.y, cachedPoint.z].every(Number.isFinite)
+      ? { x: cachedPoint.x, y: cachedPoint.y, z: cachedPoint.z, polyRef: cachedPoint.polyRef || 0 }
+      : this._closestWalkPoint(rawPosition, canonical ? 0.75 : 0.6);
+
+    // Map callers normally resolve to a canonical hotspot. If a UI event was
+    // queued while the scene was rebuilding, retry once against the latest
+    // canonical destination before failing the click.
+    if (!point && canonical) {
+      const canonicalPosition = canonical.resolvedWalkPoint || canonical.position;
+      point = this._closestWalkPoint(canonicalPosition, 0.75);
     }
     if (!point) {
-      this.onState?.({ type: 'error', message: 'That navigation point is no longer available.' });
+      this.onState?.({ type: 'error', message: 'This destination could not be matched to a safe walkable floor point. Choose another visible marker or regenerate the navigation data.' });
       return false;
     }
 
-    if (!usesCanonicalValidatedHotspot && !this._hasCameraClearance([point.x, point.y, point.z])) {
-      this.onState?.({ type: 'error', message: 'That navigation point is no longer available.' });
+    if (!usesValidatedNavigationTarget && !this._hasCameraClearance([point.x, point.y, point.z])) {
+      this.onState?.({ type: 'error', message: 'This destination could not be matched to a safe walkable floor point. Choose another visible marker or regenerate the navigation data.' });
       return false;
     }
 
@@ -1889,14 +2084,40 @@ class WalkRuntime {
     this.guidedShotSubjectUntil = 0;
 
     const label = resolvedHotspot.label || 'Navigation point';
-    const start = { x: this.position.x, y: this.position.y, z: this.position.z };
-    const result = this.query?.computePath(start, point, {
+    let start = { x: this.position.x, y: this.position.y, z: this.position.z };
+    let result = this.query?.computePath(start, point, {
       filter: this.filter,
       maxStraightPathSize: 256,
       maxPathSize: 256,
     });
 
-    const endpointStatus = this._inspectPathEndpoint(result, point);
+    let endpointStatus = this._inspectPathEndpoint(result, point);
+    if (!endpointStatus.complete) {
+      // Camera motion can accumulate a small offset outside the serialized
+      // NavMesh. A marker should not require a fresh render because of that drift:
+      // retry once from the nearest walkable point, but only within 0.75 m.
+      const snappedStart = this._closestWalkPoint(start, 0.75);
+      if (snappedStart && Math.hypot(snappedStart.x - start.x, snappedStart.z - start.z) <= 0.75 * Math.max(this.metersPerUnit, 0.000001)) {
+        const retryStart = { x: snappedStart.x, y: snappedStart.y, z: snappedStart.z };
+        const retryResult = this.query?.computePath(retryStart, point, {
+          filter: this.filter,
+          maxStraightPathSize: 256,
+          maxPathSize: 256,
+        });
+        const retryStatus = this._inspectPathEndpoint(retryResult, point);
+        if (retryStatus.complete) {
+          this.position.set(snappedStart.x, snappedStart.y, snappedStart.z);
+          this.currentPolyRef = snappedStart.polyRef || this.currentPolyRef;
+          this.lastMovementPosition.copy(this.position);
+          start = retryStart;
+          result = retryResult;
+          endpointStatus = retryStatus;
+          this._syncCamera();
+          console.info('[Walkthrough] Recovered a slightly off-mesh camera start before navigating to the selected destination.');
+        }
+      }
+    }
+
     if (!endpointStatus.complete) {
       console.warn('[Walkthrough] Destination rejected because the NavMesh route is incomplete.', {
         hotspotId: resolvedHotspot.id || null,
@@ -1905,11 +2126,17 @@ class WalkRuntime {
       });
       this.stuck = true;
       this.recoveryAvailable = this.hotspots.length > 0;
-      this.onState?.({ type: 'error', message: `${label} is not fully reachable through the current walkable route.` });
+      this.onState?.({ type: 'error', message: `${label} is not fully reachable from the current position. Use Move to safe position to recover navigation.` });
       this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
       return false;
     }
 
+    // Travel is disabled while the stationary 360 presentation is active. Once
+    // a destination has a confirmed route, leave presentation mode and start the
+    // normal NavMesh travel path. This also supports the React floor-map buttons.
+    if (this.immersivePresentationActive || this.immersive360Active) {
+      this.exitImmersivePresentation?.();
+    }
     return this.travelTo([point.x, point.y, point.z], label, { resolvedPoint: point });
   }
 
@@ -2825,28 +3052,81 @@ if (name === 'top') {
     this._moveTo(this.position.clone().addScaledVector(this.pathVelocity, dt));
   }
 
+  _restoreToSafeAnchor(entry, label = 'Safe position', mode = 'safe-anchor-restore') {
+    const anchorId = entry?.hotspot?.id || entry?.id || null;
+    const rawPoint = entry?.point;
+    if (!rawPoint || ![rawPoint.x, rawPoint.y, rawPoint.z].every(Number.isFinite)) return false;
+
+    // Recovery can be requested precisely when the camera is no longer on the
+    // NavMesh. Revalidate the stored anchor, not the current (possibly invalid)
+    // position, before allowing this explicit emergency reposition.
+    const point = this._closestWalkPoint([rawPoint.x, rawPoint.y, rawPoint.z], 0.45);
+    if (!point || !this._hasCameraClearance([point.x, point.y, point.z])) return false;
+
+    this.path = null;
+    this.pathIndex = 0;
+    this.pathReplanAttempts = 0;
+    this.directTravel = null;
+    this.pathVelocity.set(0, 0, 0);
+    this.velocity.set(0, 0, 0);
+    this.travelTotalDistance = 0;
+    this.travelElapsed = 0;
+    this.travelMode = null;
+    this.blockedTime = 0;
+    this.cameraClearanceTimer = 0;
+    this.progressWatchTime = 0;
+    this.lastMoveDirection.set(0, 0, 0);
+
+    if (anchorId) this.activeHotspotId = anchorId;
+    const restored = this._teleportToDestination(point, label, mode);
+    if (!restored) return false;
+
+    this.stuck = false;
+    this.recoveryAvailable = false;
+    this.lastMovementPosition.copy(this.position);
+    this.onState?.({ type: 'navigation-recovery', mode, anchorId });
+    this.onState?.({ type: 'stuck', available: false });
+    this.onState?.({ type: 'unstuck' });
+    return true;
+  }
+
   recoverToSafeSpot(label = 'Safe position') {
-    if (!this.query || !this.hotspots.length) return false;
+    if (!this.query) {
+      this.onState?.({ type: 'error', message: 'Walk navigation is not ready yet. Reopen the walkthrough and try again.' });
+      return false;
+    }
+    if (!this.hotspots.length) {
+      this.stuck = true;
+      this.recoveryAvailable = false;
+      this.onState?.({ type: 'error', message: 'No validated floor markers are available for recovery in this scene.' });
+      this.onState?.({ type: 'stuck', available: false });
+      return false;
+    }
 
     this.path = null;
     this.pathIndex = 0;
     this.directTravel = null;
     this.pathVelocity.set(0, 0, 0);
     this.velocity.set(0, 0, 0);
-    // Preserve blockedTime until a valid recovery route starts. Callers need
-    // to distinguish a successful reroute from a recovery attempt that failed.
     this.cameraClearanceTimer = 0;
     this.progressWatchTime = 0;
 
+    // First correct small drift onto the NavMesh. The previous implementation
+    // calculated a snapped start point but still asked Recast to plan from the
+    // unsnapped camera position, which can make every recovery route fail.
     const start = this._closestWalkPoint(
       [this.position.x, this.position.y, this.position.z],
-      0.9,
+      0.45,
     );
+    if (start && this._hasCameraClearance([start.x, start.y, start.z])) {
+      this.position.set(start.x, start.y, start.z);
+      this.currentPolyRef = start.polyRef || this.currentPolyRef;
+      this.lastMovementPosition.copy(this.position);
+    }
     const startPoint = start || { x: this.position.x, y: this.position.y, z: this.position.z };
 
     // 1) Prefer an actual breadcrumb from the user's recent route. This creates
-    // a natural backtrack rather than teleporting to whichever hotspot happens
-    // to be numerically closest.
+    // a natural backtrack rather than selecting an arbitrary point in the house.
     const history = [...this.navigationHistory].reverse();
     for (const item of history) {
       if (!item?.id || this.recoveryAttemptedIds.has(item.id)) continue;
@@ -2872,13 +3152,13 @@ if (name === 'top') {
         this.recoveryAvailable = false;
         this.onState?.({ type: 'navigation-recovery', mode: 'backtrack', anchorId: item.id });
         this.onState?.({ type: 'stuck', available: false });
+        this.onState?.({ type: 'unstuck' });
         return true;
       }
     }
 
-    // 2) Re-plan to the best connected safe anchor. Score favors open, useful
-    // presentation anchors and known-good points while still respecting physical
-    // reachability from the current location.
+    // 2) Re-plan to a connected safe anchor, preferring open, useful presentation
+    // positions while still requiring a complete NavMesh path from the current spot.
     const candidates = this._safeAnchorCandidates(startPoint);
     const chosen = candidates[0];
     if (chosen) {
@@ -2890,19 +3170,36 @@ if (name === 'top') {
         this.recoveryAvailable = false;
         this.onState?.({ type: 'navigation-recovery', mode: 'reroute', anchorId: chosen.id });
         this.onState?.({ type: 'stuck', available: false });
+        this.onState?.({ type: 'unstuck' });
         return true;
       }
     }
 
-    // Phase A: never teleport the camera through the house as an automatic
-    // fallback. If no complete NavMesh route exists, leave the agent where it
-    // is and surface a recoverable stuck state. Teleports hid broken routes and
-    // made room traversal look successful when it was not physically connected.
+    // 3) If this camera is off the NavMesh (for example after a tight clearance
+    // collision), a route cannot be planned from it. The explicit recovery button
+    // may return the user to a previously validated anchor. This is a safe, bounded
+    // recovery action, not a route-travel fallback; every target is re-snapped and
+    // rechecked for headroom before moving the camera.
+    const fallbackIds = [
+      this.lastSafeAnchorId,
+      ...[...this.navigationHistory].reverse().map((item) => item?.id),
+      ...this.safeAnchorIds,
+    ].filter(Boolean);
+    const visitedIds = new Set();
+    for (const id of fallbackIds) {
+      if (visitedIds.has(id)) continue;
+      visitedIds.add(id);
+      const entry = this.safeAnchorById.get(id);
+      if (this._restoreToSafeAnchor(entry, label, 'safe-anchor-restore')) return true;
+    }
+
+    // No complete path and no still-valid safe anchor: keep the camera in place
+    // and tell the user why the action could not be completed.
     this.stuck = true;
     this.recoveryAvailable = this.hotspots.length > 0;
     this.onState?.({
       type: 'error',
-      message: 'No complete walkable recovery route is available from this position.',
+      message: 'No safe recovery point could be validated from this position. Choose an orange floor marker to continue.',
     });
     this.onState?.({ type: 'stuck', available: this.recoveryAvailable });
     return false;
@@ -3997,7 +4294,13 @@ if (name === 'top') {
     // a final-approach reveal and a short arrival settle.
     if (this.immersive360Active) {
       this.guidedTravelRotating = false;
-      this.targetPitch = this.guidedPitch;
+      // 360 has its own architectural pitch. Do not overwrite it with the
+      // nearly-level Guided pitch on every camera-sync frame.
+      this.targetPitch = THREE.MathUtils.clamp(
+        Number.isFinite(this.immersive360Pitch) ? this.immersive360Pitch : -0.19,
+        -0.48,
+        0.14,
+      );
     } else if (this.walkMode === 'guided' && this.guidedAutoRotate) {
       const now = performance.now();
 
@@ -4205,8 +4508,10 @@ if (name === 'top') {
   }
 
   _updatePortals() {
-    const visibleLimit = this.walkMode === 'guided' ? 5 : 8;
-    const maxDistance = 11 * Math.max(this.metersPerUnit, 0.000001);
+    // The 360 viewer is a panorama-navigation experience: it needs enough
+    // visible choices to move among room viewpoints without leaving the mode.
+    const visibleLimit = this.immersive360Active ? 8 : (this.walkMode === 'guided' ? 5 : 8);
+    const maxDistance = (this.immersive360Active ? 16 : 11) * Math.max(this.metersPerUnit, 0.000001);
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
 
     if (this.viewMode !== 'walk') {

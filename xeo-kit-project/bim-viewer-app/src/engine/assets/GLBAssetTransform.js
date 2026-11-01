@@ -187,9 +187,14 @@ export const computeGLBLocalPivot = (model, pivotMode = GLB_DEFAULT_PIVOT_MODE, 
     (aabb[2] + aabb[5]) / 2,
   ];
 
-  const pivotLocal = pivotMode === 'center'
+  const safePivotMode = ['center', 'top-center'].includes(pivotMode)
+    ? pivotMode
+    : GLB_DEFAULT_PIVOT_MODE;
+  const pivotLocal = safePivotMode === 'center'
     ? center
-    : [center[0], aabb[1], center[2]];
+    : safePivotMode === 'top-center'
+      ? [center[0], aabb[4], center[2]]
+      : [center[0], aabb[1], center[2]];
 
   return {
     pivotLocal,
@@ -198,7 +203,7 @@ export const computeGLBLocalPivot = (model, pivotMode = GLB_DEFAULT_PIVOT_MODE, 
       Math.max(0, aabb[4] - aabb[1]),
       Math.max(0, aabb[5] - aabb[2]),
     ],
-    pivotMode: pivotMode === 'center' ? 'center' : GLB_DEFAULT_PIVOT_MODE,
+    pivotMode: safePivotMode,
   };
 };
 
@@ -206,17 +211,22 @@ export const buildGLBNormalization = (model, options = {}) => {
   const pivotMode = options.pivotMode || GLB_DEFAULT_PIVOT_MODE;
   const descriptor = options.descriptor;
 
-  const descriptorPivot = pivotMode === 'center'
+  const safePivotMode = ['center', 'top-center'].includes(pivotMode)
+    ? pivotMode
+    : GLB_DEFAULT_PIVOT_MODE;
+  const descriptorPivot = safePivotMode === 'center'
     ? descriptor?.pivotModes?.center
-    : descriptor?.pivotModes?.bottomCenter;
+    : safePivotMode === 'top-center'
+      ? descriptor?.pivotModes?.topCenter
+      : descriptor?.pivotModes?.bottomCenter;
 
   const result = descriptor?.coordinateSpace === 'gltf-scene' && Array.isArray(descriptorPivot)
     ? {
         pivotLocal: vector3(options.pivotLocal || descriptorPivot, [0, 0, 0]),
         dimensions: vector3(descriptor.dimensions, [0, 0, 0]),
-        pivotMode: pivotMode === 'center' ? 'center' : GLB_DEFAULT_PIVOT_MODE,
+        pivotMode: safePivotMode,
       }
-    : computeGLBLocalPivot(model, pivotMode, options.pivotLocal);
+    : computeGLBLocalPivot(model, safePivotMode, options.pivotLocal);
 
   return {
     version: GLB_TRANSFORM_VERSION,

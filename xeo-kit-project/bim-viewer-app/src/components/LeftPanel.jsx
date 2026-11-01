@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { PanelLeftClose, Loader2, Layout, Orbit, ExternalLink, Box, Pencil, Trash2, X, AlertTriangle, FolderOpen, Layers, PackagePlus, PanelsTopLeft, Sparkles, ArrowRight } from 'lucide-react';
+import { PanelLeftClose, Loader2, Layout, Orbit, ExternalLink, Box, Pencil, Trash2, X, AlertTriangle, FolderOpen, Layers, PackagePlus, PanelsTopLeft, Sparkles, ArrowRight, Eye, EyeOff, Layers3 } from 'lucide-react';
 import { LayoutMetadataForm } from './LayoutMetadataForm';
 import { CatalogTree } from './CatalogTree'; //[cite: 1]
 
@@ -20,6 +20,8 @@ export const LeftPanel = ({
   savedLayouts = [], savedLayoutsLoading = false, savedLayoutsError = null, onOpenSavedLayout,
   onEditSavedLayout, onDeleteSavedLayout, fileNameForLayoutMetadata, activeSavedLayout = null,
   activeTab = null, onActiveTabChange = null,
+  isCeilingHidden = false, onToggleCeiling = null, onOpenCeilingDesigner = null,
+  hasDesignedCeilings = false, areDesignedCeilingsHidden = false, onToggleDesignedCeilings = null,
 }) => {
   const [internalLeftTab, setInternalLeftTab] = useState('explorer');
   const leftTab = activeTab ?? internalLeftTab;
@@ -42,6 +44,42 @@ export const LeftPanel = ({
   const [deletingLayout, setDeletingLayout] = useState(null);
   const [layoutMutationBusy, setLayoutMutationBusy] = useState(false);
   const [layoutMutationError, setLayoutMutationError] = useState(null);
+
+  // These demo fixtures are bundled with the frontend so they remain available
+  // even when the remote catalogue API is unavailable.
+  const lightingItems = useMemo(() => {
+    const baseUrl = new URL(import.meta.env.BASE_URL || '/', window.location.origin);
+    const makeItem = (id, name, fileName, description) => ({
+      id,
+      name,
+      description,
+      url: new URL(`assets/lighting/${fileName}`, baseUrl).toString(),
+      file_type: 'glb',
+      fileType: 'glb',
+      type: 'lighting',
+      category: 'lighting',
+      assetCategory: 'lighting',
+      isLightFixture: true,
+      lightEnabled: false,
+      pivotMode: 'top-center',
+      placementSurface: 'surface',
+      scale: [1, 1, 1],
+    });
+    return [
+      makeItem('hci_linear_tubelight', 'Linear LED Tubelight', 'linear-tubelight.glb', 'Ceiling-mounted strip light'),
+      makeItem('hci_led_bulb', 'LED Bulb', 'led-bulb.glb', 'Compact LED bulb fixture'),
+      makeItem('hci_recessed_downlight', 'Recessed Downlight', 'recessed-downlight.glb', 'False-ceiling recessed spotlight'),
+      makeItem('hci_flush_ceiling', 'Flush-mount Ceiling Light', 'flush-mount-ceiling-light.glb', 'Low-profile ceiling fixture'),
+      makeItem('hci_pendant_lamp', 'Pendant Hanging Lamp', 'pendant-lamp.glb', 'Decorative hanging ceiling lamp'),
+      makeItem('hci_caged_ceiling', 'Caged Ceiling Light', 'caged-ceiling-light.glb', 'Compact utility ceiling light'),
+      makeItem('hci_square_ceiling', 'Square Ceiling Lamp', 'square-ceiling-lamp.glb', 'Compact square ceiling fixture'),
+    ];
+  }, []);
+
+  const mergedCatalogTree = useMemo(() => ([
+    ...(Array.isArray(catalogTree) ? catalogTree : []),
+    { id: 'hci-lighting-fixtures', name: 'Lighting Fixtures', items: lightingItems },
+  ]), [catalogTree, lightingItems]);
 
   const resetLayoutNavigation = () => setLayoutPath({ level: 'root', type: null, category: null, subCategory: null });
 
@@ -204,13 +242,21 @@ export const LeftPanel = ({
           )}
         </div>
         <div className="px-1 pb-3 pt-1">
-          <div className="mx-3 mb-1 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Building parts</span><span className="text-[10px] text-slate-400">Choose one to edit</span></div>
+          <div className="mx-3 mb-1 flex items-center justify-between gap-2">
+            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Building parts</span>
+            <button type="button" onClick={onOpenCeilingDesigner} disabled={!onOpenCeilingDesigner} className="inline-flex items-center gap-1.5 rounded-lg border border-orange-200 bg-orange-50 px-2.5 py-1.5 text-[10px] font-semibold text-orange-700 shadow-sm transition hover:border-orange-300 hover:bg-orange-100 disabled:opacity-50 dark:border-orange-500/30 dark:bg-orange-500/10 dark:text-orange-300" title="Automatically create ceilings fitted to detected rooms"><Layers3 className="h-3 w-3"/> Design ceiling</button>
+          </div>
+          <div className="mx-3 mb-2 flex flex-wrap items-center gap-1.5">
+            {hasDesignedCeilings && <button type="button" onClick={onToggleDesignedCeilings} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[10px] font-semibold text-slate-600 shadow-sm transition hover:border-orange-300 hover:text-[#d96b25] dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"><Eye className="h-3 w-3"/>{areDesignedCeilingsHidden ? 'Show created' : 'Hide created'}</button>}
+            <button type="button" onClick={onToggleCeiling} disabled={!onToggleCeiling} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[10px] font-semibold text-slate-600 shadow-sm transition hover:border-orange-300 hover:text-[#d96b25] disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300" title="Temporarily hide or show IFC ceiling and roof elements">{isCeilingHidden ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}{isCeilingHidden ? 'Show IFC' : 'Hide IFC'}</button>
+          </div>
+          <div className="mx-3 mb-1 text-[10px] text-slate-400">Choose a building element to inspect</div>
           <div ref={treeRef} className="p-3 text-sm text-slate-700 dark:text-slate-300" />
         </div>
       </div>
 
       <div className={`flex-1 overflow-hidden ${leftTab === 'assets' ? 'flex' : 'hidden'}`}>
-        <CatalogTree tree={catalogTree || []} loading={catalogLoading} error={catalogError} placementMode={placementMode} setPlacementMode={setPlacementMode} resetSelection={resetSelection} />
+        <CatalogTree tree={mergedCatalogTree} loading={catalogLoading} error={catalogError} placementMode={placementMode} setPlacementMode={setPlacementMode} resetSelection={resetSelection} />
       </div>
 
       <div className={`flex-1 overflow-y-auto ${leftTab === 'templates' ? 'block' : 'hidden'}`}>

@@ -63,6 +63,56 @@ function touchManifest(jobDir) {
   }
 }
 
+// Write durable JSON snapshots atomically. A browser continuing a project must
+// never observe a partially-written project_state.json while an autosave/render
+// request is replacing it.
+function atomicWriteJson(filePath, value) {
+  const temporaryPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  fs.writeFileSync(temporaryPath, JSON.stringify(value, null, 2), 'utf8');
+  fs.renameSync(temporaryPath, filePath);
+  return fs.statSync(filePath).mtimeMs;
+}
+
+function readProjectStateMetadata(jobDir) {
+  const statePath = path.join(jobDir, 'project_state.json');
+  const metaPath = path.join(jobDir, 'project_state_meta.json');
+  let sidecar = null;
+  try {
+    if (fs.existsSync(metaPath)) sidecar = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+  } catch (error) {
+    console.warn('[ProjectState] Ignoring unreadable metadata sidecar:', error.message);
+  }
+  const fileSavedAt = fs.existsSync(statePath) ? fs.statSync(statePath).mtimeMs : 0;
+  return {
+    exists: fs.existsSync(statePath),
+    savedAt: Number(sidecar?.savedAt) || fileSavedAt,
+    clientRevision: Number(sidecar?.clientRevision) || 0,
+  };
+}
+
+function writeProjectStateSnapshot(jobDir, state, revisionValue) {
+  const current = readProjectStateMetadata(jobDir);
+  const statePath = path.join(jobDir, 'project_state.json');
+  const revisionParsed = Number(revisionValue);
+  const hasRevision = Number.isFinite(revisionParsed) && revisionParsed > 0;
+
+  // Once revisioned snapshots exist, require the client to identify its version.
+  // This blocks a late render request or older frontend tab from overwriting newer furniture.
+  if (current.clientRevision > 0 && (!hasRevision || revisionParsed < current.clientRevision)) {
+    return { stale: true, ...current };
+  }
+
+  const savedAt = atomicWriteJson(statePath, state);
+  const clientRevision = hasRevision ? revisionParsed : 0;
+  atomicWriteJson(path.join(jobDir, 'project_state_meta.json'), {
+    version: 1,
+    clientRevision,
+    savedAt,
+  });
+  touchManifest(jobDir);
+  return { stale: false, exists: true, savedAt, clientRevision };
+}
+
 function generateSavedLayoutId() {
   let id;
   do {
@@ -909,7 +959,7 @@ app.post('/api/projects', projectCreateUpload.single('ifcFile'), (req, res) => {
         // original.ifc is strictly immutable
         fs.writeFileSync(path.join(jobDir, 'original.ifc'), req.file.buffer);
         fs.writeFileSync(path.join(jobDir, 'input.ifc'), req.file.buffer);
-        fs.writeFileSync(path.join(jobDir, 'project_state.json'), JSON.stringify({ materials: {}, furniture: [] }, null, 2));
+        atomicWriteJson(path.join(jobDir, 'project_state.json'), { materials: {}, furniture: [] });
 
         const now = new Date().toISOString();
         const manifest = {
@@ -953,31 +1003,221 @@ app.post('/api/projects/:jobId/save', (req, res) => {
         if (!requireActiveProject(jobId, res)) return;
 
         const jobDirPath = path.join(jobsDir, jobId);
-        const statePath = path.join(jobDirPath, 'project_state.json');
-
         const incomingState = req.body && req.body.projectState ? req.body.projectState : req.body;
-        fs.writeFileSync(statePath, JSON.stringify(incomingState, null, 2));
-        
-        touchManifest(jobDirPath);
-        res.json({ success: true, message: 'Design saved successfully' });
+        if (!incomingState || typeof incomingState !== 'object' || Array.isArray(incomingState)) {
+            return res.status(400).json({ success: false, error: 'Project state must be a JSON object.' });
+        }
+
+        const clientRevision = req.get('X-HCI-Project-Revision');
+        const result = writeProjectStateSnapshot(jobDirPath, incomingState, clientRevision);
+        if (result.stale) {
+            return res.status(409).json({
+                success: false,
+                error: 'This save is older than the current project snapshot. The newer state was kept; reload the project before saving again.',
+                savedAt: result.savedAt,
+                clientRevision: result.clientRevision,
+            });
+        }
+        res.json({
+            success: true,
+            message: 'Design saved successfully',
+            savedAt: result.savedAt,
+            clientRevision: result.clientRevision,
+        });
     } catch (error) {
-        console.error("Save Error:", error);
+        console.error('Save Error:', error);
         res.status(500).json({ error: 'Failed to save project state' });
     }
 });
 
+// Versioned room/ceiling analysis API. The legacy /ceiling-rooms route below
+// remains for older editor builds; new clients use this versioned contract.
+function resolveLocalTsxCli() {
+    const candidates = [
+        'tsx/cli',
+        'tsx/dist/cli.mjs',
+    ];
+    for (const candidate of candidates) {
+        try { return require.resolve(candidate, { paths: [__dirname] }); }
+        catch (_) { /* try the next package entry */ }
+    }
+    const directCandidates = [
+        path.join(__dirname, 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+        path.join(__dirname, 'node_modules', 'tsx', 'dist', 'cli.js'),
+    ];
+    return directCandidates.find((candidate) => fs.existsSync(candidate)) || null;
+}
+
+app.post('/api/projects/:jobId/ceiling-analysis', (req, res) => {
+    const { jobId } = req.params;
+    if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) return res.status(400).json({ error: 'Invalid project id.' });
+    if (!requireActiveProject(jobId, res)) return;
+
+    const jobDir = path.join(jobsDir, jobId);
+    const inputIfcPath = [path.join(jobDir, 'input.ifc'), path.join(jobDir, 'original.ifc')]
+        .find((candidate) => fs.existsSync(candidate));
+    const statePath = path.join(jobDir, 'project_state.json');
+    if (!inputIfcPath) return res.status(404).json({ error: 'Project IFC source was not found.' });
+    if (!fs.existsSync(statePath)) return res.status(409).json({ error: 'Project state is not ready yet. Save the project and retry.' });
+
+    const tsxCliPath = resolveLocalTsxCli();
+    if (!tsxCliPath) {
+        return res.status(500).json({
+            error: 'The local tsx runtime was not found. Install backend dependencies with npm install before running ceiling analysis.',
+        });
+    }
+
+    const outputPath = path.join(jobDir, 'ceiling_analysis.json');
+    const scriptPath = path.join(__dirname, 'compiler', 'analyze-ceiling-rooms.ts');
+    if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: 'Ceiling analysis script is missing.', details: scriptPath });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const MAX_OUTPUT = 8 * 1024 * 1024;
+    const child = spawn(process.execPath, [
+        tsxCliPath,
+        scriptPath,
+        jobDir,
+        inputIfcPath,
+        outputPath,
+        req.body?.forceRebuild === true ? '--force' : '',
+    ].filter(Boolean), {
+        cwd: __dirname,
+        windowsHide: true,
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const timeout = setTimeout(() => {
+        if (settled) return;
+        child.kill();
+        settled = true;
+        if (!res.headersSent) res.status(504).json({ error: 'Ceiling analysis timed out. Check the IFC geometry and retry.' });
+    }, 120000);
+
+    const finish = (status, payload) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (!res.headersSent) res.status(status).json(payload);
+    };
+
+    child.stdout.on('data', (chunk) => {
+        if (stdout.length < MAX_OUTPUT) stdout += chunk.toString().slice(0, MAX_OUTPUT - stdout.length);
+    });
+    child.stderr.on('data', (chunk) => {
+        if (stderr.length < MAX_OUTPUT) stderr += chunk.toString().slice(0, MAX_OUTPUT - stderr.length);
+    });
+    child.on('error', (error) => {
+        console.error('[CeilingAnalysis] Failed to start local tsx process:', error);
+        finish(500, { error: 'Could not start ceiling analysis.', details: error.message });
+    });
+    child.on('close', (code, signal) => {
+        if (settled) return;
+        if (code !== 0) {
+            console.error('[CeilingAnalysis] Detector failed:', stderr || stdout || signal);
+            return finish(500, {
+                error: 'Room and ceiling analysis failed for this IFC model.',
+                details: (stderr || stdout || `Process exited with ${code ?? signal}`).slice(-5000),
+            });
+        }
+        try {
+            const responseText = stdout.trim();
+            const result = responseText ? JSON.parse(responseText) : JSON.parse(fs.readFileSync(outputPath, 'utf8'));
+            if (result?.schemaVersion !== 1 || !Array.isArray(result.rooms) || !Array.isArray(result.levels)) {
+                return finish(500, { error: 'Ceiling analysis returned an unsupported response contract.' });
+            }
+            finish(200, result);
+        } catch (error) {
+            console.error('[CeilingAnalysis] Invalid detector response:', error.message, stdout.slice(-1000));
+            finish(500, { error: 'Ceiling analysis returned invalid JSON.', details: error.message });
+        }
+    });
+
+    res.on('close', () => {
+        if (!res.writableEnded && !settled) {
+            settled = true;
+            clearTimeout(timeout);
+            child.kill();
+        }
+    });
+});
+
+// Detect room footprints and estimated ceiling elevations for the editor's
+// room-aware ceiling designer. Results are generated from the same IFC room
+// topology engine used by the presentation compiler.
+app.post('/api/projects/:jobId/ceiling-rooms', (req, res) => {
+  const { jobId } = req.params;
+  if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) return res.status(400).json({ error: 'Invalid project id.' });
+  if (!requireActiveProject(jobId, res)) return;
+
+  const jobDir = path.join(jobsDir, jobId);
+  const inputIfcPath = [path.join(jobDir, 'input.ifc'), path.join(jobDir, 'original.ifc')]
+    .find((candidate) => fs.existsSync(candidate));
+  const statePath = path.join(jobDir, 'project_state.json');
+  if (!inputIfcPath) return res.status(404).json({ error: 'Project IFC source was not found.' });
+  if (!fs.existsSync(statePath)) return res.status(409).json({ error: 'Project state is not ready yet. Save the project and retry.' });
+
+  const outputPath = path.join(jobDir, 'ceiling_rooms.json');
+  const scriptPath = path.join(__dirname, 'compiler', 'detect-ceiling-rooms.ts');
+  const npxCommand = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+  const child = spawn(npxCommand, ['tsx', scriptPath, jobDir, inputIfcPath, outputPath], {
+    cwd: __dirname,
+    windowsHide: true,
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  child.on('error', (error) => {
+    console.error('[CeilingDesigner] Room detection failed to start:', error);
+    if (!res.headersSent) res.status(500).json({ error: 'Could not start room detection.', details: error.message });
+  });
+  child.on('close', (code) => {
+    if (res.headersSent) return;
+    if (code !== 0) {
+      console.error('[CeilingDesigner] Room detection failed:', stderr || stdout);
+      return res.status(500).json({ error: 'Room detection failed for this IFC model.', details: (stderr || stdout).slice(-3000) });
+    }
+    try {
+      const result = JSON.parse(stdout.trim());
+      res.json(result);
+    } catch (error) {
+      console.error('[CeilingDesigner] Invalid detector response:', error.message, stdout.slice(-1000));
+      res.status(500).json({ error: 'Room detector returned an invalid response.' });
+    }
+  });
+  child.stdout.on('error', () => {});
+  child.stderr.on('error', () => {});
+  res.on('close', () => { if (!res.writableEnded) child.kill(); });
+});
+
+
 app.get('/api/projects/:jobId/load', (req, res) => {
     try {
         const jobId = req.params.jobId;
-        const statePath = path.join(jobsDir, jobId, 'project_state.json');
-        
-        if (fs.existsSync(statePath)) {
+        const jobDir = path.join(jobsDir, jobId);
+        if (!fs.existsSync(jobDir)) {
+            return res.status(404).json({ error: 'Project job was not found.' });
+        }
+        const statePath = path.join(jobDir, 'project_state.json');
+        const metadata = readProjectStateMetadata(jobDir);
+
+        if (metadata.exists) {
             const state = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
-            res.json(state);
+            const safeState = state && typeof state === 'object' && !Array.isArray(state)
+                ? state
+                : { materials: {}, furniture: [] };
+            res.json({
+                ...safeState,
+                _persistence: metadata,
+            });
         } else {
-            res.json({ materials: {}, furniture: [] });
+            res.json({ materials: {}, furniture: [], _persistence: metadata });
         }
     } catch (error) {
+        console.error('[ProjectState] Load error:', error.message);
         res.status(500).json({ error: 'Failed to load project state' });
     }
 });
@@ -1406,6 +1646,189 @@ app.post('/api/projects/:jobId/rescale', (req, res) => {
 });
 
 // ==========================================
+// RENDER CACHE HELPERS
+// ==========================================
+const RENDER_CACHE_VERSION = 'hci-render-cache-v1';
+const RENDER_CACHE_REQUIRED_ARTIFACTS = [
+    'output.glb',
+    'navigation_navmesh.bin',
+    'navigation_surface.json',
+    'navigation_meta.json',
+    'walk_hotspots.json',
+    'presentation_rooms.json',
+    'presentation_portals.json',
+    'optimization_report.json',
+    'performance_report.json',
+    'presentation_manifest.json',
+];
+const RENDER_PIPELINE_SOURCE_FILES = [
+    'server.js',
+    'package.json',
+    'scene_merger.py',
+    'compiler/compiler.ts',
+    'compiler/geometry.ts',
+    'compiler/math.ts',
+    'compiler/glb-optimizer.ts',
+    'compiler/navigation/WalkNavigationPipeline.ts',
+    'compiler/navigation/RoomDetector.ts',
+    'compiler/performanceReport.ts',
+    'compiler/presentationManifest.ts',
+];
+
+function sha256File(filePath) {
+    // Hash large IFC files in chunks so render-cache checks do not duplicate an
+    // entire source IFC in memory.
+    const hash = crypto.createHash('sha256');
+    const descriptor = fs.openSync(filePath, 'r');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    try {
+        let bytesRead = 0;
+        do {
+            bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+            if (bytesRead > 0) hash.update(buffer.subarray(0, bytesRead));
+        } while (bytesRead > 0);
+    } finally {
+        fs.closeSync(descriptor);
+    }
+    return hash.digest('hex');
+}
+
+function fileStamp(filePath, includeHash = false) {
+    try {
+        const stat = fs.statSync(filePath);
+        return {
+            path: path.relative(__dirname, filePath).split(path.sep).join('/'),
+            size: stat.size,
+            ...(includeHash
+                ? { sha256: sha256File(filePath) }
+                : { mtimeMs: Math.trunc(stat.mtimeMs), ino: Number(stat.ino) || 0 }),
+        };
+    } catch {
+        return null;
+    }
+}
+
+function resolveRenderDependencyPath(src) {
+    if (!src || typeof src !== 'string') return null;
+    let clean = src.trim();
+    try {
+        if (/^https?:\/\//i.test(clean)) clean = new URL(clean).pathname;
+    } catch {
+        return null;
+    }
+    clean = clean.split('?')[0].split('#')[0];
+    if (!clean) return null;
+
+    let candidate = null;
+    if (clean.startsWith('/uploads/')) {
+        candidate = path.resolve(__dirname, clean.slice(1));
+    } else if (clean.startsWith('/assets/')) {
+        candidate = path.resolve(assetsDir, clean.slice('/assets/'.length));
+    } else if (clean.startsWith('/materials/')) {
+        candidate = path.resolve(__dirname, 'compiler', 'materials', clean.slice('/materials/'.length));
+    } else if (clean.startsWith('/jobs/')) {
+        const match = clean.match(/^\/jobs\/([^/]+)\/(.+)$/);
+        if (!match) return null;
+        candidate = path.resolve(jobsDir, match[1], match[2]);
+        const jobsRoot = path.resolve(jobsDir);
+        if (candidate !== jobsRoot && !candidate.startsWith(`${jobsRoot}${path.sep}`)) return null;
+    } else if (path.isAbsolute(clean)) {
+        candidate = path.resolve(clean);
+    }
+
+    return candidate && fs.existsSync(candidate) && fs.statSync(candidate).isFile()
+        ? candidate
+        : null;
+}
+
+function computeRenderInputSignature(jobDir) {
+    const inputIfcPath = path.join(jobDir, 'input.ifc');
+    const projectStatePath = path.join(jobDir, 'project_state.json');
+    if (!fs.existsSync(inputIfcPath) || !fs.existsSync(projectStatePath)) return null;
+
+    let projectState;
+    try {
+        projectState = JSON.parse(fs.readFileSync(projectStatePath, 'utf8'));
+    } catch {
+        return null;
+    }
+
+    const dependencyPaths = new Set();
+    const addDependency = (src) => {
+        const resolved = resolveRenderDependencyPath(src);
+        if (resolved) dependencyPaths.add(resolved);
+    };
+
+    for (const item of Array.isArray(projectState.furniture) ? projectState.furniture : []) {
+        addDependency(item?.src);
+    }
+    const materials = projectState.materials && typeof projectState.materials === 'object'
+        ? Object.values(projectState.materials)
+        : [];
+    for (const material of materials) {
+        addDependency(material?.texture?.src);
+        addDependency(material?.textureSrc);
+    }
+
+    const codeStamps = RENDER_PIPELINE_SOURCE_FILES
+        .map((relative) => fileStamp(path.join(__dirname, relative), false))
+        .filter(Boolean)
+        .sort((a, b) => String(a.path).localeCompare(String(b.path)));
+    const assetStamps = Array.from(dependencyPaths)
+        .map((filePath) => fileStamp(filePath, false))
+        .filter(Boolean)
+        .sort((a, b) => String(a.path).localeCompare(String(b.path)));
+
+    const payload = {
+        version: RENDER_CACHE_VERSION,
+        inputIfc: fileStamp(inputIfcPath, true),
+        projectState: fileStamp(projectStatePath, true),
+        code: codeStamps,
+        dependencies: assetStamps,
+        optimizer: {
+            simplifyRatio: process.env.HCI_GLB_SIMPLIFY_RATIO || '0.70',
+            simplifyError: process.env.HCI_GLB_SIMPLIFY_ERROR || '0.001',
+            maxTextureSize: process.env.HCI_GLB_MAX_TEXTURE_SIZE || '2048',
+            textureQuality: process.env.HCI_GLB_TEXTURE_QUALITY || '86',
+        },
+    };
+    return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+function readReusableRenderCache(jobDir, signature) {
+    if (!signature) return null;
+    const manifestPath = path.join(jobDir, 'render_cache_manifest.json');
+    try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        if (manifest.version !== RENDER_CACHE_VERSION || manifest.signature !== signature) return null;
+        if (!RENDER_CACHE_REQUIRED_ARTIFACTS.every((name) => fs.existsSync(path.join(jobDir, name)))) return null;
+        const outputPath = path.join(jobDir, 'output.glb');
+        if (!manifest.outputGlbSha256 || sha256File(outputPath) !== manifest.outputGlbSha256) return null;
+        return manifest;
+    } catch {
+        return null;
+    }
+}
+
+function writeReusableRenderCache(jobDir, signature, compileDurationMs) {
+    if (!signature) return;
+    const availableArtifacts = RENDER_CACHE_REQUIRED_ARTIFACTS.filter((name) => fs.existsSync(path.join(jobDir, name)));
+    if (!RENDER_CACHE_REQUIRED_ARTIFACTS.every((name) => availableArtifacts.includes(name))) {
+        console.warn('[Render] Skipping render-cache manifest because required presentation artifacts are missing.');
+        return;
+    }
+    const outputPath = path.join(jobDir, 'output.glb');
+    atomicWriteJson(path.join(jobDir, 'render_cache_manifest.json'), {
+        version: RENDER_CACHE_VERSION,
+        signature,
+        generatedAt: new Date().toISOString(),
+        compileDurationMs,
+        outputGlbSha256: sha256File(outputPath),
+        artifacts: availableArtifacts,
+    });
+}
+
+// ==========================================
 // RENDER API
 // ==========================================
 app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
@@ -1437,12 +1860,28 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
 
     const projectStatePath = path.join(jobDir, 'project_state.json');
     if (req.body.projectState) {
-        const stateData = typeof req.body.projectState === 'string' 
-            ? req.body.projectState 
-            : JSON.stringify(req.body.projectState);
-        fs.writeFileSync(projectStatePath, stateData);
+        let stateData;
+        try {
+            stateData = typeof req.body.projectState === 'string'
+                ? JSON.parse(req.body.projectState)
+                : req.body.projectState;
+        } catch (_) {
+            return res.status(400).json({ error: 'projectState must be valid JSON.' });
+        }
+        if (!stateData || typeof stateData !== 'object' || Array.isArray(stateData)) {
+            return res.status(400).json({ error: 'projectState must be a JSON object.' });
+        }
+        const renderRevision = req.body.projectRevision;
+        const snapshotResult = writeProjectStateSnapshot(jobDir, stateData, renderRevision);
+        if (snapshotResult.stale) {
+            return res.status(409).json({
+                error: 'The project changed while this render was being prepared. Reopen/save the latest project state and render again.',
+                savedAt: snapshotResult.savedAt,
+                clientRevision: snapshotResult.clientRevision,
+            });
+        }
     } else if (!fs.existsSync(projectStatePath)) {
-        fs.writeFileSync(projectStatePath, JSON.stringify({ materials: {}, furniture: [] }));
+        atomicWriteJson(projectStatePath, { materials: {}, furniture: [] });
     }
     touchManifest(jobDir);
 
@@ -1453,6 +1892,33 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
     if (angle === "360") {
         const compilerScriptPath = path.join(__dirname, "compiler", "compiler.ts");
         const outputGlbPath = path.join(jobDir, "output.glb");
+        const compileStartedAt = Date.now();
+        let renderSignature = null;
+        try {
+            renderSignature = computeRenderInputSignature(jobDir);
+        } catch (signatureError) {
+            console.warn('[Render] Could not compute render cache signature; compiling normally:', signatureError.message);
+        }
+
+        const cachedRender = readReusableRenderCache(jobDir, renderSignature);
+        if (cachedRender && fs.existsSync(outputGlbPath)) {
+            console.log(`[Render] Full scene cache hit for ${jobId}; reusing output.glb and navigation artifacts.`);
+            const legacyViewerPath = path.join(jobDir, '360_viewer.html');
+            try {
+                if (fs.existsSync(legacyViewerPath)) fs.unlinkSync(legacyViewerPath);
+            } catch (cleanupError) {
+                console.warn('[Render] Unable to remove legacy 360_viewer.html:', cleanupError.message);
+            }
+            return res.json({
+                type: "360",
+                url: `/walkthrough/${encodeURIComponent(jobId)}`,
+                walkthroughPath: `/walkthrough/${encodeURIComponent(jobId)}`,
+                modelUrl: `${baseUrl}/jobs/${encodeURIComponent(jobId)}/output.glb`,
+                jobId,
+                cacheHit: true,
+                compileDurationMs: 0,
+            });
+        }
 
         try {
             execSync(`npx tsx "${compilerScriptPath}" "${jobDir}" "${assetsDir}"`, {
@@ -1464,6 +1930,26 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
 
         if (!fs.existsSync(outputGlbPath)) {
             return res.status(500).json({ error: "output.glb was not generated." });
+        }
+
+        const compileDurationMs = Date.now() - compileStartedAt;
+        let navigationCacheHit = false;
+        try {
+            const perfPath = path.join(jobDir, 'performance_report.json');
+            if (fs.existsSync(perfPath)) {
+                const performanceReport = JSON.parse(fs.readFileSync(perfPath, 'utf8'));
+                navigationCacheHit = Boolean(performanceReport?.navigation?.cacheHit);
+            }
+        } catch (performanceReadError) {
+            console.warn('[Render] Could not read navigation cache status:', performanceReadError.message);
+        }
+        try {
+            // The synchronous compile keeps the request's saved-state snapshot stable.
+            // Cache only when the exact inputs are unchanged and every artifact exists.
+            const completedSignature = computeRenderInputSignature(jobDir);
+            writeReusableRenderCache(jobDir, completedSignature, compileDurationMs);
+        } catch (cacheError) {
+            console.warn('[Render] Could not persist render-cache manifest:', cacheError.message);
         }
 
         // React /walkthrough/:jobId is the only client-facing presentation runtime.
@@ -1480,7 +1966,10 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
             url: `/walkthrough/${encodeURIComponent(jobId)}`,
             walkthroughPath: `/walkthrough/${encodeURIComponent(jobId)}`,
             modelUrl: `${baseUrl}/jobs/${encodeURIComponent(jobId)}/output.glb`,
-            jobId
+            jobId,
+            cacheHit: false,
+            navigationCacheHit,
+            compileDurationMs,
         });
     }
 
