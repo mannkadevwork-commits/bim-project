@@ -34,7 +34,7 @@ from google.genai.errors import APIError, ClientError, ServerError
 from pydantic import BaseModel, Field, field_validator
 
 PIPELINE_VERSION = 7
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 # ============================================================================
@@ -1305,7 +1305,10 @@ def _load_gemini_api_keys() -> List[str]:
 
 def _gemini_model_candidates() -> List[str]:
     primary = os.environ.get("GEMINI_MODEL", MODEL_NAME).strip()
-    fallback_env = os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash")
+    fallback_env = os.environ.get(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3-flash-preview,gemini-3.1-flash-lite,gemini-3.5-flash-lite",
+    )
     models = [primary] + _split_env_list(fallback_env)
     result: List[str] = []
     seen = set()
@@ -1375,8 +1378,8 @@ def _bounded_sleep(round_index: int, exc: Exception) -> None:
     if retry_after is not None:
         delay = retry_after
     else:
-        base = float(os.environ.get("GEMINI_RETRY_BASE_SECONDS", "2"))
-        maximum = float(os.environ.get("GEMINI_RETRY_MAX_SECONDS", "20"))
+        base = float(os.environ.get("GEMINI_RETRY_BASE_SECONDS", "1"))
+        maximum = float(os.environ.get("GEMINI_RETRY_MAX_SECONDS", "8"))
         delay = min(maximum, base * (2 ** max(0, round_index - 1)))
         delay += random.uniform(0.0, min(1.0, delay * 0.25))
     print(f"[AI-RETRY] Waiting {delay:.1f}s before the next Gemini failover round.")

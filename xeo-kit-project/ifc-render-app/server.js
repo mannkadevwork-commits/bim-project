@@ -1125,7 +1125,7 @@ app.post('/api/projects/:jobId/ceiling-analysis', (req, res) => {
         try {
             const responseText = stdout.trim();
             const result = responseText ? JSON.parse(responseText) : JSON.parse(fs.readFileSync(outputPath, 'utf8'));
-            if (result?.schemaVersion !== 1 || !Array.isArray(result.rooms) || !Array.isArray(result.levels)) {
+            if (![1, 2].includes(Number(result?.schemaVersion)) || !Array.isArray(result.rooms) || !Array.isArray(result.levels)) {
                 return finish(500, { error: 'Ceiling analysis returned an unsupported response contract.' });
             }
             finish(200, result);
