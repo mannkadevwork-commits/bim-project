@@ -4,8 +4,8 @@ import { createHash } from "crypto";
 import { RoomDetector } from "../navigation/RoomDetector";
 import type { DetectedCeilingCandidate, DetectedRoom, RoomDebugArtifact, RoomPolygonPoint } from "../navigation/RoomTypes";
 
-const ANALYSIS_SCHEMA_VERSION = 1;
-const DETECTOR_VERSION = "hci-ceiling-room-topology-2026-10-v3";
+const ANALYSIS_SCHEMA_VERSION = 2;
+const DETECTOR_VERSION = "hci-ceiling-room-topology-2026-10-v4-ifcspace-geodesic";
 
 export interface CeilingAnalysisOptions {
   jobDirectory: string;
@@ -31,6 +31,9 @@ export interface CeilingAnalysisRoom {
   recommendedCeilingY: number;
   elevationSource: string;
   confidence: number;
+  boundarySource: "ifc-space-anchor-geodesic" | "wall-topology-grid";
+  boundaryConfidence: number;
+  semanticSpace: DetectedRoom["semanticSpace"];
   diagnostics: string[];
 }
 
@@ -61,6 +64,9 @@ export interface CeilingAnalysisResponse {
     candidateCeilingCount: number;
     floorLevelGroupCount: number;
     analysedFloorLevelCount: number;
+    semanticSpaceCount?: number;
+    anchoredRoomCount?: number;
+    roomCoverageRatio?: number;
     cacheHit: boolean;
   };
 }
@@ -144,6 +150,7 @@ function roomDiagnostics(room: DetectedRoom): string[] {
   const diagnostics: string[] = [];
   if (!room.boundary?.outer?.length) diagnostics.push("Room boundary came from the legacy outer-loop field; no verified inner opening loops were returned.");
   if (room.ceilingElevationSource === "fallback-estimate") diagnostics.push("Ceiling elevation is a low-confidence fallback estimate and requires manual confirmation.");
+  if (room.boundarySource === "ifc-space-anchor-geodesic") diagnostics.push("Room footprint is inferred from its IFC space placement anchor and wall-constrained floor partition. The IFC has no explicit IfcSpace geometry for this room; verify the boundary preview before applying a ceiling.");
   if (!room.ceilingCandidates?.length) diagnostics.push("No overhead IFC surface with meaningful projected room overlap was found.");
   else if (!room.ceilingCandidates.some((candidate) => candidate.flatCeilingCompatible)) diagnostics.push("Overhead candidates have significant vertical variation and may represent a pitched roof; they are not used as a flat-ceiling height reference.");
   else if (room.ceilingCandidates.filter((candidate) => candidate.flatCeilingCompatible).sort((a, b) => b.confidence - a.confidence)[0]?.overlapRatio < 0.55) diagnostics.push("The best flat-compatible overhead surface has limited room overlap; inspect it before applying a ceiling.");
@@ -177,6 +184,7 @@ export class CeilingAnalysisService {
       jobDirectory,
       inputIfcPath,
       outputPath: path.join(jobDirectory, "ceiling_room_topology_debug.json"),
+      useIfcSpaceAnchors: true,
     });
     const unitInfo = roomArtifact.units || {
       sourceLengthUnit: "unknown (assumed metre)",
@@ -207,6 +215,9 @@ export class CeilingAnalysisService {
         recommendedCeilingY: Number(room.ceilingElevation ?? ((room.floorElevation || 0) + 2.7)),
         elevationSource: room.ceilingElevationSource || "fallback-estimate",
         confidence: Number(room.ceilingConfidence ?? room.confidence ?? 0.25),
+        boundarySource: room.boundarySource || "wall-topology-grid",
+        boundaryConfidence: Number(room.boundaryConfidence ?? room.confidence ?? 0.5),
+        semanticSpace: room.semanticSpace || null,
         diagnostics,
       };
     });
@@ -248,6 +259,9 @@ export class CeilingAnalysisService {
         candidateCeilingCount: rooms.reduce((sum, room) => sum + room.ceilingCandidates.length, 0),
         floorLevelGroupCount: Number(roomArtifact.stats?.floorLevelGroupCount) || levels.length || 1,
         analysedFloorLevelCount: 1,
+        semanticSpaceCount: Number(roomArtifact.stats?.semanticSpaceCount) || 0,
+        anchoredRoomCount: Number(roomArtifact.stats?.anchoredRoomCount) || 0,
+        roomCoverageRatio: Number(roomArtifact.stats?.roomCoverageRatio) || 0,
         cacheHit: false,
       },
     };

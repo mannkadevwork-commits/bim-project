@@ -1,7 +1,8 @@
 export type RoomSource =
   | "wall-topology-grid-v1"
   | "mixed-structural-sources"
-  | "wall-topology-grid-v2";
+  | "wall-topology-grid-v2"
+  | "ifc-space-anchor-geodesic-v1";
 
 export interface RoomPolygonPoint {
   x: number;
@@ -72,6 +73,18 @@ export interface DetectedRoom {
   ceilingElevation?: number;
   ceilingElevationSource?: "ifc-overhead-surface" | "boundary-wall-top" | "fallback-estimate";
   ceilingConfidence?: number;
+  /** How the room footprint was obtained. Anchor geodesic boundaries are inferred, not exact IFC space solids. */
+  boundarySource?: "ifc-space-anchor-geodesic" | "wall-topology-grid";
+  boundaryConfidence?: number;
+  semanticSpace?: {
+    expressId: number;
+    globalId: string | null;
+    name: string;
+    description: string;
+    anchor: RoomPolygonPoint;
+    snapDistanceMeters: number;
+    hasGeometryRepresentation: boolean;
+  } | null;
 }
 
 export interface RoomComponentDiagnostic {
@@ -147,6 +160,9 @@ export interface RoomDebugArtifact {
     retainedRoomCount: number;
     floorLevelGroupCount?: number;
     analysedFloorLevelCount?: number;
+    semanticSpaceCount?: number;
+    anchoredRoomCount?: number;
+    roomCoverageRatio?: number;
     sealedDoorCount: number;
     portalCount: number;
   };

@@ -81,6 +81,9 @@ function buildCeilingDesign(room, analysis, settings) {
     analysis: {
       elevationSource: room.elevationSource || 'fallback-estimate',
       confidence: safeNumber(room.confidence, 0),
+      boundarySource: room.boundarySource || 'wall-topology-grid',
+      boundaryConfidence: safeNumber(room.boundaryConfidence, 0),
+      semanticSpace: room.semanticSpace || null,
       diagnostics: Array.isArray(room.diagnostics) ? room.diagnostics : [],
       ceilingCandidateIds: (room.ceilingCandidates || []).map((candidate) => candidate.id),
     },
@@ -93,6 +96,14 @@ function getElevationSourceLabel(room) {
     case 'ifc-overhead-surface': return 'IFC overhead surface';
     case 'boundary-wall-top': return 'Enclosing wall tops';
     default: return 'Fallback estimate — manual review required';
+  }
+}
+
+function getBoundarySourceLabel(room) {
+  switch (room?.boundarySource) {
+    case 'ifc-space-anchor-geodesic': return 'IFC room anchor + wall constraints (inferred)';
+    case 'wall-topology-grid': return 'Wall-topology footprint';
+    default: return 'Unclassified boundary source';
   }
 }
 
@@ -185,7 +196,7 @@ export const CeilingDesignerModal = ({
         const details = payload.details ? `\n${payload.details}` : '';
         throw new Error(`${payload.error || `Ceiling analysis failed (${response.status}).`}${details}`);
       }
-      if (payload.schemaVersion !== 1 || !Array.isArray(payload.rooms) || !Array.isArray(payload.levels)) {
+      if (![1, 2].includes(Number(payload.schemaVersion)) || !Array.isArray(payload.rooms) || !Array.isArray(payload.levels)) {
         throw new Error('The backend returned an unsupported ceiling-analysis response. Update the backend analyzer and restart it.');
       }
       if (requestVersion !== requestVersionRef.current) return;
@@ -195,7 +206,7 @@ export const CeilingDesignerModal = ({
       ));
       if (!detectedRooms.length) {
         const reason = payload.warnings?.length ? ` ${payload.warnings.join(' ')}` : '';
-        throw new Error(`No usable enclosed rooms were detected in the analysed floor.${reason}`);
+        throw new Error(`No usable room regions were detected on the analysed floor.${reason}`);
       }
 
       const activeLevels = payload.levels.filter((level) => level.analysisStatus === 'analysed');
@@ -276,9 +287,12 @@ export const CeilingDesignerModal = ({
   if (!open) return null;
 
   const confidence = safeNumber(selectedRoom?.confidence, 0);
+  const boundaryConfidence = safeNumber(selectedRoom?.boundaryConfidence, selectedRoom?.confidence || 0);
   const needsManualConfirmation = Boolean(selectedRoom && (
     confidence < 0.75 ||
+    boundaryConfidence < 0.75 ||
     selectedRoom.elevationSource !== 'ifc-overhead-surface' ||
+    selectedRoom.boundarySource === 'ifc-space-anchor-geodesic' ||
     analysis?.units?.confidence === 'assumed-metre'
   ));
   const selectedExistingCeiling = selectedRoom ? existingCeilings.find((item) => (
@@ -327,8 +341,9 @@ export const CeilingDesignerModal = ({
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
           {analysis && (
-            <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-700 dark:bg-slate-800/50 md:grid-cols-4">
+            <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-700 dark:bg-slate-800/50 md:grid-cols-5">
               <div><span className="block text-[10px] text-slate-400">Detected rooms</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.roomCount ?? rooms.length}</strong></div>
+              <div><span className="block text-[10px] text-slate-400">IFC space anchors</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.semanticSpaceCount ?? 0}</strong></div>
               <div><span className="block text-[10px] text-slate-400">Candidate ceilings</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.candidateCeilingCount ?? 0}</strong></div>
               <div><span className="block text-[10px] text-slate-400">IFC length unit</span><strong className="text-slate-800 dark:text-slate-100">{analysis.units?.sourceLengthUnit || 'Unknown'}</strong></div>
               <div><span className="block text-[10px] text-slate-400">Analysis cache</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.cacheHit ? 'Reused' : 'Fresh'}</strong></div>
@@ -418,9 +433,14 @@ export const CeilingDesignerModal = ({
                               {hasExisting && <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-[9px] font-bold text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300">Ceiling exists</span>}
                             </div>
                             <p className="mt-1 text-[10px] text-slate-500">{safeNumber(room.areaM2, 0).toFixed(2)} m² · Floor Y {safeNumber(room.floorY, 0).toFixed(2)} m</p>
+                            <p className="mt-0.5 text-[10px] text-slate-400">{getBoundarySourceLabel(room)}</p>
                             <p className="mt-0.5 text-[10px] text-slate-400">{room.ceilingCandidates?.length || 0} overhead candidates · {getElevationSourceLabel(room)}</p>
                           </div>
-                          <span className={`shrink-0 rounded-full border px-2 py-1 text-[9px] font-bold ${getConfidenceTone(roomConfidence)}`}>{Math.round(roomConfidence * 100)}%</span>
+                          <span className={`shrink-0 rounded-full border px-2 py-1 text-[9px] font-bold ${getConfidenceTone(roomConfidence)}`}>Height {Math.round(roomConfidence * 100)}%</span>
+                        </div>
+                        <div className="mt-2 flex items-center gap-2 text-[9px] text-slate-500">
+                          <span className="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">Boundary {Math.round(safeNumber(room.boundaryConfidence, 0) * 100)}%</span>
+                          {room.semanticSpace?.globalId && <span className="truncate">IFC space · {room.semanticSpace.globalId.slice(0, 8)}</span>}
                         </div>
                         {room.diagnostics?.length > 0 && <p className="mt-2 line-clamp-2 text-[10px] text-amber-700 dark:text-amber-300">{room.diagnostics[0]}</p>}
                       </button>
@@ -444,6 +464,8 @@ export const CeilingDesignerModal = ({
                       <div className="flex justify-between gap-2"><span className="text-slate-500">Reference ceiling Y</span><strong className="text-slate-800 dark:text-slate-100">{safeNumber(selectedRoom.recommendedCeilingY, 0).toFixed(3)} m</strong></div>
                       <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Proposed underside Y</span><strong className="text-slate-800 dark:text-slate-100">{finishedBottomY.toFixed(3)} m</strong></div>
                       <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Room footprint</span><strong className="text-slate-800 dark:text-slate-100">{selectedRoom.boundary?.outer?.length || 0} vertices · {selectedRoom.boundary?.holes?.length || 0} openings</strong></div>
+                      <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Boundary confidence</span><strong className="text-slate-800 dark:text-slate-100">{Math.round(boundaryConfidence * 100)}%</strong></div>
+                      <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Boundary method</span><strong className="max-w-[62%] text-right text-slate-800 dark:text-slate-100">{getBoundarySourceLabel(selectedRoom)}</strong></div>
                     </div>
 
                     <label className="block text-xs font-semibold text-slate-600 dark:text-slate-300">
@@ -474,7 +496,7 @@ export const CeilingDesignerModal = ({
                     {needsManualConfirmation && (
                       <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-[10px] text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
                         <input type="checkbox" checked={confirmLowConfidence} onChange={(event) => setConfirmLowConfidence(event.target.checked)} className="mt-0.5 accent-orange-500"/>
-                        <span><strong>Confirm manual review.</strong> The elevation or IFC unit information is uncertain. I have checked the proposed height in the 3D preview.</span>
+                        <span><strong>Confirm manual review.</strong> The room boundary is inferred and/or the ceiling elevation needs review. I have inspected the selected room footprint and proposed height in the 3D preview.</span>
                       </label>
                     )}
 
