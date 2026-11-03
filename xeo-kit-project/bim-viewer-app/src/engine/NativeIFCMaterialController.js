@@ -225,8 +225,6 @@ export class NativeIFCMaterialController {
           e1[2]*e2[0] - e1[0]*e2[2],
           e1[0]*e2[1] - e1[1]*e2[0],
         ];
-        const len = Math.hypot(...fn) || 1;
-        const normal = [fn[0]/len, fn[1]/len, fn[2]/len];
         for (const [index, normalIndex] of [[ia, ia], [ib, ib], [ic, ic]]) {
           const p = rawVertices[index];
           const n = rawNormals[normalIndex];
@@ -284,23 +282,29 @@ export class NativeIFCMaterialController {
       selectedBounds[5] = Math.max(selectedBounds[5], p[2]);
     });
 
-    const representativeNormal = [0, 0, 0];
-    for (let i = 0; i < normals.length; i += 3) {
-      representativeNormal[0] += normals[i];
-      representativeNormal[1] += normals[i + 1];
-      representativeNormal[2] += normals[i + 2];
-    }
-    const representativeLength = Math.hypot(...representativeNormal) || 1;
-    representativeNormal[0] /= representativeLength;
-    representativeNormal[1] /= representativeLength;
-    representativeNormal[2] /= representativeLength;
-
-    const [axisA, axisB] = chooseProjection(representativeNormal);
+    // Project each triangle using its own geometric face normal. Averaging all
+    // vertex normals across a slab cancels the opposing top/bottom normals and
+    // can select a wall projection axis for horizontal faces. Per-face
+    // projection keeps finishes visible on both slab faces and on the exposed
+    // vertical returns, regardless of IFC triangle winding.
     const uvs = [];
-    for (let i = 0; i < positions.length; i += 3) {
-      const p = [positions[i], positions[i + 1], positions[i + 2]];
-      const uv = projectCoordinate(p, axisA, axisB, selectedBounds, repeat);
-      uvs.push(uv[0], uv[1]);
+    for (let i = 0; i < positions.length; i += 9) {
+      const p0 = [positions[i], positions[i + 1], positions[i + 2]];
+      const p1 = [positions[i + 3], positions[i + 4], positions[i + 5]];
+      const p2 = [positions[i + 6], positions[i + 7], positions[i + 8]];
+      const e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+      const e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+      const faceNormal = [
+        e1[1] * e2[2] - e1[2] * e2[1],
+        e1[2] * e2[0] - e1[0] * e2[2],
+        e1[0] * e2[1] - e1[1] * e2[0],
+      ];
+      const length = Math.hypot(...faceNormal) || 1;
+      const [axisA, axisB] = chooseProjection(faceNormal.map((value) => value / length));
+      for (const point of [p0, p1, p2]) {
+        const uv = projectCoordinate(point, axisA, axisB, selectedBounds, repeat);
+        uvs.push(uv[0], uv[1]);
+      }
     }
 
     const indices = Array.from({ length: positions.length / 3 }, (_, i) => i);

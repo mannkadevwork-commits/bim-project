@@ -637,6 +637,7 @@ class WalkRuntime {
       this.walkAreas = semanticAreas.filter((area) => activeAreaIds.has(area.id));
     }
     this.lightingDirector.setRoomAnchors(this.walkAreas);
+    this.lightingDirector.setLightFixtures?.(projectStatePayload?.furniture || [], this.metersPerUnit);
     this._assignHotspotRoles();
     this._buildDestinationPresentationIndex();
     this._buildSafeAnchorRegistry();

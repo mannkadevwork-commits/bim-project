@@ -884,6 +884,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
 
   const handleSaveAsLayout = async (metadata, renderResult, renderConfig) => {
     const savedLayout = await saveRenderedLayout(metadata, renderResult, renderConfig);
+    // Bind the new stable layout id to this workspace so future Save design
+    // actions update this layout instead of creating another record.
+    onSavedLayoutCreated?.(savedLayout);
     setToastMessage(`Saved “${savedLayout.name}” to Layouts.`);
     setTimeout(() => setToastMessage(null), 2200);
     return savedLayout;
@@ -1397,6 +1400,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         onClose={() => { engineActions.clearRoomCeilingPreview?.(); setShowCeilingDesigner(false); }}
         onApply={handleApplyRoomCeilings}
         onPreview={handlePreviewRoomCeiling}
+        materialLibrary={materialLibrary}
+        materialLibraryLoading={materialLibraryLoading}
+        materialLibraryError={materialLibraryError}
       />
 
       <ReplaceAssetModal
@@ -1418,7 +1424,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         setRenderError={setRenderError}
         onSaveAsLayout={handleSaveAsLayout}
         onUpdateSavedLayoutSnapshot={handleUpdateSavedLayoutSnapshot}
-        currentSavedLayout={savedLayouts.find((layout) => layout.id === activeProject?.savedLayoutId) || null}
+        currentSavedLayout={savedLayouts.find((layout) => layout.id === activeProject?.savedLayoutId) || activeSavedLayout || null}
         activeFileName={fileName}
         existingSavedLayouts={savedLayouts}
       />

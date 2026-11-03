@@ -22,6 +22,7 @@ import { RoomDetector } from "./navigation/RoomDetector";
 import { optimizeGlb } from "./glb-optimizer";
 import { collectNodePerformanceMetrics, readJsonIfPresent, writePerformanceReport } from "./performanceReport";
 import { writePresentationManifest } from "./presentationManifest";
+import { appendAuthoredCeilings } from "./ceiling/CeilingGeometry";
 
 enum AssetType {
   STRUCTURAL_REPLACEMENT = "structural_replacement",
@@ -107,6 +108,9 @@ interface ProjectState {
   structural_edits?: Record<string, StructuralEditEntry>;
   materials?: Record<string, MaterialEntry>;
   furniture: FurnitureItem[];
+  ceilingDesigns?: Array<Record<string, any>>;
+  ceilings?: Array<Record<string, any>>;
+  ceiling_hidden_entity_ids?: string[];
   scene_calibration?: {
     scaleFactor?: {
       x: number;
@@ -1267,8 +1271,19 @@ export async function compileScene(
   performanceStages.projectStateReadMs = Date.now() - performanceStageStartedAt;
   performanceStageStartedAt = Date.now();
 
-  const structuralEdits =
-    projectState.structural_edits ?? {};
+  // Explicit ceiling visibility is persisted separately from ordinary structural
+  // edits. Merge it into the same visibility map used by IFC geometry extraction
+  // so a user-hidden native ceiling stays hidden in the 360 presentation too.
+  const structuralEdits: Record<string, StructuralEditEntry> = {
+    ...(projectState.structural_edits ?? {}),
+  };
+  for (const entityId of Array.isArray(projectState.ceiling_hidden_entity_ids)
+    ? projectState.ceiling_hidden_entity_ids
+    : []) {
+    const key = String(entityId || "").trim();
+    if (!key) continue;
+    structuralEdits[key] = { ...(structuralEdits[key] ?? {}), visible: false };
+  }
   const materials = projectState.materials ?? {};
 
   warnAboutUnhostedDoorAssets(projectState.furniture);
@@ -1930,7 +1945,7 @@ export async function compileScene(
       sceneMetricCollectionError = (metricsError as Error).message;
       console.warn(`[compiler:perf] Scene metric collection failed; continuing render - ${sceneMetricCollectionError}`);
     }
-    const glbBuffer = await io.writeBinary(doc);
+    let glbBuffer = await io.writeBinary(doc);
 
     fs.writeFileSync(
       RAW_GLB_PATH,
@@ -1938,7 +1953,7 @@ export async function compileScene(
     );
 
     console.log(
-      `[compiler] Wrote raw build GLB ${RAW_GLB_PATH} (${glbBuffer.byteLength} bytes)`,
+      `[compiler] Wrote navigation source GLB ${RAW_GLB_PATH} (${glbBuffer.byteLength} bytes)`,
     );
     performanceStages.sceneAssemblyAndRawExportMs = Date.now() - performanceStageStartedAt;
     performanceStageStartedAt = Date.now();
@@ -1975,6 +1990,65 @@ export async function compileScene(
       );
     }
     performanceStages.navigationBuildMs = Date.now() - navigationStartedAt;
+
+    // Authored ceilings are visual-only geometry. Append them after navigation
+    // generation so they appear in output.glb without blocking room traversal or
+    // changing the NavMesh / navigation cache signature.
+    const ceilingDesigns = Array.isArray(projectState.ceilingDesigns)
+      ? projectState.ceilingDesigns
+      : (Array.isArray(projectState.ceilings) ? projectState.ceilings : []);
+    let ceilingSummary = { created: 0, skipped: 0, triangleCount: 0 };
+    if (ceilingDesigns.length) {
+      try {
+        ceilingSummary = appendAuthoredCeilings(
+          doc,
+          buffer,
+          scene,
+          ceilingDesigns,
+          projectState.scene_calibration?.scaleFactor,
+          (source) => resolveMaterialTexturePath(source, assetsDirectory),
+          (material, repeat) => applyBaseColorTextureRepeat(doc, material, repeat),
+        );
+        if (ceilingSummary.created > 0) {
+          const ceilingExportStartedAt = Date.now();
+          glbBuffer = await io.writeBinary(doc);
+          fs.writeFileSync(RAW_GLB_PATH, Buffer.from(glbBuffer));
+          performanceStages.ceilingVisualExportMs = Date.now() - ceilingExportStartedAt;
+          console.log(
+            `[compiler:ceiling] Included ${ceilingSummary.created} authored ceiling(s) in the visual GLB (${ceilingSummary.triangleCount} triangles; ${ceilingSummary.skipped} skipped). Navigation was compiled before ceiling geometry was appended.`,
+          );
+        } else if (ceilingSummary.skipped > 0) {
+          console.warn(`[compiler:ceiling] No authored ceiling could be exported (${ceilingSummary.skipped} skipped).`);
+        }
+      } catch (ceilingError) {
+        // A damaged optional ceiling must not prevent a valid structural/furniture
+        // render from being delivered. The editor state remains saved for repair.
+        console.warn(`[compiler:ceiling] Ceiling export failed; continuing without authored ceilings: ${(ceilingError as Error).message}`);
+      }
+    }
+
+    // The performance report should describe the final visual source GLB, including
+    // ceilings, while keeping ceiling nodes out of the per-furniture instance map.
+    try {
+      rawSceneMetrics = collectNodePerformanceMetrics(scene as any);
+      compiledAssetMetricsByInstance.clear();
+      topLevelSceneMetrics = scene.listChildren().map((node) => {
+        const name = node.getName() || "unnamed";
+        const metrics = collectNodePerformanceMetrics(node as any);
+        if (
+          name &&
+          name !== "IFC_Structure" &&
+          name !== "IFC_Structure_Frame" &&
+          name !== "HCI_Authored_Ceilings"
+        ) {
+          compiledAssetMetricsByInstance.set(name, metrics);
+        }
+        return { name, metrics };
+      });
+    } catch (metricsError) {
+      sceneMetricCollectionError = (metricsError as Error).message;
+      console.warn(`[compiler:perf] Final visual scene metric collection failed; continuing render - ${sceneMetricCollectionError}`);
+    }
 
     // -----------------------------------------------------------
     // PRODUCTION VISUAL GLB

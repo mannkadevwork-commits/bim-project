@@ -410,6 +410,71 @@ app.get('/api/assets', (req, res) => {
 
 
 // ==========================================
+// SAVED 360 LAYOUT SNAPSHOT CONTRACT
+// ==========================================
+// Current WalkNavigationPipeline writes walk_hotspots.json (areas + hotspots).
+// walk_areas.json is retained as an optional legacy artifact only; it is not
+// produced by the current compiler and must never block a valid layout update.
+const SAVED_LAYOUT_REQUIRED_RENDER_FILES = [
+  'output.glb',
+  'navigation_surface.json',
+  'navigation_navmesh.bin',
+  'walk_hotspots.json',
+  'input.ifc',
+];
+
+const SAVED_LAYOUT_OPTIONAL_RENDER_FILES = [
+  'original.ifc',
+  'walk_areas.json', // Legacy compatibility only.
+  'presentation_rooms.json',
+  'presentation_portals.json',
+  'presentation_room_graph.json',
+  'navigation_meta.json',
+  'room_connectivity.json',
+  'doorway_traversability.json',
+  'hosted_door_portals.json',
+  'performance_report.json',
+  'optimization_report.json',
+  'presentation_manifest.json',
+];
+
+function inspectSavedLayoutRenderSnapshot(sourceJobDir) {
+  const missingFiles = SAVED_LAYOUT_REQUIRED_RENDER_FILES.filter((fileName) => (
+    !fs.existsSync(path.join(sourceJobDir, fileName))
+    || !fs.statSync(path.join(sourceJobDir, fileName)).isFile()
+    || fs.statSync(path.join(sourceJobDir, fileName)).size <= 0
+  ));
+  if (missingFiles.length) return { files: [], missingFiles };
+
+  const files = [
+    ...SAVED_LAYOUT_REQUIRED_RENDER_FILES,
+    ...SAVED_LAYOUT_OPTIONAL_RENDER_FILES.filter((fileName) => (
+      fs.existsSync(path.join(sourceJobDir, fileName))
+      && fs.statSync(path.join(sourceJobDir, fileName)).isFile()
+    )),
+  ];
+
+  // A few older working jobs do not retain original.ifc separately. Keep the
+  // restore contract intact by using the exact rendered input as the fallback.
+  if (!files.includes('original.ifc')) files.push('original.ifc');
+  return { files, missingFiles: [] };
+}
+
+function copySavedLayoutRenderSnapshot(sourceJobDir, destinationJobDir, files) {
+  fs.mkdirSync(destinationJobDir, { recursive: true });
+  for (const fileName of files) {
+    const sourceName = fileName === 'original.ifc'
+      && !fs.existsSync(path.join(sourceJobDir, 'original.ifc'))
+      ? 'input.ifc'
+      : fileName;
+    fs.copyFileSync(
+      path.join(sourceJobDir, sourceName),
+      path.join(destinationJobDir, fileName),
+    );
+  }
+}
+
+// ==========================================
 // SAVED 360 LAYOUTS API
 // ==========================================
 // Each saved layout is an immutable snapshot of the already-rendered scene.
@@ -444,8 +509,12 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     if (!requireActiveProject(jobId, res)) return;
 
     const parentJobDir = path.join(jobsDir, jobId);
-    if (!fs.existsSync(path.join(parentJobDir, 'output.glb'))) {
-      return res.status(409).json({ error: 'Run the final 360 render before saving a layout.' });
+    const snapshot = inspectSavedLayoutRenderSnapshot(parentJobDir);
+    if (snapshot.missingFiles.length) {
+      return res.status(409).json({
+        error: `The 360 render is not ready to save. Missing required artifacts: ${snapshot.missingFiles.join(', ')}. Run a fresh 360 render and try again.`,
+        missingFiles: snapshot.missingFiles,
+      });
     }
 
     const rawName = String(req.body?.name || '').trim();
@@ -472,25 +541,10 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     fs.mkdirSync(renderJobDir, { recursive: true });
     fs.mkdirSync(layoutsDir, { recursive: true });
 
-    // Freeze everything needed to reproduce the render AND restore the scene
-    // back into the normal xeokit editor later.
-    //
-    // input.ifc = the exact IFC that was used for the final render, including
-    // any edits that were baked into the IFC (door cuts/rescale/etc.).
-    // original.ifc = kept for the normal project validation/continue-work flow.
-    // project_state.json below = the authored editor state (materials, furniture,
-    // structural edits, matrices, calibration, etc.).
-    [
-      'output.glb',
-      'navigation_surface.json',
-      'walk_areas.json',
-      'navigation_navmesh.bin',
-      'input.ifc',
-      'original.ifc',
-    ].forEach(fileName => {
-      const source = path.join(parentJobDir, fileName);
-      if (fs.existsSync(source)) fs.copyFileSync(source, path.join(renderJobDir, fileName));
-    });
+    // Freeze the exact compiled scene and the artifacts consumed by the React
+    // walkthrough. Current navigation uses walk_hotspots.json; walk_areas.json
+    // is copied only when found on legacy jobs.
+    copySavedLayoutRenderSnapshot(parentJobDir, renderJobDir, snapshot.files);
 
     if (req.file?.buffer) fs.writeFileSync(path.join(renderJobDir, 'thumbnail.jpg'), req.file.buffer);
 
@@ -563,20 +617,14 @@ app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'
       return res.status(403).json({ error: 'The current working project is archived and cannot update a saved layout.' });
     }
 
-    const requiredFiles = [
-      'output.glb',
-      'navigation_surface.json',
-      'walk_areas.json',
-      'navigation_navmesh.bin',
-      'input.ifc',
-      'original.ifc',
-    ];
-    const missingFiles = requiredFiles.filter((fileName) => !fs.existsSync(path.join(sourceJobDir, fileName)));
-    if (missingFiles.length) {
+    const snapshot = inspectSavedLayoutRenderSnapshot(sourceJobDir);
+    if (snapshot.missingFiles.length) {
       return res.status(409).json({
-        error: `Render snapshot is incomplete. Missing: ${missingFiles.join(', ')}`,
+        error: `The current 360 render is incomplete. Missing required artifacts: ${snapshot.missingFiles.join(', ')}. Generate a fresh 360 render before updating this layout.`,
+        missingFiles: snapshot.missingFiles,
       });
     }
+    const snapshotFiles = snapshot.files;
 
     let renderConfig = {};
     if (req.body?.renderConfig) {
@@ -601,14 +649,7 @@ app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'
     // record. A failure therefore leaves the previous saved version usable.
     const newRenderJobId = generateSavedLayoutId();
     newSnapshotDir = path.join(jobsDir, newRenderJobId);
-    fs.mkdirSync(newSnapshotDir, { recursive: true });
-
-    requiredFiles.forEach((fileName) => {
-      fs.copyFileSync(
-        path.join(sourceJobDir, fileName),
-        path.join(newSnapshotDir, fileName)
-      );
-    });
+    copySavedLayoutRenderSnapshot(sourceJobDir, newSnapshotDir, snapshotFiles);
 
     if (req.file?.buffer) {
       fs.writeFileSync(path.join(newSnapshotDir, 'thumbnail.jpg'), req.file.buffer);
@@ -1125,8 +1166,28 @@ app.post('/api/projects/:jobId/ceiling-analysis', (req, res) => {
         try {
             const responseText = stdout.trim();
             const result = responseText ? JSON.parse(responseText) : JSON.parse(fs.readFileSync(outputPath, 'utf8'));
-            if (![1, 2].includes(Number(result?.schemaVersion)) || !Array.isArray(result.rooms) || !Array.isArray(result.levels)) {
-                return finish(500, { error: 'Ceiling analysis returned an unsupported response contract.' });
+            // CeilingAnalysisService currently emits schemaVersion 2. Keep
+            // accepting v1 during the migration window so older cached outputs
+            // and compatible workers remain usable, while validating the same
+            // required rooms/levels arrays for both response versions.
+            const schemaVersion = Number(result?.schemaVersion);
+            const supportedSchemaVersions = [1, 2];
+            if (
+                !supportedSchemaVersions.includes(schemaVersion) ||
+                !Array.isArray(result?.rooms) ||
+                !Array.isArray(result?.levels)
+            ) {
+                const details = [
+                    `schemaVersion=${String(result?.schemaVersion ?? 'missing')}`,
+                    `rooms=${Array.isArray(result?.rooms) ? 'array' : typeof result?.rooms}`,
+                    `levels=${Array.isArray(result?.levels) ? 'array' : typeof result?.levels}`,
+                    `supported=${supportedSchemaVersions.join(',')}`,
+                ].join('; ');
+                console.error('[CeilingAnalysis] Unsupported response contract:', details);
+                return finish(500, {
+                    error: 'Ceiling analysis returned an unsupported response contract.',
+                    details,
+                });
             }
             finish(200, result);
         } catch (error) {
@@ -1357,6 +1418,31 @@ app.post('/api/convert-floorplan', uploadFloorplan.single('image'), async (req, 
 
     res.json({ success: true, message: 'Conversion successful', fileUrl: fileUrl, jobId: jobId });
   } catch (err) {
+    console.error(`[ConvertFloorplan] AI generation failed for jobId ${jobId}:`, (err && err.body) || err);
+
+    const fallbackLayout = PREDEFINED_LAYOUTS.find(l => l.id === '3bhk');
+    if (fallbackLayout && fs.existsSync(fallbackLayout.assetPath)) {
+      try {
+        const fallbackFileName = `${jobId}_Generated.ifc`;
+        const fallbackOutputPath = path.join(jobDir, fallbackFileName);
+        fs.copyFileSync(fallbackLayout.assetPath, fallbackOutputPath);
+
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        const host = req.headers.host;
+        const fileUrl = `${protocol}://${host}/jobs/${jobId}/${fallbackFileName}`;
+
+        return res.json({
+          success: true,
+          fallback: true,
+          message: 'AI generation failed. Showing the default 3 BHK layout instead.',
+          fileUrl: fileUrl,
+          jobId: jobId,
+        });
+      } catch (copyErr) {
+        console.error(`[ConvertFloorplan] Fallback copy failed for jobId ${jobId}:`, copyErr);
+      }
+    }
+
     const status = (err && err.status) || 500;
     const body = (err && err.body) || { error: 'Failed to convert floorplan.' };
     res.status(status).json(body);
@@ -1648,7 +1734,7 @@ app.post('/api/projects/:jobId/rescale', (req, res) => {
 // ==========================================
 // RENDER CACHE HELPERS
 // ==========================================
-const RENDER_CACHE_VERSION = 'hci-render-cache-v1';
+const RENDER_CACHE_VERSION = 'hci-render-cache-v3-ceiling-finishes-profiles';
 const RENDER_CACHE_REQUIRED_ARTIFACTS = [
     'output.glb',
     'navigation_navmesh.bin',
@@ -1666,6 +1752,7 @@ const RENDER_PIPELINE_SOURCE_FILES = [
     'package.json',
     'scene_merger.py',
     'compiler/compiler.ts',
+    'compiler/ceiling/CeilingGeometry.ts',
     'compiler/geometry.ts',
     'compiler/math.ts',
     'compiler/glb-optimizer.ts',
@@ -1761,6 +1848,17 @@ function computeRenderInputSignature(jobDir) {
 
     for (const item of Array.isArray(projectState.furniture) ? projectState.furniture : []) {
         addDependency(item?.src);
+    }
+    // Ceiling texture/fabric finishes are first-class render inputs. Include
+    // their files in the cache key so replacing a library texture cannot reuse
+    // an older GLB compiled with the previous image.
+    const ceilingDesigns = Array.isArray(projectState.ceilingDesigns)
+        ? projectState.ceilingDesigns
+        : (Array.isArray(projectState.ceilings) ? projectState.ceilings : []);
+    for (const ceiling of ceilingDesigns) {
+        addDependency(ceiling?.finish?.texture?.src);
+        addDependency(ceiling?.finish?.textureSrc);
+        addDependency(ceiling?.finish?.textureUrl);
     }
     const materials = projectState.materials && typeof projectState.materials === 'object'
         ? Object.values(projectState.materials)

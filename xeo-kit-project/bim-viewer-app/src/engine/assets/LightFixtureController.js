@@ -1,7 +1,11 @@
 import { PointLight } from '@xeokit/xeokit-sdk/src/viewer/scene/lights/PointLight.js';
 
 const LIGHT_ID_PREFIX = 'hci_fixture_point_light_';
+// Xeokit's PointLight is a scene component, not an emissive material on the
+// fixture. Keep its values bounded and update its position without destroying
+// and recreating the component on every render tick.
 const clamp = (value, min, max) => Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Number(value) : min));
+const MAX_INTENSITY = 0.55;
 
 const colorForTemperature = (kelvin) => {
   const t = clamp(kelvin, 2700, 6500);
@@ -17,7 +21,7 @@ const getEmitterPosition = (model) => {
   const aabb = model?.aabb;
   if (!aabb || aabb.length < 6 || !Array.from(aabb).slice(0, 6).every(Number.isFinite)) return null;
   const height = Math.max(0.05, aabb[4] - aabb[1]);
-  // Put the emitter near the room-facing underside, not buried in the ceiling asset.
+  // The fixture's lower/front side faces the room in the viewer's Y-up frame.
   return [
     (aabb[0] + aabb[3]) / 2,
     aabb[1] + Math.min(height * 0.18, 0.10),
@@ -25,7 +29,7 @@ const getEmitterPosition = (model) => {
   ];
 };
 
-/** Creates a conservative, world-space light per fixture and keeps it attached to its model. */
+/** Owns one world-space PointLight per placed lighting fixture. */
 export const createLightFixtureController = (viewer) => {
   const scene = viewer?.scene;
   const liveLights = new Map();
@@ -50,15 +54,18 @@ export const createLightFixtureController = (viewer) => {
       return;
     }
 
-    const intensity = clamp(meta.lightIntensity ?? 0.30, 0, 0.55);
+    const intensity = clamp(meta.lightIntensity ?? 0.12, 0, MAX_INTENSITY);
     const temperature = clamp(meta.lightTemperature ?? 4000, 2700, 6500);
     const color = colorForTemperature(temperature);
     const signature = `${intensity.toFixed(3)}:${temperature}`;
     let entry = liveLights.get(model.id);
+
     if (entry && entry.signature !== signature) {
+      // Keep component IDs unique while replacing changed settings.
       destroyLight(model.id);
       entry = null;
     }
+
     if (!entry) {
       const safeId = `${LIGHT_ID_PREFIX}${String(model.id).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
       try {
@@ -67,11 +74,11 @@ export const createLightFixtureController = (viewer) => {
           pos: position,
           color,
           intensity,
-          // A unit constant term prevents the extreme near-source brightness
-          // caused by the previous 0.25 constant attenuation.
+          // Broader attenuation than the old near-source-heavy setup prevents
+          // a single luminaire from washing out the entire room/ceiling.
           constantAttenuation: 1.0,
-          linearAttenuation: 0.10,
-          quadraticAttenuation: 0.035,
+          linearAttenuation: 0.35,
+          quadraticAttenuation: 0.12,
           space: 'world',
           castsShadow: false,
         });
@@ -111,7 +118,7 @@ export const createLightFixtureController = (viewer) => {
     },
     setSettings(model, settings = {}) {
       if (!model?._assetMeta || model._assetMeta.isLightFixture !== true) return false;
-      if (settings.intensity !== undefined) model._assetMeta.lightIntensity = clamp(settings.intensity, 0, 0.55);
+      if (settings.intensity !== undefined) model._assetMeta.lightIntensity = clamp(settings.intensity, 0, MAX_INTENSITY);
       if (settings.temperature !== undefined) model._assetMeta.lightTemperature = clamp(settings.temperature, 2700, 6500);
       syncModel(model);
       return true;

@@ -768,8 +768,10 @@ export const useProjectSync = (activeProject) => {
     }
     if (!renderResult?.jobId) throw new Error('The 360 render is not available to save.');
 
-    const sourceModelUrl = renderResult.modelUrl ||
-      `${API_BASE_URL}/jobs/${encodeURIComponent(renderResult.jobId)}/output.glb`;
+    // Always thumbnail the freshly compiled working-project output. A previous
+    // Update Layout action may have redirected renderResult.modelUrl to the
+    // immutable saved snapshot; that URL must not become the next update source.
+    const sourceModelUrl = `${API_BASE_URL}/jobs/${encodeURIComponent(renderResult.jobId)}/output.glb`;
 
     const modelResponse = await fetch(sourceModelUrl, { cache: 'no-store' });
     if (!modelResponse.ok) {
@@ -843,13 +845,14 @@ export const useProjectSync = (activeProject) => {
   const updateSavedLayoutSnapshot = async (layoutId, renderResult, renderConfig) => {
     if (!layoutId) throw new Error('Saved layout id is required.');
     if (!jobId) throw new Error('No active project is available.');
-    if (!renderResult?.jobId || renderResult.jobId != jobId) {
+    if (!renderResult?.jobId || String(renderResult.jobId) !== String(jobId)) {
       throw new Error('Render the current project before updating the saved layout.');
     }
 
     let thumbnailBlob = null;
-    const sourceModelUrl = renderResult.modelUrl ||
-      `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`;
+    // `jobId` is the mutable working project. The saved layout's renderJobId
+    // changes after every successful update, but must never replace this source.
+    const sourceModelUrl = `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`;
 
     try {
       const modelResponse = await fetch(sourceModelUrl, { cache: 'no-store' });

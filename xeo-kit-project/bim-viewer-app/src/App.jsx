@@ -202,6 +202,32 @@ function ViewerApp() {
     setShowStartChoice(false);
   };
 
+  const handleSavedLayoutCreated = (layout) => {
+    if (!layout?.id || !activeProject?.jobId) return;
+
+    const nextProject = {
+      ...activeProject,
+      savedLayoutsSourceJobId: activeProject.savedLayoutsSourceJobId || activeProject.jobId,
+      savedLayoutId: layout.id,
+      savedLayoutName: layout.name || activeProject.savedLayoutName || 'Saved Layout',
+    };
+    setActiveProject(nextProject);
+
+    // Persist the association so reopening/continuing this workspace keeps
+    // the Save design button in Update layout mode.
+    try {
+      localStorage.setItem('hci_active_project', JSON.stringify({
+        jobId: nextProject.jobId,
+        fileName: nextProject.fileName,
+        savedLayoutsSourceJobId: nextProject.savedLayoutsSourceJobId,
+        savedLayoutId: nextProject.savedLayoutId,
+        savedLayoutName: nextProject.savedLayoutName,
+      }));
+    } catch (error) {
+      console.warn('[App] Could not persist saved-layout association:', error);
+    }
+  };
+
   const handleDeleteRequest = () => {
     setIsDeleteModalOpen(true);
   };
@@ -393,6 +419,7 @@ function ViewerApp() {
             onAdd={() => setIsUploadOpen(true)}
             onReplaceProject={handleLayoutReplace}
             onOpenSavedLayout={handleOpenSavedLayout}
+            onSavedLayoutCreated={handleSavedLayoutCreated}
           />
         ) : null}
       </div>

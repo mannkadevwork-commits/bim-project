@@ -2,6 +2,27 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
 const MODE_ORDER = ['day', 'evening', 'night'];
+const FIXTURE_LIGHT_MODE_GAIN = { day: 0.42, evening: 1.0, night: 1.2 };
+const MAX_FIXTURE_LIGHTS = 48;
+
+function clampFixture(value, min, max) {
+  const number = Number(value);
+  return THREE.MathUtils.clamp(Number.isFinite(number) ? number : min, min, max);
+}
+
+function fixtureColorForTemperature(kelvin) {
+  const temperature = clampFixture(kelvin, 2700, 6500);
+  if (temperature <= 4000) {
+    const factor = (temperature - 2700) / 1300;
+    return new THREE.Color(1, 0.72 + factor * 0.20, 0.52 + factor * 0.30);
+  }
+  const factor = (temperature - 4000) / 2500;
+  return new THREE.Color(1 - factor * 0.12, 0.92 + factor * 0.06, 0.82 + factor * 0.18);
+}
+
+function fixtureModeGain(mode) {
+  return FIXTURE_LIGHT_MODE_GAIN[mode] ?? FIXTURE_LIGHT_MODE_GAIN.day;
+}
 
 const LIGHTING_MODES = {
   day: {
@@ -177,6 +198,8 @@ export class LightingDirector {
     this.modelCenter = new THREE.Vector3();
     this.modelSize = new THREE.Vector3(12, 3, 12);
     this.roomAnchors = [];
+    this.fixtureLightSources = [];
+    this.fixtureSceneUnitsPerMeter = 1;
 
     this.pmremGenerator = null;
     this.environmentScene = null;
@@ -281,6 +304,57 @@ export class LightingDirector {
     this.staticShadowPrepared = true;
   }
 
+  setLightFixtures(furniture, metersPerUnit = 1) {
+    const physicalMetersPerUnit = Number(metersPerUnit);
+    // WalkNavigationPipeline's physicalMetersPerUnit is the number of GLB
+    // scene units occupied by one physical metre (it multiplies metric radii,
+    // heights and sample distances by this value). Use the same convention for
+    // fixture-light offsets and falloff distances.
+    this.fixtureSceneUnitsPerMeter = Number.isFinite(physicalMetersPerUnit) && physicalMetersPerUnit > 0
+      ? physicalMetersPerUnit
+      : 1;
+    this.fixtureLightSources = (Array.isArray(furniture) ? furniture : [])
+      .filter((item) => item && (item.isLightFixture === true || String(item.assetCategory || '').toLowerCase() === 'lighting'))
+      .map((item) => {
+        const instanceId = String(item.instanceId || item.id || '');
+        const persistedPosition = Array.isArray(item.position) ? item.position.slice(0, 3).map(Number) : [];
+        if (persistedPosition.length !== 3 || !persistedPosition.every(Number.isFinite)) return null;
+
+        // The saved position is the asset's placement/contact target (usually
+        // its bottom-centre pivot), not necessarily the bulb/emitter location.
+        // The compiler preserves each instance under a node named instanceId;
+        // use its final world-space bounds to mirror the editor's AABB-based
+        // emitter placement. Fall back to the persisted target for legacy GLBs
+        // whose node name could not be resolved.
+        let position = [...persistedPosition];
+        const fixtureNode = instanceId ? this.model?.getObjectByName?.(instanceId) : null;
+        if (fixtureNode) {
+          fixtureNode.updateWorldMatrix?.(true, true);
+          const bounds = new THREE.Box3().setFromObject(fixtureNode);
+          if (!bounds.isEmpty()) {
+            const size = bounds.getSize(new THREE.Vector3());
+            position = [
+              (bounds.min.x + bounds.max.x) * 0.5,
+              bounds.min.y + Math.min(Math.max(size.y, 0.05 * this.fixtureSceneUnitsPerMeter) * 0.18, 0.10 * this.fixtureSceneUnitsPerMeter),
+              (bounds.min.z + bounds.max.z) * 0.5,
+            ];
+          }
+        } else {
+          position[1] -= 0.045 * this.fixtureSceneUnitsPerMeter;
+        }
+
+        return {
+          instanceId,
+          position,
+          enabled: item.lightEnabled === true,
+          intensity: clampFixture(item.lightIntensity ?? 0.30, 0, 0.55),
+          temperature: clampFixture(item.lightTemperature ?? 4000, 2700, 6500),
+        };
+      })
+      .filter(Boolean);
+    this._rebuildPracticalLights();
+  }
+
   setRoomAnchors(areas) {
     this.roomAnchors = Array.isArray(areas)
       ? areas
@@ -325,13 +399,54 @@ export class LightingDirector {
     });
     this.practicalLights = [];
 
-    const usable = this.roomAnchors.slice(0, this._maxPracticalLights);
-    if (!usable.length) return;
+    const sceneUnitsPerMeter = Math.max(this.fixtureSceneUnitsPerMeter || 1, 0.000001);
+    const coveredRoomIds = new Set();
 
-    const floorY = this.modelCenter.y - (this.modelSize.y * 0.5);
-    const fixtureY = floorY + THREE.MathUtils.clamp(this.modelSize.y * 0.78, 2.25, 2.85);
+    // Remember which rooms have authored fixtures even when a fixture is switched
+    // off. Otherwise the generic room-centre practical would make an explicitly
+    // disabled light appear to remain on in the walkthrough.
+    this.fixtureLightSources.forEach((source) => {
+      let nearest = null;
+      let nearestDistance = Infinity;
+      for (const anchor of this.roomAnchors) {
+        const distance = Math.hypot(anchor.center.x - source.position[0], anchor.center.z - source.position[2]);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearest = anchor;
+        }
+      }
+      if (nearest && nearestDistance <= 7.0 * sceneUnitsPerMeter) coveredRoomIds.add(nearest.id);
+    });
 
-    usable.forEach((anchor) => {
+    this.fixtureLightSources
+      .filter((source) => source.enabled && source.intensity > 0)
+      .slice(0, MAX_FIXTURE_LIGHTS)
+      .forEach((source) => {
+        const baseColor = fixtureColorForTemperature(source.temperature);
+        // Editor fixture intensity is intentionally conservative (0..0.55).
+        // Convert it to a modest Three.js point-light scale. Position already
+        // comes from the final fixture AABB when that node is present.
+        const baseIntensity = (source.intensity / 0.55) * 3.0;
+        const light = new THREE.PointLight(baseColor, 0, 5.8 * sceneUnitsPerMeter, 2.0);
+        light.position.set(source.position[0], source.position[1], source.position[2]);
+        light.castShadow = false;
+        light.userData.hciFixtureLight = true;
+        light.userData.hciFixtureId = source.instanceId;
+        light.userData.hciFixtureBaseIntensity = baseIntensity;
+        light.userData.hciFixtureBaseColor = baseColor.clone();
+        this.scene.add(light);
+        this.practicalLights.push(light);
+      });
+
+    // Keep the existing ambient practical-light fallback for rooms without a
+    // catalogue fixture. A room containing an authored fixture is controlled by
+    // that fixture's on/off and brightness settings instead.
+    const fallbackAnchors = this.fixtureLightSources.length
+      ? this.roomAnchors.filter((anchor) => !coveredRoomIds.has(anchor.id))
+      : this.roomAnchors;
+    fallbackAnchors.slice(0, this._maxPracticalLights).forEach((anchor) => {
+      const floorY = this.modelCenter.y - (this.modelSize.y * 0.5);
+      const fixtureY = floorY + THREE.MathUtils.clamp(this.modelSize.y * 0.78, 2.25, 2.85);
       const light = new THREE.PointLight(PREPARED_MODES.day.practicalColor, 0, 5.8, 2.0);
       light.position.set(anchor.center.x, fixtureY, anchor.center.z);
       light.castShadow = false;
@@ -345,6 +460,11 @@ export class LightingDirector {
 
   _applyPracticalIntensity(currentProfile) {
     this.practicalLights.forEach((light) => {
+      if (light.userData?.hciFixtureLight) {
+        light.color.copy(light.userData.hciFixtureBaseColor || currentProfile.practicalColor);
+        light.intensity = Number(light.userData.hciFixtureBaseIntensity || 0) * fixtureModeGain(this.mode);
+        return;
+      }
       light.color.copy(currentProfile.practicalColor);
       light.intensity = currentProfile.practical.intensity;
     });
@@ -447,6 +567,12 @@ export class LightingDirector {
     this.rimLight.intensity = THREE.MathUtils.lerp(from.rim.intensity, to.rim.intensity, t);
 
     this.practicalLights.forEach((light) => {
+      if (light.userData?.hciFixtureLight) {
+        light.color.copy(light.userData.hciFixtureBaseColor || to.practicalColor);
+        const gain = THREE.MathUtils.lerp(fixtureModeGain(this.mode), fixtureModeGain(this.targetMode), t);
+        light.intensity = Number(light.userData.hciFixtureBaseIntensity || 0) * gain;
+        return;
+      }
       light.color.lerpColors(from.practicalColor, to.practicalColor, t);
       light.intensity = THREE.MathUtils.lerp(from.practical.intensity, to.practical.intensity, t);
     });
