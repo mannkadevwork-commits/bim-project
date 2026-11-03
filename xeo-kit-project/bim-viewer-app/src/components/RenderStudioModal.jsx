@@ -69,7 +69,11 @@ export const RenderStudioModal = ({
       const nextModelUrl = updatedLayout.modelUrl || modelUrl;
       setRenderResult?.((previous) => previous ? ({
         ...previous,
-        jobId: updatedLayout.renderJobId || previous.jobId,
+        // Keep jobId tied to the active working project: the update API reads
+        // its fresh output.glb from that job. Track the immutable snapshot id
+        // separately so a second update cannot accidentally use the snapshot as
+        // the mutable source project.
+        renderJobId: updatedLayout.renderJobId || previous.renderJobId || null,
         modelUrl: nextModelUrl,
         walkthroughUrl: nextWalkthroughUrl,
         isSavedLayout: true,

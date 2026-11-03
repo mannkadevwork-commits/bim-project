@@ -900,6 +900,7 @@ function createRoomObjects(
   floorY: number,
   boundaryWallsByComponent: Map<number, string[]>,
   wallTopElevationsById: Map<string, number>,
+  wallElements: ElementFootprint[],
   overheadSurfaceElements: ElementFootprint[],
   anchorByComponent: Map<number, ResolvedRoomAnchor> = new Map(),
 ): { rooms: DetectedRoom[]; componentToRoom: Map<number, string> } {
@@ -943,10 +944,29 @@ function createRoomObjects(
     const levelId = stableLevelId(floorY);
     componentToRoom.set(component.id, id);
     const roomBoundaryWallIds = boundaryWallsByComponent.get(component.id) ?? [];
-    const wallTopValues = roomBoundaryWallIds
+    const mappedWallTopValues = roomBoundaryWallIds
       .map((wallId) => wallTopElevationsById.get(wallId))
       .filter((value): value is number => Number.isFinite(value) && value > floorY + 1.8 && value < floorY + 6.5)
       .sort((a, b) => a - b);
+
+    // The centre-cell association above is deliberately conservative, but a
+    // wall can straddle the 5 cm analysis grid so its centre misses the room's
+    // neighbouring cells. Only when that mapping found no wall tops, recover
+    // enclosing walls from their actual plan-footprint distance to the detected
+    // room perimeter. This prevents a generic 2.7 m fallback when the IFC has
+    // measurable wall heads but the raster association missed them.
+    const nearbyBoundaryWallTops = mappedWallTopValues.length
+      ? []
+      : wallElements
+          .filter((wall) => (
+            Number.isFinite(wall.maxY)
+            && wall.maxY > floorY + 1.8
+            && wall.maxY < floorY + 6.5
+            && distanceBetweenFootprintLoops(outer, wall.points) <= Math.max(grid.cellSize * 3, 0.18)
+          ))
+          .map((wall) => wall.maxY)
+          .sort((a, b) => a - b);
+    const wallTopValues = mappedWallTopValues.length ? mappedWallTopValues : nearbyBoundaryWallTops;
     const ceilingCandidates = overheadSurfaceElements
       .filter((surface) => (
         surface.points.length >= 3 &&
@@ -993,7 +1013,11 @@ function createRoomObjects(
       : wallTopMedian == null ? "fallback-estimate" : "boundary-wall-top";
     const ceilingConfidence = selectedOverhead
       ? selectedOverhead.confidence
-      : wallTopMedian == null ? 0.25 : Math.min(0.88, 0.55 + wallTopValues.length * 0.06);
+      : wallTopMedian == null
+        ? 0.25
+        : (mappedWallTopValues.length
+            ? Math.min(0.88, 0.55 + wallTopValues.length * 0.06)
+            : Math.min(0.78, 0.50 + wallTopValues.length * 0.05));
     const roomAnchorPoint = roomAnchor
       ? ifcToFrontend({ x: roomAnchor.x, y: roomAnchor.y }, floorY)
       : null;
@@ -1096,6 +1120,63 @@ function portalBetweenRooms(
     grid,
     components,
   );
+}
+
+function pointToSegmentDistance(point: Point2, start: Point2, end: Point2): number {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared <= 1e-12) return Math.hypot(point.x - start.x, point.y - start.y);
+  const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
+  const nearestX = start.x + t * dx;
+  const nearestY = start.y + t * dy;
+  return Math.hypot(point.x - nearestX, point.y - nearestY);
+}
+
+function segmentOrientation(a: Point2, b: Point2, c: Point2): number {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+function segmentsIntersect(a: Point2, b: Point2, c: Point2, d: Point2): boolean {
+  const epsilon = 1e-8;
+  const o1 = segmentOrientation(a, b, c);
+  const o2 = segmentOrientation(a, b, d);
+  const o3 = segmentOrientation(c, d, a);
+  const o4 = segmentOrientation(c, d, b);
+  if (((o1 > epsilon && o2 < -epsilon) || (o1 < -epsilon && o2 > epsilon))
+    && ((o3 > epsilon && o4 < -epsilon) || (o3 < -epsilon && o4 > epsilon))) return true;
+
+  const onSegment = (p: Point2, q: Point2, r: Point2) => (
+    Math.abs(segmentOrientation(p, q, r)) <= epsilon
+    && r.x >= Math.min(p.x, q.x) - epsilon
+    && r.x <= Math.max(p.x, q.x) + epsilon
+    && r.y >= Math.min(p.y, q.y) - epsilon
+    && r.y <= Math.max(p.y, q.y) + epsilon
+  );
+  return onSegment(a, b, c) || onSegment(a, b, d) || onSegment(c, d, a) || onSegment(c, d, b);
+}
+
+/** Minimum plan-distance between two closed IFC/room footprint outlines. */
+function distanceBetweenFootprintLoops(a: Point2[], b: Point2[]): number {
+  if (a.length < 2 || b.length < 2) return Number.POSITIVE_INFINITY;
+  let minimum = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < a.length; i++) {
+    const a0 = a[i];
+    const a1 = a[(i + 1) % a.length];
+    for (let j = 0; j < b.length; j++) {
+      const b0 = b[j];
+      const b1 = b[(j + 1) % b.length];
+      if (segmentsIntersect(a0, a1, b0, b1)) return 0;
+      minimum = Math.min(
+        minimum,
+        pointToSegmentDistance(a0, b0, b1),
+        pointToSegmentDistance(a1, b0, b1),
+        pointToSegmentDistance(b0, a0, a1),
+        pointToSegmentDistance(b1, a0, a1),
+      );
+    }
+  }
+  return minimum;
 }
 
 function countNearbyComponentCells(grid: Grid, wall: ElementFootprint, componentId: number, paddingCells = 2): number {
@@ -1566,6 +1647,7 @@ export class RoomDetector {
         actualFloorY,
         boundaryWallsByComponent,
         wallTopElevationsById,
+        wallElements,
         overheadSurfaceElements,
         anchorByComponent,
       );
@@ -1725,6 +1807,7 @@ export class RoomDetector {
           hostWallGlobalId: opening?.hostWallGlobalId ?? null,
           resolvedActiveHostWallGlobalId: hostWall?.globalId ?? null,
           resolvedActiveHostWallSourceFile: hostWall?.sourceFile ?? null,
+          resolvedHostWallResolution: hostWallResolution.source,
           center: effectivePlacement ? { x: effectivePlacement.x, y: effectivePlacement.y, z: effectivePlacement.z } : null,
           wallNormal: normal,
           wallSize: hostWall ? { x: hostWall.sizeX, y: hostWall.sizeY } : null,

@@ -5,7 +5,7 @@ import { RoomDetector } from "../navigation/RoomDetector";
 import type { DetectedCeilingCandidate, DetectedRoom, RoomDebugArtifact, RoomPolygonPoint } from "../navigation/RoomTypes";
 
 const ANALYSIS_SCHEMA_VERSION = 2;
-const DETECTOR_VERSION = "hci-ceiling-room-topology-2026-10-v4-ifcspace-geodesic";
+const DETECTOR_VERSION = "hci-ceiling-room-topology-2026-11-v5-wall-footprint-ceiling-height";
 
 export interface CeilingAnalysisOptions {
   jobDirectory: string;

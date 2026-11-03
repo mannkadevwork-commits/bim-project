@@ -190,10 +190,10 @@ export const RightPanel = ({
               }}
               disabled={isLayoutSaving}
               className="flex items-center gap-2 bg-[#ff914d] hover:bg-[#ff7a28] disabled:opacity-75 disabled:cursor-wait text-white px-3 py-1.5 rounded-md text-[10px] font-bold tracking-wide transition-colors shadow-sm"
-              title={activeSavedLayout?.id ? `Save changes to ${activeSavedLayout.name}` : 'Save a reusable version of this design'}
+              title={activeSavedLayout?.id ? `Update the saved layout “${activeSavedLayout.name}”` : 'Save a reusable version of this design'}
             >
               {isLayoutSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Layers3 className="w-3.5 h-3.5"/>}
-              {isLayoutSaving ? 'Saving…' : 'Save design'}
+              {isLayoutSaving ? 'Saving…' : activeSavedLayout?.id ? 'Update layout' : 'Save design'}
             </button>
           </div>
 

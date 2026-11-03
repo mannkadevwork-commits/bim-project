@@ -10,13 +10,96 @@ import {
   MoveVertical,
   Eye,
   Info,
+  Palette,
+  Grid3X3,
+  Brush,
+  Sun,
 } from 'lucide-react';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-const DEFAULT_COLOR = '#F3F1EB';
-const DEFAULT_DROP_METRES = 0.15;
+const DEFAULT_COLOR = '#F4F1EA';
+// Start flush with the enclosing wall heads. A dropped ceiling remains available
+// through the Drop control, but should be an intentional user choice.
+const DEFAULT_DROP_METRES = 0;
 const DEFAULT_THICKNESS_METRES = 0.05;
 const CONFIDENCE_REVIEW_THRESHOLD = 0.6;
+
+const DEFAULT_CEILING_FINISH = {
+  kind: 'color',
+  id: 'ceiling-warm-white',
+  materialId: 'ceiling-warm-white',
+  name: 'Warm White',
+  color: DEFAULT_COLOR,
+  rgb: [0.9569, 0.9451, 0.9176],
+  roughness: 0.9,
+  metallic: 0,
+  texture: null,
+  repeat: [2, 2],
+};
+
+const ARCHITECTURAL_CEILING_COLORS = [
+  { id: 'ceiling-soft-white', name: 'Soft White', color: '#F7F5EF' },
+  { id: 'ceiling-ivory', name: 'Ivory', color: '#EEE8D8' },
+  { id: 'ceiling-pearl', name: 'Pearl Grey', color: '#D9D9D3' },
+  { id: 'ceiling-greige', name: 'Warm Greige', color: '#D0C7B8' },
+  { id: 'ceiling-sandstone', name: 'Sandstone', color: '#C9B79C' },
+  { id: 'ceiling-sage', name: 'Soft Sage', color: '#AAB6A4' },
+  { id: 'ceiling-charcoal', name: 'Charcoal', color: '#45484A' },
+  { id: 'ceiling-walnut', name: 'Walnut Accent', color: '#76543B' },
+];
+
+const CEILING_STYLE_PRESETS = [
+  { id: 'flat', name: 'Minimal flat', description: 'Clean, seamless ceiling', icon: Layers3 },
+  { id: 'cove', name: 'Soft cove', description: 'Warm perimeter reveal', icon: Sun },
+  { id: 'timber-slats', name: 'Linear timber', description: 'Walnut battens with a finished base', icon: Grid3X3 },
+];
+
+function rgbFromHex(hex) {
+  const value = String(hex || '#FFFFFF').replace('#', '');
+  if (!/^[0-9a-f]{6}$/i.test(value)) return [1, 1, 1];
+  return [0, 2, 4].map((offset) => parseInt(value.slice(offset, offset + 2), 16) / 255);
+}
+
+function texturePathForMaterial(material) {
+  if (material?.texture?.src) return material.texture.src;
+  if (material?.textureUrl) return material.textureUrl;
+  const source = material?.textureSrc;
+  if (!source) return null;
+  try {
+    return /^https?:\/\//i.test(source) ? new URL(source).pathname : source;
+  } catch {
+    return null;
+  }
+}
+
+function materialToCeilingFinish(material) {
+  const kind = ['color', 'fabric', 'texture'].includes(material?.kind) ? material.kind : 'color';
+  const color = material?.color || '#FFFFFF';
+  const repeat = Array.isArray(material?.texture?.repeat)
+    ? material.texture.repeat
+    : Array.isArray(material?.repeat) ? material.repeat : [2, 2];
+  const texturePath = kind === 'color' ? null : texturePathForMaterial(material);
+  return {
+    kind,
+    id: material?.id || material?.slug || material?.materialAssetId || null,
+    materialId: material?.materialAssetId || material?.id || material?.slug || null,
+    name: material?.name || 'Custom finish',
+    brand: material?.brand || null,
+    collection: material?.collection || null,
+    color,
+    rgb: Array.isArray(material?.rgb) ? material.rgb : rgbFromHex(color),
+    texture: texturePath ? {
+      id: material?.texture?.id || material?.slug || material?.id || null,
+      name: material?.name || null,
+      src: texturePath,
+      repeat: [...repeat],
+    } : null,
+    textureSrc: texturePath,
+    repeat: [...repeat],
+    roughness: Number.isFinite(Number(material?.roughness)) ? Number(material.roughness) : 0.86,
+    metallic: Number.isFinite(Number(material?.metallic)) ? Number(material.metallic) : 0,
+  };
+}
 
 const safeNumber = (value, fallback) => {
   const number = Number(value);
@@ -37,6 +120,19 @@ function normalizeBoundary(boundary) {
   };
 }
 
+function usesWallTopReference(room) {
+  return room?.elevationSource === 'boundary-wall-top'
+    || room?.elevationSource === 'fallback-estimate';
+}
+
+function getFinishedBottomY(room, structuralY, drop, thickness) {
+  // RoomDetector reports the underside of an existing IFC overhead surface,
+  // but a wall-top reference describes the top of the generated slab. Keep
+  // the slab's top face on the wall head for wall-top/fallback references.
+  const topFaceReferenceOffset = usesWallTopReference(room) ? thickness : 0;
+  return round3(structuralY - drop - topFaceReferenceOffset);
+}
+
 function buildCeilingDesign(room, analysis, settings) {
   const boundary = normalizeBoundary(room?.boundary);
   if (boundary.outer.length < 3) {
@@ -46,7 +142,7 @@ function buildCeilingDesign(room, analysis, settings) {
   const structuralY = safeNumber(settings.structuralY, safeNumber(room.recommendedCeilingY, room.floorY + 2.7));
   const drop = Math.max(0, Math.min(1, safeNumber(settings.drop, DEFAULT_DROP_METRES)));
   const thickness = Math.max(0.025, Math.min(0.25, safeNumber(settings.thickness, DEFAULT_THICKNESS_METRES)));
-  const finishedBottomY = round3(structuralY - drop);
+  const finishedBottomY = getFinishedBottomY(room, structuralY, drop, thickness);
   const ceilingId = `ceiling_${String(room.id).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 
   return {
@@ -66,15 +162,19 @@ function buildCeilingDesign(room, analysis, settings) {
       thickness: round3(thickness),
       unit: 'm',
     },
+    profileType: settings.profileType || 'flat',
     parameters: {
       perimeterInset: 0,
-      profileDepth: 0,
-      coveWidth: 0,
+      profileDepth: settings.profileType === 'cove' ? 0.022 : settings.profileType === 'timber-slats' ? 0.045 : 0,
+      coveWidth: settings.profileType === 'cove' ? 0.026 : 0,
+      slatSpacing: settings.profileType === 'timber-slats' ? 0.18 : 0,
     },
     finish: {
-      kind: 'color',
-      color: settings.color || DEFAULT_COLOR,
-      materialId: null,
+      ...(settings.finish || DEFAULT_CEILING_FINISH),
+      kind: settings.finish?.kind || 'color',
+      color: settings.finish?.color || settings.color || DEFAULT_COLOR,
+      rgb: settings.finish?.rgb || rgbFromHex(settings.finish?.color || settings.color || DEFAULT_COLOR),
+      materialId: settings.finish?.materialId || settings.finish?.id || null,
     },
     visible: true,
     areaM2: safeNumber(room.areaM2, 0),
@@ -120,6 +220,9 @@ export const CeilingDesignerModal = ({
   onClose,
   onApply,
   onPreview,
+  materialLibrary = [],
+  materialLibraryLoading = false,
+  materialLibraryError = '',
 }) => {
   const [analysis, setAnalysis] = useState(null);
   const [rooms, setRooms] = useState([]);
@@ -129,7 +232,10 @@ export const CeilingDesignerModal = ({
   const [drop, setDrop] = useState(DEFAULT_DROP_METRES);
   const [thickness, setThickness] = useState(DEFAULT_THICKNESS_METRES);
   const [heightOverrides, setHeightOverrides] = useState({});
-  const [color, setColor] = useState(DEFAULT_COLOR);
+  const [finish, setFinish] = useState(DEFAULT_CEILING_FINISH);
+  const [finishMode, setFinishMode] = useState('color');
+  const [finishSearch, setFinishSearch] = useState('');
+  const [profileType, setProfileType] = useState('flat');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [loadedAt, setLoadedAt] = useState(null);
@@ -160,6 +266,69 @@ export const CeilingDesignerModal = ({
     () => visibleRooms.find((room) => room.id === selectedRoomId) || null,
     [visibleRooms, selectedRoomId],
   );
+
+  // Reopen a room's saved ceiling settings when the user selects a room that
+  // already has a design. This prevents a simple edit from silently replacing
+  // an existing finish/profile with the dialog defaults.
+  useEffect(() => {
+    if (!selectedRoomId) return;
+    const room = rooms.find((item) => item.id === selectedRoomId);
+    if (!room) return;
+    const saved = existingCeilings.find((item) => (
+      item?.roomId === room.id ||
+      item?.roomId === room.navigationRoomId ||
+      item?.navigationRoomId === room.navigationRoomId
+    ));
+    if (!saved) return;
+
+    const elevation = saved.elevation && typeof saved.elevation === 'object' ? saved.elevation : {};
+    const structuralY = safeNumber(elevation.structuralY, safeNumber(room.recommendedCeilingY, safeNumber(room.floorY, 0) + 2.7));
+    const savedThickness = Math.max(0.025, Math.min(0.25, safeNumber(elevation.thickness, DEFAULT_THICKNESS_METRES)));
+    setHeightOverrides((previous) => ({ ...previous, [room.id]: round3(structuralY) }));
+    setDrop(Math.max(0, Math.min(1, safeNumber(elevation.drop, 0))));
+    setThickness(savedThickness);
+    setProfileType(['flat', 'cove', 'timber-slats'].includes(saved.profileType) ? saved.profileType : 'flat');
+
+    const savedFinish = saved.finish && typeof saved.finish === 'object'
+      ? saved.finish
+      : { kind: 'color', color: saved.color || DEFAULT_COLOR };
+    const finishKind = ['color', 'fabric', 'texture'].includes(savedFinish.kind) ? savedFinish.kind : 'color';
+    setFinish({
+      ...DEFAULT_CEILING_FINISH,
+      ...savedFinish,
+      kind: finishKind,
+      color: savedFinish.color || DEFAULT_COLOR,
+      rgb: Array.isArray(savedFinish.rgb) ? savedFinish.rgb : rgbFromHex(savedFinish.color || DEFAULT_COLOR),
+    });
+    setFinishMode(finishKind);
+  }, [selectedRoomId, rooms, existingCeilings]);
+
+  const architecturalColorMaterials = useMemo(() => {
+    const builtIns = ARCHITECTURAL_CEILING_COLORS.map((item) => ({
+      ...item,
+      kind: 'color',
+      brand: 'HCI Architectural Palette',
+      collection: 'Ceiling finishes',
+      rgb: rgbFromHex(item.color),
+      roughness: 0.9,
+      metallic: 0,
+    }));
+    const source = (Array.isArray(materialLibrary) ? materialLibrary : []).filter((item) => item?.kind === 'color');
+    const seen = new Set();
+    return [...builtIns, ...source].filter((item) => {
+      const key = String(item.color || '').toUpperCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [materialLibrary]);
+
+  const filteredFinishMaterials = useMemo(() => {
+    const query = finishSearch.trim().toLowerCase();
+    return (Array.isArray(materialLibrary) ? materialLibrary : [])
+      .filter((item) => item?.kind === finishMode && finishMode !== 'color')
+      .filter((item) => !query || [item.name, item.category, item.brand, item.collection, item.shadeCode].filter(Boolean).join(' ').toLowerCase().includes(query));
+  }, [materialLibrary, finishMode, finishSearch]);
 
   const detectRooms = useCallback(async (rebuild = false) => {
     if (!jobId) {
@@ -262,12 +431,13 @@ export const CeilingDesignerModal = ({
         structuralY: heightOverrides[selectedRoom.id] ?? selectedRoom.recommendedCeilingY,
         drop,
         thickness,
-        color,
+        finish,
+        profileType,
       });
     } catch {
       return null;
     }
-  }, [selectedRoom, analysis, heightOverrides, drop, thickness, color]);
+  }, [selectedRoom, analysis, heightOverrides, drop, thickness, finish, profileType]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -282,7 +452,7 @@ export const CeilingDesignerModal = ({
 
   useEffect(() => {
     setConfirmLowConfidence(false);
-  }, [selectedRoomId, selectedLevelId, drop, thickness, color]);
+  }, [selectedRoomId, selectedLevelId, drop, thickness, finish, profileType]);
 
   if (!open) return null;
 
@@ -303,7 +473,31 @@ export const CeilingDesignerModal = ({
   const selectedStructuralY = selectedRoom
     ? safeNumber(heightOverrides[selectedRoom.id], selectedRoom.recommendedCeilingY)
     : 0;
-  const finishedBottomY = selectedStructuralY - drop;
+  const finishedBottomY = selectedRoom
+    ? getFinishedBottomY(selectedRoom, selectedStructuralY, drop, thickness)
+    : 0;
+  const topFaceY = round3(finishedBottomY + thickness);
+  const selectedUsesWallTop = usesWallTopReference(selectedRoom);
+
+  const selectFinishMaterial = (material) => {
+    setFinish(materialToCeilingFinish(material));
+  };
+
+  const selectCustomCeilingColor = (nextColor) => {
+    setFinish({
+      kind: 'color',
+      id: `custom-${nextColor.replace('#', '').toLowerCase()}`,
+      materialId: null,
+      name: 'Custom colour',
+      color: nextColor,
+      rgb: rgbFromHex(nextColor),
+      roughness: 0.9,
+      metallic: 0,
+      texture: null,
+      textureSrc: null,
+      repeat: [2, 2],
+    });
+  };
 
   const createCeiling = () => {
     if (!selectedRoom || !analysis || !previewDesign) return;
@@ -324,7 +518,7 @@ export const CeilingDesignerModal = ({
 
   return (
     <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/65 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="hci-ceiling-designer-title">
-      <section className="flex max-h-[min(92vh,820px)] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+      <section className="flex max-h-[min(92vh,820px)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
         <header className="flex items-start justify-between gap-4 border-b border-slate-200 px-5 py-4 dark:border-slate-700">
           <div>
             <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
@@ -463,6 +657,8 @@ export const CeilingDesignerModal = ({
                     <div className="rounded-lg bg-slate-50 p-3 text-xs dark:bg-slate-800/70">
                       <div className="flex justify-between gap-2"><span className="text-slate-500">Reference ceiling Y</span><strong className="text-slate-800 dark:text-slate-100">{safeNumber(selectedRoom.recommendedCeilingY, 0).toFixed(3)} m</strong></div>
                       <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Proposed underside Y</span><strong className="text-slate-800 dark:text-slate-100">{finishedBottomY.toFixed(3)} m</strong></div>
+                      <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Proposed top-face Y</span><strong className="text-slate-800 dark:text-slate-100">{topFaceY.toFixed(3)} m</strong></div>
+                      <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Top-face alignment</span><strong className="text-slate-800 dark:text-slate-100">{selectedUsesWallTop ? 'Wall head' : 'IFC overhead reference'}</strong></div>
                       <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Room footprint</span><strong className="text-slate-800 dark:text-slate-100">{selectedRoom.boundary?.outer?.length || 0} vertices · {selectedRoom.boundary?.holes?.length || 0} openings</strong></div>
                       <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Boundary confidence</span><strong className="text-slate-800 dark:text-slate-100">{Math.round(boundaryConfidence * 100)}%</strong></div>
                       <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Boundary method</span><strong className="max-w-[62%] text-right text-slate-800 dark:text-slate-100">{getBoundarySourceLabel(selectedRoom)}</strong></div>
@@ -488,10 +684,102 @@ export const CeilingDesignerModal = ({
                       </label>
                     </div>
 
-                    <label className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 p-2.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
-                      Ceiling finish
-                      <input aria-label="Ceiling finish colour" type="color" value={color} onChange={(event) => setColor(event.target.value)} className="h-9 w-14 cursor-pointer rounded-md border border-slate-200 bg-white p-1 dark:border-slate-700 dark:bg-slate-950"/>
-                    </label>
+                    <section className="space-y-3 rounded-xl border border-slate-200 p-3 dark:border-slate-700">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="text-xs font-bold text-slate-800 dark:text-slate-100">Ceiling design</div>
+                          <p className="mt-0.5 text-[10px] text-slate-400">Choose a profile and then its surface finish.</p>
+                        </div>
+                        <Brush className="h-4 w-4 text-orange-500"/>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        {CEILING_STYLE_PRESETS.map((preset) => {
+                          const StyleIcon = preset.icon;
+                          const selected = profileType === preset.id;
+                          return (
+                            <button
+                              key={preset.id}
+                              type="button"
+                              onClick={() => setProfileType(preset.id)}
+                              aria-pressed={selected}
+                              className={`min-w-0 rounded-xl border p-2 text-left transition ${selected ? 'border-orange-400 bg-orange-50 ring-1 ring-orange-200 dark:border-orange-400/60 dark:bg-orange-500/10 dark:ring-orange-500/20' : 'border-slate-200 hover:border-slate-300 dark:border-slate-700 dark:hover:border-slate-500'}`}
+                            >
+                              <div className={`mb-2 flex h-10 items-center justify-center rounded-lg ${preset.id === 'cove' ? 'bg-gradient-to-b from-amber-100 to-slate-100 dark:from-amber-400/15 dark:to-slate-800' : preset.id === 'timber-slats' ? 'bg-[repeating-linear-gradient(90deg,#A77B4A_0px,#A77B4A_3px,#E6D5BF_3px,#E6D5BF_8px)]' : 'bg-slate-100 dark:bg-slate-800'}`}>
+                                <StyleIcon className={`h-4 w-4 ${preset.id === 'timber-slats' ? 'text-white drop-shadow' : 'text-orange-500'}`}/>
+                              </div>
+                              <span className="block truncate text-[10px] font-bold text-slate-800 dark:text-slate-100">{preset.name}</span>
+                              <span className="mt-0.5 block text-[9px] leading-3 text-slate-500 dark:text-slate-400">{preset.description}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </section>
+
+                    <section className="space-y-3 rounded-xl border border-slate-200 p-3 dark:border-slate-700">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="text-xs font-bold text-slate-800 dark:text-slate-100">Architectural finishes</div>
+                          <p className="mt-0.5 text-[10px] text-slate-400">The selected finish is mapped to both faces and exposed edges.</p>
+                        </div>
+                        <Palette className="h-4 w-4 text-orange-500"/>
+                      </div>
+                      <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-800">
+                        {['color', 'fabric', 'texture'].map((mode) => (
+                          <button key={mode} type="button" onClick={() => { setFinishMode(mode); setFinishSearch(''); }} className={`rounded-md py-1.5 text-[9px] font-bold capitalize transition ${finishMode === mode ? 'bg-white text-slate-800 shadow-sm dark:bg-slate-700 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'}`}>
+                            {mode === 'color' ? 'Colours' : mode === 'fabric' ? 'Fabric' : 'Texture'}
+                          </button>
+                        ))}
+                      </div>
+
+                      {finishMode === 'color' ? (
+                        <>
+                          <div className="grid grid-cols-4 gap-2">
+                            {architecturalColorMaterials.map((material) => {
+                              const selected = String(finish.color || '').toUpperCase() === String(material.color || '').toUpperCase();
+                              return (
+                                <button key={`${material.id}-${material.color}`} type="button" onClick={() => selectFinishMaterial(material)} title={`${material.name} ${material.color}`} aria-pressed={selected} className={`min-w-0 rounded-lg border p-1.5 text-left transition ${selected ? 'border-orange-400 ring-1 ring-orange-300 dark:border-orange-400' : 'border-slate-200 hover:border-slate-300 dark:border-slate-700'}`}>
+                                  <span className="block h-7 rounded-md border border-black/10" style={{ backgroundColor: material.color }}/>
+                                  <span className="mt-1 block truncate text-[8px] font-semibold text-slate-600 dark:text-slate-300">{material.name}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <label className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 p-2 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                            Custom colour
+                            <input aria-label="Custom ceiling finish colour" type="color" value={finish.color || DEFAULT_COLOR} onChange={(event) => selectCustomCeilingColor(event.target.value)} className="h-8 w-12 cursor-pointer rounded-md border border-slate-200 bg-white p-1 dark:border-slate-700 dark:bg-slate-950"/>
+                          </label>
+                        </>
+                      ) : (
+                        <>
+                          <input value={finishSearch} onChange={(event) => setFinishSearch(event.target.value)} placeholder={`Search ${finishMode === 'fabric' ? 'fabrics' : 'textures'}…`} className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[10px] text-slate-700 outline-none focus:border-orange-400 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200"/>
+                          {filteredFinishMaterials.length > 0 ? (
+                            <div className="grid max-h-40 grid-cols-2 gap-2 overflow-y-auto pr-1">
+                              {filteredFinishMaterials.map((material) => {
+                                const selected = finish.materialId === material.materialAssetId || finish.id === material.id || finish.name === material.name;
+                                const image = material.textureSrc || material.texture?.src;
+                                return (
+                                  <button key={material.id} type="button" onClick={() => selectFinishMaterial(material)} aria-pressed={selected} className={`flex min-w-0 items-center gap-2 rounded-lg border p-2 text-left transition ${selected ? 'border-orange-400 bg-orange-50 dark:bg-orange-500/10' : 'border-slate-200 hover:border-slate-300 dark:border-slate-700'}`}>
+                                    <span className="h-9 w-9 shrink-0 rounded-md border border-black/10 bg-cover bg-center" style={{ backgroundColor: material.color || '#FFFFFF', backgroundImage: image ? `url(${image})` : 'none' }}/>
+                                    <span className="min-w-0"><span className="block truncate text-[9px] font-bold text-slate-700 dark:text-slate-200">{material.name}</span><span className="block truncate text-[8px] text-slate-400">{material.brand || material.category || 'Surface finish'}</span></span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-center dark:border-slate-700">
+                              <p className="text-[10px] font-semibold text-slate-600 dark:text-slate-300">{materialLibraryLoading ? 'Loading finishes…' : materialLibraryError ? 'Material library unavailable' : 'No matching finishes uploaded'}</p>
+                              <p className="mt-1 text-[9px] text-slate-400">{materialLibraryError || 'Upload reusable fabrics and textures under Admin → Surface Materials.'}</p>
+                            </div>
+                          )}
+                        </>
+                      )}
+
+                      <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-2.5 py-2 text-[10px] dark:bg-slate-800/70">
+                        <span className="min-w-0 truncate text-slate-500">Selected: <strong className="text-slate-800 dark:text-slate-100">{finish.name || 'Custom colour'}</strong></span>
+                        <span className="shrink-0 rounded-md border border-slate-200 px-2 py-1 font-mono text-slate-500 dark:border-slate-700">{finish.kind || 'color'}</span>
+                      </div>
+                      {finishMode !== 'color' && !filteredFinishMaterials.length && materialLibraryLoading && <div className="flex items-center gap-2 text-[9px] text-slate-400"><span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-orange-500"/> Loading reusable finishes…</div>}
+                    </section>
 
                     {needsManualConfirmation && (
                       <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-[10px] text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">

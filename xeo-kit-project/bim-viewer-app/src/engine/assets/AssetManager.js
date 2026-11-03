@@ -162,6 +162,8 @@ export const loadIFCAssetIntoScene = async (
         assetCategory: options.assetCategory || null,
         isLightFixture: options.isLightFixture === true || options.assetCategory === 'lighting',
         lightEnabled: options.lightEnabled === true,
+        lightIntensity: Number.isFinite(Number(options.lightIntensity)) ? Number(options.lightIntensity) : 0.12,
+        lightTemperature: Number.isFinite(Number(options.lightTemperature)) ? Number(options.lightTemperature) : 4000,
       };
 
       const applyLoadedTransform = async () => {
@@ -295,6 +297,14 @@ export const loadIFCAssetIntoScene = async (
       fileType: 'ifc',
       assetFormat: 'ifc',
       srcUrl,
+      // Keep lighting metadata consistent with the GLB loader path. Without
+      // this, IFC luminaires from the catalogue could be placed but would not
+      // be recognised by LightFixtureController.
+      assetCategory: options.assetCategory || null,
+      isLightFixture: options.isLightFixture === true || options.assetCategory === 'lighting',
+      lightEnabled: options.lightEnabled === true,
+      lightIntensity: Number.isFinite(Number(options.lightIntensity)) ? Number(options.lightIntensity) : 0.12,
+      lightTemperature: Number.isFinite(Number(options.lightTemperature)) ? Number(options.lightTemperature) : 4000,
       ...(options.isNativeIsolation ? { isNativeIsolation: true } : {}),
       ...(options.nativeSourceId ? { nativeSourceId: options.nativeSourceId } : {}),
       ...(options.sourceJobId ? { sourceJobId: options.sourceJobId } : {}),
@@ -303,66 +313,66 @@ export const loadIFCAssetIntoScene = async (
 
     assetModel.on('loaded', () => {
       try {
-      // Capture the model's local geometry bounds before any user transform is
-      // applied. IFC resize uses these bounds to build a true oriented gizmo and
-      // to keep the opposite face anchored during local-axis scaling.
-      ensureIFCResizeMetadata(assetModel);
+        // Capture the model's local geometry bounds before any user transform is
+        // applied. IFC resize uses these bounds to build a true oriented gizmo and
+        // to keep the opposite face anchored during local-axis scaling.
+        ensureIFCResizeMetadata(assetModel);
 
-      const userScale = Array.isArray(options.scale) && options.scale.length === 3
-        ? options.scale
-        : [1, 1, 1];
+        const userScale = Array.isArray(options.scale) && options.scale.length === 3
+          ? options.scale
+          : [1, 1, 1];
 
-      const safeRotation = Array.isArray(rotation) && rotation.length === 3
-        ? rotation
-        : [0, 0, 0];
+        const safeRotation = Array.isArray(rotation) && rotation.length === 3
+          ? rotation
+          : [0, 0, 0];
 
-      // Raw IFC matrices are authoritative only for native-isolated elements.
-      // Standalone/catalogue IFCs (including hosted doors) persist semantic
-      // target + rotation + scale. Replaying a stale model-origin matrix for
-      // those assets makes them jump because their saved position is an AABB
-      // floor/contact target, not the SceneModel origin translation.
-      const persistedIFCMatrix = options.isNativeIsolation && isValidMatrix16(options.persistedMatrix)
-        ? Array.from(options.persistedMatrix)
-        : null;
+        // Raw IFC matrices are authoritative only for native-isolated elements.
+        // Standalone/catalogue IFCs (including hosted doors) persist semantic
+        // target + rotation + scale. Replaying a stale model-origin matrix for
+        // those assets makes them jump because their saved position is an AABB
+        // floor/contact target, not the SceneModel origin translation.
+        const persistedIFCMatrix = options.isNativeIsolation && isValidMatrix16(options.persistedMatrix)
+          ? Array.from(options.persistedMatrix)
+          : null;
 
-      assetModel.scale = [...userScale];
-      assetModel.rotation = [...safeRotation];
+        assetModel.scale = [...userScale];
+        assetModel.rotation = [...safeRotation];
 
-      if (persistedIFCMatrix) {
-        // A native-isolated IFC is a full SceneModel created from the isolated IFC
-        // bytes. Restore the exact runtime matrix produced by the gizmo instead of
-        // rebuilding it from TRS; this preserves the pivot-correct transform.
-        try { assetModel.matrix = persistedIFCMatrix; } catch (_) {}
-      } else if (Array.isArray(targetPosition) && targetPosition.length === 3) {
-        const aabb = assetModel.aabb;
-        if (aabb && aabb.length >= 6) {
-          const centerX = (aabb[0] + aabb[3]) / 2;
-          const centerZ = (aabb[2] + aabb[5]) / 2;
-          const bottomY = aabb[1];
-          assetModel.position = [
-            targetPosition[0] - centerX,
-            targetPosition[1] - bottomY,
-            targetPosition[2] - centerZ,
-          ];
-        } else {
-          assetModel.position = [...targetPosition];
+        if (persistedIFCMatrix) {
+          // A native-isolated IFC is a full SceneModel created from the isolated IFC
+          // bytes. Restore the exact runtime matrix produced by the gizmo instead of
+          // rebuilding it from TRS; this preserves the pivot-correct transform.
+          try { assetModel.matrix = persistedIFCMatrix; } catch (_) {}
+        } else if (Array.isArray(targetPosition) && targetPosition.length === 3) {
+          const aabb = assetModel.aabb;
+          if (aabb && aabb.length >= 6) {
+            const centerX = (aabb[0] + aabb[3]) / 2;
+            const centerZ = (aabb[2] + aabb[5]) / 2;
+            const bottomY = aabb[1];
+            assetModel.position = [
+              targetPosition[0] - centerX,
+              targetPosition[1] - bottomY,
+              targetPosition[2] - centerZ,
+            ];
+          } else {
+            assetModel.position = [...targetPosition];
+          }
         }
-      }
 
-      if (typeof options.onLoaded === 'function') {
-        options.onLoaded(assetModel);
-      }
+        if (typeof options.onLoaded === 'function') {
+          options.onLoaded(assetModel);
+        }
 
-      assetLoadEnd({ loaded: true, format: 'ifc', modelId: assetModel.id, bytes: buffer.byteLength });
-      perfLog('ASSET', 'IFC model loaded', { instanceId, modelId: assetModel.id, srcUrl, bytes: buffer.byteLength });
+        assetLoadEnd({ loaded: true, format: 'ifc', modelId: assetModel.id, bytes: buffer.byteLength });
+        perfLog('ASSET', 'IFC model loaded', { instanceId, modelId: assetModel.id, srcUrl, bytes: buffer.byteLength });
 
-      if (typeof options.onPlaced === 'function') {
-        const persistedTarget = Array.isArray(targetPosition) && targetPosition.length === 3
-          ? [...targetPosition]
-          : [...assetModel.position];
-        options.onPlaced(instanceId, persistedTarget, assetModel);
-      }
-      readySignal.resolve(assetModel);
+        if (typeof options.onPlaced === 'function') {
+          const persistedTarget = Array.isArray(targetPosition) && targetPosition.length === 3
+            ? [...targetPosition]
+            : [...assetModel.position];
+          options.onPlaced(instanceId, persistedTarget, assetModel);
+        }
+        readySignal.resolve(assetModel);
       } catch (error) {
         readySignal.reject(error);
         console.error('[BIM Engine] IFC asset setup failed after load:', { instanceId, srcUrl, error });
