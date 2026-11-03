@@ -180,6 +180,63 @@ function hasAuthoredPbrTextures(material) {
   ].some((key) => material?.[key]?.isTexture === true);
 }
 
+function isAuthoredGlbObject(object) {
+  let current = object;
+  while (current) {
+    if (current.userData?.hciAssetFormat === 'glb' || current.userData?.hciAssetFormat === 'gltf') {
+      return true;
+    }
+    current = current.parent;
+  }
+  return false;
+}
+
+function inferGlbAssetFormat(item) {
+  const explicit = String(item?.assetFormat || item?.fileType || item?.file_type || '').trim().toLowerCase();
+  if (explicit === 'glb' || explicit === 'gltf') return explicit;
+  const source = String(item?.src || item?.url || '').split(/[?#]/)[0].toLowerCase();
+  return source.endsWith('.glb') ? 'glb' : (source.endsWith('.gltf') ? 'gltf' : null);
+}
+
+function markAuthoredGlbSubtrees(model, furnitureItems) {
+  const glbItems = (Array.isArray(furnitureItems) ? furnitureItems : [])
+    .filter((item) => inferGlbAssetFormat(item));
+  const missingInstanceIds = [];
+  let markedMeshCount = 0;
+
+  glbItems.forEach((item) => {
+    const instanceId = String(item?.instanceId || '');
+    if (!instanceId) return;
+    const root = model.getObjectByName?.(instanceId);
+    if (!root) {
+      missingInstanceIds.push(instanceId);
+      return;
+    }
+    root.traverse((object) => {
+      object.userData = object.userData || {};
+      object.userData.hciAssetFormat = 'glb';
+      object.userData.hciAssetInstanceId = instanceId;
+      if (!object.isMesh) return;
+      markedMeshCount += 1;
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      materials.forEach((material) => {
+        if (!material) return;
+        material.userData = material.userData || {};
+        material.userData.hciAssetFormat = 'glb';
+        material.userData.hciAssetInstanceId = instanceId;
+      });
+    });
+  });
+
+  if (glbItems.length) {
+    console.info('[Walkthrough][GLB] Preserving authored PBR materials:', {
+      assetCount: glbItems.length,
+      markedMeshCount,
+      missingInstanceIds,
+    });
+  }
+}
+
 export class LightingDirector {
   constructor({ scene, renderer, onChange }) {
     this.scene = scene;
@@ -245,9 +302,12 @@ export class LightingDirector {
     }
   }
 
-  attachModel(model) {
+  attachModel(model, furnitureItems = []) {
     this.model = model;
     model.updateMatrixWorld(true);
+    // Resolve stable GLB instance wrapper names from project_state.json as a
+    // fallback for renderers/optimizers that do not preserve glTF extras.
+    markAuthoredGlbSubtrees(model, furnitureItems);
     const box = new THREE.Box3().setFromObject(model);
     if (!box.isEmpty()) {
       box.getCenter(this.modelCenter);
@@ -265,6 +325,17 @@ export class LightingDirector {
       materials.forEach((material) => {
         if (!material) return;
         const materialKind = classifyMesh(obj, material);
+        const preserveGlbMaterial = isAuthoredGlbObject(obj)
+          || material.userData?.hciAssetFormat === 'glb'
+          || material.userData?.hciAssetFormat === 'gltf';
+
+        // Catalogue GLBs arrive with artist-authored glTF PBR factors and maps.
+        // Keep base colour, roughness, metalness, normal/occlusion maps, alpha,
+        // clearcoat, sheen and transmission intact. The room's key/fill lights
+        // and environment provide illumination; name-based IFC heuristics must
+        // not rewrite an imported furniture material.
+        if (preserveGlbMaterial) return;
+
         if ('envMapIntensity' in material) {
           material.envMapIntensity = environmentIntensityFor(materialKind);
         }
@@ -275,8 +346,8 @@ export class LightingDirector {
         if (!preserveAuthoredPbr && 'metalness' in material) {
           material.metalness = metalnessFor(materialKind, material.metalness);
         }
-        // Respect authored colour maps and base colours; only tune the PBR
-        // response here so material identity is not destroyed by heuristics.
+        // IFC exports often have generic material names and no texture maps;
+        // retain the semantic fallback only for those structural materials.
         material.needsUpdate = true;
       });
     });
