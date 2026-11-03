@@ -562,7 +562,7 @@ class WalkRuntime {
       portalCount: Array.isArray(topologyPayload?.portals) ? topologyPayload.portals.length : 0,
       parallelAssetLoadMs: Number((performance.now() - loadStartedAt).toFixed(1)),
     });
-    this.lightingDirector.attachModel(this.model);
+    this.lightingDirector.attachModel(this.model, projectStatePayload?.furniture || []);
     this.onState?.({ type: 'lighting', ...this.lightingDirector.getState() });
     this._buildPresentationSubjectIndex(projectStatePayload, hotspotsPayload);
 

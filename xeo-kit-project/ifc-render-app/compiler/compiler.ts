@@ -1160,19 +1160,104 @@ export async function compileScene(
   );
 
   function resolveGlbPath(src: string): string {
-    let pathname: string;
+    if (typeof src !== "string" || !src.trim()) {
+      throw new Error("GLB source URL is missing from the saved furniture item.");
+    }
+
+    const backendRoot = path.resolve(ROOT_DIR, "..");
+    const jobsRoot = path.resolve(backendRoot, "jobs");
+    let pathname = src.trim();
 
     try {
-      pathname = new URL(src).pathname;
+      // Browser project state normally stores an absolute backend URL. Resolve
+      // its pathname so localhost/production hosts map to the same local asset.
+      pathname = new URL(pathname).pathname;
     } catch {
-      pathname = src;
+      // Relative paths and local filesystem paths are handled below.
+    }
+
+    try {
+      pathname = decodeURIComponent(pathname);
+    } catch {
+      throw new Error(`GLB source path contains invalid URL encoding: ${src}`);
+    }
+    pathname = pathname.split("?")[0].split("#")[0].replace(/\\/g, "/");
+
+    const resolveWithin = (root: string, relativePath: string, label: string): string => {
+      const resolvedRoot = path.resolve(root);
+      const resolvedPath = path.resolve(resolvedRoot, relativePath);
+      if (resolvedPath !== resolvedRoot && !resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) {
+        throw new Error(`GLB ${label} path escapes its configured directory: ${src}`);
+      }
+      return resolvedPath;
+    };
+
+    const isFile = (candidate: string): boolean => {
+      try {
+        return fs.existsSync(candidate) && fs.statSync(candidate).isFile();
+      } catch {
+        return false;
+      }
+    };
+
+    // Match the same URL contract as resolveIfcPath(). GLB catalogue items can
+    // be served from /assets as well as uploaded under /uploads. Previously the
+    // GLB resolver handled only /uploads, so a fresh compile silently skipped
+    // every catalogue GLB whose source URL began with /assets/.
+    if (pathname.startsWith("/assets/")) {
+      const candidate = resolveWithin(assetsDirectory, pathname.slice("/assets/".length), "assets");
+      if (isFile(candidate)) return candidate;
+      throw new Error(`GLB asset was not found under assetsDirectory: ${candidate}`);
     }
 
     if (pathname.startsWith("/uploads/")) {
-      return path.join(ROOT_DIR, "..", pathname);
+      const candidate = resolveWithin(backendRoot, pathname.slice(1), "uploads");
+      if (isFile(candidate)) return candidate;
+      throw new Error(`Uploaded GLB asset was not found: ${candidate}`);
     }
 
-    return pathname;
+    if (pathname.startsWith("/jobs/")) {
+      const match = pathname.match(/^\/jobs\/([^/]+)\/(.+)$/);
+      if (!match) throw new Error(`Invalid /jobs/ GLB source URL: ${src}`);
+
+      const originalJobId = match[1];
+      const relativePath = match[2];
+      const currentJobCandidate = resolveWithin(jobDirectory, relativePath, "current job");
+      if (isFile(currentJobCandidate)) return currentJobCandidate;
+
+      const originalJobCandidate = resolveWithin(jobsRoot, path.join(originalJobId, relativePath), "original job");
+      if (isFile(originalJobCandidate)) return originalJobCandidate;
+
+      throw new Error(
+        `Job GLB asset was not found. Checked current job path ${currentJobCandidate} and original job path ${originalJobCandidate}.`,
+      );
+    }
+
+    if (pathname.startsWith("/materials/")) {
+      const materialRoot = path.join(assetsDirectory, "materials");
+      const candidate = resolveWithin(materialRoot, pathname.slice("/materials/".length), "materials");
+      if (isFile(candidate)) return candidate;
+      throw new Error(`GLB material asset was not found: ${candidate}`);
+    }
+
+    // Also support absolute local paths for controlled development workflows.
+    if (path.isAbsolute(pathname) && isFile(pathname)) return path.resolve(pathname);
+
+    // Older state snapshots may contain a path relative to the current job or
+    // backend root. Try only those known project roots; never pass an unresolved
+    // URL/path through as if it were a valid local file.
+    const relativePath = pathname.replace(/^\.\//, "").replace(/^\//, "");
+    const fallbackCandidates = [
+      resolveWithin(jobDirectory, relativePath, "job-relative"),
+      resolveWithin(backendRoot, relativePath, "backend-relative"),
+      resolveWithin(assetsDirectory, relativePath, "assets-relative"),
+    ];
+    const resolvedFallback = fallbackCandidates.find(isFile);
+    if (resolvedFallback) return resolvedFallback;
+
+    throw new Error(
+      `Unsupported or missing GLB source path: ${src}. Checked ${fallbackCandidates.join("; ")}`,
+    );
   }
 
   function resolveIfcPath(src: string): string {
@@ -1479,10 +1564,9 @@ export async function compileScene(
         }
       }
 
-      const isGlb =
-        item.assetFormat === "glb" ||
-        item.fileType === "glb" ||
-        item.src.toLowerCase().endsWith(".glb");
+      // One source-format detector is shared with hosted-door processing. It
+      // handles .GLB/.gltf URLs with query strings and missing optional fields.
+      const isGlb = isGlbFurnitureItem(item);
 
       try {
         if (isGlb) {
@@ -1552,6 +1636,10 @@ export async function compileScene(
           const clonedRoot = doc.createNode(
             `${item.instanceId}_geometry`,
           );
+          clonedRoot.setExtras({
+            hciAssetFormat: "glb",
+            hciAssetInstanceId: String(item.instanceId),
+          });
 
           function cloneNode(
             srcNode: GltfNode,
@@ -1565,6 +1653,12 @@ export async function compileScene(
               ? `HCI_HOSTED_DOOR::${item.instanceId}::${sourceNodeName}`
               : sourceNodeName;
             const dstNode = doc.createNode(destinationNodeName);
+            const sourceNodeExtras = srcNode.getExtras();
+            dstNode.setExtras({
+              ...(sourceNodeExtras && typeof sourceNodeExtras === "object" ? sourceNodeExtras : {}),
+              hciAssetFormat: "glb",
+              hciAssetInstanceId: String(item.instanceId),
+            });
 
             let copiedSourceMatrix = false;
 
@@ -1598,6 +1692,12 @@ export async function compileScene(
               const dstMesh = doc.createMesh(
                 srcMesh.getName(),
               );
+              const sourceMeshExtras = srcMesh.getExtras();
+              dstMesh.setExtras({
+                ...(sourceMeshExtras && typeof sourceMeshExtras === "object" ? sourceMeshExtras : {}),
+                hciAssetFormat: "glb",
+                hciAssetInstanceId: String(item.instanceId),
+              });
 
               for (const srcPrim of srcMesh.listPrimitives()) {
                 const dstPrim = doc.createPrimitive();
@@ -1637,10 +1737,12 @@ export async function compileScene(
                       .setBuffer(buffer)
                       .setNormalized(srcAttr.getNormalized());
                     dstAccessor.setExtras({ ...srcAttr.getExtras() });
-                    const min = srcAttr.getMin([]);
-                    const max = srcAttr.getMax([]);
-                    if (min.length) dstAccessor.setMin(min);
-                    if (max.length) dstAccessor.setMax(max);
+                    // @gltf-transform/core v4 Accessor bounds are derived from
+                    // the copied typed array and exposed through getMin/getMax.
+                    // There are no setMin/setMax methods in this API. The writer
+                    // serializes bounds from the destination accessor data, so
+                    // preserve the array + type + normalized flag and do not
+                    // call unsupported setters here.
                     dstPrim.setAttribute(semantic, dstAccessor);
                   }
                 }
@@ -1666,6 +1768,12 @@ export async function compileScene(
                     }
 
                     dstMat = copiedMaterial as Material;
+                    const sourceMaterialExtras = dstMat.getExtras();
+                    dstMat.setExtras({
+                      ...(sourceMaterialExtras && typeof sourceMaterialExtras === "object" ? sourceMaterialExtras : {}),
+                      hciAssetFormat: "glb",
+                      hciAssetInstanceId: String(item.instanceId),
+                    });
                     copiedMaterials.set(srcMat, dstMat);
                   }
 
@@ -1696,9 +1804,12 @@ export async function compileScene(
           const hostedGeometryRoot = isHostedDoor
             ? buildHostedDoorGeometryRoot(glbDoc, doc, clonedRoot, item)
             : clonedRoot;
-          const instanceWrapper = doc
-            .createNode(item.instanceId)
-            .addChild(hostedGeometryRoot);
+          const instanceWrapper = doc.createNode(item.instanceId);
+          instanceWrapper.setExtras({
+            hciAssetFormat: "glb",
+            hciAssetInstanceId: String(item.instanceId),
+          });
+          instanceWrapper.addChild(hostedGeometryRoot);
           tagWalkablePortalNodes(instanceWrapper, item);
 
           applyMaterialToSubtree(
@@ -2122,7 +2233,7 @@ export async function compileScene(
         instanceId,
         name: item.name || instanceId,
         assetId: String(item.id || ""),
-        sourceFormat: source?.sourceFormat ?? (String(item.src || "").toLowerCase().endsWith(".glb") ? "glb" : "ifc"),
+        sourceFormat: source?.sourceFormat ?? (isGlbFurnitureItem(item) ? "glb" : "ifc"),
         sourceFile: source?.sourceFile ?? path.basename(String(item.src || "")),
         sourceBytes: source?.sourceBytes ?? null,
         sourceAssetUniqueKey: source?.sourcePath ?? null,
@@ -2136,6 +2247,14 @@ export async function compileScene(
         doorHostWallId: item.doorHostWallId ?? null,
       };
     });
+    const glbAssetReports = assetReports.filter((asset) => asset.sourceFormat === "glb");
+    const mountedGlbAssetCount = glbAssetReports.filter((asset) => asset.includedInScene).length;
+    const missingGlbAssetCount = glbAssetReports.length - mountedGlbAssetCount;
+    console.log(
+      `[compiler:assets] GLB catalogue assets: ${mountedGlbAssetCount}/${glbAssetReports.length} mounted` +
+      (missingGlbAssetCount ? `; ${missingGlbAssetCount} missing or skipped. Inspect the per-instance warnings and performance_report.json.` : "."),
+    );
+
     const uniqueSourceFiles = new Map<string, number>();
     for (const asset of assetReports) {
       if (asset.sourceAssetUniqueKey && asset.sourceBytes != null && !uniqueSourceFiles.has(asset.sourceAssetUniqueKey)) {
