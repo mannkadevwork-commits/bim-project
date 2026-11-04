@@ -1734,13 +1734,14 @@ export const useProjectSync = (activeProject) => {
       const scale = Array.isArray(item.scale) && item.scale.length === 3
         ? item.scale
         : [1, 1, 1];
+      const usesNativeMatrix = item?.isNativeIsolation === true || Boolean(item?.nativeSourceId);
 
-      // Only native-isolated IFC elements have an authoritative persisted
-      // runtime matrix. GLB and catalogue IFC assets use semantic position /
-      // rotation / scale; persisting their live SceneModel.matrix creates a
-      // second transform source that the 360 compiler may interpret differently.
-      const isNativeIsolation = item.isNativeIsolation === true || Boolean(item.nativeSourceId);
-      const sourceMatrix = isNativeIsolation
+      // The raw matrix is authoritative only for an isolated native IFC.
+      // Catalogue GLBs and ordinary IFC assets must persist semantic position/
+      // rotation/scale. In particular, a GLB matrix written by the resize gizmo
+      // is a runtime implementation detail and must not shadow its normalized
+      // pivot target in the render compiler.
+      const sourceMatrix = usesNativeMatrix
         ? (normalizeMatrix(item.matrix) || normalizeMatrix(matrixSnapshots?.[item.instanceId]))
         : null;
       const nextMatrix = sourceMatrix
@@ -1761,11 +1762,12 @@ export const useProjectSync = (activeProject) => {
         ],
       };
 
-      if (isNativeIsolation && nextMatrix) {
+      if (nextMatrix) {
         nextItem.matrix = nextMatrix;
-      } else if (!isNativeIsolation) {
+      } else {
         delete nextItem.matrix;
       }
+
       return nextItem;
     });
 

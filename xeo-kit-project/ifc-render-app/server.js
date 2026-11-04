@@ -1734,7 +1734,7 @@ app.post('/api/projects/:jobId/rescale', (req, res) => {
 // ==========================================
 // RENDER CACHE HELPERS
 // ==========================================
-const RENDER_CACHE_VERSION = 'hci-render-cache-v4-glb-source-resolution-pbr-preservation';
+const RENDER_CACHE_VERSION = 'hci-render-cache-v5-preserve-glb-hierarchy-and-semantic-transforms';
 const RENDER_CACHE_REQUIRED_ARTIFACTS = [
     'output.glb',
     'navigation_navmesh.bin',

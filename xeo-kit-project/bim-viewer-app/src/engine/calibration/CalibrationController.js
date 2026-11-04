@@ -178,11 +178,12 @@ export const updateFurnitureScale = (ctx, ratio, oldSceneCenter, newSceneCenter,
     return;
   }
 
-  const persistedIds = new Set(
+  const furnitureById = new Map(
     (furnitureState || [])
-      .map(item => item?.instanceId)
-      .filter(Boolean)
+      .filter(item => item?.instanceId)
+      .map(item => [item.instanceId, item])
   );
+  const persistedIds = new Set(furnitureById.keys());
 
   // A = T(newCenter) * S(ratio) * T(-oldCenter)
   // For a uniform scene scale this can be applied directly to a column-major
@@ -196,6 +197,20 @@ export const updateFurnitureScale = (ctx, ratio, oldSceneCenter, newSceneCenter,
 
     const assetModel = viewer.scene.models[id];
     if (!assetModel) return;
+
+    const savedItem = furnitureById.get(id);
+    const format = String(
+      savedItem?.assetFormat || savedItem?.fileType || savedItem?.file_type ||
+      assetModel?._assetMeta?.assetFormat || assetModel?._assetMeta?.fileType || ''
+    ).toLowerCase();
+    if (format === 'glb' || format === 'gltf') {
+      // transformFurnitureForCalibration() has already updated the persisted
+      // semantic pivot target and scale. Do not multiply the transient GLB
+      // matrix here; restoreProjectStateToScene() immediately reapplies the
+      // canonical normalized transform. Scaling the raw matrix as well would
+      // leave a second, competing representation in the live SceneModel.
+      return;
+    }
 
     try {
       const m = assetModel.matrix;

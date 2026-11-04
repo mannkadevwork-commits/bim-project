@@ -399,9 +399,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     const snapshot = {};
     const state = projectStateRef.current || {};
     (state.furniture || []).forEach(item => {
-      // GLB and catalogue IFC instances are restored from semantic TRS. Only
-      // native-isolated IFC elements have a persisted matrix contract.
-      if (!(item?.isNativeIsolation === true || item?.nativeSourceId)) return;
+      // Runtime matrices are persisted only for native-isolated IFCs. GLB
+      // catalogue assets use normalized pivot + semantic position/rotation/
+      // scale, even when the live resize gizmo temporarily writes model.matrix.
+      if (item?.isNativeIsolation !== true && !item?.nativeSourceId) return;
       const model = item?.instanceId ? viewerRef.current?.scene?.models?.[item.instanceId] : null;
       if (model?.matrix && model.matrix.length === 16) snapshot[item.instanceId] = Array.from(model.matrix);
     });

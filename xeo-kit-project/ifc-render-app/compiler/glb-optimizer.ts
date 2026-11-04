@@ -4,7 +4,6 @@ import { NodeIO } from "@gltf-transform/core";
 import { ALL_EXTENSIONS } from "@gltf-transform/extensions";
 import {
   dedup,
-  flatten,
   prune,
   simplify,
   textureCompress,
@@ -150,15 +149,17 @@ function writeReport(
 /**
  * Converts the compiled scene into the browser-facing production GLB.
  *
- * Important performance choices:
- * - flatten() bakes the static scene graph transforms and removes unnecessary
- *   hierarchy. This is safe here because the final walkthrough visual asset
- *   contains no animation/skin data and HCI navigation uses separate navmesh
- *   artifacts.
+ * Important transform-safety choices:
+ * - Preserve the source node hierarchy. Catalogue instances are mounted under
+ *   non-uniformly-scaled wrapper nodes, and their source GLBs may contain
+ *   rotated descendants. Collapsing those transforms can create shear; glTF
+ *   Transform's flatten() decomposes the result back to TRS and can therefore
+ *   change geometry shape/position. Keep the hierarchy and let Three.js compose
+ *   the matrices at runtime.
  * - We intentionally do NOT blindly join or instance named nodes. The HCI
  *   presentation/camera code can still use semantic mesh/node names.
- * - Meshopt is delivery compression; geometry simplification and flattening
- *   are what reduce browser runtime work.
+ * - Meshopt compression, conservative simplification and texture resizing
+ *   reduce delivery cost without baking parent transforms into child meshes.
  * - Visual Phase 1 uses a high-fidelity simplify floor (0.88) and less geometric
  *   error, because previous output reduced triangles by 70–90% and softened
  *   architectural edges. Textures are preserved at high quality when present.
@@ -218,10 +219,10 @@ export async function optimizeGlb(
     // Remove duplicate buffer/accessor/material data first.
     dedup(),
 
-    // Bake static node transforms into the visual scene and collapse
-    // unnecessary transform hierarchy. This directly attacks the 14k-node
-    // scene-graph overhead seen in the uploaded production GLB.
-    flatten(),
+    // Keep node transforms hierarchical. In particular, do not flatten a
+    // non-uniformly-scaled asset wrapper containing rotated source descendants:
+    // the composed world matrix may contain shear, which cannot be represented
+    // by a single glTF TRS node without changing the asset's shape.
 
     // Merge duplicate vertices before simplification.
     weld({
