@@ -155,6 +155,7 @@ function buildCeilingDesign(room, analysis, settings) {
     sourceModelFingerprint: analysis?.sourceFingerprint || null,
     kind: 'flat',
     boundary,
+    openings: Array.isArray(settings.openings) ? settings.openings : [],
     elevation: {
       structuralY: round3(structuralY),
       drop: round3(drop),
@@ -220,6 +221,7 @@ export const CeilingDesignerModal = ({
   onClose,
   onApply,
   onPreview,
+  onOpenLightingPlan,
   materialLibrary = [],
   materialLibraryLoading = false,
   materialLibraryError = '',
@@ -241,6 +243,7 @@ export const CeilingDesignerModal = ({
   const [loadedAt, setLoadedAt] = useState(null);
   const [confirmLowConfidence, setConfirmLowConfidence] = useState(false);
   const [previewError, setPreviewError] = useState('');
+  const [applyingCeiling, setApplyingCeiling] = useState(false);
   const requestVersionRef = useRef(0);
   const onPreviewRef = useRef(onPreview);
   const abortRef = useRef(null);
@@ -279,7 +282,21 @@ export const CeilingDesignerModal = ({
       item?.roomId === room.navigationRoomId ||
       item?.navigationRoomId === room.navigationRoomId
     ));
-    if (!saved) return;
+    if (!saved) {
+      // Do not carry another room's style/height into a room that has no saved
+      // ceiling yet. Each room starts from the same safe architectural defaults.
+      setHeightOverrides((previous) => ({
+        ...previous,
+        [room.id]: round3(safeNumber(room.recommendedCeilingY, safeNumber(room.floorY, 0) + 2.7)),
+      }));
+      setDrop(DEFAULT_DROP_METRES);
+      setThickness(DEFAULT_THICKNESS_METRES);
+      setProfileType('flat');
+      setFinish({ ...DEFAULT_CEILING_FINISH, rgb: [...DEFAULT_CEILING_FINISH.rgb], repeat: [...DEFAULT_CEILING_FINISH.repeat] });
+      setFinishMode('color');
+      setFinishSearch('');
+      return;
+    }
 
     const elevation = saved.elevation && typeof saved.elevation === 'object' ? saved.elevation : {};
     const structuralY = safeNumber(elevation.structuralY, safeNumber(room.recommendedCeilingY, safeNumber(room.floorY, 0) + 2.7));
@@ -427,17 +444,23 @@ export const CeilingDesignerModal = ({
   const previewDesign = useMemo(() => {
     if (!selectedRoom || !analysis) return null;
     try {
+      const savedCeiling = existingCeilings.find((item) => (
+        item?.roomId === selectedRoom.id ||
+        item?.roomId === selectedRoom.navigationRoomId ||
+        item?.navigationRoomId === selectedRoom.navigationRoomId
+      ));
       return buildCeilingDesign(selectedRoom, analysis, {
         structuralY: heightOverrides[selectedRoom.id] ?? selectedRoom.recommendedCeilingY,
         drop,
         thickness,
         finish,
         profileType,
+        openings: savedCeiling?.openings || [],
       });
     } catch {
       return null;
     }
-  }, [selectedRoom, analysis, heightOverrides, drop, thickness, finish, profileType]);
+  }, [selectedRoom, analysis, heightOverrides, drop, thickness, finish, profileType, existingCeilings]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -499,8 +522,8 @@ export const CeilingDesignerModal = ({
     });
   };
 
-  const createCeiling = () => {
-    if (!selectedRoom || !analysis || !previewDesign) return;
+  const createCeiling = async (openLightingPlan = false) => {
+    if (!selectedRoom || !analysis || !previewDesign || applyingCeiling) return;
     if (needsManualConfirmation && !confirmLowConfidence) return;
     const next = [
       ...existingCeilings.filter((ceiling) => (
@@ -508,10 +531,23 @@ export const CeilingDesignerModal = ({
         ceiling?.roomId !== selectedRoom.navigationRoomId &&
         ceiling?.navigationRoomId !== selectedRoom.navigationRoomId
       )),
-      previewDesign,
+      { ...previewDesign, visible: true },
     ];
-    onApply?.(next);
-    onClose?.();
+
+    setApplyingCeiling(true);
+    setError('');
+    try {
+      // onApply now resolves only after the real xeokit mesh has been created.
+      // Keep the preview alive until the committed mesh is ready, preventing the
+      // editor from briefly returning to an empty room after the user clicks Done.
+      await onApply?.(next);
+      onClose?.();
+      if (openLightingPlan) onOpenLightingPlan?.(selectedRoom, next[next.length - 1]);
+    } catch (caught) {
+      setError(caught?.message || 'The ceiling could not be committed to the 3D scene. The preview has been kept so you can retry.');
+    } finally {
+      setApplyingCeiling(false);
+    }
   };
 
   const formatLevelLabel = (level) => `${level.label || 'Level'} · ${Number(level.elevationY || 0).toFixed(2)} m${level.analysisStatus === 'analysed' ? '' : ' · not segmented'}`;
@@ -810,15 +846,24 @@ export const CeilingDesignerModal = ({
 
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 px-5 py-4 dark:border-slate-700">
           <span className="text-xs text-slate-500">{selectedRoom ? `One room selected: ${selectedRoom.label || selectedRoom.id}` : 'Select a room to continue'}</span>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap justify-end gap-2">
             <button type="button" onClick={onClose} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">Cancel</button>
             <button
               type="button"
-              onClick={createCeiling}
-              disabled={!selectedRoom || !previewDesign || Boolean(previewError) || loading || (needsManualConfirmation && !confirmLowConfidence)}
+              onClick={() => createCeiling(true)}
+              disabled={!selectedRoom || !previewDesign || Boolean(previewError) || loading || applyingCeiling || (needsManualConfirmation && !confirmLowConfidence)}
+              className="inline-flex items-center gap-2 rounded-lg border border-orange-300 px-3 py-2 text-xs font-bold text-orange-700 hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-45 dark:border-orange-500/40 dark:text-orange-300 dark:hover:bg-orange-500/10"
+              title="Apply this ceiling and open its reflected ceiling plan"
+            >
+              <Grid3X3 className="h-3.5 w-3.5"/>{applyingCeiling ? 'Applying ceiling…' : 'Apply & plan lighting'}
+            </button>
+            <button
+              type="button"
+              onClick={() => createCeiling(false)}
+              disabled={!selectedRoom || !previewDesign || Boolean(previewError) || loading || applyingCeiling || (needsManualConfirmation && !confirmLowConfidence)}
               className="inline-flex items-center gap-2 rounded-lg bg-[#ff914d] px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-[#f47f39] disabled:cursor-not-allowed disabled:opacity-45"
             >
-              <Check className="h-3.5 w-3.5"/>{selectedExistingCeiling ? 'Replace room ceiling' : 'Apply ceiling to this room'}
+              <Check className="h-3.5 w-3.5"/>{applyingCeiling ? 'Applying ceiling…' : (selectedExistingCeiling ? 'Replace room ceiling' : 'Apply ceiling')}
             </button>
           </div>
         </footer>

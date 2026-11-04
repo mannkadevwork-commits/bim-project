@@ -1,4 +1,5 @@
 import { Mesh } from '@xeokit/xeokit-sdk/src/viewer/scene/mesh/Mesh.js';
+import { Node } from '@xeokit/xeokit-sdk/src/viewer/scene/nodes/Node.js';
 import { ReadableGeometry } from '@xeokit/xeokit-sdk/src/viewer/scene/geometry/ReadableGeometry.js';
 import { PhongMaterial } from '@xeokit/xeokit-sdk/src/viewer/scene/materials/PhongMaterial.js';
 import { Texture } from '@xeokit/xeokit-sdk/src/viewer/scene/materials/Texture.js';
@@ -8,6 +9,8 @@ import { ShapeUtils, Vector2 } from 'three';
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 const DEFAULT_FINISH = '#F3F1EB';
 const DEFAULT_WOOD = '#A77B4A';
+const MIN_RING_AREA_M2 = 0.01;
+const MIN_OPENING_AREA_M2 = 0.0005;
 const toRgb = (hex) => {
   const value = String(hex || DEFAULT_FINISH).replace('#', '');
   const safe = /^[0-9a-f]{6}$/i.test(value) ? value : 'F3F1EB';
@@ -16,7 +19,7 @@ const toRgb = (hex) => {
 const safeId = (value) => String(value || 'room').replace(/[^a-zA-Z0-9_-]/g, '_');
 const finite = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
 
-function normalizeRing(source, label) {
+function normalizeRing(source, label, minimumArea = MIN_RING_AREA_M2) {
   if (!Array.isArray(source)) throw new Error(`${label} boundary is missing.`);
   const points = source.map((point) => ({ x: finite(point?.x, NaN), z: finite(point?.z, NaN) }))
     .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.z));
@@ -27,7 +30,9 @@ function normalizeRing(source, label) {
   if (cleaned.length > 2 && Math.hypot(cleaned[0].x - cleaned[cleaned.length - 1].x, cleaned[0].z - cleaned[cleaned.length - 1].z) < 0.0005) cleaned.pop();
   if (cleaned.length < 3) throw new Error(`${label} must contain at least three distinct points.`);
   const area = Math.abs(ShapeUtils.area(cleaned.map((point) => new Vector2(point.x, point.z))));
-  if (!Number.isFinite(area) || area < 0.01) throw new Error(`${label} is too small or degenerate.`);
+  if (!Number.isFinite(area) || area < minimumArea) {
+    throw new Error(`${label} is too small or degenerate (area ${Number.isFinite(area) ? area.toFixed(6) : 'invalid'} m²; minimum ${minimumArea.toFixed(6)} m²).`);
+  }
   return cleaned;
 }
 
@@ -46,10 +51,10 @@ function circleOpening(opening) {
 }
 
 function normalizeOpening(opening, index) {
-  if (Array.isArray(opening)) return normalizeRing(opening, `Ceiling opening ${index + 1}`);
-  if (Array.isArray(opening?.polygon)) return normalizeRing(opening.polygon, `Ceiling opening ${index + 1}`);
+  if (Array.isArray(opening)) return normalizeRing(opening, `Ceiling opening ${index + 1}`, MIN_OPENING_AREA_M2);
+  if (Array.isArray(opening?.polygon)) return normalizeRing(opening.polygon, `Ceiling opening ${index + 1}`, MIN_OPENING_AREA_M2);
   if (opening?.type === 'circle' || Number.isFinite(Number(opening?.radius))) {
-    return normalizeRing(circleOpening(opening), `Ceiling opening ${index + 1}`);
+    return normalizeRing(circleOpening(opening), `Ceiling opening ${index + 1}`, MIN_OPENING_AREA_M2);
   }
   throw new Error(`Ceiling opening ${index + 1} has an unsupported shape.`);
 }
@@ -286,12 +291,18 @@ export const createRoomCeilingController = (viewer) => {
   let entryGeneration = 0;
   let previewGeneration = 0;
   let previewEntry = null;
-  if (!scene) return { sync: () => {}, preview: () => false, clearPreview: () => {}, destroy: () => {} };
+  if (!scene) return { sync: () => Promise.resolve(0), preview: () => false, clearPreview: () => {}, destroy: () => {} };
 
   const destroyEntry = (entry) => {
     if (!entry) return;
     const meshes = [entry.mesh, ...(entry.profileMeshes || [])].filter(Boolean);
-    meshes.forEach((mesh) => { try { mesh.destroy(); } catch (_) {} });
+    // Detach children first so destroying the model root cannot leave stale
+    // scene.objects entries or destroy resources before we release them.
+    meshes.forEach((mesh) => {
+      try { entry.root?.removeChild?.(mesh); } catch (_) {}
+      try { mesh.destroy(); } catch (_) {}
+    });
+    try { entry.root?.destroy?.(); } catch (_) {}
     const geometries = [entry.geometry, ...(entry.profileGeometries || [])].filter(Boolean);
     geometries.forEach((geometry) => { try { geometry.destroy(); } catch (_) {} });
     const materials = [...new Set([entry.material, ...(entry.profileMaterials || [])].filter(Boolean))];
@@ -335,12 +346,28 @@ export const createRoomCeilingController = (viewer) => {
       indices: geometryData.main.indices,
     });
     const id = preview ? 'hci_room_ceiling_preview' : `hci_room_ceiling_${safeId(design.id)}`;
+    // A Mesh created directly under Scene is only a component; it is not part
+    // of the renderable scene graph. Register a model Node and attach every
+    // ceiling surface to it, with each visible Mesh registered as an object.
+    // This is required for xeokit's renderer, visible-object tracking and picks.
+    const root = new Node(scene, {
+      id: `${id}_model`,
+      isModel: true,
+      visible: true,
+      pickable: false,
+      collidable: false,
+      clippable: false,
+    });
     const mesh = new Mesh(scene, {
       id,
+      parent: root,
+      isObject: true,
       geometry,
       material,
       pickable: !preview,
       collidable: false,
+      clippable: false,
+      culled: false,
       visible: true,
     });
     mesh._hciRoomCeiling = {
@@ -352,6 +379,7 @@ export const createRoomCeilingController = (viewer) => {
       profileType: geometryData.profileType,
       preview,
     };
+    root._hciRoomCeiling = { ...mesh._hciRoomCeiling, componentKind: 'ceiling-model' };
 
     const profileMeshes = [];
     const profileGeometries = [];
@@ -381,10 +409,16 @@ export const createRoomCeilingController = (viewer) => {
           : material;
       const profileMesh = new Mesh(scene, {
         id: `${id}_${geometryData.profileType}`,
+        parent: root,
+        isObject: true,
         geometry: profileGeometry,
         material: profileMaterial,
-        pickable: !preview,
+        // The profile is decorative; the main underside remains the fixture
+        // placement surface and owns the ceiling's pick metadata.
+        pickable: false,
         collidable: false,
+        clippable: false,
+        culled: false,
         visible: true,
       });
       profileMesh._hciRoomCeiling = { ...mesh._hciRoomCeiling, componentKind: geometryData.profileType };
@@ -393,47 +427,97 @@ export const createRoomCeilingController = (viewer) => {
       if (profileMaterial !== material) profileMaterials.push(profileMaterial);
     }
 
-    return {
-      mesh, geometry, material, texture, profileMeshes, profileGeometries, profileMaterials,
+    // Do not report success merely because Component construction completed.
+    // Confirm that xeokit registered a scene model and drawable object with
+    // non-empty geometry and finite world bounds.
+    const meshAabb = Array.from(mesh.aabb || []);
+    const validAabb = meshAabb.length === 6 && meshAabb.every(Number.isFinite)
+      && meshAabb[3] > meshAabb[0] && meshAabb[4] > meshAabb[1] && meshAabb[5] > meshAabb[2];
+    const entry = {
+      root, mesh, geometry, material, texture, profileMeshes, profileGeometries, profileMaterials,
       signature: meshSignature(design),
+      diagnostics: { modelId: root.id, objectId: mesh.id, triangleCount: mesh.numTriangles, aabb: meshAabb },
     };
+    if (scene.models?.[root.id] !== root) {
+      destroyEntry(entry);
+      throw new Error(`Ceiling model root was not registered in xeokit scene.models (${root.id}).`);
+    }
+    if (scene.objects?.[mesh.id] !== mesh || mesh.numTriangles < 1 || !validAabb) {
+      destroyEntry(entry);
+      throw new Error(`Ceiling surface was not registered as a drawable scene object (${mesh.id}); triangles=${mesh.numTriangles}, aabb=${meshAabb.join(',')}.`);
+    }
+
+    return entry;
   };
 
   const sync = (ceilings = []) => {
-    const next = new Map((Array.isArray(ceilings) ? ceilings : []).filter((item) => item?.id).map((item) => [String(item.id), item]));
+    const next = new Map((Array.isArray(ceilings) ? ceilings : [])
+      .filter((item) => item?.id && (Array.isArray(item.boundary?.outer) || Array.isArray(item.polygon)))
+      .map((item) => [String(item.id), item]));
+    const pending = [];
+
+    // Remove stale committed ceilings first. Preview meshes are owned separately
+    // and are never allowed to replace a committed room ceiling.
     for (const id of Array.from(entries.keys())) {
       if (!next.has(id)) {
         const current = entries.get(id);
-        current?.token && (current.token.cancelled = true);
+        if (current?.token) current.token.cancelled = true;
         destroyEntry(current?.entry);
         entries.delete(id);
       }
     }
+
     for (const [id, design] of next) {
       const signature = meshSignature(design);
       const current = entries.get(id);
       if (current?.signature === signature) {
-        if (current.entry) [current.entry.mesh, ...(current.entry.profileMeshes || [])].forEach((mesh) => { mesh.visible = design.visible !== false; });
+        if (current.entry) {
+          current.entry.root.visible = design.visible !== false;
+          [current.entry.mesh, ...(current.entry.profileMeshes || [])]
+            .forEach((mesh) => { mesh.visible = design.visible !== false; });
+        } else if (current.ready) {
+          pending.push(current.ready);
+        }
         continue;
       }
+
       if (current?.token) current.token.cancelled = true;
       destroyEntry(current?.entry);
       const token = { id: ++entryGeneration, cancelled: false };
-      entries.set(id, { signature, token, entry: null });
-      void createEntry(design).then((entry) => {
+      const record = { signature, token, entry: null, ready: null };
+      entries.set(id, record);
+
+      record.ready = createEntry(design).then((entry) => {
         const latest = entries.get(id);
         if (!latest || latest.token !== token || token.cancelled) {
           destroyEntry(entry);
-          return;
+          return null;
         }
         latest.entry = entry;
-        [entry.mesh, ...(entry.profileMeshes || [])].forEach((mesh) => { mesh.visible = design.visible !== false; });
+        entry.root.visible = design.visible !== false;
+        [entry.mesh, ...(entry.profileMeshes || [])]
+          .forEach((mesh) => { mesh.visible = design.visible !== false; });
+        console.info('[CeilingDesigner] Committed room ceiling is registered in the render scene:', {
+          id,
+          roomId: design.roomId || null,
+          openingCount: (entry.mesh?._hciRoomCeiling?.openingCount) || 0,
+          profileType: design.profileType || 'flat',
+          ...entry.diagnostics,
+          visible: entry.root.visible && entry.mesh.visible && !entry.mesh.culled,
+        });
+        return entry;
       }).catch((error) => {
         const latest = entries.get(id);
         if (latest?.token === token) entries.delete(id);
-        console.warn('[CeilingDesigner] Could not create room ceiling:', id, error);
+        console.error('[CeilingDesigner] Could not create room ceiling:', id, error);
+        throw error;
       });
+      pending.push(record.ready);
     }
+
+    // Callers that apply a design can await this promise before removing the
+    // live preview. Scene-state effects may call sync without awaiting it.
+    return Promise.all(pending).then(() => next.size);
   };
 
   const clearPreview = () => {

@@ -1,10 +1,12 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useBIMEngine } from './engine/useBIMEngine';
 import { useProjectSync } from './hooks/useProjectSync';
 import { useCloudRender } from './hooks/useCloudRender';
 import { LeftPanel } from './components/LeftPanel';
 import { RightPanel } from './components/RightPanel';
 import { CeilingDesignerModal } from './components/CeilingDesignerModal';
+import { CeilingPlanModal } from './components/CeilingPlanModal';
+import { getCeilingLightingCatalog } from './utils/ceilingLightingCatalog';
 import { BottomDock } from './components/BottomDock';
 import { RenderStudioModal } from './components/RenderStudioModal';
 import { ReplaceAssetModal } from './components/ReplaceAssetModal';
@@ -134,6 +136,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [showReplaceAssetModal, setShowReplaceAssetModal] = useState(false);
   const [showCeilingDesigner, setShowCeilingDesigner] = useState(false);
+  const [ceilingPlanContext, setCeilingPlanContext] = useState(null);
+  const ceilingPlanCameraSnapshotRef = useRef(null);
   const [replaceTargetId, setReplaceTargetId] = useState(null);
   const [replaceTargetItem, setReplaceTargetItem] = useState(null);
   const [isLayoutSaving, setIsLayoutSaving] = useState(false);
@@ -173,6 +177,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage,
     undo, redo, canUndo, canRedo, beginHistoryTransaction, endHistoryTransaction, cancelHistoryTransaction
   } = useProjectSync(activeProject);
+  const ceilingLightingAssets = useMemo(() => getCeilingLightingCatalog(), []);
 
   const insertDoor = async (asset, wallSnapData) => {
     if (!file || !jobId || doorInsertionInFlightRef.current) return;
@@ -621,6 +626,75 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     return engineActions.previewRoomCeiling?.(design) ?? false;
   }, [engineActions]);
 
+  const handleOpenCeilingLightingPlan = (room, ceiling) => {
+    ceilingPlanCameraSnapshotRef.current = engineActions.camera?.snapshot?.() || null;
+    engineActions.camera?.focusRoom?.(room, 'ceiling-plan', 0.75);
+    setCeilingPlanContext({ room, ceiling });
+  };
+
+  const handleCloseCeilingLightingPlan = () => {
+    setCeilingPlanContext(null);
+    if (ceilingPlanCameraSnapshotRef.current) {
+      engineActions.camera?.restore?.(ceilingPlanCameraSnapshotRef.current, 0.65);
+      ceilingPlanCameraSnapshotRef.current = null;
+    }
+  };
+
+  const updateCeilingPlanDesign = (roomId, updater) => {
+    const state = projectStateRef.current || {};
+    const ceilings = Array.isArray(state.ceilingDesigns) ? state.ceilingDesigns : (state.ceilings || []);
+    const nextCeilings = ceilings.map((item) => {
+      if (String(item.roomId) !== String(roomId)) return item;
+      return updater(item);
+    });
+    setRoomCeilingDesigns(nextCeilings);
+    setCeilingPlanContext((current) => current?.room?.id === roomId
+      ? { ...current, ceiling: nextCeilings.find((item) => String(item.roomId) === String(roomId)) || current.ceiling }
+      : current);
+  };
+
+  const handlePlaceCeilingFixture = async ({ asset, position, roomId, mountType, opening }) => {
+    beginHistoryTransaction(mountType === 'recessed' ? 'Place recessed ceiling light' : 'Place ceiling fixture');
+    try {
+      // Enforce the ceiling-plan default here as well as in the modal. This
+      // prevents any caller from accidentally persisting a newly placed
+      // ceiling fixture with its scene light switched on.
+      const ceilingFixtureAsset = {
+        ...asset,
+        assetCategory: 'lighting',
+        isLightFixture: true,
+        lightEnabled: false,
+        ceilingRoomId: roomId ? String(roomId) : asset?.ceilingRoomId,
+        ceilingMountType: mountType || asset?.ceilingMountType || 'surface',
+      };
+      const placedModel = await spawnAsset(ceilingFixtureAsset, position, engineActions.loadIFCAssetIntoScene);
+      if (opening) {
+        updateCeilingPlanDesign(roomId, (design) => ({
+          ...design,
+          openings: [...(Array.isArray(design.openings) ? design.openings : []), opening],
+          revision: (Number(design.revision) || 1) + 1,
+        }));
+      }
+      endHistoryTransaction();
+      return placedModel;
+    } catch (error) {
+      cancelHistoryTransaction();
+      throw error;
+    }
+  };
+
+  const handleRemoveCeilingFixture = async (fixture) => {
+    beginHistoryTransaction('Remove ceiling fixture');
+    try {
+      // deleteAsset also removes the fixture's linked recessed opening.
+      deleteAsset(refs.viewerRef, fixture.instanceId);
+      endHistoryTransaction();
+    } catch (error) {
+      cancelHistoryTransaction();
+      throw error;
+    }
+  };
+
   const handleToggleDesignedCeilings = () => {
     if (!designedCeilings.length) return;
     const show = designedCeilings.every((ceiling) => ceiling.visible === false);
@@ -884,8 +958,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
 
   const handleSaveAsLayout = async (metadata, renderResult, renderConfig) => {
     const savedLayout = await saveRenderedLayout(metadata, renderResult, renderConfig);
-    // Bind the new stable layout id to this workspace so future Save design
-    // actions update this layout instead of creating another record.
+    // Associate the new stable layout ID with the active workspace so the next
+    // Save design action updates this layout instead of creating a duplicate.
     onSavedLayoutCreated?.(savedLayout);
     setToastMessage(`Saved “${savedLayout.name}” to Layouts.`);
     setTimeout(() => setToastMessage(null), 2200);
@@ -1400,9 +1474,21 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         onClose={() => { engineActions.clearRoomCeilingPreview?.(); setShowCeilingDesigner(false); }}
         onApply={handleApplyRoomCeilings}
         onPreview={handlePreviewRoomCeiling}
+        onOpenLightingPlan={handleOpenCeilingLightingPlan}
         materialLibrary={materialLibrary}
         materialLibraryLoading={materialLibraryLoading}
         materialLibraryError={materialLibraryError}
+      />
+
+      <CeilingPlanModal
+        open={Boolean(ceilingPlanContext)}
+        room={ceilingPlanContext?.room || null}
+        ceiling={ceilingPlanContext?.ceiling || null}
+        lightingAssets={ceilingLightingAssets}
+        furniture={projectState.furniture || []}
+        onClose={handleCloseCeilingLightingPlan}
+        onPlaceFixture={handlePlaceCeilingFixture}
+        onRemoveFixture={handleRemoveCeilingFixture}
       />
 
       <ReplaceAssetModal
