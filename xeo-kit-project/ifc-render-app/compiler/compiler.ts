@@ -456,63 +456,54 @@ function computeRotatedFurniturePivotTranslation(
   ];
 }
 
-function transformPointByPersistedMatrix(
-  point: [number, number, number],
-  matrix: number[],
-): [number, number, number] | null {
-  if (!isFiniteMatrix16(matrix)) return null;
-  const [x, y, z] = point;
-  const w = matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15];
-  if (!Number.isFinite(w) || Math.abs(w) < 1e-9) return null;
-  const result: [number, number, number] = [
-    (matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12]) / w,
-    (matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13]) / w,
-    (matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14]) / w,
-  ];
-  return result.every(Number.isFinite) ? result : null;
-}
-
-/**
- * The editor's current GLB contract is semantic position + rotation + scale +
- * glbNormalization.pivotLocal. It deliberately ignores raw SceneModel.matrix
- * for normalized GLBs because that runtime snapshot can be stale after resize
- * or calibration. Older GLBs without v3 normalization are migrated exactly as
- * AssetManager.migrateLegacyGLBTransform does: transform the local pivot by
- * the legacy matrix to recover the semantic target, then rebuild the transform.
- */
-function resolveGlbPlacementItem(
+function applyPersistedGlbTransform(
+  wrapper: GltfNode,
   item: FurnitureItem,
-  pivot: [number, number, number] | null,
-): FurnitureItem {
-  // The current editor restoration path treats any persisted pivotLocal as
-  // evidence that `position` is already the semantic pivot target, even when
-  // it rebuilds an older normalization descriptor from the source GLB.
-  const hasSemanticPivotMetadata =
-    Array.isArray(item.glbNormalization?.pivotLocal) &&
+  preserveNativeFrame: boolean,
+): boolean {
+  if (preserveNativeFrame || !isFiniteMatrix16(item.matrix)) {
+    return false;
+  }
+
+  const hasCanonicalPivot = item.glbNormalization?.version === 3 &&
+    Array.isArray(item.glbNormalization.pivotLocal) &&
     item.glbNormalization.pivotLocal.length === 3 &&
     item.glbNormalization.pivotLocal.every(Number.isFinite);
 
-  if (hasSemanticPivotMetadata) {
-    if (isFiniteMatrix16(item.matrix)) {
-      debugLog(`[compiler:glb-transform] ${item.instanceId}: ignored legacy runtime matrix; using normalized semantic TRS.`);
-    }
-    return { ...item, matrix: undefined };
+  // Current editor builds persist GLBs as semantic pivot target + Euler
+  // rotation + scale. A raw xeokit runtime matrix is not part of that contract;
+  // applying it here bypasses the normalized pivot and can disagree with the
+  // editor after resize/calibration. Keep matrix application only for legacy
+  // GLB records that predate the canonical v3 normalization metadata.
+  if (hasCanonicalPivot) {
+    debugLog(`[compiler:glb-transform] ${item.instanceId}`, {
+      mode: "canonical-semantic-trs",
+      ignoredLegacyMatrix: true,
+      placementTarget: item.position,
+      rotation: item.rotation,
+      scale: item.scale,
+    });
+    return false;
   }
 
-  if (pivot && isFiniteMatrix16(item.matrix)) {
-    const migratedTarget = transformPointByPersistedMatrix(pivot, item.matrix);
-    if (migratedTarget) {
-      console.log(`[compiler:glb-transform] ${item.instanceId}: migrated legacy matrix to semantic pivot target.`);
-      return {
-        ...item,
-        position: migratedTarget,
-        matrix: undefined,
-      };
-    }
-    console.warn(`[compiler:glb-transform] ${item.instanceId}: legacy matrix could not be migrated; using saved semantic TRS.`);
+  try {
+    wrapper.setMatrix(item.matrix);
+  } catch (error) {
+    console.warn(
+      `[compiler:glb-transform] ${item.instanceId}: failed to apply legacy matrix; falling back to semantic TRS - ${
+        (error as Error).message
+      }`,
+    );
+    return false;
   }
 
-  return { ...item, matrix: undefined };
+  debugLog(`[compiler:glb-transform] ${item.instanceId}`, {
+    mode: "legacy-persisted-matrix",
+    placementTarget: item.position,
+    persistedMatrix: item.matrix,
+  });
+
+  return true;
 }
 
 function applyAuthoredTransform(
@@ -1849,22 +1840,26 @@ export async function compileScene(
             assetsDirectory,
           );
 
-          // Match the editor's normalized GLB contract. Persisted raw matrices
-          // are legacy migration input only; current normalized GLBs are always
-          // reconstructed from semantic pivot target + rotation + scale.
-          const normalizedPlacementItem = isHostedDoor
-            ? item
-            : resolveGlbPlacementItem(item, catalogFurniturePivot);
-          const placementItem: FurnitureItem = isHostedDoor
-            ? { ...normalizedPlacementItem, scale: [1, 1, 1] }
-            : normalizedPlacementItem;
-          applyAuthoredTransform(
-            instanceWrapper,
-            placementItem,
-            isHostedDoor ? null : catalogFurniturePivot,
-            isHostedDoor,
-            !isHostedDoor,
-          );
+          const appliedPersistedMatrix =
+            applyPersistedGlbTransform(
+              instanceWrapper,
+              item,
+              isHostedDoor,
+            );
+
+          if (!appliedPersistedMatrix) {
+            const placementItem: FurnitureItem = isHostedDoor
+              ? { ...item, scale: [1, 1, 1] }
+              : item;
+            applyAuthoredTransform(
+              instanceWrapper,
+              placementItem,
+              isHostedDoor ? null : catalogFurniturePivot,
+              isHostedDoor,
+              !isHostedDoor,
+            );
+          }
+
           scene.addChild(instanceWrapper);
           assetProcessingMsByInstance.set(String(item.instanceId), Date.now() - assetProcessingStartedAt);
 
@@ -1878,7 +1873,7 @@ export async function compileScene(
               matrix: isFiniteMatrix16(item.matrix)
                 ? item.matrix
                 : null,
-              matrixApplied: false,
+              matrixApplied: appliedPersistedMatrix,
             },
           );
         } else {
