@@ -1,30 +1,30 @@
 /**
- * Shared HCI presentation-settings contract, v1.
+ * Shared HCI presentation-settings contract, v2.
  * The compiler writes the same shape to presentation_manifest.json; browser
  * preferences are stored per rendered job and never mutate source geometry.
  */
-export const PRESENTATION_SETTINGS_SCHEMA_VERSION = 1;
+export const PRESENTATION_SETTINGS_SCHEMA_VERSION = 2;
 
 export const DEFAULT_PRESENTATION_SETTINGS = {
   schemaVersion: PRESENTATION_SETTINGS_SCHEMA_VERSION,
   appearance: {
-    lightingPreset: 'day',
+    lightingPreset: 'night',
     exposureMultiplier: 1,
     environmentMultiplier: 1,
     toneMapping: 'agx',
   },
   camera: {
     overviewFov: 60,
-    guidedFov: 78,
-    exploreFov: 78,
-    immersiveFov: 78,
+    guidedFov: 88,
+    exploreFov: 90,
+    immersiveFov: 88,
     eyeHeightMeters: 1.68,
     guidedEyeHeightMeters: 1.72,
-    heightOffsetMeters: 0,
+    heightOffsetMeters: 0.20,
     lookSensitivity: 0.0048,
   },
   quality: {
-    mode: 'auto',
+    mode: 'high',
   },
   interface: {
     showFloorMap: true,
@@ -134,8 +134,18 @@ export async function loadPresentationSettings(jobId, apiBaseUrl) {
     console.warn('[HCI Presentation] Saved preferences could not be read.', error);
   }
 
+  const manifestVersion = Number(manifest?.schemaVersion ?? manifest?.settings?.schemaVersion ?? 1);
   const manifestCamera = manifest?.settings?.camera || manifest?.defaults?.camera || {};
   const fromManifest = normalizePresentationSettings(manifest?.settings || manifest?.defaults || {});
+
+  // Older render manifests carry the previous camera/quality defaults. Upgrade
+  // those defaults to v2 while preserving their colour pipeline and exposure
+  // values. Per-user preferences are isolated by the v2 localStorage key.
+  if (manifest && manifestVersion < PRESENTATION_SETTINGS_SCHEMA_VERSION) {
+    fromManifest.appearance.lightingPreset = DEFAULT_PRESENTATION_SETTINGS.appearance.lightingPreset;
+    fromManifest.camera = { ...fromManifest.camera, ...DEFAULT_PRESENTATION_SETTINGS.camera };
+    fromManifest.quality = { ...DEFAULT_PRESENTATION_SETTINGS.quality };
+  }
   // Schema-v1 manifests were generated with guidedFov=72. They contain defaults,
   // not a user's actual preference (preferences live in localStorage), so upgrade
   // that legacy default for existing jobs. A saved browser preference still wins.

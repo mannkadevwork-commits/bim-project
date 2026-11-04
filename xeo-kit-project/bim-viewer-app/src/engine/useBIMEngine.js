@@ -399,6 +399,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     const snapshot = {};
     const state = projectStateRef.current || {};
     (state.furniture || []).forEach(item => {
+      // GLB and catalogue IFC instances are restored from semantic TRS. Only
+      // native-isolated IFC elements have a persisted matrix contract.
+      if (!(item?.isNativeIsolation === true || item?.nativeSourceId)) return;
       const model = item?.instanceId ? viewerRef.current?.scene?.models?.[item.instanceId] : null;
       if (model?.matrix && model.matrix.length === 16) snapshot[item.instanceId] = Array.from(model.matrix);
     });
@@ -858,8 +861,17 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
         furniture: Array.isArray(projectState?.furniture) ? projectState.furniture.length : 0,
         materials: Object.keys(projectState?.materials || {}).length,
       });
+      // Ceiling geometry is independent of catalogue furniture restoration.
+      // Sync it immediately, rather than hiding it behind potentially slow GLB loads.
+      const ceilingsNow = projectState?.ceilingDesigns || projectState?.ceilings || [];
+      roomCeilingControllerRef.current?.sync(ceilingsNow).catch((error) => {
+        console.error('[BIM Engine] Could not sync room ceilings before furniture restore:', error);
+      });
       restoreProjectStateToScene(projectState).then(() => {
-        roomCeilingControllerRef.current?.sync(projectState?.ceilingDesigns || projectState?.ceilings || []);
+        const latestState = projectStateRef.current || projectState;
+        roomCeilingControllerRef.current?.sync(latestState?.ceilingDesigns || latestState?.ceilings || []).catch((error) => {
+          console.error('[BIM Engine] Could not sync room ceilings after furniture restore:', error);
+        });
       }).catch(error => {
         console.error('[BIM Engine] Failed to restore persisted project state:', error);
       });
@@ -2629,7 +2641,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           if (!isCurrentLoad()) return;
           isModelLoadedRef.current = true;
           await restoreProjectStateToScene(projectStateRef.current);
-          roomCeilingControllerRef.current?.sync(projectStateRef.current?.ceilingDesigns || projectStateRef.current?.ceilings || []);
+          roomCeilingControllerRef.current?.sync(projectStateRef.current?.ceilingDesigns || projectStateRef.current?.ceilings || []).catch((error) => {
+            console.error('[BIM Engine] Could not sync restored room ceilings:', error);
+          });
           if (!isCurrentLoad()) return;
 
           mainLoadEnd({
@@ -2803,6 +2817,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           if (selected) return cameraManagerRef.current?.focus(selected, false);
           return cameraManagerRef.current?.fitScene();
         },
+        focusRoom: (room, mode = 'perspective', duration) => cameraManagerRef.current?.focusRoom(room, mode, duration),
         preset: (name) => cameraManagerRef.current?.preset(name),
         setProjection: (projection) => cameraManagerRef.current?.setProjection(projection),
         zoom: (direction) => cameraManagerRef.current?.zoom(direction),
@@ -2842,6 +2857,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       },
       previewRoomCeiling: (design) => roomCeilingControllerRef.current?.preview(design) ?? false,
       clearRoomCeilingPreview: () => roomCeilingControllerRef.current?.clearPreview(),
+      syncRoomCeilings: (ceilings) => {
+        const controller = roomCeilingControllerRef.current;
+        if (!controller) return Promise.reject(new Error('The 3D ceiling controller is not ready yet.'));
+        return controller.sync(Array.isArray(ceilings) ? ceilings : []);
+      },
       getCeilingEntityIds: () => findCeilingEntities(viewerRef.current, currentModelRef.current).map((entity) => entity.id),
       setCeilingEntityVisibility: (entityIds, visible) => {
         const ids = new Set((Array.isArray(entityIds) ? entityIds : []).map(String));

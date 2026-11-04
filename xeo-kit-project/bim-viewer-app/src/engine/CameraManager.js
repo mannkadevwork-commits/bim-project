@@ -139,6 +139,59 @@ export class CameraManager {
     return true;
   }
 
+  /** Frame a detected IFC room or switch to a top-down reflected-ceiling plan. */
+  focusRoom(room, mode = 'perspective', duration = 0.7) {
+    if (!this.viewer?.scene || !this.flight || !this.camera) return false;
+    const outer = Array.isArray(room?.boundary?.outer) ? room.boundary.outer : [];
+    const points = outer.filter((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.z)));
+    if (points.length < 3) return false;
+
+    const xs = points.map((point) => Number(point.x));
+    const zs = points.map((point) => Number(point.z));
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minZ = Math.min(...zs), maxZ = Math.max(...zs);
+    const floorY = Number.isFinite(Number(room.floorY)) ? Number(room.floorY) : 0;
+    const ceilingY = Number.isFinite(Number(room.recommendedCeilingY))
+      ? Number(room.recommendedCeilingY)
+      : floorY + 2.7;
+    const center = [(minX + maxX) / 2, (floorY + ceilingY) / 2, (minZ + maxZ) / 2];
+    const spanX = Math.max(maxX - minX, 0.5);
+    const spanZ = Math.max(maxZ - minZ, 0.5);
+    const spanY = Math.max(ceilingY - floorY, 2.0);
+    const roomSpan = Math.max(spanX, spanZ, spanY, 2.0);
+
+    if (mode === 'ceiling-plan') {
+      const lookY = ceilingY;
+      const orthoScale = Math.max(spanX, spanZ) * 1.28;
+      try {
+        this.camera.projection = 'ortho';
+        if (this.camera.ortho) this.camera.ortho.scale = Math.max(orthoScale, 1);
+      } catch (_) {}
+      this.flight.flyTo({
+        eye: [center[0], lookY + roomSpan * 2.2, center[2]],
+        look: [center[0], lookY, center[2]],
+        up: [0, 0, -1],
+        projection: 'ortho',
+        duration,
+        fit: false,
+      });
+      return true;
+    }
+
+    const direction = normalize([1, 0.78, 1.15]);
+    const fov = Number(this.camera.perspective?.fov || 54);
+    const distance = Math.max((roomSpan / Math.sin((fov * Math.PI / 180) / 2)) * 0.95, 3);
+    this.flight.flyTo({
+      eye: [center[0] + direction[0] * distance, center[1] + direction[1] * distance, center[2] + direction[2] * distance],
+      look: center,
+      up: [0, 1, 0],
+      projection: 'perspective',
+      duration,
+      fit: false,
+    });
+    return true;
+  }
+
   setProjection(projection, duration = this.defaultDuration) {
     if (!this.camera || !projection) return false;
     if (projection !== 'perspective' && projection !== 'ortho') return false;

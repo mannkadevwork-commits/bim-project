@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { PanelLeftClose, Loader2, Layout, Orbit, ExternalLink, Box, Pencil, Trash2, X, AlertTriangle, FolderOpen, Layers, PackagePlus, PanelsTopLeft, Sparkles, ArrowRight, Eye, EyeOff, Layers3 } from 'lucide-react';
 import { LayoutMetadataForm } from './LayoutMetadataForm';
 import { CatalogTree } from './CatalogTree'; //[cite: 1]
+import { getCeilingLightingCatalog } from '../utils/ceilingLightingCatalog';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 const resolveBackendUrl = (value) => {
@@ -47,34 +48,7 @@ export const LeftPanel = ({
 
   // These demo fixtures are bundled with the frontend so they remain available
   // even when the remote catalogue API is unavailable.
-  const lightingItems = useMemo(() => {
-    const baseUrl = new URL(import.meta.env.BASE_URL || '/', window.location.origin);
-    const makeItem = (id, name, fileName, description) => ({
-      id,
-      name,
-      description,
-      url: new URL(`assets/lighting/${fileName}`, baseUrl).toString(),
-      file_type: 'glb',
-      fileType: 'glb',
-      type: 'lighting',
-      category: 'lighting',
-      assetCategory: 'lighting',
-      isLightFixture: true,
-      lightEnabled: false,
-      pivotMode: 'top-center',
-      placementSurface: 'surface',
-      scale: [1, 1, 1],
-    });
-    return [
-      makeItem('hci_linear_tubelight', 'Linear LED Tubelight', 'linear-tubelight.glb', 'Ceiling-mounted strip light'),
-      makeItem('hci_led_bulb', 'LED Bulb', 'led-bulb.glb', 'Compact LED bulb fixture'),
-      makeItem('hci_recessed_downlight', 'Recessed Downlight', 'recessed-downlight.glb', 'False-ceiling recessed spotlight'),
-      makeItem('hci_flush_ceiling', 'Flush-mount Ceiling Light', 'flush-mount-ceiling-light.glb', 'Low-profile ceiling fixture'),
-      makeItem('hci_pendant_lamp', 'Pendant Hanging Lamp', 'pendant-lamp.glb', 'Decorative hanging ceiling lamp'),
-      makeItem('hci_caged_ceiling', 'Caged Ceiling Light', 'caged-ceiling-light.glb', 'Compact utility ceiling light'),
-      makeItem('hci_square_ceiling', 'Square Ceiling Lamp', 'square-ceiling-lamp.glb', 'Compact square ceiling fixture'),
-    ];
-  }, []);
+  const lightingItems = useMemo(() => getCeilingLightingCatalog(), []);
 
   const mergedCatalogTree = useMemo(() => ([
     ...(Array.isArray(catalogTree) ? catalogTree : []),

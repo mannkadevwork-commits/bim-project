@@ -1163,9 +1163,8 @@ export const useProjectSync = (activeProject) => {
       : null;
     const persistedMatrix = runtimeMatrix;
 
-    setProjectStateTracked(prev => ({
-      ...prev,
-      furniture: (prev.furniture || []).map(f => {
+    setProjectStateTracked(prev => {
+      const nextFurniture = (prev.furniture || []).map(f => {
         if (f.instanceId !== selectedAssetId) return f;
 
         const nextItem = {
@@ -1185,8 +1184,37 @@ export const useProjectSync = (activeProject) => {
         }
 
         return nextItem;
-      }),
-    }), { coalesceKey: `asset-transform:${selectedAssetId}:${isScale ? 'scale' : isRotation ? 'rotation' : 'position'}` });
+      });
+
+      const movedFixture = nextFurniture.find((item) => item.instanceId === selectedAssetId);
+      const shouldMoveOpening = Boolean(
+        movedFixture?.ceilingOpeningId && Array.isArray(persistedPosition) &&
+        persistedPosition.length === 3 && !isScale && !isRotation
+      );
+      if (!shouldMoveOpening) return { ...prev, furniture: nextFurniture };
+
+      const currentCeilings = Array.isArray(prev.ceilingDesigns)
+        ? prev.ceilingDesigns
+        : (Array.isArray(prev.ceilings) ? prev.ceilings : []);
+      const nextCeilings = currentCeilings.map((design) => {
+        const openings = Array.isArray(design?.openings) ? design.openings : [];
+        if (!openings.some((opening) => opening?.id === movedFixture.ceilingOpeningId)) return design;
+        return {
+          ...design,
+          openings: openings.map((opening) => opening?.id === movedFixture.ceilingOpeningId
+            ? { ...opening, x: persistedPosition[0], z: persistedPosition[2] }
+            : opening),
+          revision: (Number(design.revision) || 1) + 1,
+        };
+      });
+
+      return {
+        ...prev,
+        furniture: nextFurniture,
+        ceilingDesigns: nextCeilings,
+        ceilings: nextCeilings,
+      };
+    }, { coalesceKey: `asset-transform:${selectedAssetId}:${isScale ? 'scale' : isRotation ? 'rotation' : 'position'}` });
   };
 
   const deleteAsset = (viewerRef, selectedAssetId) => {
@@ -1197,13 +1225,34 @@ export const useProjectSync = (activeProject) => {
       assetModel.destroy();
     }
 
-    // Persistence is authoritative. Even if the live xeokit model is already
-    // gone (for example after a reload/race), the saved furniture entry must
-    // always be removed so a later calibration/reload cannot resurrect it.
-    setProjectStateTracked(prev => ({
-      ...prev,
-      furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
-    }));
+    // A recessed ceiling fixture owns a cut-out by ID. Removing the fixture
+    // through any editor path (context menu, Delete, multi-select or Ceiling
+    // Plan) must remove the linked opening in the same project-state edit.
+    setProjectStateTracked(prev => {
+      const removedItem = (prev.furniture || []).find((item) => item.instanceId === selectedAssetId);
+      const openingId = removedItem?.ceilingOpeningId;
+      const nextFurniture = (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId);
+      if (!openingId) return { ...prev, furniture: nextFurniture };
+
+      const currentCeilings = Array.isArray(prev.ceilingDesigns)
+        ? prev.ceilingDesigns
+        : (Array.isArray(prev.ceilings) ? prev.ceilings : []);
+      const nextCeilings = currentCeilings.map((design) => {
+        const openings = Array.isArray(design?.openings) ? design.openings : [];
+        if (!openings.some((opening) => opening?.id === openingId)) return design;
+        return {
+          ...design,
+          openings: openings.filter((opening) => opening?.id !== openingId),
+          revision: (Number(design.revision) || 1) + 1,
+        };
+      });
+      return {
+        ...prev,
+        furniture: nextFurniture,
+        ceilingDesigns: nextCeilings,
+        ceilings: nextCeilings,
+      };
+    });
 
     setToastMessage('Asset removed.');
     setTimeout(() => setToastMessage(null), 3000);
@@ -1403,6 +1452,9 @@ export const useProjectSync = (activeProject) => {
       lightEnabled: asset.lightEnabled === true,
       pivotMode: asset.pivotMode || null,
       placementSurface: asset.placementSurface || null,
+      ...(asset.ceilingRoomId ? { ceilingRoomId: String(asset.ceilingRoomId) } : {}),
+      ...(asset.ceilingMountType ? { ceilingMountType: String(asset.ceilingMountType) } : {}),
+      ...(asset.ceilingOpeningId ? { ceilingOpeningId: String(asset.ceilingOpeningId) } : {}),
       ...(doorHostWallId ? { doorHostWallId } : {}),
       ...(doorHostWallId && doorDimensions && Object.values(doorDimensions).every((value) => Number.isFinite(value) && value > 0)
         ? { doorDimensions }
@@ -1683,12 +1735,19 @@ export const useProjectSync = (activeProject) => {
         ? item.scale
         : [1, 1, 1];
 
-      const sourceMatrix = normalizeMatrix(item.matrix) || normalizeMatrix(matrixSnapshots?.[item.instanceId]);
+      // Only native-isolated IFC elements have an authoritative persisted
+      // runtime matrix. GLB and catalogue IFC assets use semantic position /
+      // rotation / scale; persisting their live SceneModel.matrix creates a
+      // second transform source that the 360 compiler may interpret differently.
+      const isNativeIsolation = item.isNativeIsolation === true || Boolean(item.nativeSourceId);
+      const sourceMatrix = isNativeIsolation
+        ? (normalizeMatrix(item.matrix) || normalizeMatrix(matrixSnapshots?.[item.instanceId]))
+        : null;
       const nextMatrix = sourceMatrix
         ? transformMatrixBySceneScale(sourceMatrix, ratio, oldSceneCenter, newSceneCenter)
         : null;
 
-      return {
+      const nextItem = {
         ...item,
         position: [
           newSceneCenter[0] + (position[0] - oldSceneCenter[0]) * ratio,
@@ -1700,8 +1759,14 @@ export const useProjectSync = (activeProject) => {
           scale[1] * ratio,
           scale[2] * ratio,
         ],
-        ...(nextMatrix ? { matrix: nextMatrix } : {}),
       };
+
+      if (isNativeIsolation && nextMatrix) {
+        nextItem.matrix = nextMatrix;
+      } else if (!isNativeIsolation) {
+        delete nextItem.matrix;
+      }
+      return nextItem;
     });
 
     const nextState = {

@@ -45,6 +45,10 @@ export interface CeilingCompileSummary {
 const DEFAULT_COLOR = "#F3F1EB";
 const DEFAULT_WOOD = "#A77B4A";
 const MIN_RING_AREA_M2 = 0.01;
+// Recessed downlights commonly use 50–100 mm diameter cut-outs.
+// Keep a separate, smaller threshold for authored openings; room footprints
+// still use MIN_RING_AREA_M2 so tiny/degenerate rooms remain rejected.
+const MIN_OPENING_AREA_M2 = 0.0005;
 const MIN_POINT_DISTANCE_M = 0.0005;
 
 function finite(value: unknown, fallback: number): number {
@@ -57,7 +61,7 @@ function safeId(value: unknown, fallback: string): string {
   return normalized.slice(0, 72) || fallback;
 }
 
-function normalizeRing(source: unknown, label: string): Point2[] {
+function normalizeRing(source: unknown, label: string, minimumArea = MIN_RING_AREA_M2): Point2[] {
   if (!Array.isArray(source)) throw new Error(`${label} is missing.`);
   const points = source
     .map((point: any) => ({ x: finite(point?.x, Number.NaN), z: finite(point?.z, Number.NaN) }))
@@ -76,8 +80,8 @@ function normalizeRing(source: unknown, label: string): Point2[] {
   if (cleaned.length < 3) throw new Error(`${label} must contain at least three distinct points.`);
 
   const area = Math.abs(THREE.ShapeUtils.area(cleaned.map((point) => new THREE.Vector2(point.x, point.z))));
-  if (!Number.isFinite(area) || area < MIN_RING_AREA_M2) {
-    throw new Error(`${label} is too small or degenerate.`);
+  if (!Number.isFinite(area) || area < minimumArea) {
+    throw new Error(`${label} is too small or degenerate (area ${Number.isFinite(area) ? area.toFixed(6) : "invalid"} m²; minimum ${minimumArea.toFixed(6)} m²).`);
   }
   return cleaned;
 }
@@ -97,10 +101,10 @@ function circleOpening(opening: any): Point2[] {
 }
 
 function normalizeOpening(opening: any, index: number): Point2[] {
-  if (Array.isArray(opening)) return normalizeRing(opening, `Ceiling opening ${index + 1}`);
-  if (Array.isArray(opening?.polygon)) return normalizeRing(opening.polygon, `Ceiling opening ${index + 1}`);
+  if (Array.isArray(opening)) return normalizeRing(opening, `Ceiling opening ${index + 1}`, MIN_OPENING_AREA_M2);
+  if (Array.isArray(opening?.polygon)) return normalizeRing(opening.polygon, `Ceiling opening ${index + 1}`, MIN_OPENING_AREA_M2);
   if (opening?.type === "circle" || Number.isFinite(Number(opening?.radius))) {
-    return normalizeRing(circleOpening(opening), `Ceiling opening ${index + 1}`);
+    return normalizeRing(circleOpening(opening), `Ceiling opening ${index + 1}`, MIN_OPENING_AREA_M2);
   }
   throw new Error(`Ceiling opening ${index + 1} has an unsupported shape.`);
 }
