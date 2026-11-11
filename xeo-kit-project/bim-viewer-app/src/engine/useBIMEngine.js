@@ -31,6 +31,7 @@ import { perfFetch, perfLog, perfTimer } from '../utils/perfLogger';
 import { installGLBStudioLighting } from './utils/glbStudioLighting';
 import { createLightFixtureController } from './assets/LightFixtureController';
 import { createRoomCeilingController } from './assets/RoomCeilingController';
+import { createRoomSelectionController } from './assets/RoomSelectionController';
 import { findCeilingEntities } from './utils/ceilingVisibility';
 
 const getNavCubeTheme = (isDarkMode) => ({
@@ -55,6 +56,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const viewerRef = useRef(null);
   const lightFixtureControllerRef = useRef(null);
   const roomCeilingControllerRef = useRef(null);
+  const roomSelectionControllerRef = useRef(null);
+  const selectRoomBoundaryWallsRef = useRef(null);
+  const selectPlacedAssetRef = useRef(null);
+  const selectNativeElementRef = useRef(null);
   const loadersRef = useRef({});
   const ifcLoaderOwnerRef = useRef(null);
   const ifcAPIRef = useRef(null);
@@ -91,6 +96,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const [navMode, setNavMode] = useState('orbit');
   const cameraManagerRef = useRef(null);
   const [selectedObject, setSelectedObject] = useState(null);
+  const [selectedRoom, setSelectedRoom] = useState(null);
+  const selectedRoomRef = useRef(null);
   const [selectedAssetId, setSelectedAssetId] = useState(null);
   const [selectedElements, setSelectedElements] = useState([]);
   const [multiSelectMode, setMultiSelectMode] = useState(false);
@@ -308,6 +315,9 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   };
 
   const clearSelection = () => {
+    selectedRoomRef.current = null;
+    setSelectedRoom(null);
+    roomSelectionControllerRef.current?.setSelectedRoom(null);
     const viewer = viewerRef.current;
     if (!viewer) return;
 
@@ -1383,6 +1393,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
     viewerRef.current = viewer;
     lightFixtureControllerRef.current = createLightFixtureController(viewer);
     roomCeilingControllerRef.current = createRoomCeilingController(viewer);
+    roomSelectionControllerRef.current = createRoomSelectionController(viewer);
     initializeIFCEngine();
 
     // GLTF/GLB picks are not guaranteed to have the same entity shape: depending
@@ -1548,7 +1559,83 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       setTransformMode('select');
     };
 
+    selectRoomBoundaryWallsRef.current = (room) => {
+      const ids = Array.isArray(room?.boundaryWallGlobalIds) ? room.boundaryWallGlobalIds.map(String) : [];
+      if (!ids.length) return 0;
+      const objects = viewer.scene.objects || {};
+      const entities = ids.map((globalId) => {
+        const remembered = nativeEntityRefsRef.current.get(globalId);
+        if (remembered?.entity && remembered.model === currentModelRef.current && remembered.entity.destroyed !== true) return remembered.entity;
+        if (objects[globalId]) return objects[globalId];
+        return Object.values(objects).find((candidate) => {
+          const meta = viewer.metaScene?.metaObjects?.[candidate?.id];
+          return String(meta?.id || '') === globalId;
+        }) || null;
+      }).filter((entity, index, all) => entity && all.findIndex((other) => other.id === entity.id) === index);
+      const wallEntities = entities.filter((entity) => String(entity.type || viewer.metaScene?.metaObjects?.[entity.id]?.type || '').toLowerCase().includes('wall'));
+      const records = wallEntities.map((entity) => buildSelectionRecord(entity, false)).filter((record) => record?.id);
+      if (!records.length) return 0;
+      clearSelection();
+      wallEntities.forEach((entity) => {
+        try { entity.selected = true; } catch (_) {}
+        if (entity.model) { try { entity.model.selected = false; } catch (_) {} }
+      });
+      applySelectionState(records);
+      setIsRightPanelOpen(true);
+      setRightTab('properties');
+      return records.length;
+    };
 
+    // Select one native IFC element from the active room contents list. Native
+    // elements remain non-transformable until the user explicitly chooses
+    // "Enable editing" in Properties; this avoids silently mutating the source IFC.
+    selectNativeElementRef.current = (globalId) => {
+      const targetGlobalId = String(globalId || '').trim();
+      if (!targetGlobalId) return false;
+      const objects = viewer.scene?.objects || {};
+      const remembered = nativeEntityRefsRef.current.get(targetGlobalId);
+      const entity = remembered?.entity && remembered.model === currentModelRef.current && remembered.entity.destroyed !== true
+        ? remembered.entity
+        : objects[targetGlobalId] || Object.values(objects).find((candidate) => {
+          const meta = viewer.metaScene?.metaObjects?.[candidate?.id];
+          return String(meta?.id || '') === targetGlobalId;
+        }) || null;
+      if (!entity) return false;
+      const record = buildSelectionRecord(entity, false);
+      if (!record?.id) return false;
+
+      clearSelection();
+      try { entity.selected = true; } catch (_) {}
+      if (entity.model) { try { entity.model.selected = false; } catch (_) {} }
+      applySelectionState([record]);
+      setIsRightPanelOpen(true);
+      setRightTab('properties');
+      requestAnimationFrame(() => cameraManagerRef.current?.focus(entity.id, true));
+      return true;
+    };
+
+    // The room contents list must use the exact same selection pipeline as a
+    // viewport pick so that selection visuals, Move/Rotate/Stretch gizmos,
+    // Properties and undo-safe transforms all behave identically.
+    selectPlacedAssetRef.current = (instanceId) => {
+      const model = viewer.scene?.models?.[String(instanceId)];
+      if (!model) return false;
+      const record = buildSelectionRecord(model, true);
+      if (!record?.id) return false;
+
+      clearSelection();
+      setEditableAssetSelectionVisual(viewer, model, true);
+      applySelectionState([record]);
+      setIsRightPanelOpen(true);
+      setRightTab('properties');
+      requestAnimationFrame(() => {
+        ensureSelectedAssetGizmos('move');
+        transformModeRef.current = 'move';
+        setTransformMode('move');
+        cameraManagerRef.current?.focus(instanceId, true);
+      });
+      return true;
+    };
 
     viewer.cameraControl.on('picked', (pickResult) => {
       if (isMeasuringRef.current) return;
@@ -1585,6 +1672,22 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       if (!pickResult.entity) return;
 
       const entity = pickResult.entity;
+      if (entity?._hciRoomSelection?.roomId) {
+        const room = roomSelectionControllerRef.current?.getRoom(entity._hciRoomSelection.roomId);
+        if (room) {
+          clearSelection();
+          selectedRoomRef.current = room;
+          setSelectedRoom(room);
+          roomSelectionControllerRef.current?.setSelectedRoom(room.id);
+          setIsRightPanelOpen(true);
+          setRightTab('properties');
+          transformModeRef.current = 'select';
+          setTransformMode('select');
+          setNavMode('firstPerson');
+          cameraManagerRef.current?.enterRoom(room, { duration: 1.05 });
+        }
+        return;
+      }
       // Generated room ceilings remain pickable for surface placement of lights,
       // but are not selectable as ordinary furniture/IFC objects.
       if (entity?._hciRoomCeiling) return;
@@ -2420,6 +2523,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       lightFixtureControllerRef.current = null;
       try { roomCeilingControllerRef.current?.destroy(); } catch (_) {}
       roomCeilingControllerRef.current = null;
+      try { roomSelectionControllerRef.current?.destroy(); } catch (_) {}
+      roomSelectionControllerRef.current = null;
+      selectRoomBoundaryWallsRef.current = null;
+      selectPlacedAssetRef.current = null;
+      selectNativeElementRef.current = null;
+      selectedRoomRef.current = null;
       viewerRef.current = null;
       try { viewer.destroy(); } catch (e) {}
     };
@@ -2450,8 +2559,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
   useEffect(() => {
     if (viewerRef.current) {
-      viewerRef.current.cameraControl.navMode = navMode;
-      viewerRef.current.cameraControl.active = true;
+      const control = viewerRef.current.cameraControl;
+      control.navMode = navMode;
+      control.active = true;
+      control.followPointer = navMode === 'orbit';
+      control.smartPivot = navMode === 'orbit';
+      if (navMode === 'firstPerson') control.constrainVertical = true;
     }
   }, [navMode]);
 
@@ -2773,6 +2886,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       isClipping,
       navMode,
       selectedObject,
+      selectedRoom,
       selectedAssetId,
       selectedElements,
       multiSelectMode,
@@ -2799,6 +2913,20 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       toggleClipping,
       setNavMode,
       setSelectedObject,
+      selectRoom: (room) => {
+        if (!room?.id) return false;
+        clearSelection();
+        selectedRoomRef.current = room;
+        setSelectedRoom(room);
+        roomSelectionControllerRef.current?.setSelectedRoom(room.id);
+        setIsRightPanelOpen(true);
+        setRightTab('properties');
+        return true;
+      },
+      syncRooms: (rooms) => roomSelectionControllerRef.current?.sync(rooms) || 0,
+      selectRoomBoundaryWalls: (room) => selectRoomBoundaryWallsRef.current?.(room) || 0,
+      selectPlacedAsset: (instanceId) => selectPlacedAssetRef.current?.(instanceId) || false,
+      selectNativeElement: (globalId) => selectNativeElementRef.current?.(globalId) || false,
       setSelectedAssetId: setSelectedAssetIdSafe,
       setSelectedElements,
       toggleMultiSelectMode,
@@ -2810,16 +2938,33 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       setPlacementMode,
       camera: {
         fitScene: () => cameraManagerRef.current?.fitScene(),
-        overview: (duration) => cameraManagerRef.current?.overview(duration),
+        overview: (duration) => { setNavMode('orbit'); return cameraManagerRef.current?.overview(duration); },
         focusSelected: () => {
           const selectedAsset = selectedAssetIdRef.current;
           if (selectedAsset) return cameraManagerRef.current?.focus(selectedAsset, true);
+          if (selectedRoomRef.current) return cameraManagerRef.current?.focusRoom(selectedRoomRef.current, 'perspective');
           const selected = selectedObject?.id;
           if (selected) return cameraManagerRef.current?.focus(selected, false);
           return cameraManagerRef.current?.fitScene();
         },
-        focusRoom: (room, mode = 'perspective', duration) => cameraManagerRef.current?.focusRoom(room, mode, duration),
-        preset: (name) => cameraManagerRef.current?.preset(name),
+        focusRoom: (room, mode = 'perspective', duration) => {
+          const isPlan = mode === 'plan' || mode === 'ceiling-plan';
+          setNavMode(isPlan ? 'planView' : 'orbit');
+          return cameraManagerRef.current?.focusRoom(room, mode, duration);
+        },
+        enterRoom: (room, options = {}) => {
+          if (!room?.id) return false;
+          setNavMode('firstPerson');
+          return cameraManagerRef.current?.enterRoom(room, options);
+        },
+        exitRoom: (duration) => {
+          setNavMode('orbit');
+          return cameraManagerRef.current?.exitRoom(duration);
+        },
+        preset: (name) => {
+          setNavMode(name === 'top' ? 'planView' : 'orbit');
+          return cameraManagerRef.current?.preset(name);
+        },
         setProjection: (projection) => cameraManagerRef.current?.setProjection(projection),
         zoom: (direction) => cameraManagerRef.current?.zoom(direction),
         getProjection: () => cameraManagerRef.current?.getProjection() || 'perspective',

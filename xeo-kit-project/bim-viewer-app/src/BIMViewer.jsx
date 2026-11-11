@@ -6,6 +6,7 @@ import { LeftPanel } from './components/LeftPanel';
 import { RightPanel } from './components/RightPanel';
 import { CeilingDesignerModal } from './components/CeilingDesignerModal';
 import { CeilingPlanModal } from './components/CeilingPlanModal';
+import { RoomBrowserPanel } from './components/RoomBrowserPanel';
 import { getCeilingLightingCatalog } from './utils/ceilingLightingCatalog';
 import { BottomDock } from './components/BottomDock';
 import { RenderStudioModal } from './components/RenderStudioModal';
@@ -19,9 +20,11 @@ import { TransformModesHelp } from './components/TransformModesHelp';
 import { useMaterialLibrary } from './hooks/useMaterialLibrary';
 import { clearNativeIFCMaterialOverride } from './utils/materialScene';
 import { useCatalog } from './hooks/useCatalog';
+import { API_BASE_URL } from './engine/utils/constants';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
+import { getFurnitureInRoom, isPositionInsideRoom } from './utils/roomFurniture';
 
 const doorIntrinsicBoundsCache = new Map();
 
@@ -130,6 +133,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(true);
   const [isRightPanelOpen, setIsRightPanelOpen] = useState(true);
   const [leftTab, setLeftTab] = useState('explorer');
+  const [catalogSearchTerm, setCatalogSearchTerm] = useState('');
   const [isMaxView, setIsMaxView] = useState(false);
   const [rightTab, setRightTab] = useState('properties');
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -143,6 +147,20 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const [isLayoutSaving, setIsLayoutSaving] = useState(false);
   const [lastClickPos, setLastClickPos] = useState({ x: 0, y: 0 });
   const [cameraProjection, setCameraProjection] = useState('perspective');
+  const [showRoomBrowser, setShowRoomBrowser] = useState(false);
+  const [activeRoomContext, setActiveRoomContext] = useState(null);
+  const activeRoomContextRef = useRef(null);
+  const attachActiveRoomMetadata = (asset, position) => {
+    const room = activeRoomContextRef.current;
+    if (!room || !isPositionInsideRoom(room, position)) return asset;
+    return {
+      ...asset,
+      roomId: String(room.id),
+      roomLabel: room.label || room.semanticSpace?.name || null,
+    };
+  };
+  const [roomAnalysisState, setRoomAnalysisState] = useState({ status: 'idle', rooms: [], levels: [], warnings: [], error: '' });
+  const roomAnalysisAbortRef = useRef(null);
 
   // A new project always opens in the architectural perspective overview. Keep
   // the toolbar indicator in sync if the previous project ended in flat view.
@@ -175,9 +193,67 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     deleteAsset, replaceAsset, spawnAsset, applyTemplate, setCustomColor, adoptIsolatedAsset,
     updateStructuralEdit, setAssetLightEnabled, setAssetLightIntensity, setRoomCeilingDesigns, setCeilingHiddenEntityIds,
     transformFurnitureForCalibration, repairLegacyCalibrationState, setToastMessage,
-    undo, redo, canUndo, canRedo, beginHistoryTransaction, endHistoryTransaction, cancelHistoryTransaction
+    undo, redo, canUndo, canRedo, beginHistoryTransaction, endHistoryTransaction, cancelHistoryTransaction, setRoomProperties
   } = useProjectSync(activeProject);
   const ceilingLightingAssets = useMemo(() => getCeilingLightingCatalog(), []);
+
+  const loadRoomAnalysis = useCallback(async ({ forceRebuild = false } = {}) => {
+    if (!jobId) return;
+    if (!projectStateHydratedRef.current) {
+      setRoomAnalysisState((previous) => ({ ...previous, status: 'error', error: 'Project state is still loading. Open Rooms again after the project finishes loading.' }));
+      return;
+    }
+    roomAnalysisAbortRef.current?.abort();
+    const controller = new AbortController();
+    roomAnalysisAbortRef.current = controller;
+    setRoomAnalysisState((previous) => ({ ...previous, status: 'loading', error: '' }));
+    try {
+      // Room selection has its own API contract. It must not depend on the
+      // ceiling designer's schema or ceiling-candidate processing.
+      const response = await fetch(`${API_BASE_URL}/api/projects/${encodeURIComponent(jobId)}/room-analysis`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceRebuild: Boolean(forceRebuild) }),
+        signal: controller.signal,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const details = payload.details ? `\n${payload.details}` : '';
+        throw new Error(`${payload.error || `Room analysis failed (${response.status}).`}${details}`);
+      }
+      const validRoomContract = Number.isSafeInteger(Number(payload.schemaVersion))
+        && Number(payload.schemaVersion) >= 1
+        && payload.contract === 'hci.room-analysis'
+        && payload.coordinateSystem === 'hci-y-up-xz-horizontal'
+        && Array.isArray(payload.rooms)
+        && Array.isArray(payload.levels);
+      if (!validRoomContract) {
+        throw new Error(`The backend returned an invalid room-analysis contract (schema ${payload.schemaVersion ?? 'missing'}). Restart the backend with the matching room-analysis service.`);
+      }
+      const rooms = payload.rooms.filter((room) => (
+        room?.id && room?.levelId && Array.isArray(room.boundary?.outer) && room.boundary.outer.length >= 3
+      ));
+      if (!rooms.length) {
+        const diagnostics = Array.isArray(payload.warnings) && payload.warnings.length
+          ? ` ${payload.warnings.join(' ')}`
+          : '';
+        throw new Error(`No usable room footprints were detected in this IFC model.${diagnostics}`);
+      }
+      setRoomAnalysisState({ status: 'ready', rooms, levels: payload.levels, warnings: payload.warnings || [], error: '', analysis: payload });
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        setRoomAnalysisState((previous) => ({ ...previous, status: 'error', error: error?.message || 'Could not analyse room boundaries.' }));
+      }
+    }
+  }, [jobId, projectStateHydratedRef]);
+
+  useEffect(() => () => roomAnalysisAbortRef.current?.abort(), [jobId]);
+
+  useEffect(() => {
+    if (!file || !jobId || roomAnalysisState.status !== 'idle') return;
+    if (!projectStateHydratedRef.current) return;
+    void loadRoomAnalysis();
+  }, [file, jobId, projectState, roomAnalysisState.status, loadRoomAnalysis, projectStateHydratedRef]);
 
   const insertDoor = async (asset, wallSnapData) => {
     if (!file || !jobId || doorInsertionInFlightRef.current) return;
@@ -308,7 +384,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       if (asset.type === 'door') {
         insertDoor(asset, data);
       } else {
-        spawnAsset(asset, data, engineActions.loadIFCAssetIntoScene);
+        const placementPosition = Array.isArray(data) ? data : data?.position;
+        spawnAsset(attachActiveRoomMetadata(asset, placementPosition), data, engineActions.loadIFCAssetIntoScene);
       }
     },
     setIsRightPanelOpen,
@@ -318,6 +395,126 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     isDarkMode,
     projectStateHydratedRef
   );
+
+  // Room analysis and the engine are both initialized during render. Keep all
+  // references to engineActions/engineState below the hook call to avoid the
+  // temporal-dead-zone crash introduced by Room Editor V1.
+  const syncRoomsActionRef = useRef(null);
+  syncRoomsActionRef.current = engineActions.syncRooms;
+
+  useEffect(() => {
+    if (roomAnalysisState.status !== 'ready' || engineState.isLoading) return;
+    syncRoomsActionRef.current?.(roomAnalysisState.rooms);
+  }, [roomAnalysisState.status, roomAnalysisState.rooms, engineState.isLoading]);
+
+  const selectRoomInEditor = useCallback((room, { focus = true, viewPreset = 'auto', eyeHeight = 1.55 } = {}) => {
+    if (!room) return;
+    setShowRoomBrowser(false);
+    activeRoomContextRef.current = room;
+    setActiveRoomContext(room);
+    engineActions.selectRoom?.(room);
+    setIsRightPanelOpen(true);
+    setRightTab('properties');
+    if (focus) {
+      const entered = engineActions.camera.enterRoom?.(room, { duration: 1.05, eyeHeight, viewPreset });
+      if (!entered) {
+        // Keep the room selectable even when a footprint is too small or malformed
+        // for a safe first-person camera placement. Fall back to an exterior fit.
+        engineActions.camera.focusRoom?.(room, 'perspective', 0.65);
+      }
+      setCameraProjection('perspective');
+    }
+  }, [engineActions]);
+
+  useEffect(() => {
+    // Room selection from the viewport is handled inside useBIMEngine. Keep a
+    // separate room workspace context when that selection is made. Asset picks
+    // clear engineState.selectedRoom, but must not close this room workspace.
+    if (engineState.selectedRoom?.id) {
+      activeRoomContextRef.current = engineState.selectedRoom;
+      setActiveRoomContext(engineState.selectedRoom);
+    }
+  }, [engineState.selectedRoom]);
+
+  const roomFurniture = useMemo(
+    () => getFurnitureInRoom(activeRoomContext, projectState.furniture || []),
+    [activeRoomContext, projectState.furniture]
+  );
+  const nativeRoomElements = useMemo(
+    () => Array.isArray(activeRoomContext?.elements) ? activeRoomContext.elements : [],
+    [activeRoomContext]
+  );
+  const activeRoomLabel = activeRoomContext
+    ? projectState.roomProperties?.[activeRoomContext.id]?.name || activeRoomContext.label || activeRoomContext.semanticSpace?.name || 'Selected room'
+    : '';
+  const roomContextForPanel = useMemo(() => activeRoomContext
+    ? { ...activeRoomContext, label: activeRoomLabel }
+    : null, [activeRoomContext, activeRoomLabel]);
+
+  const returnToRoomOverview = useCallback(() => {
+    if (!activeRoomContext) return;
+    engineActions.selectRoom?.(activeRoomContext);
+    const entered = engineActions.camera.enterRoom?.(activeRoomContext, { duration: 0.75, eyeHeight: 1.55 });
+    if (!entered) engineActions.camera.focusRoom?.(activeRoomContext, 'perspective', 0.6);
+    setCameraProjection('perspective');
+    setIsRightPanelOpen(true);
+    setRightTab('properties');
+  }, [activeRoomContext, engineActions]);
+
+  const exitRoomCamera = useCallback(() => {
+    engineActions.camera.exitRoom?.(0.85);
+    setCameraProjection('perspective');
+    // Keep activeRoomContext so the navigator remains anchored to the last room.
+  }, [engineActions]);
+
+  const showRoomPlan = useCallback((room) => {
+    if (!room) return;
+    activeRoomContextRef.current = room;
+    setActiveRoomContext(room);
+    engineActions.selectRoom?.(room);
+    engineActions.camera.focusRoom?.(room, 'plan', 0.7);
+    setCameraProjection('ortho');
+  }, [engineActions]);
+
+  const handleSelectRoomAsset = useCallback((item) => {
+    if (!item?.instanceId) return false;
+    const selected = engineActions.selectPlacedAsset?.(item.instanceId);
+    if (!selected) {
+      setToastMessage('This room item is not currently loaded in the 3D scene. Wait for asset restoration to finish and try again.');
+      return false;
+    }
+    setIsRightPanelOpen(true);
+    setRightTab('properties');
+    const canvasRect = refs.canvasRef.current?.getBoundingClientRect?.();
+    if (canvasRect) {
+      setLastClickPos({
+        x: canvasRect.left + Math.min(canvasRect.width - 24, Math.max(24, canvasRect.width * 0.55)),
+        y: canvasRect.top + Math.min(180, Math.max(48, canvasRect.height * 0.28)),
+      });
+    }
+    return true;
+  }, [engineActions, refs.canvasRef, setToastMessage]);
+
+  const openReplaceRoomAsset = useCallback((item) => {
+    if (!item?.instanceId || item.doorHostWallId || item.isNativeIsolation || item.nativeSourceId) return;
+    setReplaceTargetId(item.instanceId);
+    setReplaceTargetItem({ ...item });
+    setShowReplaceAssetModal(true);
+  }, []);
+
+  const deleteRoomAsset = useCallback((item) => {
+    if (!item?.instanceId || item.doorHostWallId || item.isNativeIsolation || item.nativeSourceId) return;
+    beginHistoryTransaction(`Remove ${item.name || 'room item'}`);
+    try {
+      deleteAsset(refs.viewerRef, item.instanceId);
+      endHistoryTransaction();
+      if (engineState.selectedAssetId === item.instanceId) engineActions.clearSelection();
+      setToastMessage(`${item.name || 'Item'} removed from the room.`);
+    } catch (error) {
+      cancelHistoryTransaction();
+      setToastMessage(error?.message || 'Could not remove this room item.');
+    }
+  }, [beginHistoryTransaction, cancelHistoryTransaction, deleteAsset, endHistoryTransaction, engineActions, engineState.selectedAssetId, refs.viewerRef, setToastMessage]);
 
   useEffect(() => {
     const handleAssetRestoreWarning = (event) => {
@@ -420,7 +617,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     setIsRightPanelOpen(!nextState);
   };
 
-  const openLeftPanelTab = (tab) => {
+  const openLeftPanelTab = (tab, searchTerm = null) => {
+    if (tab === 'assets' && searchTerm !== null) {
+      // React passes a MouseEvent to an unwrapped onClick callback. Never allow
+      // that event object to leak into the catalogue input as "[object Object]".
+      const safeSearchTerm = typeof searchTerm === 'string' ? searchTerm : '';
+      setCatalogSearchTerm(safeSearchTerm.trim());
+    }
     setLeftTab(tab);
     setIsLeftPanelOpen(true);
     setIsMaxView(false);
@@ -947,7 +1150,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             : 'Could not determine a valid placement point.');
           return;
         }
-        await spawnAsset(asset, worldPos, engineActions.loadIFCAssetIntoScene);
+        await spawnAsset(attachActiveRoomMetadata(asset, worldPos), worldPos, engineActions.loadIFCAssetIntoScene);
       }
       setIsRightPanelOpen(true);
       setRightTab('properties');
@@ -1026,7 +1229,14 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   // save loop here; one owner prevents duplicate/racing save pipelines.
 
   useEffect(() => {
+    roomAnalysisAbortRef.current?.abort();
+    engineActions.syncRooms?.([]);
+    setRoomAnalysisState({ status: 'idle', rooms: [], levels: [], warnings: [], error: '' });
+    activeRoomContextRef.current = null;
+    setActiveRoomContext(null);
+    setShowRoomBrowser(false);
     if (file && jobId) {
+      engineActions.clearSelection?.();
       engineActions.setSelectedObject(null);
       engineActions.setSelectedAssetId(null);
       if (engineActions.clearMeasurements) engineActions.clearMeasurements();
@@ -1092,8 +1302,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
               onOpenDesigns={() => openLeftPanelTab('templates')}
               onShowOverview={() => { engineActions.camera.overview?.(0.85); setCameraProjection('perspective'); }}
               onOpenRender={handleOpen360Walkthrough}
-              hasSelection={!!(engineState.selectedAssetId || engineState.selectedObject)}
-              selectedName={activeAsset?.name || (projectState?.furniture || []).find((item) => item.instanceId === engineState.selectedAssetId)?.name || engineState.selectedObject?.name || 'Selected element'}
+              hasSelection={!!(engineState.selectedAssetId || engineState.selectedObject || engineState.selectedRoom)}
+              selectedName={activeAsset?.name || (projectState?.furniture || []).find((item) => item.instanceId === engineState.selectedAssetId)?.name || engineState.selectedRoom?.label || engineState.selectedObject?.name || activeRoomLabel || 'Selected element'}
               onShowAppearance={openSelectionAppearance}
               onFocusSelection={() => engineActions.camera.focusSelected()}
             />
@@ -1102,6 +1312,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           <ViewportToolbar
           isMeasuring={engineState.isMeasuring}
           isClipping={engineState.isClipping}
+          onOpenRooms={() => setShowRoomBrowser((open) => !open)}
+          roomsOpen={showRoomBrowser}
+          roomCount={roomAnalysisState.rooms.length}
+          roomsLoading={roomAnalysisState.status === 'loading'}
           isMaxView={isMaxView}
           isFullscreen={isFullscreen}
           navMode={engineState.navMode}
@@ -1111,7 +1325,27 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             if (engineState.isClipping) engineActions.toggleClipping();
             engineActions.setTransformMode('select');
           }}
-          onNavMode={(next) => engineActions.setNavMode(next)}
+          onNavMode={(next) => {
+            if (next === 'planView') {
+              engineActions.camera.preset('top');
+              setCameraProjection('ortho');
+            } else if (next === 'orbit') {
+              if (engineState.navMode === 'firstPerson') {
+                exitRoomCamera();
+              } else if (engineState.navMode === 'planView') {
+                engineActions.camera.overview(0.65);
+                setCameraProjection('perspective');
+              } else {
+                engineActions.setNavMode('orbit');
+                engineActions.camera.setProjection('perspective');
+                setCameraProjection('perspective');
+              }
+            } else if (next === 'firstPerson') {
+              const room = activeRoomContext || engineState.selectedRoom;
+              if (room) selectRoomInEditor(room);
+              else setToastMessage('Choose a room from the Floor map before entering interior view.');
+            }
+          }}
           transformMode={engineState.transformMode}
           onMeasure={() => engineActions.toggleMeasurementMode()}
           onClip={() => engineActions.toggleClipping()}
@@ -1138,6 +1372,22 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           onUndo={undo}
           onRedo={redo}
           isDarkMode={isDarkMode}
+          />
+          <RoomBrowserPanel
+            open={showRoomBrowser}
+            onClose={() => setShowRoomBrowser(false)}
+            rooms={roomAnalysisState.rooms}
+            analysis={roomAnalysisState.analysis}
+            onRefresh={() => loadRoomAnalysis({ forceRebuild: true })}
+            levels={roomAnalysisState.levels}
+            status={roomAnalysisState.status}
+            error={roomAnalysisState.error}
+            selectedRoomId={engineState.selectedRoom?.id || null}
+            roomProperties={projectState.roomProperties || {}}
+            onSelectRoom={(room) => selectRoomInEditor(room)}
+            onRetry={() => loadRoomAnalysis({ forceRebuild: true })}
+            isDarkMode={isDarkMode}
+            leftOffset={isLeftPanelOpen ? 352 : 16}
           />
         </>
       )}
@@ -1373,6 +1623,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
               engineActions.clearSelection();
             }}
             fileName={fileName}
+            catalogSearchTerm={catalogSearchTerm}
+            onCatalogSearchTermChange={setCatalogSearchTerm}
+            activeRoomLabel={activeRoomLabel}
             projectState={projectState}
             isCeilingHidden={(projectState.ceiling_hidden_entity_ids || []).length > 0}
             onToggleCeiling={handleToggleCeiling}
@@ -1392,6 +1645,42 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             rightTab={rightTab}
             setRightTab={setRightTab}
             selectedObject={engineState.selectedObject}
+            selectedRoom={engineState.selectedRoom}
+            roomContext={roomContextForPanel}
+            onReturnToRoom={returnToRoomOverview}
+            roomMapRooms={roomAnalysisState.rooms}
+            roomMapLevels={roomAnalysisState.levels}
+            roomMapAnalysis={roomAnalysisState.analysis}
+            roomMapStatus={roomAnalysisState.status}
+            roomMapError={roomAnalysisState.error}
+            onRetryRoomMap={() => loadRoomAnalysis({ forceRebuild: true })}
+            activeRoomId={activeRoomContext?.id || engineState.selectedRoom?.id || null}
+            roomNavMode={engineState.navMode}
+            onSelectMapRoom={selectRoomInEditor}
+            onExitRoomMode={exitRoomCamera}
+            onPlanMapRoom={showRoomPlan}
+            onSetTransformMode={engineActions.setTransformMode}
+            roomFurniture={roomFurniture}
+            nativeRoomElements={nativeRoomElements}
+            onSelectNativeRoomElement={(element) => {
+              const selected = engineActions.selectNativeElement?.(element?.globalId);
+              if (!selected) setToastMessage('This native IFC element is not available in the loaded scene. Check that the active IFC matches the room-analysis source, then reload Rooms.');
+            }}
+            onSelectRoomAsset={handleSelectRoomAsset}
+            onReplaceRoomAsset={openReplaceRoomAsset}
+            onDeleteRoomAsset={deleteRoomAsset}
+            roomProperties={projectState.roomProperties || {}}
+            onUpdateRoom={setRoomProperties}
+            onFocusRoom={() => { const room = activeRoomContext || engineState.selectedRoom; if (room) selectRoomInEditor(room); }}
+            onPlanRoom={() => showRoomPlan(activeRoomContext || engineState.selectedRoom)}
+            onPlanCamera={() => { engineActions.camera.preset('top'); setCameraProjection('ortho'); }}
+            onOpenRoomCeilingDesigner={() => setShowCeilingDesigner(true)}
+            onSelectRoomBoundaryWalls={() => {
+              const count = engineActions.selectRoomBoundaryWalls?.(activeRoomContext || engineState.selectedRoom) || 0;
+              if (!count) setToastMessage('No matching boundary wall objects were found in the loaded IFC scene.');
+              else setToastMessage(`Selected ${count} boundary wall${count === 1 ? '' : 's'}. Edit them individually or use multi-wall appearance controls.`);
+            }}
+            hasDesignedCeiling={(projectState.ceilingDesigns || projectState.ceilings || []).some((item) => item?.roomId === (activeRoomContext || engineState.selectedRoom)?.id || item?.roomId === (activeRoomContext || engineState.selectedRoom)?.navigationRoomId)}
             selectedElements={engineState.selectedElements}
             multiSelectMode={engineState.multiSelectMode}
             onToggleMultiSelect={engineActions.toggleMultiSelectMode}
@@ -1418,7 +1707,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   engineActions.clearSelection();
 }}
             onDeleteSelected={handleDeleteSelection}
-            onBrowseItems={() => openLeftPanelTab('assets')}
+            onBrowseItems={(searchTerm = '') => openLeftPanelTab('assets', typeof searchTerm === 'string' ? searchTerm : '')}
             projectState={projectState}
             engineState={engineState}
             engineActions={engineActions}
@@ -1470,6 +1759,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       <CeilingDesignerModal
         open={showCeilingDesigner}
         jobId={jobId}
+        initialRoomId={activeRoomContext?.id || activeRoomContext?.navigationRoomId || engineState.selectedRoom?.id || engineState.selectedRoom?.navigationRoomId || ''}
         existingCeilings={designedCeilings}
         onClose={() => { engineActions.clearRoomCeilingPreview?.(); setShowCeilingDesigner(false); }}
         onApply={handleApplyRoomCeilings}

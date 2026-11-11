@@ -410,71 +410,6 @@ app.get('/api/assets', (req, res) => {
 
 
 // ==========================================
-// SAVED 360 LAYOUT SNAPSHOT CONTRACT
-// ==========================================
-// Current WalkNavigationPipeline writes walk_hotspots.json (areas + hotspots).
-// walk_areas.json is retained as an optional legacy artifact only; it is not
-// produced by the current compiler and must never block a valid layout update.
-const SAVED_LAYOUT_REQUIRED_RENDER_FILES = [
-  'output.glb',
-  'navigation_surface.json',
-  'navigation_navmesh.bin',
-  'walk_hotspots.json',
-  'input.ifc',
-];
-
-const SAVED_LAYOUT_OPTIONAL_RENDER_FILES = [
-  'original.ifc',
-  'walk_areas.json', // Legacy compatibility only.
-  'presentation_rooms.json',
-  'presentation_portals.json',
-  'presentation_room_graph.json',
-  'navigation_meta.json',
-  'room_connectivity.json',
-  'doorway_traversability.json',
-  'hosted_door_portals.json',
-  'performance_report.json',
-  'optimization_report.json',
-  'presentation_manifest.json',
-];
-
-function inspectSavedLayoutRenderSnapshot(sourceJobDir) {
-  const missingFiles = SAVED_LAYOUT_REQUIRED_RENDER_FILES.filter((fileName) => (
-    !fs.existsSync(path.join(sourceJobDir, fileName))
-    || !fs.statSync(path.join(sourceJobDir, fileName)).isFile()
-    || fs.statSync(path.join(sourceJobDir, fileName)).size <= 0
-  ));
-  if (missingFiles.length) return { files: [], missingFiles };
-
-  const files = [
-    ...SAVED_LAYOUT_REQUIRED_RENDER_FILES,
-    ...SAVED_LAYOUT_OPTIONAL_RENDER_FILES.filter((fileName) => (
-      fs.existsSync(path.join(sourceJobDir, fileName))
-      && fs.statSync(path.join(sourceJobDir, fileName)).isFile()
-    )),
-  ];
-
-  // A few older working jobs do not retain original.ifc separately. Keep the
-  // restore contract intact by using the exact rendered input as the fallback.
-  if (!files.includes('original.ifc')) files.push('original.ifc');
-  return { files, missingFiles: [] };
-}
-
-function copySavedLayoutRenderSnapshot(sourceJobDir, destinationJobDir, files) {
-  fs.mkdirSync(destinationJobDir, { recursive: true });
-  for (const fileName of files) {
-    const sourceName = fileName === 'original.ifc'
-      && !fs.existsSync(path.join(sourceJobDir, 'original.ifc'))
-      ? 'input.ifc'
-      : fileName;
-    fs.copyFileSync(
-      path.join(sourceJobDir, sourceName),
-      path.join(destinationJobDir, fileName),
-    );
-  }
-}
-
-// ==========================================
 // SAVED 360 LAYOUTS API
 // ==========================================
 // Each saved layout is an immutable snapshot of the already-rendered scene.
@@ -509,12 +444,8 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     if (!requireActiveProject(jobId, res)) return;
 
     const parentJobDir = path.join(jobsDir, jobId);
-    const snapshot = inspectSavedLayoutRenderSnapshot(parentJobDir);
-    if (snapshot.missingFiles.length) {
-      return res.status(409).json({
-        error: `The 360 render is not ready to save. Missing required artifacts: ${snapshot.missingFiles.join(', ')}. Run a fresh 360 render and try again.`,
-        missingFiles: snapshot.missingFiles,
-      });
+    if (!fs.existsSync(path.join(parentJobDir, 'output.glb'))) {
+      return res.status(409).json({ error: 'Run the final 360 render before saving a layout.' });
     }
 
     const rawName = String(req.body?.name || '').trim();
@@ -541,10 +472,26 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     fs.mkdirSync(renderJobDir, { recursive: true });
     fs.mkdirSync(layoutsDir, { recursive: true });
 
-    // Freeze the exact compiled scene and the artifacts consumed by the React
-    // walkthrough. Current navigation uses walk_hotspots.json; walk_areas.json
-    // is copied only when found on legacy jobs.
-    copySavedLayoutRenderSnapshot(parentJobDir, renderJobDir, snapshot.files);
+    // Freeze everything needed to reproduce the render AND restore the scene
+    // back into the normal xeokit editor later.
+    //
+    // input.ifc = the exact IFC that was used for the final render, including
+    // any edits that were baked into the IFC (door cuts/rescale/etc.).
+    // original.ifc = kept for the normal project validation/continue-work flow.
+    // project_state.json below = the authored editor state (materials, furniture,
+    // structural edits, matrices, calibration, etc.).
+    [
+      'output.glb',
+      'navigation_surface.json',
+      'walk_areas.json',
+      'navigation_navmesh.bin',
+      'input.ifc',
+      'original.ifc',
+      'scene_frame.json',
+    ].forEach(fileName => {
+      const source = path.join(parentJobDir, fileName);
+      if (fs.existsSync(source)) fs.copyFileSync(source, path.join(renderJobDir, fileName));
+    });
 
     if (req.file?.buffer) fs.writeFileSync(path.join(renderJobDir, 'thumbnail.jpg'), req.file.buffer);
 
@@ -617,14 +564,20 @@ app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'
       return res.status(403).json({ error: 'The current working project is archived and cannot update a saved layout.' });
     }
 
-    const snapshot = inspectSavedLayoutRenderSnapshot(sourceJobDir);
-    if (snapshot.missingFiles.length) {
+    const requiredFiles = [
+      'output.glb',
+      'navigation_surface.json',
+      'walk_areas.json',
+      'navigation_navmesh.bin',
+      'input.ifc',
+      'original.ifc',
+    ];
+    const missingFiles = requiredFiles.filter((fileName) => !fs.existsSync(path.join(sourceJobDir, fileName)));
+    if (missingFiles.length) {
       return res.status(409).json({
-        error: `The current 360 render is incomplete. Missing required artifacts: ${snapshot.missingFiles.join(', ')}. Generate a fresh 360 render before updating this layout.`,
-        missingFiles: snapshot.missingFiles,
+        error: `Render snapshot is incomplete. Missing: ${missingFiles.join(', ')}`,
       });
     }
-    const snapshotFiles = snapshot.files;
 
     let renderConfig = {};
     if (req.body?.renderConfig) {
@@ -649,7 +602,20 @@ app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'
     // record. A failure therefore leaves the previous saved version usable.
     const newRenderJobId = generateSavedLayoutId();
     newSnapshotDir = path.join(jobsDir, newRenderJobId);
-    copySavedLayoutRenderSnapshot(sourceJobDir, newSnapshotDir, snapshotFiles);
+    fs.mkdirSync(newSnapshotDir, { recursive: true });
+
+    requiredFiles.forEach((fileName) => {
+      fs.copyFileSync(
+        path.join(sourceJobDir, fileName),
+        path.join(newSnapshotDir, fileName)
+      );
+    });
+    // Calibration provenance is part of the frozen render snapshot. Keep it
+    // optional for legacy projects created before scene_frame.json existed.
+    const sourceSceneFramePath = path.join(sourceJobDir, 'scene_frame.json');
+    if (fs.existsSync(sourceSceneFramePath)) {
+      fs.copyFileSync(sourceSceneFramePath, path.join(newSnapshotDir, 'scene_frame.json'));
+    }
 
     if (req.file?.buffer) {
       fs.writeFileSync(path.join(newSnapshotDir, 'thumbnail.jpg'), req.file.buffer);
@@ -833,6 +799,10 @@ app.post('/api/projects/:jobId/saved-layouts/:layoutId/restore', (req, res) => {
       path.join(newJobDir, 'original.ifc')
     );
     fs.copyFileSync(statePath, path.join(newJobDir, 'project_state.json'));
+    const sceneFramePath = path.join(sourceJobDir, 'scene_frame.json');
+    if (fs.existsSync(sceneFramePath)) {
+      fs.copyFileSync(sceneFramePath, path.join(newJobDir, 'scene_frame.json'));
+    }
 
     const now = new Date().toISOString();
     const sourceManifest = readManifest(sourceJobDir);
@@ -952,8 +922,22 @@ app.post('/api/projects/:jobId/layout', (req, res) => {
 
         fs.writeFileSync(
             path.join(newJobDir, 'project_state.json'),
-            JSON.stringify({ materials: {}, furniture: [] }, null, 2)
+            JSON.stringify({
+              materials: {},
+              furniture: [],
+              sceneFrame: {
+                schemaVersion: 1, revision: 0,
+                modelToScene: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+                geometryScaleAppliedToIfc: false, sourceLengthUnit: 'unknown',
+              },
+            }, null, 2)
         );
+        atomicWriteJson(path.join(newJobDir, 'scene_frame.json'), {
+          schemaVersion: 1, revision: 0,
+          modelToScene: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+          geometryScaleAppliedToIfc: false, sourceLengthUnit: 'unknown',
+          calibrationScale: { x: 1, y: 1, z: 1 },
+        });
 
         const now = new Date().toISOString();
         writeManifest(newJobDir, {
@@ -1000,7 +984,26 @@ app.post('/api/projects', projectCreateUpload.single('ifcFile'), (req, res) => {
         // original.ifc is strictly immutable
         fs.writeFileSync(path.join(jobDir, 'original.ifc'), req.file.buffer);
         fs.writeFileSync(path.join(jobDir, 'input.ifc'), req.file.buffer);
-        atomicWriteJson(path.join(jobDir, 'project_state.json'), { materials: {}, furniture: [] });
+        atomicWriteJson(path.join(jobDir, 'project_state.json'), {
+          materials: {},
+          furniture: [],
+          sceneFrame: {
+            schemaVersion: 1,
+            revision: 0,
+            modelToScene: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            geometryScaleAppliedToIfc: false,
+            sourceLengthUnit: 'unknown',
+          },
+        });
+        atomicWriteJson(path.join(jobDir, 'scene_frame.json'), {
+          schemaVersion: 1,
+          revision: 0,
+          modelToScene: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+          geometryScaleAppliedToIfc: false,
+          sourceLengthUnit: 'unknown',
+          calibrationScale: { x: 1, y: 1, z: 1 },
+          sourceIfcSha256: crypto.createHash('sha256').update(req.file.buffer).digest('hex'),
+        });
 
         const now = new Date().toISOString();
         const manifest = {
@@ -1089,6 +1092,110 @@ function resolveLocalTsxCli() {
     return directCandidates.find((candidate) => fs.existsSync(candidate)) || null;
 }
 
+// Room discovery has its own endpoint and payload contract. The room browser
+// must not depend on the ceiling designer's response version or UI lifecycle.
+app.post('/api/projects/:jobId/room-analysis', (req, res) => {
+    const { jobId } = req.params;
+    if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) return res.status(400).json({ error: 'Invalid project id.' });
+    if (!requireActiveProject(jobId, res)) return;
+
+    const jobDir = path.join(jobsDir, jobId);
+    const inputIfcPath = [path.join(jobDir, 'input.ifc'), path.join(jobDir, 'original.ifc')]
+        .find((candidate) => fs.existsSync(candidate));
+    const statePath = path.join(jobDir, 'project_state.json');
+    if (!inputIfcPath) return res.status(404).json({ error: 'Project IFC source was not found.' });
+    if (!fs.existsSync(statePath)) return res.status(409).json({ error: 'Project state is not ready yet. Save the project and retry.' });
+
+    const tsxCliPath = resolveLocalTsxCli();
+    if (!tsxCliPath) return res.status(500).json({
+        error: 'The local tsx runtime was not found. Install backend dependencies with npm install before running room analysis.',
+    });
+
+    const outputPath = path.join(jobDir, 'room_analysis.json');
+    const debugOutputPath = path.join(jobDir, 'room_topology_debug.json');
+    const scriptPath = path.join(__dirname, 'compiler', 'analyze-room-selection.ts');
+    if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: 'Room analysis script is missing.', details: scriptPath });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const MAX_OUTPUT = 8 * 1024 * 1024;
+    const child = spawn(process.execPath, [
+        tsxCliPath,
+        scriptPath,
+        jobDir,
+        inputIfcPath,
+        outputPath,
+        debugOutputPath,
+        req.body?.forceRebuild === true ? '--force' : '',
+    ].filter(Boolean), {
+        cwd: __dirname,
+        windowsHide: true,
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const timeout = setTimeout(() => {
+        if (settled) return;
+        child.kill();
+        settled = true;
+        if (!res.headersSent) res.status(504).json({ error: 'Room analysis timed out. Check the IFC geometry and retry.' });
+    }, 120000);
+    const finish = (status, payload) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (!res.headersSent) res.status(status).json(payload);
+    };
+
+    child.stdout.on('data', (chunk) => {
+        if (stdout.length < MAX_OUTPUT) stdout += chunk.toString().slice(0, MAX_OUTPUT - stdout.length);
+    });
+    child.stderr.on('data', (chunk) => {
+        if (stderr.length < MAX_OUTPUT) stderr += chunk.toString().slice(0, MAX_OUTPUT - stderr.length);
+    });
+    child.on('error', (error) => {
+        console.error('[RoomAnalysis] Failed to start local tsx process:', error);
+        finish(500, { error: 'Could not start room analysis.', details: error.message });
+    });
+    child.on('close', (code, signal) => {
+        if (settled) return;
+        if (code !== 0) {
+            console.error('[RoomAnalysis] Detector failed:', stderr || stdout || signal);
+            return finish(500, {
+                error: 'Room analysis failed for this IFC model.',
+                details: (stderr || stdout || `Process exited with ${code ?? signal}`).slice(-5000),
+            });
+        }
+        try {
+            const responseText = stdout.trim();
+            const result = responseText ? JSON.parse(responseText) : JSON.parse(fs.readFileSync(outputPath, 'utf8'));
+            const validVersion = Number.isSafeInteger(Number(result?.schemaVersion)) && Number(result.schemaVersion) >= 1;
+            const validRoomContract = result?.contract === 'hci.room-analysis'
+                && result?.coordinateSystem === 'hci-y-up-xz-horizontal'
+                && Array.isArray(result.rooms)
+                && Array.isArray(result.levels)
+                && result.rooms.every((room) => room && typeof room.id === 'string' && typeof room.levelId === 'string'
+                    && Array.isArray(room.boundary?.outer) && room.boundary.outer.length >= 3);
+            if (!validVersion || !validRoomContract) {
+                return finish(502, { error: 'Room analysis returned an invalid hci.room-analysis payload.', details: `schemaVersion=${result?.schemaVersion ?? 'missing'}, rooms=${Array.isArray(result?.rooms) ? result.rooms.length : 'invalid'}, levels=${Array.isArray(result?.levels) ? result.levels.length : 'invalid'}` });
+            }
+            finish(200, result);
+        } catch (error) {
+            console.error('[RoomAnalysis] Invalid detector response:', error.message, stdout.slice(-1000));
+            finish(502, { error: 'Room analysis returned invalid JSON.', details: error.message });
+        }
+    });
+
+    res.on('close', () => {
+        if (!res.writableEnded && !settled) {
+            settled = true;
+            clearTimeout(timeout);
+            child.kill();
+        }
+    });
+});
+
 app.post('/api/projects/:jobId/ceiling-analysis', (req, res) => {
     const { jobId } = req.params;
     if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) return res.status(400).json({ error: 'Invalid project id.' });
@@ -1166,27 +1273,14 @@ app.post('/api/projects/:jobId/ceiling-analysis', (req, res) => {
         try {
             const responseText = stdout.trim();
             const result = responseText ? JSON.parse(responseText) : JSON.parse(fs.readFileSync(outputPath, 'utf8'));
-            // CeilingAnalysisService currently emits schemaVersion 2. Keep
-            // accepting v1 during the migration window so older cached outputs
-            // and compatible workers remain usable, while validating the same
-            // required rooms/levels arrays for both response versions.
-            const schemaVersion = Number(result?.schemaVersion);
-            const supportedSchemaVersions = [1, 2];
-            if (
-                !supportedSchemaVersions.includes(schemaVersion) ||
-                !Array.isArray(result?.rooms) ||
-                !Array.isArray(result?.levels)
-            ) {
-                const details = [
-                    `schemaVersion=${String(result?.schemaVersion ?? 'missing')}`,
-                    `rooms=${Array.isArray(result?.rooms) ? 'array' : typeof result?.rooms}`,
-                    `levels=${Array.isArray(result?.levels) ? 'array' : typeof result?.levels}`,
-                    `supported=${supportedSchemaVersions.join(',')}`,
-                ].join('; ');
-                console.error('[CeilingAnalysis] Unsupported response contract:', details);
-                return finish(500, {
-                    error: 'Ceiling analysis returned an unsupported response contract.',
-                    details,
+            // Schema versions are additive. Validate the stable response envelope
+            // instead of keeping a second, manually maintained version allowlist.
+            const validVersion = Number.isSafeInteger(Number(result?.schemaVersion)) && Number(result.schemaVersion) >= 1;
+            const validEnvelope = Array.isArray(result?.rooms) && Array.isArray(result?.levels);
+            if (!validVersion || !validEnvelope) {
+                return finish(502, {
+                    error: 'Ceiling analysis returned an invalid response envelope.',
+                    details: `schemaVersion=${result?.schemaVersion ?? 'missing'}, rooms=${Array.isArray(result?.rooms) ? result.rooms.length : 'invalid'}, levels=${Array.isArray(result?.levels) ? result.levels.length : 'invalid'}`,
                 });
             }
             finish(200, result);
@@ -1698,43 +1792,146 @@ app.post('/api/projects/:jobId/rescale', (req, res) => {
     const { jobId } = req.params;
     if (!requireActiveProject(jobId, res)) return;
 
-    const { factor } = req.body;
+    const factor = Number(req.body?.factor);
+    const axis = String(req.body?.axis || 'uniform').toLowerCase();
+    if (!Number.isFinite(factor) || factor <= 0 || factor > 100 || factor < 0.01) {
+      return res.status(400).json({ error: 'Calibration factor must be between 0.01 and 100.' });
+    }
+    if (!['uniform', 'y'].includes(axis)) {
+      return res.status(400).json({ error: 'Axis must be uniform or y.' });
+    }
+
     const jobDir = path.join(jobsDir, jobId);
     const inputPath = path.join(jobDir, 'input.ifc');
+    const originalPath = path.join(jobDir, 'original.ifc');
     const scriptPath = path.join(__dirname, 'ifc_element_editor.py');
+    const tempOutputPath = path.join(jobDir, `input.calibration-${process.pid}-${Date.now()}.ifc`);
 
     try {
-        const child = require('child_process').spawnSync('python', [
-            scriptPath, 'rescale', 
-            '--input', inputPath, 
-            '--output', inputPath, 
-            '--factor', factor
-        ], { encoding: 'utf-8' });
+      if (!fs.existsSync(inputPath)) {
+        if (!fs.existsSync(originalPath)) return res.status(404).json({ error: 'Canonical IFC source is missing.' });
+        fs.copyFileSync(originalPath, inputPath);
+      }
 
-        const stdoutTrimmed = (child.stdout || '').trim();
-        if (!stdoutTrimmed) {
-             return res.status(500).json({ error: child.stderr ? `Python Crash: ${child.stderr.toString()}` : 'Python script crashed without output.' });
+      const framePath = path.join(jobDir, 'scene_frame.json');
+      const projectStatePath = path.join(jobDir, 'project_state.json');
+      let frame = {};
+      let savedProjectState = {};
+      try { if (fs.existsSync(framePath)) frame = JSON.parse(fs.readFileSync(framePath, 'utf8')); } catch (_) {}
+      try { if (fs.existsSync(projectStatePath)) savedProjectState = JSON.parse(fs.readFileSync(projectStatePath, 'utf8')); } catch (_) {}
+
+      const alreadyEmbedded = frame.geometryScaleAppliedToIfc === true ||
+        savedProjectState.sceneFrame?.geometryScaleAppliedToIfc === true;
+      const legacyScale = savedProjectState.scene_calibration?.scaleFactor || { x: 1, y: 1, z: 1 };
+      const legacy = { x: Number(legacyScale.x) || 1, y: Number(legacyScale.y) || 1, z: Number(legacyScale.z) || 1 };
+      const legacyNeedsEmbedding = !alreadyEmbedded &&
+        [legacy.x, legacy.y, legacy.z].some(value => Math.abs(value - 1) > 1e-9);
+      const legacyUniform = Math.abs(legacy.x - legacy.y) < 1e-8 && Math.abs(legacy.y - legacy.z) < 1e-8;
+      const intermediatePath = `${tempOutputPath}.legacy.ifc`;
+      let calibrationInputPath = inputPath;
+      let previous = alreadyEmbedded
+        ? (frame.calibrationScale || legacy)
+        : { x: 1, y: 1, z: 1 };
+
+      if (legacyNeedsEmbedding) {
+        // Legacy projects used a compiler-only scene scale while input.ifc was
+        // routinely reset to original.ifc during render. Only auto-migrate when
+        // the canonical input is byte-identical to original.ifc; if it differs,
+        // it may contain independent IFC edits and must not be guessed at.
+        if (!legacyUniform) {
+          return res.status(409).json({ error: 'This project has a legacy non-uniform calibration. Automatic migration is unsafe; restore the source layout and recalibrate using a supported reference.' });
         }
-        
-        const responseData = JSON.parse(child.stdout.trim());
-        if (responseData.error) return res.status(500).json(responseData);
+        if (!fs.existsSync(originalPath) || sha256File(inputPath) !== sha256File(originalPath)) {
+          return res.status(409).json({ error: 'This legacy project has calibration metadata but its IFC differs from the immutable original. We cannot safely determine whether the old scale is already embedded. No file was changed; please provide the project for calibration migration.' });
+        }
+        const migration = require('child_process').spawnSync('python', [
+          scriptPath, 'rescale', '--input', inputPath, '--output', intermediatePath,
+          '--factor', String(legacy.x), '--axis', 'uniform',
+        ], { encoding: 'utf-8', maxBuffer: 20 * 1024 * 1024 });
+        let migrationResult = {};
+        try { migrationResult = migration.stdout?.trim() ? JSON.parse(migration.stdout.trim()) : {}; } catch (_) {}
+        if (migration.status !== 0 || migrationResult.error || !fs.existsSync(intermediatePath)) {
+          try { if (fs.existsSync(intermediatePath)) fs.unlinkSync(intermediatePath); } catch (_) {}
+          return res.status(500).json({ error: migrationResult.error || migration.stderr || 'Legacy calibration migration failed; canonical IFC was not changed.' });
+        }
+        calibrationInputPath = intermediatePath;
+        previous = legacy;
+      }
 
-        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-        const host = req.headers.host; 
-        
-        res.json({ 
-            success: true, 
-            fileUrl: `${protocol}://${host}/jobs/${jobId}/input.ifc?v=${Date.now()}` 
+      const child = require('child_process').spawnSync('python', [
+        scriptPath, 'rescale',
+        '--input', calibrationInputPath,
+        '--output', tempOutputPath,
+        '--factor', String(factor),
+        '--axis', axis,
+      ], { encoding: 'utf-8', maxBuffer: 20 * 1024 * 1024 });
+
+      const stdoutTrimmed = (child.stdout || '').trim();
+      let responseData = {};
+      try { responseData = stdoutTrimmed ? JSON.parse(stdoutTrimmed) : {}; }
+      catch (_) { responseData = { error: child.stderr || 'Calibration tool returned invalid output.' }; }
+      try { if (fs.existsSync(intermediatePath)) fs.unlinkSync(intermediatePath); } catch (_) {}
+
+      if (child.status !== 0 || responseData.error || !fs.existsSync(tempOutputPath)) {
+        try { if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath); } catch (_) {}
+        return res.status(500).json({
+          error: responseData.error || child.stderr || 'IFC calibration failed; the original project file was not replaced.',
         });
+      }
+
+      // Atomic promotion: never leave a partially-written canonical IFC.
+      fs.renameSync(tempOutputPath, inputPath);
+
+      const nextScale = {
+        x: Number(previous.x) || 1,
+        y: Number(previous.y) || 1,
+        z: Number(previous.z) || 1,
+      };
+      if (axis === 'uniform') {
+        nextScale.x *= factor; nextScale.y *= factor; nextScale.z *= factor;
+      } else {
+        // IFC source is Z-up; HCI scene is Y-up. The backend's --axis y
+        // option scales source Z, which maps to scene Y.
+        nextScale.y *= factor;
+      }
+      const nextFrame = {
+        ...frame,
+        schemaVersion: 1,
+        revision: Number(frame.revision || 0) + 1,
+        // Source IFC coordinates map to the currently calibrated IFC frame.
+        // IFC is Z-up; this matrix is expressed in HCI's Y-up scene axes.
+        modelToScene: [
+          nextScale.x, 0, 0, 0,
+          0, nextScale.y, 0, 0,
+          0, 0, nextScale.z, 0,
+          0, 0, 0, 1,
+        ],
+        geometryScaleAppliedToIfc: true,
+        calibrationScale: nextScale,
+        lastCalibration: { factor, axis, appliedAt: new Date().toISOString() },
+        calibratedIfcSha256: sha256File(inputPath),
+      };
+      atomicWriteJson(framePath, nextFrame);
+
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+      const host = req.headers.host;
+      res.json({
+        success: true,
+        axis,
+        factor,
+        sceneFrame: nextFrame,
+        fileUrl: `${protocol}://${host}/jobs/${jobId}/input.ifc?v=${Date.now()}`,
+      });
     } catch (error) {
-        res.status(500).json({ error: `Server exception: ${error.message}` });
+      try { if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath); } catch (_) {}
+      res.status(500).json({ error: `Server exception: ${error.message}` });
     }
 });
 
 // ==========================================
 // RENDER CACHE HELPERS
 // ==========================================
-const RENDER_CACHE_VERSION = 'hci-render-cache-v5-preserve-glb-hierarchy-and-semantic-transforms';
+const RENDER_CACHE_VERSION = 'hci-render-cache-v2';
 const RENDER_CACHE_REQUIRED_ARTIFACTS = [
     'output.glb',
     'navigation_navmesh.bin',
@@ -1752,12 +1949,17 @@ const RENDER_PIPELINE_SOURCE_FILES = [
     'package.json',
     'scene_merger.py',
     'compiler/compiler.ts',
-    'compiler/ceiling/CeilingGeometry.ts',
     'compiler/geometry.ts',
     'compiler/math.ts',
     'compiler/glb-optimizer.ts',
     'compiler/navigation/WalkNavigationPipeline.ts',
     'compiler/navigation/RoomDetector.ts',
+    'compiler/navigation/RoomTopologyReconstructor.ts',
+    'compiler/navigation/RoomFootprintReconstructor.ts',
+    'compiler/navigation/RoomTypes.ts',
+    'compiler/navigation/RoomLevelAssociation.ts',
+    'compiler/room-analysis/RoomAnalysisService.ts',
+    'compiler/ceiling/CeilingAnalysisService.ts',
     'compiler/performanceReport.ts',
     'compiler/presentationManifest.ts',
 ];
@@ -1849,17 +2051,6 @@ function computeRenderInputSignature(jobDir) {
     for (const item of Array.isArray(projectState.furniture) ? projectState.furniture : []) {
         addDependency(item?.src);
     }
-    // Ceiling texture/fabric finishes are first-class render inputs. Include
-    // their files in the cache key so replacing a library texture cannot reuse
-    // an older GLB compiled with the previous image.
-    const ceilingDesigns = Array.isArray(projectState.ceilingDesigns)
-        ? projectState.ceilingDesigns
-        : (Array.isArray(projectState.ceilings) ? projectState.ceilings : []);
-    for (const ceiling of ceilingDesigns) {
-        addDependency(ceiling?.finish?.texture?.src);
-        addDependency(ceiling?.finish?.textureSrc);
-        addDependency(ceiling?.finish?.textureUrl);
-    }
     const materials = projectState.materials && typeof projectState.materials === 'object'
         ? Object.values(projectState.materials)
         : [];
@@ -1881,6 +2072,7 @@ function computeRenderInputSignature(jobDir) {
         version: RENDER_CACHE_VERSION,
         inputIfc: fileStamp(inputIfcPath, true),
         projectState: fileStamp(projectStatePath, true),
+        sceneFrame: fileStamp(path.join(jobDir, 'scene_frame.json'), true),
         code: codeStamps,
         dependencies: assetStamps,
         optimizer: {
@@ -1942,18 +2134,23 @@ app.post('/api/render', renderUpload.single('ifcFile'), (req, res) => {
     if (!requireActiveProject(jobId, res)) return;
     const jobDir = path.join(jobsDir, jobId);
 
-    if (req.file) {
-        fs.writeFileSync(path.join(jobDir, 'input.ifc'), req.file.buffer);
-    } else {
-        const inputIfcPath = path.join(jobDir, 'input.ifc');
-        if (!fs.existsSync(inputIfcPath)) {
-            const generatedIfcPath = path.join(jobDir, `${jobId}_Generated.ifc`);
-            if (fs.existsSync(generatedIfcPath)) {
-                fs.copyFileSync(generatedIfcPath, inputIfcPath);
-            } else {
-                return res.status(400).json({ error: 'input.ifc or AI-generated IFC not found.' });
-            }
+    // Existing jobs own their canonical input.ifc. A browser File is the
+    // original upload and may predate calibration or IFC edits; accepting it
+    // here silently reverts the server's authoritative geometry.
+    const inputIfcPath = path.join(jobDir, 'input.ifc');
+    if (!fs.existsSync(inputIfcPath)) {
+        const generatedIfcPath = path.join(jobDir, `${jobId}_Generated.ifc`);
+        const originalIfcPath = path.join(jobDir, 'original.ifc');
+        if (fs.existsSync(generatedIfcPath)) {
+            fs.copyFileSync(generatedIfcPath, inputIfcPath);
+        } else if (fs.existsSync(originalIfcPath)) {
+            fs.copyFileSync(originalIfcPath, inputIfcPath);
+        } else {
+            return res.status(400).json({ error: 'Canonical input.ifc is missing for this project.' });
         }
+    }
+    if (req.file) {
+        console.warn(`[Render] Ignoring browser IFC upload for existing job ${jobId}; canonical input.ifc is authoritative.`);
     }
 
     const projectStatePath = path.join(jobDir, 'project_state.json');

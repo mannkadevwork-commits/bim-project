@@ -105,6 +105,14 @@ interface MaterialEntry {
 }
 
 interface ProjectState {
+  sceneFrame?: {
+    schemaVersion?: number;
+    revision?: number;
+    modelToScene?: number[];
+    geometryScaleAppliedToIfc?: boolean;
+    sourceLengthUnit?: string;
+    calibrationScale?: { x: number; y: number; z: number };
+  };
   structural_edits?: Record<string, StructuralEditEntry>;
   materials?: Record<string, MaterialEntry>;
   furniture: FurnitureItem[];
@@ -951,9 +959,9 @@ function toPresentationVec3(value: any): [number, number, number] | null {
   return [result[0], result[1], result[2]];
 }
 
-// RoomDetector currently derives room regions from wall-grid components, so its
-// component centers can be several metres from a doorway. Do not bridge unrelated
-// room regions across the house just because they lie on opposite sides of a wall.
+// RoomDetector derives physical room faces from wall topology and logical zones
+// inside connected open-plan faces. Their representative centres can still be
+// several metres from a doorway; do not bridge unrelated rooms based on proximity.
 const MAX_ROOM_CENTER_PORTAL_ASSOCIATION_DISTANCE_METERS = 5.0;
 
 function roomCenterForPortalSide(
@@ -1505,33 +1513,47 @@ export async function compileScene(
       );
     }
 
-    const persistedCalibration =
-      projectState.scene_calibration?.scaleFactor;
+    const persistedCalibration = projectState.scene_calibration?.scaleFactor;
+    let sceneFrameMetadata: any = null;
+    try {
+      const sceneFramePath = path.join(jobDirectory, "scene_frame.json");
+      if (fs.existsSync(sceneFramePath)) {
+        sceneFrameMetadata = JSON.parse(fs.readFileSync(sceneFramePath, "utf8"));
+      }
+    } catch (error) {
+      console.warn(
+        "[compiler:scene-frame] Could not read scene_frame.json; using legacy calibration metadata.",
+        error,
+      );
+    }
 
-    const calibrationScale: [
-      number,
-      number,
-      number
-    ] =
-      persistedCalibration &&
-      Number.isFinite(persistedCalibration.x) &&
-      Number.isFinite(persistedCalibration.y) &&
-      Number.isFinite(persistedCalibration.z) &&
-      persistedCalibration.x > 0 &&
-      persistedCalibration.y > 0 &&
-      persistedCalibration.z > 0
-        ? [
-            persistedCalibration.x,
-            persistedCalibration.y,
-            persistedCalibration.z,
-          ]
-        : [1, 1, 1];
+    const geometryScaleAppliedToIfc =
+      sceneFrameMetadata?.geometryScaleAppliedToIfc === true ||
+      projectState.sceneFrame?.geometryScaleAppliedToIfc === true;
 
-    if (
-      calibrationScale.some(
-        (value) => Math.abs(value - 1) > 1e-9,
-      )
-    ) {
+    // Calibrated jobs physically embed their scale in canonical input.ifc.
+    // Legacy jobs without that marker still need the old scene wrapper.
+    // Never apply the same calibration to structural geometry twice.
+    const calibrationScale: [number, number, number] = geometryScaleAppliedToIfc
+      ? [1, 1, 1]
+      : persistedCalibration &&
+        Number.isFinite(persistedCalibration.x) &&
+        Number.isFinite(persistedCalibration.y) &&
+        Number.isFinite(persistedCalibration.z) &&
+        persistedCalibration.x > 0 &&
+        persistedCalibration.y > 0 &&
+        persistedCalibration.z > 0
+          ? [persistedCalibration.x, persistedCalibration.y, persistedCalibration.z]
+          : [1, 1, 1];
+
+    console.log("[compiler:scene-frame] Calibration source", {
+      geometryScaleAppliedToIfc,
+      calibrationScale,
+      frameRevision: sceneFrameMetadata?.revision ?? projectState.sceneFrame?.revision ?? null,
+      sourceLengthUnit: sceneFrameMetadata?.sourceLengthUnit ?? projectState.sceneFrame?.sourceLengthUnit ?? "unknown",
+    });
+
+    if (calibrationScale.some((value) => Math.abs(value - 1) > 1e-9)) {
       const structureFrame = doc
         .createNode("IFC_Structure_Frame")
         .addChild(structureNode);
@@ -1539,13 +1561,10 @@ export async function compileScene(
       structureFrame.setScale(calibrationScale);
       scene.addChild(structureFrame);
 
-      debugLog(
-        "[compiler:calibration] applied structural scene-frame scale",
-        {
-          calibrationScale,
-          pivot: "world-origin",
-        },
-      );
+      debugLog("[compiler:calibration] applied legacy structural scene-frame scale", {
+        calibrationScale,
+        pivot: "world-origin",
+      });
     } else {
       scene.addChild(structureNode);
     }

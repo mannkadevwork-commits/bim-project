@@ -8,6 +8,7 @@ import {
   IFCRELVOIDSELEMENT,
   IFCRELFILLSELEMENT,
   IFCSLAB,
+  IFCFURNISHINGELEMENT,
   IFCROOF,
   IFCCOVERING,
   IFCWALL,
@@ -15,10 +16,11 @@ import {
   IFCPROJECT,
   IFCSPACE,
 } from "web-ifc";
-import type { DetectedRoom, RoomDebugArtifact, RoomPortal, RoomPolygonPoint } from "./RoomTypes";
+import type { DetectedRoom, DetectedRoomElement, RoomDebugArtifact, RoomPortal, RoomPolygonPoint } from "./RoomTypes";
 import { makeComponentDiagnostics, makeDoorDiagnostic, makeRoomBoundaryCandidateDiagnostics } from "./RoomDiagnostics";
-import { partitionFloorByRoomAnchors } from "./RoomAnchorPartition";
-import type { ResolvedRoomAnchor, RoomAnchorSeed } from "./RoomAnchorPartition";
+import type { RoomFootprintAnchor } from "./RoomFootprintReconstructor";
+import { createDoorGapClosureFootprint, reconstructRoomsFromWallFootprints, polygonArea as planarPolygonArea } from "./RoomPlanarGraph";
+import { readIfcStepSpaceFootprints } from "./IfcStepSpaceFootprints";
 
 interface Point2 {
   x: number;
@@ -87,15 +89,31 @@ interface Grid {
   room: Int32Array;
 }
 
+interface ResolvedRoomAnchor extends RoomFootprintAnchor {
+  snappedX: number;
+  snappedY: number;
+  snapDistanceMeters: number;
+  associationMethod?: "inside-room-polygon" | "nearest-room-polygon";
+}
+
 interface Component {
   id: number;
   cells: number[];
   area: number;
+  center?: Point2;
   minI: number;
   maxI: number;
   minJ: number;
   maxJ: number;
   touchesBoundary: boolean;
+  /** Vector boundary extracted from semantic wall-constrained floor regions. */
+  polygon?: Point2[];
+  holes?: Point2[][];
+  anchor?: ResolvedRoomAnchor;
+  reconstructionSource?: "ifc-space-step-profile-v1" | "ifc-space-body-envelope-v1" | "ifc-space-wall-constrained-geodesic-v2" | "wall-face-reconstruction";
+  boundaryWallIds?: string[];
+  semanticSpaces?: ResolvedRoomAnchor[];
+  confidence?: number;
 }
 
 const CELL_SIZE = 0.05;
@@ -129,29 +147,21 @@ function getWrappedValue(value: any): any {
   return current;
 }
 
-function numericVector3(value: any): [number, number, number] | null {
+/**
+ * web-ifc GetLine() exposes EXPRESS scalar values as typed wrappers, e.g.
+ * IfcLengthMeasure { type: 4, value: 3.25 }. Number(wrapper) is NaN.
+ * Always unwrap each aggregate member before numeric conversion; unwrapping
+ * only the aggregate itself is not sufficient for Coordinates/DirectionRatios.
+ */
+function ifcScalarNumber(value: any, fallback = Number.NaN): number {
   const unwrapped = getWrappedValue(value);
-  if (unwrapped == null) return null;
+  const number = typeof unwrapped === "number" ? unwrapped : Number(unwrapped);
+  return Number.isFinite(number) ? number : fallback;
+}
 
-  let values: any[] | null = null;
-  if (Array.isArray(unwrapped)) {
-    values = unwrapped;
-  } else if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(unwrapped)) {
-    values = Array.from(unwrapped as any);
-  } else if (typeof unwrapped === "object") {
-    const candidate = (unwrapped as any).value;
-    if (Array.isArray(candidate) || (candidate && typeof candidate.length === "number")) {
-      values = Array.from(candidate);
-    } else {
-      const ordered = [unwrapped[0], unwrapped[1], unwrapped[2]];
-      if (ordered.some((v) => v !== undefined)) values = ordered;
-    }
-  }
-
-  if (!values || values.length < 3) return null;
-  const nums = values.slice(0, 3).map(Number);
-  if (nums.some((n) => !Number.isFinite(n))) return null;
-  return [nums[0], nums[1], nums[2]];
+function ifcNumberArray(value: any): number[] {
+  // Preserve coordinate indices; callers decide how to handle missing values.
+  return asIfcArray(value).map((item) => ifcScalarNumber(item));
 }
 
 function ifcZUpToViewer(p: Point3): Point3 {
@@ -178,23 +188,108 @@ function numberField(line: any, field: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function extractPlacementPointRaw(ifc: IfcAPI, modelId: number, placementExpressId: number | null, depth = 0): Point3 | null {
-  if (!placementExpressId || depth > 24) return null;
+interface PlacementFrame {
+  origin: Point3;
+  xAxis: Point3;
+  yAxis: Point3;
+  zAxis: Point3;
+}
+
+function dot3(a: Point3, b: Point3): number {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+function cross3(a: Point3, b: Point3): Point3 {
+  return { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x };
+}
+
+function normalize3(vector: Point3, fallback: Point3): Point3 {
+  const length = Math.hypot(vector.x, vector.y, vector.z);
+  if (!Number.isFinite(length) || length <= 1e-10) return fallback;
+  return { x: vector.x / length, y: vector.y / length, z: vector.z / length };
+}
+
+function readPointCoordinates(ifc: IfcAPI, modelId: number, pointId: number | null): Point3 {
+  if (!pointId) return { x: 0, y: 0, z: 0 };
+  const point: any = ifc.GetLine(modelId, pointId);
+  const values = ifcNumberArray(point?.Coordinates);
+  return {
+    x: Number.isFinite(values[0]) ? values[0] : 0,
+    y: Number.isFinite(values[1]) ? values[1] : 0,
+    z: Number.isFinite(values[2]) ? values[2] : 0,
+  };
+}
+
+function readDirection(ifc: IfcAPI, modelId: number, directionId: number | null, fallback: Point3): Point3 {
+  if (!directionId) return fallback;
+  const direction: any = ifc.GetLine(modelId, directionId);
+  const values = ifcNumberArray(direction?.DirectionRatios);
+  return normalize3({
+    x: Number.isFinite(values[0]) ? values[0] : fallback.x,
+    y: Number.isFinite(values[1]) ? values[1] : fallback.y,
+    z: Number.isFinite(values[2]) ? values[2] : fallback.z,
+  }, fallback);
+}
+
+function composePlacementFrames(parent: PlacementFrame, local: PlacementFrame): PlacementFrame {
+  const transformVector = (vector: Point3): Point3 => ({
+    x: parent.xAxis.x * vector.x + parent.yAxis.x * vector.y + parent.zAxis.x * vector.z,
+    y: parent.xAxis.y * vector.x + parent.yAxis.y * vector.y + parent.zAxis.y * vector.z,
+    z: parent.xAxis.z * vector.x + parent.yAxis.z * vector.y + parent.zAxis.z * vector.z,
+  });
+  const translated = transformVector(local.origin);
+  return {
+    origin: {
+      x: parent.origin.x + translated.x,
+      y: parent.origin.y + translated.y,
+      z: parent.origin.z + translated.z,
+    },
+    xAxis: normalize3(transformVector(local.xAxis), parent.xAxis),
+    yAxis: normalize3(transformVector(local.yAxis), parent.yAxis),
+    zAxis: normalize3(transformVector(local.zAxis), parent.zAxis),
+  };
+}
+
+function axisPlacementFrame(ifc: IfcAPI, modelId: number, placementId: number): PlacementFrame | null {
+  const placement: any = ifc.GetLine(modelId, placementId);
+  if (!placement) return null;
+  const origin = readPointCoordinates(ifc, modelId, lineRefId(placement, "Location"));
+  const axisId = lineRefId(placement, "Axis");
+  const referenceId = lineRefId(placement, "RefDirection");
+  if (axisId != null) {
+    const zAxis = readDirection(ifc, modelId, axisId, { x: 0, y: 0, z: 1 });
+    const reference = readDirection(ifc, modelId, referenceId, { x: 1, y: 0, z: 0 });
+    const projection = dot3(reference, zAxis);
+    const xAxis = normalize3({
+      x: reference.x - zAxis.x * projection,
+      y: reference.y - zAxis.y * projection,
+      z: reference.z - zAxis.z * projection,
+    }, { x: 1, y: 0, z: 0 });
+    const yAxis = normalize3(cross3(zAxis, xAxis), { x: 0, y: 1, z: 0 });
+    return { origin, xAxis, yAxis, zAxis };
+  }
+  const reference = readDirection(ifc, modelId, referenceId, { x: 1, y: 0, z: 0 });
+  const xAxis = normalize3({ x: reference.x, y: reference.y, z: 0 }, { x: 1, y: 0, z: 0 });
+  const zAxis = { x: 0, y: 0, z: 1 };
+  const yAxis = normalize3(cross3(zAxis, xAxis), { x: 0, y: 1, z: 0 });
+  return { origin, xAxis, yAxis, zAxis };
+}
+
+function extractPlacementFrame(ifc: IfcAPI, modelId: number, placementExpressId: number | null, depth = 0): PlacementFrame | null {
+  if (!placementExpressId || depth > 32) return null;
   const placement: any = ifc.GetLine(modelId, placementExpressId);
   if (!placement) return null;
-
   const relativePlacementId = lineRefId(placement, "RelativePlacement");
   const parentPlacementId = lineRefId(placement, "PlacementRelTo");
-  const rel: any = relativePlacementId ? ifc.GetLine(modelId, relativePlacementId) : null;
-  const locationId = lineRefId(rel, "Location");
-  const location: any = locationId ? ifc.GetLine(modelId, locationId) : null;
-  const coords = numericVector3(location?.Coordinates) ?? [0, 0, 0];
-  const local: Point3 = { x: coords[0], y: coords[1], z: coords[2] };
+  if (!relativePlacementId) return null;
+  const local = axisPlacementFrame(ifc, modelId, relativePlacementId);
+  if (!local) return null;
+  const parent = parentPlacementId ? extractPlacementFrame(ifc, modelId, parentPlacementId, depth + 1) : null;
+  return parent ? composePlacementFrames(parent, local) : local;
+}
 
-  const parent = parentPlacementId ? extractPlacementPointRaw(ifc, modelId, parentPlacementId, depth + 1) : null;
-  return parent
-    ? { x: parent.x + local.x, y: parent.y + local.y, z: parent.z + local.z }
-    : local;
+function extractPlacementPointRaw(ifc: IfcAPI, modelId: number, placementExpressId: number | null): Point3 | null {
+  return extractPlacementFrame(ifc, modelId, placementExpressId)?.origin ?? null;
 }
 
 function extractPlacementPoint(ifc: IfcAPI, modelId: number, placementExpressId: number | null): Point3 | null {
@@ -202,16 +297,137 @@ function extractPlacementPoint(ifc: IfcAPI, modelId: number, placementExpressId:
   return raw ? ifcZUpToViewer(raw) : null;
 }
 
+/**
+ * Reads an IfcSpace footprint from its IFC STEP representation instead of
+ * depending on StreamAllMeshes(). Web-IFC may omit semantic/non-renderable
+ * IfcSpace solids from the mesh stream even though their Body representation
+ * is valid. The room detector still needs those profiles as authoritative
+ * boundary input, so read the profile curve and compose its IFC placements.
+ */
+function ifcEntityTypeName(ifc: IfcAPI, modelId: number, expressId: number): string {
+  try {
+    return String(ifc.GetNameFromTypeCode(ifc.GetLineType(modelId, expressId)) || "")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "");
+  } catch {
+    return "";
+  }
+}
+
+function extractIfcPolylinePoints(ifc: IfcAPI, modelId: number, curveExpressId: number): Point2[] {
+  const curve: any = ifc.GetLine(modelId, curveExpressId);
+  if (!curve || ifcEntityTypeName(ifc, modelId, curveExpressId) !== "IFCPOLYLINE") return [];
+  const result: Point2[] = [];
+  for (const pointRef of asIfcArray(curve.Points)) {
+    const pointId = asExpressId(pointRef);
+    if (pointId == null) continue;
+    const coordinates = ifcNumberArray((ifc.GetLine(modelId, pointId) as any)?.Coordinates);
+    const x = Number(coordinates[0]);
+    const y = Number(coordinates[1]);
+    if (Number.isFinite(x) && Number.isFinite(y)) result.push({ x, y });
+  }
+  if (result.length > 1) {
+    const first = result[0];
+    const last = result[result.length - 1];
+    if (Math.hypot(first.x - last.x, first.y - last.y) <= 1e-7) result.pop();
+  }
+  return result.length >= 3 ? result : [];
+}
+
+function transformProfilePoint(frame: PlacementFrame, point: Point2): Point3 {
+  return {
+    x: frame.origin.x + frame.xAxis.x * point.x + frame.yAxis.x * point.y,
+    y: frame.origin.y + frame.xAxis.y * point.x + frame.yAxis.y * point.y,
+    z: frame.origin.z + frame.xAxis.z * point.x + frame.yAxis.z * point.y,
+  };
+}
+
+function extractIfcSpaceBodyPolygon(
+  ifc: IfcAPI,
+  modelId: number,
+  spaceExpressId: number,
+  unitToMeters = 1,
+): Point2[] | null {
+  const space: any = ifc.GetLine(modelId, spaceExpressId);
+  if (!space) return null;
+
+  const objectPlacementId = lineRefId(space, "ObjectPlacement");
+  const objectFrame = extractPlacementFrame(ifc, modelId, objectPlacementId);
+  const productShapeId = lineRefId(space, "Representation");
+  if (!objectFrame || productShapeId == null) return null;
+
+  const productShape: any = ifc.GetLine(modelId, productShapeId);
+  const representationIds = asIfcArray(productShape?.Representations)
+    .map(asExpressId)
+    .filter((id): id is number => id != null);
+  let bestPolygon: Point2[] | null = null;
+  let bestArea = 0;
+
+  for (const representationId of representationIds) {
+    const representation: any = ifc.GetLine(modelId, representationId);
+    const representationIdentifier = String(getWrappedValue(representation?.RepresentationIdentifier) || "").toUpperCase();
+    if (representationIdentifier && representationIdentifier !== "BODY") continue;
+
+    const itemIds = asIfcArray(representation?.Items)
+      .map(asExpressId)
+      .filter((id): id is number => id != null);
+    for (const itemId of itemIds) {
+      if (ifcEntityTypeName(ifc, modelId, itemId) !== "IFCEXTRUDEDAREASOLID") continue;
+      const solid: any = ifc.GetLine(modelId, itemId);
+      const profileId = lineRefId(solid, "SweptArea");
+      const positionId = lineRefId(solid, "Position");
+      if (profileId == null) continue;
+
+      const profile: any = ifc.GetLine(modelId, profileId);
+      const outerCurveId = lineRefId(profile, "OuterCurve");
+      if (outerCurveId == null) continue;
+      const localProfile = extractIfcPolylinePoints(ifc, modelId, outerCurveId);
+      if (localProfile.length < 3) continue;
+
+      const solidPlacement = positionId == null
+        ? null
+        : axisPlacementFrame(ifc, modelId, positionId);
+      const worldFrame = solidPlacement
+        ? composePlacementFrames(objectFrame, solidPlacement)
+        : objectFrame;
+      const polygon = localProfile.map((point) => {
+        const world = transformProfilePoint(worldFrame, point);
+        // IFC source files use Z-up. The editor's horizontal plane is X/Z,
+        // therefore IFC global X/Y maps to editor X/-Z (plan Y).
+        return {
+          x: world.x * unitToMeters,
+          y: -world.y * unitToMeters,
+        };
+      });
+
+      const area = Math.abs(planarPolygonArea(polygon));
+      if (polygon.length >= 3 && Number.isFinite(area) && area > bestArea) {
+        bestPolygon = polygon;
+        bestArea = area;
+      }
+    }
+  }
+
+  return bestPolygon;
+}
+
 function collectIfcSpaceAnchors(
   ifc: IfcAPI,
   modelId: number,
   sourceFile: string,
-): RoomAnchorSeed[] {
-  const anchors: RoomAnchorSeed[] = [];
+  unitToMeters = 1,
+): RoomFootprintAnchor[] {
+  const anchors: RoomFootprintAnchor[] = [];
+  const safeUnitToMeters = Number.isFinite(unitToMeters) && unitToMeters > 0 ? unitToMeters : 1;
   for (const expressId of idsWithType(ifc, modelId, IFCSPACE)) {
     const line: any = ifc.GetLine(modelId, expressId);
-    const placement = extractPlacementPoint(ifc, modelId, lineRefId(line, "ObjectPlacement"));
-    if (!placement) continue;
+    const rawPlacement = extractPlacementPointRaw(ifc, modelId, lineRefId(line, "ObjectPlacement"));
+    const scaledRawPlacement = rawPlacement ? {
+      x: rawPlacement.x * safeUnitToMeters,
+      y: rawPlacement.y * safeUnitToMeters,
+      z: rawPlacement.z * safeUnitToMeters,
+    } : null;
+    const placement = scaledRawPlacement ? ifcZUpToViewer(scaledRawPlacement) : null;
     const globalId = lineGlobalId(line);
     const name = String(getWrappedValue(line?.LongName) || lineName(line) || `IFC Space ${expressId}`).trim();
     const description = String(getWrappedValue(line?.Description) || "").trim();
@@ -222,11 +438,16 @@ function collectIfcSpaceAnchors(
       expressId,
       // extractPlacementPoint returns the viewer's Y-up frame; horizontal plan
       // coordinates are X/Z, not X/Y.
-      x: placement.x,
-      y: placement.z,
-      elevationY: placement.y,
+      // Preserve every IfcSpace identity even when its ObjectPlacement is
+      // missing or malformed. The planar graph reports it as unmatched rather
+      // than silently dropping it from semantic coverage diagnostics.
+      x: placement?.x ?? Number.NaN,
+      y: placement?.z ?? Number.NaN,
+      elevationY: placement?.y ?? Number.NaN,
       description,
       hasGeometryRepresentation: lineRefId(line, "Representation") != null,
+      sourceX: scaledRawPlacement?.x,
+      sourceY: scaledRawPlacement?.y,
     });
   }
   return anchors;
@@ -454,165 +675,9 @@ function buildGrid(floorPoints: Point2[], cellSize: number): Grid {
   };
 }
 
-function floodComponents(grid: Grid, startId = 0): Component[] {
-  const components: Component[] = [];
-  const queue: number[] = [];
-  let nextId = startId;
-
-  const pushNeighbors = (idx: number, i: number, j: number, cells: number[]) => {
-    const neighbors = [
-      i > 0 ? idx - 1 : -1,
-      i < grid.width - 1 ? idx + 1 : -1,
-      j > 0 ? idx - grid.width : -1,
-      j < grid.height - 1 ? idx + grid.width : -1,
-    ];
-    for (const n of neighbors) {
-      if (n < 0) continue;
-      if (grid.floor[n] === 0 || grid.blocked[n] !== 0 || grid.room[n] !== -1) continue;
-      grid.room[n] = nextId;
-      queue.push(n);
-      cells.push(n);
-    }
-  };
-
-  for (let j = 0; j < grid.height; j++) {
-    for (let i = 0; i < grid.width; i++) {
-      const start = j * grid.width + i;
-      if (grid.floor[start] === 0 || grid.blocked[start] !== 0 || grid.room[start] !== -1) continue;
-
-      queue.length = 0;
-      const cells: number[] = [start];
-      const component: Component = {
-        id: nextId,
-        cells,
-        area: 0,
-        minI: i,
-        maxI: i,
-        minJ: j,
-        maxJ: j,
-        touchesBoundary: i === 0 || j === 0 || i === grid.width - 1 || j === grid.height - 1,
-      };
-      grid.room[start] = nextId;
-      queue.push(start);
-
-      while (queue.length) {
-        const idx = queue.pop()!;
-        const ci = idx % grid.width;
-        const cj = Math.floor(idx / grid.width);
-        component.minI = Math.min(component.minI, ci);
-        component.maxI = Math.max(component.maxI, ci);
-        component.minJ = Math.min(component.minJ, cj);
-        component.maxJ = Math.max(component.maxJ, cj);
-        component.touchesBoundary ||= ci === 0 || cj === 0 || ci === grid.width - 1 || cj === grid.height - 1;
-        pushNeighbors(idx, ci, cj, cells);
-      }
-
-      component.area = cells.length * grid.cellSize * grid.cellSize;
-      components.push(component);
-      nextId++;
-    }
-  }
-
-  return components;
-}
-
-function boundaryLoops(grid: Grid, cells: number[]): Point2[][] {
-  const cellSet = new Set(cells);
-  const edges = new Map<string, { a: [number, number]; b: [number, number] }>();
-  const has = (i: number, j: number) => cellSet.has(j * grid.width + i);
-  const addEdge = (a: [number, number], b: [number, number]) => {
-    const key = `${a[0]},${a[1]}|${b[0]},${b[1]}`;
-    const reverse = `${b[0]},${b[1]}|${a[0]},${a[1]}`;
-    if (edges.has(reverse)) edges.delete(reverse);
-    else edges.set(key, { a, b });
-  };
-
-  for (const idx of cells) {
-    const i = idx % grid.width;
-    const j = Math.floor(idx / grid.width);
-    if (!has(i, j - 1)) addEdge([i, j], [i + 1, j]);
-    if (!has(i + 1, j)) addEdge([i + 1, j], [i + 1, j + 1]);
-    if (!has(i, j + 1)) addEdge([i + 1, j + 1], [i, j + 1]);
-    if (!has(i - 1, j)) addEdge([i, j + 1], [i, j]);
-  }
-
-  const outgoing = new Map<string, [number, number][]>();
-  for (const edge of edges.values()) {
-    const key = `${edge.a[0]},${edge.a[1]}`;
-    const list = outgoing.get(key) ?? [];
-    list.push(edge.b);
-    outgoing.set(key, list);
-  }
-
-  const used = new Set<string>();
-  const loops: Point2[][] = [];
-  const edgeKey = (a: [number, number], b: [number, number]) => `${a[0]},${a[1]}|${b[0]},${b[1]}`;
-
-  for (const edge of edges.values()) {
-    const startKey = edgeKey(edge.a, edge.b);
-    if (used.has(startKey)) continue;
-    const loop: Point2[] = [];
-    let a = edge.a;
-    let b = edge.b;
-    loop.push(gridVertexToWorld(grid, a));
-    used.add(startKey);
-
-    for (let guard = 0; guard < edges.size + 10; guard++) {
-      loop.push(gridVertexToWorld(grid, b));
-      if (b[0] === a[0] && b[1] === a[1]) break;
-      const candidates = outgoing.get(`${b[0]},${b[1]}`) ?? [];
-      const next = candidates.find((candidate) => !used.has(edgeKey(b, candidate)));
-      if (!next) break;
-      used.add(edgeKey(b, next));
-      a = b;
-      b = next;
-    }
-
-    if (loop.length >= 4) loops.push(simplifyCollinear(loop));
-  }
-
-  loops.sort((a, b) => Math.abs(polygonArea2D(b)) - Math.abs(polygonArea2D(a)));
-  return loops;
-}
-
-function gridVertexToWorld(grid: Grid, point: [number, number]): Point2 {
-  return {
-    x: grid.minX + point[0] * grid.cellSize,
-    y: grid.minY + point[1] * grid.cellSize,
-  };
-}
-
-function simplifyCollinear(points: Point2[]): Point2[] {
-  if (points.length <= 4) return points;
-  const out: Point2[] = [];
-  for (let i = 0; i < points.length; i++) {
-    const prev = points[(i - 1 + points.length) % points.length];
-    const curr = points[i];
-    const next = points[(i + 1) % points.length];
-    const ax = curr.x - prev.x;
-    const ay = curr.y - prev.y;
-    const bx = next.x - curr.x;
-    const by = next.y - curr.y;
-    if (Math.abs(ax * by - ay * bx) > 1e-9) out.push(curr);
-  }
-  return out;
-}
-
-function polygonArea2D(points: Point2[]): number {
-  let sum = 0;
-  for (let i = 0; i < points.length; i++) {
-    const a = points[i];
-    const b = points[(i + 1) % points.length];
-    sum += a.x * b.y - b.x * a.y;
-  }
-  return sum / 2;
-}
-
 function ifcToFrontend(p: Point2, floorY: number): RoomPolygonPoint {
-  // web-ifc flatTransformation is already the same Y-up scene frame consumed by
-  // the existing compiler (see geometry.ts). Do not apply a second Z-up -> Y-up
-  // conversion here. Horizontal IFC-domain geometry is represented by X/Z and
-  // vertical elevation is Y.
+  // RoomDetector normalizes all source IFC mesh points to the viewer's Y-up
+  // frame before projecting them into this X/Z plan coordinate system.
   return { x: p.x, y: floorY, z: p.y };
 }
 
@@ -651,14 +716,20 @@ function elementFromLine(ifc: IfcAPI, modelId: number, expressId: number, source
   };
 }
 
-function addPoint(element: ElementFootprint, p: Point3) {
-  // Room topology lives in the horizontal X/Z plane of the web-ifc world frame.
-  const point = { x: p.x, y: p.z };
+function addPoint(element: ElementFootprint, worldPoint: Point3) {
+  // IMPORTANT: placedGeometry.flatTransformation is already the baked
+  // web-ifc world transform used by compiler/geometry.ts. It is already in
+  // the viewer's Y-up world frame, with X/Z as the horizontal plan axes.
+  // Do not apply the IFC-placement Z-up conversion here and do not multiply
+  // by the IFC unit factor again: web-ifc has already produced scene-space
+  // geometry for the editor. IFC ObjectPlacement values are a different
+  // source and are normalized separately in collectIfcSpaceAnchors().
+  const point = { x: worldPoint.x, y: worldPoint.z };
   element.points.push(point);
-  element.minX = Math.min(element.minX, p.x);
-  element.maxX = Math.max(element.maxX, p.x);
-  element.minY = Math.min(element.minY, p.y);
-  element.maxY = Math.max(element.maxY, p.y);
+  element.minX = Math.min(element.minX, worldPoint.x);
+  element.maxX = Math.max(element.maxX, worldPoint.x);
+  element.minY = Math.min(element.minY, worldPoint.y);
+  element.maxY = Math.max(element.maxY, worldPoint.y);
 }
 
 function finalizeElement(element: ElementFootprint): ElementFootprint | null {
@@ -894,6 +965,33 @@ function candidateCoverage(component: Component, grid: Grid, polygon: Point2[]):
   return tested ? covered / tested : 0;
 }
 
+
+function gridCellsInsidePolygon(grid: Grid, polygon: Point2[]): number[] {
+  if (polygon.length < 3) return [];
+  const bounds = bbox(polygon);
+  const [minI, maxI] = clampRange(
+    Math.floor((bounds.minX - grid.minX) / grid.cellSize),
+    Math.floor((bounds.maxX - grid.minX) / grid.cellSize),
+    0,
+    grid.width - 1,
+  );
+  const [minJ, maxJ] = clampRange(
+    Math.floor((bounds.minY - grid.minY) / grid.cellSize),
+    Math.floor((bounds.maxY - grid.minY) / grid.cellSize),
+    0,
+    grid.height - 1,
+  );
+  const cells: number[] = [];
+  for (let j = minJ; j <= maxJ; j++) {
+    for (let i = minI; i <= maxI; i++) {
+      const index = j * grid.width + i;
+      if (!grid.floor[index] || grid.blocked[index]) continue;
+      if (polygonContains(gridToWorld(grid, i, j), polygon)) cells.push(index);
+    }
+  }
+  return cells;
+}
+
 function createRoomObjects(
   components: Component[],
   grid: Grid,
@@ -904,41 +1002,32 @@ function createRoomObjects(
   overheadSurfaceElements: ElementFootprint[],
   anchorByComponent: Map<number, ResolvedRoomAnchor> = new Map(),
 ): { rooms: DetectedRoom[]; componentToRoom: Map<number, string> } {
-  const enclosed = components.filter((component) => !component.touchesBoundary && component.area >= MIN_COMPONENT_AREA);
-  const candidates = enclosed.length
-    ? enclosed
-    : components.filter((component) => component.area >= MIN_COMPONENT_AREA)
-        .sort((a, b) => b.area - a.area)
-        .slice(0, 1);
+  const candidates = components.filter((component) => component.area >= MIN_COMPONENT_AREA);
 
   const rooms: DetectedRoom[] = [];
   const componentToRoom = new Map<number, string>();
   let roomIndex = 1;
   for (const component of candidates) {
-    const loops = boundaryLoops(grid, component.cells);
-    const outer = loops[0] ?? [];
-    if (outer.length < 4) continue;
-    const holes = loops.slice(1).filter((loop) => {
-      if (loop.length < 4) return false;
-      const sample = centroid(loop);
-      return pointInsidePolygon(sample, outer);
-    });
+    // The geometry reconstructor must provide an actual vector boundary. Do not
+    // fall back to inventing a generic grid component if it failed to do so.
+    const outer = component.polygon || [];
+    if (outer.length < 3) continue;
+    const holes = component.holes || [];
 
-    let cx = 0;
-    let cy = 0;
-    for (const idx of component.cells) {
-      const i = idx % grid.width;
-      const j = Math.floor(idx / grid.width);
-      const p = gridToWorld(grid, i, j);
-      cx += p.x;
-      cy += p.y;
-    }
-    cx /= component.cells.length;
-    cy /= component.cells.length;
+    // Room geometry is authoritative. IFC space placements label a physical
+    // face; they never become its centre or decide whether the face exists.
+    const faceCenter = component.center ?? centroid(outer);
+    const cx = faceCenter.x;
+    const cy = faceCenter.y;
 
     const id = `room-${String(roomIndex).padStart(3, "0")}`;
-    const roomAnchor = anchorByComponent.get(component.id) ?? null;
-    const stableId = roomAnchor?.globalId
+    const semanticAssignments = component.semanticSpaces?.length
+      ? component.semanticSpaces
+      : (anchorByComponent.get(component.id) ?? component.anchor)
+        ? [anchorByComponent.get(component.id) ?? component.anchor!]
+        : [];
+    const roomAnchor = semanticAssignments[0] ?? null;
+    const stableId = semanticAssignments.length === 1 && roomAnchor?.globalId
       ? `ifcspace_${createHash("sha1").update(roomAnchor.globalId).digest("hex").slice(0, 16)}`
       : stableRoomId(outer, floorY);
     const levelId = stableLevelId(floorY);
@@ -946,7 +1035,7 @@ function createRoomObjects(
     const roomBoundaryWallIds = boundaryWallsByComponent.get(component.id) ?? [];
     const mappedWallTopValues = roomBoundaryWallIds
       .map((wallId) => wallTopElevationsById.get(wallId))
-      .filter((value): value is number => Number.isFinite(value) && value > floorY + 1.8 && value < floorY + 6.5)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > floorY + 1.8 && value < floorY + 6.5)
       .sort((a, b) => a - b);
 
     // The centre-cell association above is deliberately conservative, but a
@@ -1030,24 +1119,47 @@ function createRoomObjects(
         holes: holes.map((loop) => loop.map((p) => ifcToFrontend(p, floorY))),
       },
       ceilingCandidates: ceilingCandidates.map(({ semanticBonus: _semanticBonus, ...candidate }) => candidate),
-      label: roomAnchor?.label || `Room ${roomIndex}`,
-      source: roomAnchor ? "ifc-space-anchor-geodesic-v1" : "wall-topology-grid-v2",
+      label: semanticAssignments.length > 1
+        ? semanticAssignments.map((item) => item.label).filter(Boolean).join(" / ")
+        : roomAnchor?.label || `Room ${roomIndex}`,
+      source: component.reconstructionSource === "wall-face-reconstruction"
+        ? "ifc-wall-planar-graph-v1"
+        : component.reconstructionSource === "ifc-space-step-profile-v1"
+          ? "ifc-space-step-profile-v1"
+          : component.reconstructionSource === "ifc-space-body-envelope-v1"
+            ? "ifc-space-body-envelope-v1"
+            : "ifc-space-wall-constrained-geodesic-v2",
       area: Number(component.area.toFixed(4)),
       center: ifcToFrontend({ x: cx, y: cy }, floorY),
       polygon: outer.map((p) => ifcToFrontend(p, floorY)),
       boundaryWalls: roomBoundaryWallIds,
       portals: [],
       touchesFloorBoundary: component.touchesBoundary,
-      confidence: component.touchesBoundary ? 0.55 : (roomAnchor ? 0.76 : 0.95),
+      confidence: component.confidence ?? (component.touchesBoundary ? 0.55 : (roomAnchor ? 0.62 : 0.95)),
       floorElevation: floorY,
       ceilingElevation,
       ceilingElevationSource,
       ceilingConfidence,
-      boundarySource: roomAnchor ? "ifc-space-anchor-geodesic" : "wall-topology-grid",
-      // IFCSPACE placement anchors provide room identity and a seed point, not
-      // exact boundaries. Confidence is intentionally capped until an explicit
-      // IfcSpace solid or IfcRelSpaceBoundary is available.
-      boundaryConfidence: roomAnchor ? 0.62 : (component.touchesBoundary ? 0.55 : 0.82),
+      semanticSpaces: semanticAssignments.map((assignment) => ({
+        expressId: Number(assignment.expressId) || 0,
+        globalId: assignment.globalId || null,
+        name: assignment.label,
+        description: assignment.description || "",
+        anchor: ifcToFrontend({ x: assignment.x, y: assignment.y }, floorY),
+        associationDistanceMeters: Number(assignment.snapDistanceMeters.toFixed(3)),
+        associationMethod: assignment.associationMethod || "nearest-room-polygon",
+        hasGeometryRepresentation: Boolean(assignment.hasGeometryRepresentation),
+      })),
+      boundarySource: component.reconstructionSource === "wall-face-reconstruction"
+        ? "wall-face-reconstruction"
+        : component.reconstructionSource === "ifc-space-step-profile-v1"
+          ? "ifc-space-step-profile"
+          : component.reconstructionSource === "ifc-space-body-envelope-v1"
+            ? "ifc-space-body-envelope"
+            : "ifc-space-wall-constrained-geodesic",
+      // IFCSPACE placements provide room identity and seed points, not exact
+      // boundaries. A body-envelope fallback remains explicitly low-confidence.
+      boundaryConfidence: component.confidence ?? (roomAnchor ? 0.55 : (component.touchesBoundary ? 0.55 : 0.82)),
       semanticSpace: roomAnchor ? {
         expressId: Number(roomAnchor.expressId) || 0,
         globalId: roomAnchor.globalId || null,
@@ -1056,11 +1168,61 @@ function createRoomObjects(
         anchor: roomAnchorPoint!,
         snapDistanceMeters: Number(roomAnchor.snapDistanceMeters.toFixed(3)),
         hasGeometryRepresentation: Boolean(roomAnchor.hasGeometryRepresentation),
+        associationMethod: roomAnchor.associationMethod || "nearest-room-polygon",
       } : null,
     });
     roomIndex++;
   }
   return { rooms, componentToRoom };
+}
+
+function attachNativeFurnitureToRooms(
+  rooms: DetectedRoom[],
+  elements: ElementFootprint[],
+  floorY: number,
+): number {
+  let assignedCount = 0;
+  for (const room of rooms) {
+    const outerPoints = (room.boundary?.outer?.length ? room.boundary.outer : room.polygon)
+      .map((point) => ({ x: Number(point.x), y: Number(point.z) }))
+      .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+    const holes = (room.boundary?.holes || []).map((ring) => ring
+      .map((point) => ({ x: Number(point.x), y: Number(point.z) }))
+      .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)));
+    if (outerPoints.length < 3) {
+      room.elements = [];
+      continue;
+    }
+
+    const assigned: DetectedRoomElement[] = [];
+    for (const element of elements) {
+      if (!element.globalId || !Number.isFinite(element.center.x) || !Number.isFinite(element.center.y)) continue;
+      if (!pointInsidePolygon(element.center, outerPoints)) continue;
+      if (holes.some((ring) => ring.length >= 3 && pointInsidePolygon(element.center, ring))) continue;
+      if (Number.isFinite(element.maxY) && element.maxY < floorY - 0.5) continue;
+      if (typeof room.ceilingElevation === "number" && Number.isFinite(room.ceilingElevation) && Number.isFinite(element.minY) && element.minY > room.ceilingElevation + 1.0) continue;
+
+      assigned.push({
+        globalId: element.globalId,
+        expressId: element.expressId,
+        name: element.name || `${element.ifcType} #${element.expressId}`,
+        ifcType: element.ifcType,
+        predefinedType: element.predefinedType || "",
+        sourceFile: element.sourceFile,
+        center: ifcToFrontend(element.center, floorY),
+        size: {
+          x: Number(element.sizeX.toFixed(3)),
+          z: Number(element.sizeY.toFixed(3)),
+          height: Number(Math.max(0, element.maxY - element.minY).toFixed(3)),
+        },
+        editingMode: "native-ifc-element",
+      });
+    }
+    assigned.sort((a, b) => a.name.localeCompare(b.name) || a.expressId - b.expressId);
+    room.elements = assigned;
+    assignedCount += assigned.length;
+  }
+  return assignedCount;
 }
 
 function componentAtWorld(grid: Grid, components: Component[], p: Point2): number | null {
@@ -1292,7 +1454,7 @@ export interface RoomDetectorOptions {
   jobDirectory: string;
   inputIfcPath?: string;
   outputPath?: string;
-  /** Enable semantic IFC space anchor partitioning for the ceiling designer only. */
+  /** Enable semantic IFC space geometry/placement reconstruction for room-aware consumers. */
   useIfcSpaceAnchors?: boolean;
 }
 
@@ -1361,6 +1523,8 @@ export class RoomDetector {
     const doorElements: ElementFootprint[] = [];
     const slabElements: ElementFootprint[] = [];
     const overheadSurfaceElements: ElementFootprint[] = [];
+    const nativeFurnitureElements: ElementFootprint[] = [];
+    let nativeFurnitureSemanticCount = 0;
   let semanticOpeningCount = 0;
   let semanticDoorCount = 0;
   const semanticBySource: Array<{ sourceFile: string; wallCount: number; openingCount: number; doorCount: number; slabCount: number }> = [];
@@ -1385,6 +1549,8 @@ export class RoomDetector {
 
       for (const model of models) {
         sourceFiles.push(model.label);
+        const modelLengthUnitInfo = readIfcLengthUnitFromModel(ifc, model.modelId);
+        if (modelLengthUnitInfo.warning) warnings.push(`${model.label}: ${modelLengthUnitInfo.warning}`);
         const wallIds = Array.from(new Set([
           ...idsWithType(ifc, model.modelId, IFCWALL),
           ...idsWithType(ifc, model.modelId, IFCWALLSTANDARDCASE),
@@ -1421,6 +1587,44 @@ export class RoomDetector {
         overheadSurfaceElements.push(...Array.from(coverings.values()).filter((element) => (
           element.predefinedType === "CEILING" || /ceiling|soffit/i.test(element.name)
         )));
+      }
+
+      // Native furniture is part of the base IFC, not projectState.furniture.
+      // Collect it separately so the room workspace can list these elements
+      // without pretending they are already isolated, transformable GLB assets.
+      if (models[0]) {
+        const baseModel = models[0];
+        const furnishingIds = idsWithType(ifc, baseModel.modelId, IFCFURNISHINGELEMENT);
+        nativeFurnitureSemanticCount = furnishingIds.length;
+        const furnishingMap = await collectElements(
+          ifc,
+          baseModel.modelId,
+          baseModel.filePath,
+          baseModel.label,
+          new Set(furnishingIds),
+          true,
+        );
+        for (const expressId of furnishingIds) {
+          const element = furnishingMap.get(expressId);
+          if (!element) continue;
+          if (element.points.length < 3) {
+            const line = ifc.GetLine(baseModel.modelId, expressId);
+            const rawPlacement = extractPlacementPointRaw(ifc, baseModel.modelId, lineRefId(line, "ObjectPlacement"));
+            if (!rawPlacement) continue;
+            const placement = ifcZUpToViewer({
+              x: rawPlacement.x * lengthUnitInfo.toMeters,
+              y: rawPlacement.y * lengthUnitInfo.toMeters,
+              z: rawPlacement.z * lengthUnitInfo.toMeters,
+            });
+            element.center = { x: placement.x, y: placement.z };
+            element.minY = placement.y;
+            element.maxY = placement.y;
+          }
+          if (element.globalId && Number.isFinite(element.center.x) && Number.isFinite(element.center.y)) {
+            if (baseModel.hiddenWallGlobalIds.has(element.globalId)) continue;
+            nativeFurnitureElements.push(element);
+          }
+        }
       }
 
       const semanticOpenings: SemanticOpening[] = [];
@@ -1485,21 +1689,6 @@ export class RoomDetector {
       const selectedFloorSlabs = selectedLevel?.slabs ?? slabElements;
       const floorPoints = selectedFloorSlabs.flatMap((slab) => slab.points);
       const actualFloorY = selectedLevel?.elevation ?? Math.min(...slabElements.map((slab) => slab.maxY).filter(Number.isFinite));
-      const semanticSpaceAnchors = options.useIfcSpaceAnchors && models.length
-        ? collectIfcSpaceAnchors(ifc, models[0].modelId, models[0].label)
-        : [];
-      const semanticSpaceAnchorsOnLevel = semanticSpaceAnchors.filter((anchor) =>
-        !Number.isFinite(anchor.elevationY) || Math.abs(Number(anchor.elevationY) - actualFloorY) <= 0.45,
-      );
-      if (semanticSpaceAnchors.length && !semanticSpaceAnchorsOnLevel.length) {
-        warnings.push(`Found ${semanticSpaceAnchors.length} IFC spaces, but none of their placement anchors matched the analysed floor elevation (${actualFloorY.toFixed(3)} m).`);
-      }
-      if (semanticSpaceAnchorsOnLevel.length && semanticSpaceAnchorsOnLevel.every((anchor) => !anchor.hasGeometryRepresentation)) {
-        warnings.push(`Found ${semanticSpaceAnchorsOnLevel.length} named IFC spaces without geometric representations. Their placement anchors will be used to infer separate room regions, constrained by the wall geometry.`);
-      }
-      if (levelGroups.length > 1) {
-        warnings.push(`Detected ${levelGroups.length} candidate floor levels using floor-slab top elevations. This first ceiling-analysis pass segments the lowest level only (${actualFloorY.toFixed(3)} m); higher levels are reported for follow-up and are not merged into this room grid.`);
-      }
       if (!Number.isFinite(actualFloorY)) throw new Error("RoomDetector: could not resolve a valid floor elevation.");
 
       // Walls from other storeys must not be projected into the selected level's
@@ -1535,6 +1724,7 @@ export class RoomDetector {
         })
         .filter((value): value is { opening: SemanticOpening; door: SemanticDoor | null; placement: Point3 } => Boolean(value?.placement));
 
+      const doorGapClosureWalls: Array<{ id: string; points: Point2[] }> = [];
       for (const sealed of sealableOpenings) {
         const hostWallGlobalId = sealed.opening.hostWallGlobalId;
         const wall = hostWallGlobalId
@@ -1544,6 +1734,9 @@ export class RoomDetector {
             ? null
             : wallElements.find((candidate) => candidate.sourceFile === sealed.opening.sourceFile && candidate.expressId === sealed.opening.hostWallExpressId));
         if (!wall) continue;
+        // A hosted opening from another storey must not be projected into this
+        // level's planar graph or navigation grid.
+        if (wall.minY > actualFloorY + 0.45 || wall.maxY < actualFloorY + 1.5) continue;
 
         const wallWidth = Math.min(wall.sizeX || Infinity, wall.sizeY || Infinity);
         const openingGeometry = openingElements.find(
@@ -1552,9 +1745,12 @@ export class RoomDetector {
         const openingWidth = openingGeometry
           ? Math.max(openingGeometry.sizeX, openingGeometry.sizeY)
           : null;
+        const doorWidthMeters = Number.isFinite(sealed.door?.width) && Number(sealed.door?.width) > 0
+          ? Number(sealed.door?.width) * lengthUnitInfo.toMeters
+          : null;
         const width = Math.max(
           grid.cellSize * 2,
-          sealed.door?.width ?? openingWidth ?? grid.cellSize * 8,
+          doorWidthMeters ?? openingWidth ?? grid.cellSize * 8,
         );
         const depth = Number.isFinite(wallWidth) && wallWidth > 0 ? wallWidth + ROOM_SEAL_PADDING * 2 : grid.cellSize * 4;
         const center = { x: sealed.placement.x, y: sealed.placement.z };
@@ -1575,65 +1771,219 @@ export class RoomDetector {
               { x: center.x - halfDepth, y: center.y + halfWidth },
             ];
         rasterizePolygon(grid, rect, grid.blocked);
+
+        const openingCenter = openingGeometry?.center ?? { x: center.x, y: center.y };
+        const closure = createDoorGapClosureFootprint(
+          { id: wall.globalId ?? `${wall.sourceFile}:${wall.expressId}`, points: wall.points },
+          openingCenter,
+          width,
+          `door-gap:${sealed.opening.openingGlobalId ?? sealed.opening.openingExpressId}`,
+        );
+        if (closure) doorGapClosureWalls.push(closure);
       }
 
-      const topologyComponents = floodComponents(grid);
-      const anchorPartition = semanticSpaceAnchorsOnLevel.length >= 2
-        ? partitionFloorByRoomAnchors(grid, semanticSpaceAnchorsOnLevel, {
-            maxSnapDistance: 1.5,
-            minRoomArea: 0.75,
-          })
-        : null;
-      let components: Component[] = topologyComponents;
-      let anchorByComponent = new Map<number, ResolvedRoomAnchor>();
-      let roomCoverageRatio = 0;
-      if (anchorPartition) {
-        // The seed partition resets grid.room and assigns a unique region id to
-        // each semantic IfcSpace. Any separate unseeded floor island is retained
-        // as a generic topology room rather than being silently discarded.
-        anchorByComponent = anchorPartition.anchorByComponent;
-        roomCoverageRatio = anchorPartition.coverageRatio;
-        components = [
-          ...(anchorPartition.components as Component[]),
-          ...floodComponents(grid, anchorPartition.components.length),
-        ];
-        warnings.push(...anchorPartition.warnings);
-      } else if (semanticSpaceAnchorsOnLevel.length) {
-        warnings.push("IFC space anchors were present but could not form at least two usable room regions; the wall-topology fallback was retained.");
+      // Geometry-first room reconstruction. Wall footprints create a planar
+      // graph; closed faces are the physical rooms. IFC space placements only
+      // annotate those faces after the graph has already produced them.
+      const semanticSpaceIds = options.useIfcSpaceAnchors && models.length
+        ? idsWithType(ifc, models[0].modelId, IFCSPACE)
+        : [];
+      const semanticSpaceAnchors = options.useIfcSpaceAnchors && models.length
+        ? collectIfcSpaceAnchors(ifc, models[0].modelId, models[0].label, lengthUnitInfo.toMeters)
+        : [];
+      const semanticSpaceAnchorsOnLevel = semanticSpaceAnchors.filter((anchor) =>
+        !Number.isFinite(anchor.elevationY) || Math.abs(Number(anchor.elevationY) - actualFloorY) <= 0.45,
+      );
+      // Read source STEP profiles first. This path is independent of WebIFC's
+      // GetLine wrappers and StreamAllMeshes output, so a missing semantic mesh
+      // cannot suppress valid IfcSpace geometry.
+      const stepProfiles = semanticSpaceIds.length
+        ? readIfcStepSpaceFootprints(models[0].filePath, lengthUnitInfo.toMeters)
+        : { footprints: new Map<number, { polygon: Point2[] }>(), diagnostics: [] as string[] };
+      warnings.push(...stepProfiles.diagnostics);
+
+      // Only ask WebIFC for geometry for spaces that did not have a supported
+      // source STEP profile. This preserves compatibility with tessellated
+      // exports without making the authoritative source depend on that stream.
+      const spaceIdsNeedingMesh = semanticSpaceIds.filter((id) => !stepProfiles.footprints.has(id));
+      let spaceGeometry = new Map<number, ElementFootprint>();
+      if (spaceIdsNeedingMesh.length) {
+        try {
+          spaceGeometry = await collectElements(
+            ifc,
+            models[0].modelId,
+            models[0].filePath,
+            models[0].label,
+            new Set(spaceIdsNeedingMesh),
+            true,
+          );
+        } catch (error: any) {
+          warnings.push(`WebIFC semantic-space mesh fallback failed; source STEP profiles and wall geometry remain available: ${String(error?.message || error)}`);
+        }
       }
 
-      const boundaryWallsByComponent = new Map<number, string[]>();
-      for (const wall of wallElements) {
-        for (const component of components) {
-          if (anchorPartition) {
-            // For inferred per-space regions, the old centre-cell test misses
-            // wall tops whenever the wall centre lands inside its blocked raster.
-            // Count nearby region cells around the wall footprint. A partition
-            // wall can legitimately bound two semantic rooms.
-            const nearbyCells = countNearbyComponentCells(grid, wall, component.id, 4);
-            if (nearbyCells < 2) continue;
-            const list = boundaryWallsByComponent.get(component.id) ?? [];
-            const wallId = wall.globalId ?? `${wall.sourceFile}:${wall.expressId}`;
-            if (!list.includes(wallId)) list.push(wallId);
-            boundaryWallsByComponent.set(component.id, list);
-            continue;
-          }
-
-          // Preserve the original centre-cell boundary mapping for all existing
-          // RoomDetector consumers (walk navigation and 360 compilation).
-          const center = wall.center;
-          const [i, j] = worldToGrid(grid, center);
-          const candidates = [[i - 1, j], [i + 1, j], [i, j - 1], [i, j + 1]];
-          for (const [ci, cj] of candidates) {
-            if (ci < 0 || cj < 0 || ci >= grid.width || cj >= grid.height) continue;
-            const id = grid.room[cj * grid.width + ci];
-            if (id !== component.id) continue;
-            const list = boundaryWallsByComponent.get(component.id) ?? [];
-            const wallId = wall.globalId ?? `${wall.sourceFile}:${wall.expressId}`;
-            if (!list.includes(wallId)) list.push(wallId);
-            boundaryWallsByComponent.set(component.id, list);
+      const explicitSpacePolygons = new Map<string, Point2[]>();
+      const explicitSpacePolygonSources = new Map<string, "ifc-space-step-profile" | "ifc-space-body-envelope">();
+      let directSpaceProfileCount = 0;
+      let stepSpaceProfileCount = 0;
+      for (const anchor of semanticSpaceAnchorsOnLevel) {
+        const expressId = Number(anchor.expressId);
+        const stepOutline = stepProfiles.footprints.get(expressId)?.polygon;
+        // Skip WebIFC line traversal for spaces already resolved by STEP.
+        let directOutline: Point2[] | null = null;
+        if (!stepOutline) {
+          try {
+            directOutline = extractIfcSpaceBodyPolygon(
+              ifc,
+              models[0].modelId,
+              expressId,
+              lengthUnitInfo.toMeters,
+            );
+          } catch (error: any) {
+            warnings.push(`WebIFC profile extraction failed for IfcSpace #${expressId}; source STEP and mesh fallbacks remain available: ${String(error?.message || error)}`);
           }
         }
+        const meshOutline = spaceGeometry.get(expressId)?.points;
+        const outline = stepOutline && stepOutline.length >= 3
+          ? stepOutline
+          : (directOutline && directOutline.length >= 3
+            ? directOutline
+            : (meshOutline && meshOutline.length >= 3 ? hull(meshOutline) : null));
+        if (outline && outline.length >= 3) {
+          explicitSpacePolygons.set(anchor.key, outline);
+          if (stepOutline && stepOutline.length >= 3) {
+            explicitSpacePolygonSources.set(anchor.key, "ifc-space-step-profile");
+            stepSpaceProfileCount++;
+          } else if (directOutline && directOutline.length >= 3) {
+            explicitSpacePolygonSources.set(anchor.key, "ifc-space-step-profile");
+            directSpaceProfileCount++;
+          } else {
+            explicitSpacePolygonSources.set(anchor.key, "ifc-space-body-envelope");
+          }
+        }
+      }
+      if (directSpaceProfileCount) {
+        warnings.push(`${directSpaceProfileCount} IfcSpace Body footprint(s) were read directly from WebIFC profile curves.`);
+      }
+      if (stepSpaceProfileCount) {
+        warnings.push(`${stepSpaceProfileCount} IfcSpace footprint(s) were recovered from source IFC STEP profiles; these bypass WebIFC line-wrapper and mesh-stream interpretation.`);
+      }
+      const semanticSpacesForGraph = semanticSpaceAnchorsOnLevel.map((anchor) => ({
+        ...anchor,
+        explicitPolygon: explicitSpacePolygons.get(anchor.key) || null,
+        explicitPolygonSource: explicitSpacePolygonSources.get(anchor.key),
+      }));
+      const explicitSpaceGeometryCount = explicitSpacePolygons.size;
+      if (explicitSpaceGeometryCount) {
+        warnings.push(`${explicitSpaceGeometryCount} IfcSpace body representation(s) contain usable plan geometry. These are preferred when consistent with wall-bounded room faces; smaller polygons inside one physical room remain semantic zones.`);
+      }
+      if (semanticSpaceIds.length && !semanticSpaceAnchorsOnLevel.length) {
+        warnings.push(`Found ${semanticSpaceIds.length} IFC spaces, but no placement metadata could be resolved on the analysed floor (${actualFloorY.toFixed(3)} m). Physical wall-bounded faces will still be detected.`);
+      }
+      if (levelGroups.length > 1) {
+        warnings.push(`Detected ${levelGroups.length} candidate floor levels using floor-slab top elevations. This release reconstructs the lowest floor level only (${actualFloorY.toFixed(3)} m); higher levels are reported but not segmented yet.`);
+      }
+
+      const roomGraph = reconstructRoomsFromWallFootprints({
+        walls: [
+          ...wallElements.map((wall) => ({
+            id: wall.globalId ?? `${wall.sourceFile}:${wall.expressId}`,
+            points: wall.points,
+          })),
+          ...doorGapClosureWalls,
+        ],
+        semanticSpaces: semanticSpacesForGraph,
+        maxSemanticAssociationDistanceM: 3.25,
+      });
+      warnings.push(...roomGraph.warnings);
+      if (!semanticSpaceIds.length) {
+        warnings.push("No IfcSpace entities were found. Physical rooms are still generated from closed wall geometry and receive editable generated names.");
+      }
+
+      const components: Component[] = [];
+      const anchorByComponent = new Map<number, ResolvedRoomAnchor>();
+      grid.room.fill(-1);
+      for (const face of roomGraph.faces) {
+        const polygon = face.polygon;
+        const cells = gridCellsInsidePolygon(grid, polygon);
+        const semanticAssignments: ResolvedRoomAnchor[] = face.semanticSpaces.map((space) => ({
+          ...space,
+          snappedX: space.x,
+          snappedY: space.y,
+          snapDistanceMeters: space.associationDistanceMeters,
+          associationMethod: space.associationMethod,
+        }));
+        let minI = grid.width - 1;
+        let minJ = grid.height - 1;
+        let maxI = 0;
+        let maxJ = 0;
+        for (const cell of cells) {
+          const i = cell % grid.width;
+          const j = Math.floor(cell / grid.width);
+          minI = Math.min(minI, i);
+          minJ = Math.min(minJ, j);
+          maxI = Math.max(maxI, i);
+          maxJ = Math.max(maxJ, j);
+        }
+        const id = components.length;
+        const component: Component = {
+          id,
+          cells,
+          area: face.areaM2,
+          center: face.center,
+          minI: cells.length ? minI : 0,
+          maxI: cells.length ? maxI : 0,
+          minJ: cells.length ? minJ : 0,
+          maxJ: cells.length ? maxJ : 0,
+          touchesBoundary: false,
+          polygon,
+          holes: [],
+          boundaryWallIds: face.boundaryWallIds,
+          semanticSpaces: semanticAssignments,
+          anchor: semanticAssignments[0],
+          reconstructionSource: face.geometrySource === "ifc-space-step-profile"
+            ? "ifc-space-step-profile-v1"
+            : face.geometrySource === "ifc-space-body-envelope"
+              ? "ifc-space-body-envelope-v1"
+              : "wall-face-reconstruction",
+          confidence: face.confidence,
+        };
+        components.push(component);
+        if (semanticAssignments[0]) anchorByComponent.set(id, semanticAssignments[0]);
+        for (const cell of cells) grid.room[cell] = id;
+      }
+
+      const semanticMatchedSpaceCount = roomGraph.faces.reduce((sum, face) => sum + face.semanticSpaces.length, 0);
+      const anchoredRoomCount = roomGraph.faces.filter((face) => face.semanticSpaces.length > 0).length;
+      const roomCoverageRatio = roomGraph.faces.length
+        ? Math.min(1, roomGraph.faces.reduce((sum, face) => sum + face.areaM2, 0) / Math.max(0.001, planarPolygonArea(slabHull)))
+        : 0;
+      const totalWalkableCells = grid.floor.reduce((sum, value, index) => sum + (value && !grid.blocked[index] ? 1 : 0), 0);
+      const assignedRoomCells = components.reduce((sum, component) => sum + component.cells.length, 0);
+      const anchorPartition = {
+        resolvedAnchors: semanticSpaceAnchorsOnLevel.filter((anchor) => !roomGraph.unmatchedSemanticSpaces.includes(anchor.label)),
+        mappingId: "semantic-polygon-association",
+        partitioned: components.length > 1,
+      };
+      const reconstruction = {
+        regions: components,
+        warnings: roomGraph.warnings,
+        coverageRatio: totalWalkableCells ? assignedRoomCells / totalWalkableCells : 0,
+        method: components.length
+          ? (roomGraph.wallGraphFaceCount > 0
+            ? "ifc-wall-planar-graph-v1" as const
+            : (components.every((component) => component.reconstructionSource === "ifc-space-step-profile-v1")
+              ? "ifc-space-step-profile-v1" as const
+              : "ifc-space-body-envelope-v1" as const))
+          : "none" as const,
+        floorAreaM2: planarPolygonArea(slabHull),
+        totalWalkableCells,
+        assignedWalkableCells: assignedRoomCells,
+      };
+
+      const boundaryWallsByComponent = new Map<number, string[]>();
+      for (const component of components) {
+        boundaryWallsByComponent.set(component.id, Array.from(new Set(component.boundaryWallIds || [])));
       }
 
       const wallTopElevationsById = new Map<string, number>();
@@ -1651,6 +2001,7 @@ export class RoomDetector {
         overheadSurfaceElements,
         anchorByComponent,
       );
+      const assignedNativeFurnitureCount = attachNativeFurnitureToRooms(rooms, nativeFurnitureElements, actualFloorY);
 
       const portals: RoomPortal[] = [];
       for (const semanticOpening of semanticOpenings) {
@@ -1848,9 +2199,25 @@ export class RoomDetector {
           retainedRoomCount: rooms.length,
           floorLevelGroupCount: levelGroups.length || 1,
           analysedFloorLevelCount: 1,
-          semanticSpaceCount: semanticSpaceAnchorsOnLevel.length,
-          anchoredRoomCount: anchorByComponent.size,
+          semanticSpaceCount: semanticSpaceIds.length,
+          anchoredRoomCount,
+          resolvedAnchorCount: semanticMatchedSpaceCount,
+          anchorMappingId: anchorPartition.mappingId,
           roomCoverageRatio: Number(roomCoverageRatio.toFixed(4)),
+          roomReconstructionMethod: reconstruction.method,
+          floorDomainAreaM2: Number(reconstruction.floorAreaM2.toFixed(4)),
+          roomFootprintCoverageRatio: Number(reconstruction.coverageRatio.toFixed(4)),
+          totalWalkableRoomCells: reconstruction.totalWalkableCells,
+          assignedWalkableRoomCells: reconstruction.assignedWalkableCells,
+          semanticMatchedSpaceCount,
+          unmatchedSemanticSpaces: roomGraph.unmatchedSemanticSpaces,
+          wallAxisCount: roomGraph.wallAxisCount,
+          wallGraphNodeCount: roomGraph.graphNodeCount,
+          wallGraphEdgeCount: roomGraph.graphEdgeCount,
+          wallGraphFaceCount: roomGraph.wallGraphFaceCount,
+          nativeFurnitureSemanticCount,
+          nativeFurnitureGeometryCount: nativeFurnitureElements.length,
+          nativeFurnitureAssignedCount: assignedNativeFurnitureCount,
           // Count all openings intentionally sealed for room partitioning,
           // including hosted GLB door openings identified by their opening name.
           sealedDoorCount: sealableOpenings.length,

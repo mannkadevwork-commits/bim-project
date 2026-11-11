@@ -154,6 +154,15 @@ const normalizeProjectStatePayload = (value) => ({
   materials: value?.materials || {},
   furniture: sanitizePersistedFurniture(value?.furniture || []),
   structural_edits: value?.structural_edits || {},
+  roomProperties: value?.roomProperties && typeof value.roomProperties === 'object' && !Array.isArray(value.roomProperties)
+    ? Object.fromEntries(Object.entries(value.roomProperties).map(([roomId, properties]) => [
+        String(roomId),
+        {
+          ...(typeof properties?.name === 'string' ? { name: properties.name.slice(0, 120) } : {}),
+          ...(typeof properties?.type === 'string' ? { type: properties.type.slice(0, 48) } : {}),
+        },
+      ]))
+    : {},
   ceiling_hidden_entity_ids: Array.isArray(value?.ceiling_hidden_entity_ids)
     ? value.ceiling_hidden_entity_ids.map(String).filter(Boolean)
     : [],
@@ -178,6 +187,18 @@ const normalizeProjectStatePayload = (value) => ({
   ceilings: Array.isArray(value?.ceilingDesigns)
     ? value.ceilingDesigns
     : (Array.isArray(value?.ceilings) ? value.ceilings.filter((item) => item && typeof item === 'object') : []),
+  sceneFrame: {
+    schemaVersion: 1,
+    revision: Number.isFinite(value?.sceneFrame?.revision) ? value.sceneFrame.revision : 0,
+    modelToScene: Array.isArray(value?.sceneFrame?.modelToScene) &&
+      value.sceneFrame.modelToScene.length === 16 &&
+      value.sceneFrame.modelToScene.every(Number.isFinite)
+      ? value.sceneFrame.modelToScene
+      : [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    geometryScaleAppliedToIfc: value?.sceneFrame?.geometryScaleAppliedToIfc === true,
+    sourceLengthUnit: value?.sceneFrame?.sourceLengthUnit || 'unknown',
+    ...(value?.sceneFrame?.calibrationScale ? { calibrationScale: value.sceneFrame.calibrationScale } : {}),
+  },
   scene_calibration: value?.scene_calibration || { scaleFactor: { x: 1, y: 1, z: 1 } },
 });
 
@@ -768,10 +789,8 @@ export const useProjectSync = (activeProject) => {
     }
     if (!renderResult?.jobId) throw new Error('The 360 render is not available to save.');
 
-    // Always thumbnail the freshly compiled working-project output. A previous
-    // Update Layout action may have redirected renderResult.modelUrl to the
-    // immutable saved snapshot; that URL must not become the next update source.
-    const sourceModelUrl = `${API_BASE_URL}/jobs/${encodeURIComponent(renderResult.jobId)}/output.glb`;
+    const sourceModelUrl = renderResult.modelUrl ||
+      `${API_BASE_URL}/jobs/${encodeURIComponent(renderResult.jobId)}/output.glb`;
 
     const modelResponse = await fetch(sourceModelUrl, { cache: 'no-store' });
     if (!modelResponse.ok) {
@@ -845,14 +864,13 @@ export const useProjectSync = (activeProject) => {
   const updateSavedLayoutSnapshot = async (layoutId, renderResult, renderConfig) => {
     if (!layoutId) throw new Error('Saved layout id is required.');
     if (!jobId) throw new Error('No active project is available.');
-    if (!renderResult?.jobId || String(renderResult.jobId) !== String(jobId)) {
+    if (!renderResult?.jobId || renderResult.jobId != jobId) {
       throw new Error('Render the current project before updating the saved layout.');
     }
 
     let thumbnailBlob = null;
-    // `jobId` is the mutable working project. The saved layout's renderJobId
-    // changes after every successful update, but must never replace this source.
-    const sourceModelUrl = `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`;
+    const sourceModelUrl = renderResult.modelUrl ||
+      `${API_BASE_URL}/jobs/${encodeURIComponent(jobId)}/output.glb`;
 
     try {
       const modelResponse = await fetch(sourceModelUrl, { cache: 'no-store' });
@@ -1163,8 +1181,9 @@ export const useProjectSync = (activeProject) => {
       : null;
     const persistedMatrix = runtimeMatrix;
 
-    setProjectStateTracked(prev => {
-      const nextFurniture = (prev.furniture || []).map(f => {
+    setProjectStateTracked(prev => ({
+      ...prev,
+      furniture: (prev.furniture || []).map(f => {
         if (f.instanceId !== selectedAssetId) return f;
 
         const nextItem = {
@@ -1184,37 +1203,8 @@ export const useProjectSync = (activeProject) => {
         }
 
         return nextItem;
-      });
-
-      const movedFixture = nextFurniture.find((item) => item.instanceId === selectedAssetId);
-      const shouldMoveOpening = Boolean(
-        movedFixture?.ceilingOpeningId && Array.isArray(persistedPosition) &&
-        persistedPosition.length === 3 && !isScale && !isRotation
-      );
-      if (!shouldMoveOpening) return { ...prev, furniture: nextFurniture };
-
-      const currentCeilings = Array.isArray(prev.ceilingDesigns)
-        ? prev.ceilingDesigns
-        : (Array.isArray(prev.ceilings) ? prev.ceilings : []);
-      const nextCeilings = currentCeilings.map((design) => {
-        const openings = Array.isArray(design?.openings) ? design.openings : [];
-        if (!openings.some((opening) => opening?.id === movedFixture.ceilingOpeningId)) return design;
-        return {
-          ...design,
-          openings: openings.map((opening) => opening?.id === movedFixture.ceilingOpeningId
-            ? { ...opening, x: persistedPosition[0], z: persistedPosition[2] }
-            : opening),
-          revision: (Number(design.revision) || 1) + 1,
-        };
-      });
-
-      return {
-        ...prev,
-        furniture: nextFurniture,
-        ceilingDesigns: nextCeilings,
-        ceilings: nextCeilings,
-      };
-    }, { coalesceKey: `asset-transform:${selectedAssetId}:${isScale ? 'scale' : isRotation ? 'rotation' : 'position'}` });
+      }),
+    }), { coalesceKey: `asset-transform:${selectedAssetId}:${isScale ? 'scale' : isRotation ? 'rotation' : 'position'}` });
   };
 
   const deleteAsset = (viewerRef, selectedAssetId) => {
@@ -1225,34 +1215,13 @@ export const useProjectSync = (activeProject) => {
       assetModel.destroy();
     }
 
-    // A recessed ceiling fixture owns a cut-out by ID. Removing the fixture
-    // through any editor path (context menu, Delete, multi-select or Ceiling
-    // Plan) must remove the linked opening in the same project-state edit.
-    setProjectStateTracked(prev => {
-      const removedItem = (prev.furniture || []).find((item) => item.instanceId === selectedAssetId);
-      const openingId = removedItem?.ceilingOpeningId;
-      const nextFurniture = (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId);
-      if (!openingId) return { ...prev, furniture: nextFurniture };
-
-      const currentCeilings = Array.isArray(prev.ceilingDesigns)
-        ? prev.ceilingDesigns
-        : (Array.isArray(prev.ceilings) ? prev.ceilings : []);
-      const nextCeilings = currentCeilings.map((design) => {
-        const openings = Array.isArray(design?.openings) ? design.openings : [];
-        if (!openings.some((opening) => opening?.id === openingId)) return design;
-        return {
-          ...design,
-          openings: openings.filter((opening) => opening?.id !== openingId),
-          revision: (Number(design.revision) || 1) + 1,
-        };
-      });
-      return {
-        ...prev,
-        furniture: nextFurniture,
-        ceilingDesigns: nextCeilings,
-        ceilings: nextCeilings,
-      };
-    });
+    // Persistence is authoritative. Even if the live xeokit model is already
+    // gone (for example after a reload/race), the saved furniture entry must
+    // always be removed so a later calibration/reload cannot resurrect it.
+    setProjectStateTracked(prev => ({
+      ...prev,
+      furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
+    }));
 
     setToastMessage('Asset removed.');
     setTimeout(() => setToastMessage(null), 3000);
@@ -1292,6 +1261,10 @@ export const useProjectSync = (activeProject) => {
       position: safeVector(existingItem.position, [0, 0, 0]),
       rotation: safeVector(existingItem.rotation, [0, 0, 0]),
       scale: safeVector(existingItem.scale, [1, 1, 1]),
+      ...(existingItem.roomId ? { roomId: existingItem.roomId } : {}),
+      ...(existingItem.roomLabel ? { roomLabel: existingItem.roomLabel } : {}),
+      ...(existingItem.ceilingRoomId ? { ceilingRoomId: existingItem.ceilingRoomId } : {}),
+      ...(existingItem.ceilingMountType ? { ceilingMountType: existingItem.ceilingMountType } : {}),
       ...(replacementAsset.category_id != null ? { categoryId: replacementAsset.category_id } : {}),
       ...(replacementAsset.thumbnail_url ? { thumbnailUrl: replacementAsset.thumbnail_url } : {}),
       ...(replacementAsset.attributes ? { catalogAttributes: replacementAsset.attributes } : {}),
@@ -1452,9 +1425,10 @@ export const useProjectSync = (activeProject) => {
       lightEnabled: asset.lightEnabled === true,
       pivotMode: asset.pivotMode || null,
       placementSurface: asset.placementSurface || null,
+      ...(asset.roomId ? { roomId: String(asset.roomId) } : {}),
+      ...(asset.roomLabel ? { roomLabel: String(asset.roomLabel).slice(0, 120) } : {}),
       ...(asset.ceilingRoomId ? { ceilingRoomId: String(asset.ceilingRoomId) } : {}),
       ...(asset.ceilingMountType ? { ceilingMountType: String(asset.ceilingMountType) } : {}),
-      ...(asset.ceilingOpeningId ? { ceilingOpeningId: String(asset.ceilingOpeningId) } : {}),
       ...(doorHostWallId ? { doorHostWallId } : {}),
       ...(doorHostWallId && doorDimensions && Object.values(doorDimensions).every((value) => Number.isFinite(value) && value > 0)
         ? { doorDimensions }
@@ -1599,6 +1573,23 @@ export const useProjectSync = (activeProject) => {
     return true;
   };
 
+  const setRoomProperties = (roomId, patch) => {
+    const id = String(roomId || '').trim();
+    if (!id || !patch || typeof patch !== 'object') return false;
+    const safePatch = {};
+    if (typeof patch.name === 'string') safePatch.name = patch.name.trim().slice(0, 120);
+    if (typeof patch.type === 'string') safePatch.type = patch.type.trim().slice(0, 48);
+    if (!Object.keys(safePatch).length) return false;
+    setProjectStateTracked((previous) => ({
+      ...previous,
+      roomProperties: {
+        ...(previous.roomProperties || {}),
+        [id]: { ...(previous.roomProperties?.[id] || {}), ...safePatch },
+      },
+    }), { coalesceKey: `room-properties:${id}` });
+    return true;
+  };
+
   const setRoomCeilingDesigns = (ceilings) => {
     const safeCeilings = Array.isArray(ceilings) ? ceilings.filter((item) => (
       item && item.id && (Array.isArray(item.polygon) || Array.isArray(item.boundary?.outer))
@@ -1734,21 +1725,13 @@ export const useProjectSync = (activeProject) => {
       const scale = Array.isArray(item.scale) && item.scale.length === 3
         ? item.scale
         : [1, 1, 1];
-      const usesNativeMatrix = item?.isNativeIsolation === true || Boolean(item?.nativeSourceId);
 
-      // The raw matrix is authoritative only for an isolated native IFC.
-      // Catalogue GLBs and ordinary IFC assets must persist semantic position/
-      // rotation/scale. In particular, a GLB matrix written by the resize gizmo
-      // is a runtime implementation detail and must not shadow its normalized
-      // pivot target in the render compiler.
-      const sourceMatrix = usesNativeMatrix
-        ? (normalizeMatrix(item.matrix) || normalizeMatrix(matrixSnapshots?.[item.instanceId]))
-        : null;
+      const sourceMatrix = normalizeMatrix(item.matrix) || normalizeMatrix(matrixSnapshots?.[item.instanceId]);
       const nextMatrix = sourceMatrix
         ? transformMatrixBySceneScale(sourceMatrix, ratio, oldSceneCenter, newSceneCenter)
         : null;
 
-      const nextItem = {
+      return {
         ...item,
         position: [
           newSceneCenter[0] + (position[0] - oldSceneCenter[0]) * ratio,
@@ -1760,20 +1743,33 @@ export const useProjectSync = (activeProject) => {
           scale[1] * ratio,
           scale[2] * ratio,
         ],
+        ...(nextMatrix ? { matrix: nextMatrix } : {}),
       };
-
-      if (nextMatrix) {
-        nextItem.matrix = nextMatrix;
-      } else {
-        delete nextItem.matrix;
-      }
-
-      return nextItem;
     });
 
     const nextState = {
       ...currentState,
       furniture: nextFurniture,
+      sceneFrame: {
+        ...(currentState.sceneFrame || {}),
+        schemaVersion: 1,
+        revision: Number(currentState.sceneFrame?.revision || 0) + 1,
+        modelToScene: [
+          safePrevious.x * ratio, 0, 0, 0,
+          0, safePrevious.y * ratio, 0, 0,
+          0, 0, safePrevious.z * ratio, 0,
+          0, 0, 0, 1,
+        ],
+        // Calibration API rewrites the canonical input.ifc geometry. The
+        // compiler must not apply the same scale to the structural node again.
+        geometryScaleAppliedToIfc: true,
+        sourceLengthUnit: currentState.sceneFrame?.sourceLengthUnit || 'unknown',
+        calibrationScale: {
+          x: safePrevious.x * ratio,
+          y: safePrevious.y * ratio,
+          z: safePrevious.z * ratio,
+        },
+      },
       scene_calibration: {
         ...(currentState.scene_calibration || {}),
         scaleFactor: {
@@ -1876,6 +1872,7 @@ export const useProjectSync = (activeProject) => {
     setAssetLightEnabled,
     setAssetLightIntensity,
     setRoomCeilingDesigns,
+    setRoomProperties,
     setCeilingHiddenEntityIds,
     transformFurnitureForCalibration,
     repairLegacyCalibrationState,

@@ -29,5 +29,15 @@ export const createInitialProjectState = () => ({
   ceiling_hidden_entity_ids: [],
   ceilingDesigns: [],
   ceilings: [],
+  roomProperties: {},
+  // Versioned coordinate-frame metadata. Identity is the safe default;
+  // legacy scene_calibration remains readable during migration.
+  sceneFrame: {
+    schemaVersion: 1,
+    revision: 0,
+    modelToScene: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    geometryScaleAppliedToIfc: false,
+    sourceLengthUnit: 'unknown',
+  },
   scene_calibration: { scaleFactor: { x: 1, y: 1, z: 1 } },
 });

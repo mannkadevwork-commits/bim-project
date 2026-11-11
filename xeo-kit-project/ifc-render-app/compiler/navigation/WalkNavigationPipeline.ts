@@ -1502,9 +1502,12 @@ function writeDebugObj(filePath: string, positions: Float32Array, indices: Uint3
   fs.writeFileSync(filePath, lines.join("\n") + "\n", "utf8");
 }
 
-const NAV_CACHE_ALGORITHM_VERSION = "hci-walknav-2026-10-29-v1";
+const NAV_CACHE_ALGORITHM_VERSION = "hci-walknav-room-topology-v3-storey-association-2026-11-10";
 const NAV_PIPELINE_SOURCE_PATH = fileURLToPath(import.meta.url);
 const ROOM_DETECTOR_SOURCE_PATH = path.join(path.dirname(NAV_PIPELINE_SOURCE_PATH), "RoomDetector.ts");
+const ROOM_TOPOLOGY_SOURCE_PATH = path.join(path.dirname(NAV_PIPELINE_SOURCE_PATH), "RoomTopologyReconstructor.ts");
+const ROOM_FOOTPRINT_SOURCE_PATH = path.join(path.dirname(NAV_PIPELINE_SOURCE_PATH), "RoomFootprintReconstructor.ts");
+const ROOM_LEVEL_ASSOCIATION_SOURCE_PATH = path.join(path.dirname(NAV_PIPELINE_SOURCE_PATH), "RoomLevelAssociation.ts");
 const NAV_CACHE_REQUIRED_ARTIFACTS = [
   "navigation_navmesh.bin",
   "navigation_surface.json",
@@ -1536,7 +1539,13 @@ function navigationGeometrySignature(
   hash.update(Buffer.from(indices.buffer, indices.byteOffset, indices.byteLength));
   hash.update(JSON.stringify({
     algorithm: NAV_CACHE_ALGORITHM_VERSION,
-    algorithmSources: [NAV_PIPELINE_SOURCE_PATH, ROOM_DETECTOR_SOURCE_PATH].map((sourcePath) => {
+    algorithmSources: [
+      NAV_PIPELINE_SOURCE_PATH,
+      ROOM_DETECTOR_SOURCE_PATH,
+      ROOM_TOPOLOGY_SOURCE_PATH,
+      ROOM_FOOTPRINT_SOURCE_PATH,
+      ROOM_LEVEL_ASSOCIATION_SOURCE_PATH,
+    ].map((sourcePath) => {
       try {
         const stat = fs.statSync(sourcePath);
         return { sourcePath: path.basename(sourcePath), size: stat.size, mtimeMs: Math.trunc(stat.mtimeMs) };
