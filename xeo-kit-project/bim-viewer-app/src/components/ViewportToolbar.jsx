@@ -9,6 +9,7 @@ import {
   Crosshair,
   Box,
   Grid2X2,
+  DoorOpen,
   ScanSearch,
   Bookmark,
   Save,
@@ -24,6 +25,7 @@ import {
   ArrowRight,
   Layers3,
   Check,
+  Loader2,
 } from 'lucide-react';
 
 const PRESETS = [
@@ -62,6 +64,10 @@ function getPopupPosition(anchor) {
 export const ViewportToolbar = ({
   isMeasuring,
   isClipping,
+  onOpenRooms,
+  roomsOpen = false,
+  roomCount = 0,
+  roomsLoading = false,
   onSelect,
   onMeasure,
   onClip,
@@ -327,14 +333,24 @@ export const ViewportToolbar = ({
             <span className="hidden 2xl:inline text-[11px] font-semibold">Select</span>
           </button>
 
+          <button type="button" className={item(roomsOpen)} onClick={onOpenRooms} title="Browse and select rooms" aria-label="Open room browser">
+            {roomsLoading ? <Loader2 className="h-4.5 w-4.5 animate-spin" /> : <DoorOpen className="h-4.5 w-4.5" />}
+            <span className="hidden 2xl:inline text-[11px] font-semibold">Rooms{roomCount ? ` (${roomCount})` : ''}</span>
+          </button>
+
+          <button type="button" className={item(navMode === 'planView')} onClick={() => onNavMode?.(navMode === 'planView' ? 'orbit' : 'planView')} title="Lock the camera to a top-down floor plan" aria-label="Toggle plan view">
+            <Grid2X2 className="h-4.5 w-4.5" />
+            <span className="hidden 2xl:inline text-[11px] font-semibold">Plan</span>
+          </button>
+
           <button
             className={item(navMode === 'firstPerson')}
-            onClick={() => onNavMode?.(navMode === 'firstPerson' ? 'orbit' : 'firstPerson')}
+            onClick={() => onNavMode?.(navMode === 'firstPerson' ? 'orbit' : (navMode === 'planView' ? 'orbit' : 'firstPerson'))}
             title={navMode === 'firstPerson' ? 'Switch to orbit controls to inspect the model from outside' : 'Walk through the rooms at eye level'}
             aria-label={navMode === 'firstPerson' ? 'Switch to orbit controls' : 'Walk through the model'}
           >
-            {navMode === 'firstPerson' ? <Footprints className="h-4.5 w-4.5" /> : <Orbit className="h-4.5 w-4.5" />}
-            <span className="hidden 2xl:inline text-[11px] font-semibold">{navMode === 'firstPerson' ? 'Orbit' : 'Walk'}</span>
+            {navMode === 'firstPerson' ? <Orbit className="h-4.5 w-4.5" /> : navMode === 'planView' ? <Orbit className="h-4.5 w-4.5" /> : <Footprints className="h-4.5 w-4.5" />}
+            <span className="hidden 2xl:inline text-[11px] font-semibold">{navMode === 'firstPerson' || navMode === 'planView' ? 'Orbit' : 'Walk'}</span>
           </button>
 
           <div ref={cameraRef} className="relative flex items-center">

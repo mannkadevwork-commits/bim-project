@@ -1,3 +1,5 @@
+import { getRoomInteriorCameraPose } from './roomCameraGeometry.js';
+
 const PRESETS = {
   top: { direction: [0, 1, 0], up: [0, 0, -1], projection: 'ortho' },
   front: { direction: [0, 0, 1], up: [0, 1, 0], projection: 'perspective' },
@@ -63,6 +65,14 @@ export class CameraManager {
     this.control.active = true;
     this.control.followPointer = true;
     this.control.smartPivot = true;
+  }
+
+  setPlanView() {
+    if (!this.control) return;
+    this.control.navMode = 'planView';
+    this.control.active = true;
+    this.control.followPointer = false;
+    this.control.smartPivot = false;
   }
 
   fitScene(duration = this.defaultDuration) {
@@ -160,8 +170,9 @@ export class CameraManager {
     const spanY = Math.max(ceilingY - floorY, 2.0);
     const roomSpan = Math.max(spanX, spanZ, spanY, 2.0);
 
-    if (mode === 'ceiling-plan') {
-      const lookY = ceilingY;
+    if (mode === 'ceiling-plan' || mode === 'plan') {
+      this.setPlanView();
+      const lookY = mode === 'ceiling-plan' ? ceilingY : floorY + 0.02;
       const orthoScale = Math.max(spanX, spanZ) * 1.28;
       try {
         this.camera.projection = 'ortho';
@@ -178,6 +189,7 @@ export class CameraManager {
       return true;
     }
 
+    this.setOrbit();
     const direction = normalize([1, 0.78, 1.15]);
     const fov = Number(this.camera.perspective?.fov || 54);
     const distance = Math.max((roomSpan / Math.sin((fov * Math.PI / 180) / 2)) * 0.95, 3);
@@ -190,6 +202,43 @@ export class CameraManager {
       fit: false,
     });
     return true;
+  }
+
+
+  /**
+   * Enter a room at human eye height, matching an interior-design walkthrough
+   * camera rather than framing the room from outside. The camera remains in
+   * first-person mode so users can look around and move with the native xeokit
+   * controls while selecting objects directly in the viewport.
+   */
+  enterRoom(room, { duration = 1.05, eyeHeight = 1.55, viewPreset = 'auto' } = {}) {
+    if (!this.viewer?.scene || !this.flight || !this.camera || !this.control) return false;
+    const pose = getRoomInteriorCameraPose(room, { eyeHeight, viewPreset });
+    if (!pose) return false;
+
+    this.camera.projection = 'perspective';
+    if (this.camera.perspective) this.camera.perspective.fov = 65;
+    this.control.navMode = 'firstPerson';
+    this.control.active = true;
+    this.control.followPointer = false;
+    this.control.smartPivot = false;
+    this.control.constrainVertical = true;
+
+    this.flight.flyTo({
+      eye: pose.eye,
+      look: pose.look,
+      up: pose.up,
+      projection: 'perspective',
+      duration,
+      fit: false,
+    });
+    return pose;
+  }
+
+  /** Returns from interior navigation to an orbit view of the whole building. */
+  exitRoom(duration = 0.8) {
+    this.setOrbit();
+    return this.overview(duration);
   }
 
   setProjection(projection, duration = this.defaultDuration) {
@@ -272,9 +321,11 @@ export class CameraManager {
 
   preset(name, duration = 0.55) {
     if (!this.viewer?.scene || !this.flight) return false;
-    if (name === 'iso') return this.overview(duration);
+    if (name === 'iso') { this.setOrbit(); return this.overview(duration); }
     const preset = PRESETS[name];
     if (!preset) return false;
+    if (name === 'top') this.setPlanView();
+    else this.setOrbit();
 
     const fit = getBoundsCenterAndRadius(getSceneAABB(this.viewer));
     if (!fit) return false;

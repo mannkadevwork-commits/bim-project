@@ -185,6 +185,9 @@ function buildCeilingDesign(room, analysis, settings) {
       boundarySource: room.boundarySource || 'wall-topology-grid',
       boundaryConfidence: safeNumber(room.boundaryConfidence, 0),
       semanticSpace: room.semanticSpace || null,
+      semanticSpaces: Array.isArray(room.semanticSpaces) ? room.semanticSpaces : [],
+      geometrySource: room.geometrySource || null,
+      validation: room.validation || null,
       diagnostics: Array.isArray(room.diagnostics) ? room.diagnostics : [],
       ceilingCandidateIds: (room.ceilingCandidates || []).map((candidate) => candidate.id),
     },
@@ -202,7 +205,10 @@ function getElevationSourceLabel(room) {
 
 function getBoundarySourceLabel(room) {
   switch (room?.boundarySource) {
+    case 'ifc-space-wall-constrained-geodesic': return 'IFC room placement + wall-constrained regions (inferred)';
     case 'ifc-space-anchor-geodesic': return 'IFC room anchor + wall constraints (inferred)';
+    case 'ifc-space-body-envelope': return 'IFC body envelope · manual review';
+    case 'wall-face-reconstruction': return 'IFC wall planar graph (inferred)';
     case 'wall-topology-grid': return 'Wall-topology footprint';
     default: return 'Unclassified boundary source';
   }
@@ -217,6 +223,7 @@ function getConfidenceTone(confidence) {
 export const CeilingDesignerModal = ({
   open,
   jobId,
+  initialRoomId = '',
   existingCeilings = [],
   onClose,
   onApply,
@@ -382,8 +389,14 @@ export const CeilingDesignerModal = ({
         const details = payload.details ? `\n${payload.details}` : '';
         throw new Error(`${payload.error || `Ceiling analysis failed (${response.status}).`}${details}`);
       }
-      if (![1, 2].includes(Number(payload.schemaVersion)) || !Array.isArray(payload.rooms) || !Array.isArray(payload.levels)) {
-        throw new Error('The backend returned an unsupported ceiling-analysis response. Update the backend analyzer and restart it.');
+      // Ceiling response fields are additive across schema revisions. Validate
+      // the stable envelope rather than hardcoding an outdated version list.
+      const validCeilingContract = Number.isSafeInteger(Number(payload.schemaVersion))
+        && Number(payload.schemaVersion) >= 1
+        && Array.isArray(payload.rooms)
+        && Array.isArray(payload.levels);
+      if (!validCeilingContract) {
+        throw new Error(`The backend returned an invalid ceiling-analysis contract (schema ${payload.schemaVersion ?? 'missing'}). Update and restart the backend analyzer.`);
       }
       if (requestVersion !== requestVersionRef.current) return;
 
@@ -396,8 +409,13 @@ export const CeilingDesignerModal = ({
       }
 
       const activeLevels = payload.levels.filter((level) => level.analysisStatus === 'analysed');
-      const nextLevelId = activeLevels[0]?.id || detectedRooms[0]?.levelId || '';
-      const firstRoom = detectedRooms.find((room) => room.levelId === nextLevelId) || detectedRooms[0];
+      // When opened from a selected room, keep the ceiling workflow scoped to
+      // that room instead of silently defaulting to the first room in the IFC.
+      const preferredRoom = detectedRooms.find((room) => (
+        room.id === initialRoomId || room.navigationRoomId === initialRoomId
+      ));
+      const nextLevelId = preferredRoom?.levelId || activeLevels[0]?.id || detectedRooms[0]?.levelId || '';
+      const firstRoom = preferredRoom || detectedRooms.find((room) => room.levelId === nextLevelId) || detectedRooms[0];
 
       setAnalysis(payload);
       setRooms(detectedRooms);
@@ -416,7 +434,7 @@ export const CeilingDesignerModal = ({
     } finally {
       if (requestVersion === requestVersionRef.current) setLoading(false);
     }
-  }, [jobId]);
+  }, [jobId, initialRoomId]);
 
   useEffect(() => {
     if (!open) {
@@ -485,6 +503,8 @@ export const CeilingDesignerModal = ({
     confidence < 0.75 ||
     boundaryConfidence < 0.75 ||
     selectedRoom.elevationSource !== 'ifc-overhead-surface' ||
+    selectedRoom.boundarySource === 'wall-face-reconstruction' ||
+    selectedRoom.boundarySource === 'ifc-space-wall-constrained-geodesic' ||
     selectedRoom.boundarySource === 'ifc-space-anchor-geodesic' ||
     analysis?.units?.confidence === 'assumed-metre'
   ));

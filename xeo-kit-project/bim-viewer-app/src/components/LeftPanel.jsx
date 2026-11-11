@@ -23,6 +23,7 @@ export const LeftPanel = ({
   activeTab = null, onActiveTabChange = null,
   isCeilingHidden = false, onToggleCeiling = null, onOpenCeilingDesigner = null,
   hasDesignedCeilings = false, areDesignedCeilingsHidden = false, onToggleDesignedCeilings = null,
+  catalogSearchTerm = '', onCatalogSearchTermChange = () => {}, activeRoomLabel = '',
 }) => {
   const [internalLeftTab, setInternalLeftTab] = useState('explorer');
   const leftTab = activeTab ?? internalLeftTab;
@@ -230,7 +231,17 @@ export const LeftPanel = ({
       </div>
 
       <div className={`flex-1 overflow-hidden ${leftTab === 'assets' ? 'flex' : 'hidden'}`}>
-        <CatalogTree tree={mergedCatalogTree} loading={catalogLoading} error={catalogError} placementMode={placementMode} setPlacementMode={setPlacementMode} resetSelection={resetSelection} />
+        <CatalogTree
+          tree={mergedCatalogTree}
+          loading={catalogLoading}
+          error={catalogError}
+          placementMode={placementMode}
+          setPlacementMode={setPlacementMode}
+          resetSelection={resetSelection}
+          searchQuery={catalogSearchTerm}
+          onSearchQueryChange={onCatalogSearchTermChange}
+          activeRoomLabel={activeRoomLabel}
+        />
       </div>
 
       <div className={`flex-1 overflow-y-auto ${leftTab === 'templates' ? 'block' : 'hidden'}`}>

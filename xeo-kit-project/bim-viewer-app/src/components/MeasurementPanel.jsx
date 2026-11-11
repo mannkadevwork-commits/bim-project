@@ -462,7 +462,7 @@ export const MeasurementPanel = ({
                   <div className="flex items-center justify-between gap-2 mb-2">
                     <div>
                       <div className="text-[10px] font-semibold text-slate-600 dark:text-slate-300">Reference segment</div>
-                      <div className="text-[9px] text-slate-400 mt-0.5">Known physical dimension used to rescale the scene</div>
+                      <div className="text-[9px] text-slate-400 mt-0.5">Known physical dimension used to calibrate the entire model</div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <div className="text-xs font-bold text-amber-700 dark:text-amber-400 tabular-nums">{formatLength(calibrationMeasurement.lengthMeters)}</div>
@@ -478,7 +478,7 @@ export const MeasurementPanel = ({
                     </div>
                   </div>
                   <div className="text-[10px] leading-4 text-slate-500 dark:text-slate-400 mb-2.5">
-                    Enter the known real-world length in the selected unit.
+                    Enter the real-world length. Calibration updates the whole imported building and its placed assets; it does not resize only one wall.
                   </div>
                   <div className="flex items-center gap-1.5">
                     <input

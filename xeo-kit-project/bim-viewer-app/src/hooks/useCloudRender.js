@@ -3,7 +3,7 @@ import { useState } from 'react';
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
 export const useCloudRender = (activeProject, projectStateRef) => {
-  const { file, jobId } = activeProject || {};
+  const { jobId } = activeProject || {};
   const [isRendering, setIsRendering] = useState(false);
   const [renderResult, setRenderResult] = useState(null);
   const [renderTime, setRenderTime] = useState(null);
@@ -11,7 +11,7 @@ export const useCloudRender = (activeProject, projectStateRef) => {
   const [renderConfig, setRenderConfig] = useState({ type: '360', quality: 'high', lighting: 'daylight' });
 
   const executeRender = async ({ silent = false, typeOverride = null } = {}) => {
-    if (!file || !jobId) {
+    if (!jobId) {
       if (silent) throw new Error('No active project is available for rendering.');
       return null;
     }
@@ -25,7 +25,9 @@ export const useCloudRender = (activeProject, projectStateRef) => {
     }
 
     const formData = new FormData();
-    formData.append('ifcFile', file);
+    // The backend job owns the canonical IFC. Never upload the browser's
+    // original File during render: it may predate calibration or structural
+    // edits and would silently replace the authoritative input.ifc.
     formData.append('jobId', jobId);
 
     const effectiveRenderType = typeOverride || renderConfig.type;

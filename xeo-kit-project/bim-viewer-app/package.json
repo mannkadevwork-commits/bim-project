@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:room-utils": "node --test tests/roomFurniture.test.mjs"
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.2.2",

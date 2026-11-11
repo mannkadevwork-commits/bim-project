@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { 
   PanelRightClose, Component, Settings2, Eye, EyeOff, Scissors, 
-  Footprints, Orbit, Info, Palette, Maximize2, Move, Ruler,
-  Sun, Moon, Trash2, CloudCog, Loader2, Clock, Layers3, X, MousePointer2, ChevronDown  
+  Footprints, Orbit, Grid2X2, Info, Palette, Maximize2, Move, Ruler,
+  Sun, Moon, Trash2, CloudCog, Loader2, Clock, Layers3, X, MousePointer2, ChevronDown, RotateCcw  
 } from 'lucide-react';
 import { LayoutMetadataForm } from './LayoutMetadataForm';
+import { RoomPropertiesPanel } from './RoomPropertiesPanel';
+import { RoomMapNavigator } from './RoomMapNavigator';
 
 const POSITION_RADIUS = 8;   
 const ELEVATION_RANGE = [-2, 6]; 
@@ -32,14 +34,15 @@ const formatElementType = (value) => {
 
 export const RightPanel = ({
   isOpen, onClose, rightTab, setRightTab,
-  selectedObject, selectedElements = [], multiSelectMode = false, onToggleMultiSelect, onClearSelection, onDeleteSelected, activeAsset, selectedAssetId,
+  selectedObject, selectedRoom = null, roomContext = null, onReturnToRoom, onSetTransformMode, roomFurniture = [], nativeRoomElements = [], onSelectNativeRoomElement, onSelectRoomAsset, onReplaceRoomAsset, onDeleteRoomAsset, roomProperties = {}, onUpdateRoom, onFocusRoom, onPlanRoom, onOpenRoomCeilingDesigner, onSelectRoomBoundaryWalls, hasDesignedCeiling = false, selectedElements = [], multiSelectMode = false, onToggleMultiSelect, onClearSelection, onDeleteSelected, activeAsset, selectedAssetId,
+  roomMapRooms = [], roomMapLevels = [], roomMapAnalysis = null, roomMapStatus = 'idle', roomMapError = '', activeRoomId = null, roomNavMode = 'orbit', onSelectMapRoom, onExitRoomMode, onPlanMapRoom, onRetryRoomMap,
   customColor, handleCustomColorChange,
   updateSelectedAsset, deleteSelectedAsset, projectState,
   engineState, engineActions, adoptIsolatedAsset, updateStructuralEdit,
   onDeleteProject, isDarkMode, toggleTheme, activeSavedLayout = null, onSaveLayout, isLayoutSaving = false,
   fileNameForLayoutMetadata = '', existingSavedLayouts = [], saveStatus, onApplyToAllWalls,
   materialLibrary = [], materialLibraryLoading = false, materialLibraryError = '', selectedMaterial = null, onApplyMaterial, onApplyMaterialToAllWalls,
-  wallSurfaceScope = 'both', onWallSurfaceScopeChange = () => {}, onBrowseItems = null,
+  wallSurfaceScope = 'both', onWallSurfaceScopeChange = () => {}, onBrowseItems = null, onPlanCamera = () => {},
   isSelectedLightFixture = false, selectedLightEnabled = false, selectedLightIntensity = 0.30, selectedLightTemperature = 4000, onToggleSelectedLight = null, onSetSelectedLightIntensity = null
 }) => {
   const [propertySubTab, setPropertySubTab] = useState('design');
@@ -190,10 +193,10 @@ export const RightPanel = ({
               }}
               disabled={isLayoutSaving}
               className="flex items-center gap-2 bg-[#ff914d] hover:bg-[#ff7a28] disabled:opacity-75 disabled:cursor-wait text-white px-3 py-1.5 rounded-md text-[10px] font-bold tracking-wide transition-colors shadow-sm"
-              title={activeSavedLayout?.id ? `Update the saved layout “${activeSavedLayout.name}”` : 'Save a reusable version of this design'}
+              title={activeSavedLayout?.id ? `Save changes to ${activeSavedLayout.name}` : 'Save a reusable version of this design'}
             >
               {isLayoutSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Layers3 className="w-3.5 h-3.5"/>}
-              {isLayoutSaving ? 'Saving…' : activeSavedLayout?.id ? 'Update layout' : 'Save design'}
+              {isLayoutSaving ? 'Saving…' : 'Save design'}
             </button>
           </div>
 
@@ -237,6 +240,24 @@ export const RightPanel = ({
         </div>
       </div>
 
+      {rightTab === 'properties' && (roomMapRooms.length > 0 || roomMapStatus === 'loading' || roomMapStatus === 'error') && (
+        <RoomMapNavigator
+          rooms={roomMapRooms}
+          levels={roomMapLevels}
+          analysis={roomMapAnalysis}
+          status={roomMapStatus}
+          error={roomMapError}
+          onRetry={onRetryRoomMap}
+          activeRoomId={activeRoomId || roomContext?.id || selectedRoom?.id || null}
+          roomProperties={roomProperties}
+          onSelectRoom={onSelectMapRoom}
+          onExitRoom={onExitRoomMode}
+          onPlanRoom={onPlanMapRoom}
+          navMode={roomNavMode}
+          isDarkMode={isDarkMode}
+        />
+      )}
+
       {showSaveLayoutForm && !activeSavedLayout?.id && (
         <div className="absolute inset-0 z-[80] overflow-y-auto bg-slate-950/60 p-3 backdrop-blur-sm">
           <div className="min-h-full rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl dark:border-slate-700 dark:bg-slate-900">
@@ -267,8 +288,27 @@ export const RightPanel = ({
 
       {/* ── Properties Tab ── */}
       {rightTab === 'properties' && (
-        <div className="flex flex-col h-full overflow-hidden">
-            {!(selectedObject || activeAsset) ? (
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            {selectedRoom || (roomContext && !(selectedObject || activeAsset)) ? (
+                <RoomPropertiesPanel
+                  room={selectedRoom || roomContext}
+                  roomProperties={roomProperties}
+                  onUpdateRoom={onUpdateRoom}
+                  onFocusRoom={onFocusRoom}
+                  onPlanRoom={onPlanRoom}
+                  onOpenCeilingDesigner={onOpenRoomCeilingDesigner}
+                  onSelectBoundaryWalls={onSelectRoomBoundaryWalls}
+                  roomFurniture={roomFurniture}
+                  nativeModelElements={nativeRoomElements}
+                  onSelectNativeModelElement={onSelectNativeRoomElement}
+                  onSelectRoomAsset={onSelectRoomAsset}
+                  onReplaceRoomAsset={onReplaceRoomAsset}
+                  onDeleteRoomAsset={onDeleteRoomAsset}
+                  onBrowseItems={onBrowseItems}
+                  hasDesignedCeiling={hasDesignedCeiling}
+                  isDarkMode={isDarkMode}
+                />
+            ) : !(selectedObject || activeAsset) ? (
                 <div className="flex-1 overflow-y-auto px-4 py-6 text-slate-500 dark:text-slate-400">
                     <div className="mx-auto flex max-w-[270px] flex-col items-center text-center">
                         <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-orange-200 bg-orange-50 text-[#ff914d] shadow-sm dark:border-orange-500/20 dark:bg-orange-500/10">
@@ -289,7 +329,7 @@ export const RightPanel = ({
                         {onBrowseItems && (
                           <button
                             type="button"
-                            onClick={onBrowseItems}
+                            onClick={() => onBrowseItems?.('')}
                             className="flex w-full items-center justify-between gap-3 rounded-xl border border-[#ff914d]/25 bg-[#ff914d]/10 px-3 py-2.5 text-left text-xs font-bold text-[#e97831] transition hover:border-[#ff914d]/45 hover:bg-[#ff914d]/15 dark:text-orange-200"
                           >
                             <span>Browse furniture & accessories</span>
@@ -301,6 +341,41 @@ export const RightPanel = ({
                 </div>
             ) : (
                 <>
+                    {roomContext && (
+                      <div className="mx-4 mt-3 rounded-xl border border-[#ff914d]/25 bg-[#ff914d]/[0.07] p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="text-[9px] font-bold uppercase tracking-[0.14em] text-[#e97831]">Room workspace</p>
+                            <p className="mt-0.5 truncate text-[11px] font-bold text-slate-800 dark:text-slate-100">{roomContext.label || roomContext.semanticSpace?.name || 'Selected room'}</p>
+                          </div>
+                          <button type="button" onClick={onReturnToRoom} className="shrink-0 rounded-lg border border-[#ff914d]/30 px-2.5 py-1.5 text-[9px] font-bold text-[#e97831] transition hover:bg-[#ff914d]/10">Back to room</button>
+                        </div>
+                        {activeAsset && (
+                          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                            {[
+                              { mode: 'move', label: 'Move', Icon: Move },
+                              { mode: 'rotate', label: 'Rotate', Icon: RotateCcw },
+                              { mode: 'stretch', label: 'Resize', Icon: Maximize2 },
+                            ].map(({ mode, label, Icon }) => {
+                              const active = engineState?.transformMode === mode;
+                              return (
+                                <button
+                                  key={mode}
+                                  type="button"
+                                  aria-pressed={active}
+                                  onClick={() => onSetTransformMode?.(mode)}
+                                  className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[9px] font-bold transition ${active
+                                    ? 'border-[#ff914d] bg-[#ff914d] text-white shadow-sm'
+                                    : 'border-slate-300 text-slate-600 hover:border-[#ff914d]/60 dark:border-slate-700 dark:text-slate-300'}`}
+                                >
+                                  <Icon className="h-3 w-3" /> {label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <div className="px-5 py-4 border-b border-slate-100 dark:border-slate-800 shrink-0">
                         <h3 className="text-slate-900 dark:text-white font-bold text-sm break-all">{isMultiSelection ? `${selectedElements.length} items selected` : (activeAsset ? projectState.furniture.find(f => f.instanceId === selectedAssetId)?.name : (selectedObject.name || formatElementType(selectedObject.type)))}</h3>
                         <span className="text-indigo-500 dark:text-indigo-400 text-[10px] uppercase tracking-wider font-bold">{isMultiSelection ? `${selectedWallCount} walls${selectedAssetCount ? ` · ${selectedAssetCount} other items` : ''}` : (activeAsset ? 'Placed item' : formatElementType(selectedObject.type))}</span>
@@ -533,11 +608,12 @@ export const RightPanel = ({
                                                         if (!result.success) console.warn('[RightPanel] Height calibration failed:', result.error);
                                                     }}
                                                     className="w-full mt-1.5 py-1.5 bg-[#ff914d] text-white rounded-md hover:bg-indigo-700 transition text-[11px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
-                                                    title="Set this height for every wall in the floor plan"
+                                                    title="Calibrate the entire imported model using this reference height; this does not resize only the selected wall."
                                                 >
                                                     <Maximize2 className="w-3 h-3" />
-                                                    Set Height for Entire Scene
+                                                    Calibrate Entire Model
                                                 </button>
+                                                <p className="mt-1 text-[9px] leading-4 text-slate-400">Uses this wall as a reference and updates the whole building. Individual wall editing is a separate operation.</p>
                                             </div>
                                             <div>
                                                 <label className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 flex justify-between mb-1">
@@ -722,12 +798,15 @@ export const RightPanel = ({
 
             <section>
                 <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2"><Footprints className="w-3.5 h-3.5"/> Camera Navigation</h4>
-                <div className="flex bg-slate-100 dark:bg-slate-800/50 p-1 rounded-lg">
-                    <button onClick={() => engineActions.setNavMode('orbit')} className={`flex-1 flex items-center justify-center gap-2 py-2 text-xs font-bold rounded-md transition-all cursor-pointer ${engineState.navMode === 'orbit' ? 'bg-white dark:bg-slate-700 shadow text-indigo-600 dark:text-white' : 'text-slate-500'}`}>
-                        <Orbit className="w-4 h-4"/> Orbit
+                <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-800/50">
+                    <button onClick={() => { engineActions.setNavMode('orbit'); engineActions.camera.setProjection('perspective'); }} className={`flex items-center justify-center gap-1.5 rounded-md py-2 text-[10px] font-bold transition-all cursor-pointer ${engineState.navMode === 'orbit' ? 'bg-white text-indigo-600 shadow dark:bg-slate-700 dark:text-white' : 'text-slate-500'}`}>
+                        <Orbit className="h-3.5 w-3.5"/> Orbit
                     </button>
-                    <button onClick={() => engineActions.setNavMode('firstPerson')} className={`flex-1 flex items-center justify-center gap-2 py-2 text-xs font-bold rounded-md transition-all cursor-pointer ${engineState.navMode === 'firstPerson' ? 'bg-white dark:bg-slate-700 shadow text-cyan-600 dark:text-cyan-400' : 'text-slate-500'}`}>
-                        <Footprints className="w-4 h-4"/> Walk
+                    <button onClick={onPlanCamera} className={`flex items-center justify-center gap-1.5 rounded-md py-2 text-[10px] font-bold transition-all cursor-pointer ${engineState.navMode === 'planView' ? 'bg-white text-indigo-600 shadow dark:bg-slate-700 dark:text-white' : 'text-slate-500'}`}>
+                        <Grid2X2 className="h-3.5 w-3.5"/> Plan
+                    </button>
+                    <button onClick={() => engineActions.setNavMode('firstPerson')} className={`flex items-center justify-center gap-1.5 rounded-md py-2 text-[10px] font-bold transition-all cursor-pointer ${engineState.navMode === 'firstPerson' ? 'bg-white text-cyan-600 shadow dark:bg-slate-700 dark:text-cyan-400' : 'text-slate-500'}`}>
+                        <Footprints className="h-3.5 w-3.5"/> Walk
                     </button>
                 </div>
             </section>

@@ -2,7 +2,11 @@ export type RoomSource =
   | "wall-topology-grid-v1"
   | "mixed-structural-sources"
   | "wall-topology-grid-v2"
-  | "ifc-space-anchor-geodesic-v1";
+  | "ifc-space-anchor-geodesic-v1"
+  | "ifc-space-body-envelope-v1"
+  | "ifc-space-step-profile-v1"
+  | "ifc-space-wall-constrained-geodesic-v2"
+  | "ifc-wall-planar-graph-v1";
 
 export interface RoomPolygonPoint {
   x: number;
@@ -52,6 +56,18 @@ export interface DetectedCeilingCandidate {
   confidence: number;
 }
 
+export interface DetectedRoomElement {
+  globalId: string;
+  expressId: number;
+  name: string;
+  ifcType: string;
+  predefinedType?: string;
+  sourceFile: string;
+  center: RoomPolygonPoint;
+  size?: { x: number; z: number; height: number };
+  editingMode: "native-ifc-element";
+}
+
 export interface DetectedRoom {
   id: string;
   /** Stable geometry-derived identity for authored ceiling designs; navigation id remains unchanged. */
@@ -73,9 +89,21 @@ export interface DetectedRoom {
   ceilingElevation?: number;
   ceilingElevationSource?: "ifc-overhead-surface" | "boundary-wall-top" | "fallback-estimate";
   ceilingConfidence?: number;
-  /** How the room footprint was obtained. Anchor geodesic boundaries are inferred, not exact IFC space solids. */
-  boundarySource?: "ifc-space-anchor-geodesic" | "wall-topology-grid";
+  /** How the room footprint was obtained. Anchor-derived boundaries remain inferred, not exact IFC space solids. */
+  boundarySource?: "ifc-space-step-profile" | "ifc-space-body-envelope" | "ifc-space-wall-constrained-geodesic" | "ifc-space-anchor-geodesic" | "wall-topology-grid" | "wall-face-reconstruction";
   boundaryConfidence?: number;
+  /** Native furniture and fixtures from the source IFC whose center lies inside this inferred room footprint. */
+  elements?: DetectedRoomElement[];
+  semanticSpaces?: Array<{
+    expressId: number;
+    globalId: string | null;
+    name: string;
+    description: string;
+    anchor: RoomPolygonPoint;
+    associationDistanceMeters: number;
+    associationMethod: "inside-room-polygon" | "nearest-room-polygon";
+    hasGeometryRepresentation: boolean;
+  }>;
   semanticSpace?: {
     expressId: number;
     globalId: string | null;
@@ -84,6 +112,7 @@ export interface DetectedRoom {
     anchor: RoomPolygonPoint;
     snapDistanceMeters: number;
     hasGeometryRepresentation: boolean;
+    associationMethod?: "inside-room-polygon" | "nearest-room-polygon";
   } | null;
 }
 
@@ -162,7 +191,23 @@ export interface RoomDebugArtifact {
     analysedFloorLevelCount?: number;
     semanticSpaceCount?: number;
     anchoredRoomCount?: number;
+    resolvedAnchorCount?: number;
+    anchorMappingId?: string;
     roomCoverageRatio?: number;
+    roomReconstructionMethod?: "ifc-space-step-profile-v1" | "ifc-space-body-envelope-v1" | "ifc-space-wall-constrained-geodesic-v2" | "ifc-wall-planar-graph-v1" | "none";
+    semanticMatchedSpaceCount?: number;
+    unmatchedSemanticSpaces?: string[];
+    wallAxisCount?: number;
+    wallGraphNodeCount?: number;
+    wallGraphEdgeCount?: number;
+    wallGraphFaceCount?: number;
+    floorDomainAreaM2?: number;
+    roomFootprintCoverageRatio?: number;
+    totalWalkableRoomCells?: number;
+    assignedWalkableRoomCells?: number;
+    nativeFurnitureSemanticCount?: number;
+    nativeFurnitureGeometryCount?: number;
+    nativeFurnitureAssignedCount?: number;
     sealedDoorCount: number;
     portalCount: number;
   };

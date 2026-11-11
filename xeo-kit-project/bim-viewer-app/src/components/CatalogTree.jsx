@@ -244,8 +244,17 @@ function CategoryNode({ node, depth, placementMode, setPlacementMode, resetSelec
   );
 }
 
-export function CatalogTree({ tree, loading, error, placementMode, setPlacementMode, resetSelection }) {
-  const [searchQuery, setSearchQuery] = useState('');
+export function CatalogTree({
+  tree,
+  loading,
+  error,
+  placementMode,
+  setPlacementMode,
+  resetSelection,
+  searchQuery = '',
+  onSearchQueryChange = () => {},
+  activeRoomLabel = '',
+}) {
   const [openRootId, setOpenRootId] = useState('hci-lighting-fixtures');
 
   if (loading && !(tree || []).length) {
@@ -278,16 +287,21 @@ export function CatalogTree({ tree, loading, error, placementMode, setPlacementM
             aria-label="Search furniture, doors and building items"
             placeholder="Search furniture, doors or items…"
             value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
+            onChange={e => onSearchQueryChange(e.target.value)}
             className="flex-1 bg-transparent text-xs text-slate-700 dark:text-slate-300 placeholder-slate-400 outline-none"
           />
           {searchQuery && (
-            <button type="button" onClick={() => setSearchQuery('')} className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700 dark:hover:bg-slate-700 dark:hover:text-white" aria-label="Clear search" title="Clear search">✕</button>
+            <button type="button" onClick={() => onSearchQueryChange('')} className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700 dark:hover:bg-slate-700 dark:hover:text-white" aria-label="Clear search" title="Clear search">✕</button>
           )}
         </div>
       </div>
       <div className="mx-3 my-2 rounded-lg bg-orange-50/80 px-2.5 py-2 dark:bg-orange-500/10">
-        <p className="text-[10px] leading-4 text-slate-600 dark:text-slate-300"><span className="font-semibold text-slate-800 dark:text-white">Add to your design:</span> click an item, then click in the model—or drag it into place.</p>
+        <p className="text-[10px] leading-4 text-slate-600 dark:text-slate-300">
+          <span className="font-semibold text-slate-800 dark:text-white">{activeRoomLabel ? `Adding to ${activeRoomLabel}:` : 'Add to your design:'}</span>{' '}
+          {activeRoomLabel
+            ? 'place the item inside this room footprint. Its room association is saved automatically.'
+            : 'click an item, then click in the model—or drag it into place.'}
+        </p>
       </div>
       {error && (
         <div className="mx-3 mb-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/10 dark:text-amber-200">
@@ -309,7 +323,7 @@ export function CatalogTree({ tree, loading, error, placementMode, setPlacementM
             <Search className="mx-auto h-6 w-6 text-slate-400" />
             <p className="mt-2 text-xs font-semibold text-slate-700 dark:text-slate-200">No matching items</p>
             <p className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">Try a shorter name or a different search.</p>
-            <button type="button" onClick={() => setSearchQuery('')} className="mt-3 rounded-lg bg-[#ff914d]/10 px-3 py-1.5 text-[10px] font-semibold text-[#c96320] hover:bg-[#ff914d]/20 dark:text-orange-300">Clear search</button>
+            <button type="button" onClick={() => onSearchQueryChange('')} className="mt-3 rounded-lg bg-[#ff914d]/10 px-3 py-1.5 text-[10px] font-semibold text-[#c96320] hover:bg-[#ff914d]/20 dark:text-orange-300">Clear search</button>
           </div>
         ) : tree.map(rootNode => (
           <CategoryNode
