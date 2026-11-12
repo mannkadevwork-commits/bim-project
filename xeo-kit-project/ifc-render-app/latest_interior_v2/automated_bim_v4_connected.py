@@ -1307,7 +1307,7 @@ def _gemini_model_candidates() -> List[str]:
     primary = os.environ.get("GEMINI_MODEL", MODEL_NAME).strip()
     fallback_env = os.environ.get(
         "GEMINI_FALLBACK_MODELS",
-        "gemini-3-flash-preview,gemini-3.1-flash-lite,gemini-3.5-flash-lite",
+        "gemini-3.8-flash,gemini-4-argon,gemini-3.5-flash-lite",
     )
     models = [primary] + _split_env_list(fallback_env)
     result: List[str] = []
