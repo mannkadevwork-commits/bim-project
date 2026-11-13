@@ -15,6 +15,9 @@ export const smart720TourDirectorMethods = {
     this.smart720NextTravelAt = 0;
     this.smart720OfferAvailable = false;
     this.smart720ProgrammaticTravel = false;
+    this.smart720PendingTarget = null;
+    this.smart720ArrivalRetries = 0;
+    this.smart720MaxArrivalRetries = 2;
   },
 
   _isSmart720PrimaryDestination(hotspot) {
@@ -70,9 +73,11 @@ export const smart720TourDirectorMethods = {
       const result = this.query.computePath(
         { x: this.position.x, y: this.position.y, z: this.position.z },
         point,
-        { filter: this.filter, maxStraightPathSize: 256, maxPathSize: 256 },
+        { filter: this.filter, maxStraightPathSize: 512, maxPathSize: 512 },
       );
-      if (!result?.success || !result.path?.length) continue;
+      // A partial Detour path is not a valid tour stop. Preflight the actual
+      // endpoint so the tour never advertises an unreachable room as a stop.
+      if (!this._inspectPathEndpoint?.(result, point, 0.4)?.complete) continue;
 
       let pathLength = 0;
       let previous = this.position;
@@ -197,6 +202,7 @@ export const smart720TourDirectorMethods = {
     this.smart720NextTravelAt = 0;
     this.smart720ProgrammaticTravel = false;
     this.smart720OfferAvailable = false;
+    this.smart720PendingTarget = null;
 
     if (wasPresenting) {
       this.exitImmersivePresentation?.();
@@ -216,6 +222,7 @@ export const smart720TourDirectorMethods = {
     this.smart720Phase = 'complete';
     this.smart720ProgrammaticTravel = false;
     this.smart720OfferAvailable = false;
+    this.smart720PendingTarget = null;
     this.guidedTourArmed = false;
     this.guidedTourAdvanceLock = true;
     this.exitImmersivePresentation?.();
@@ -239,6 +246,8 @@ export const smart720TourDirectorMethods = {
     this.smart720CurrentAreaId = next.hotspot.areaId || null;
     this.smart720Phase = 'traveling';
     this.smart720ProgrammaticTravel = true;
+    this.smart720PendingTarget = { x: next.point.x, y: next.point.y, z: next.point.z, polyRef: next.point.polyRef || 0 };
+    this.smart720ArrivalRetries = 0;
     this.guidedTourAdvanceLock = true;
     this.guidedShotSubject = null;
     this.guidedShotSubjectId = null;
@@ -250,7 +259,9 @@ export const smart720TourDirectorMethods = {
     this.smart720ProgrammaticTravel = false;
     if (!started) {
       this.guidedTourAdvanceLock = false;
-      return this._finishSmart720Tour();
+      this.cancelSmart720Tour('destination-route-failed');
+      this.onState?.({ type: 'error', message: `The home tour paused because ${this.smart720CurrentLabel || 'the next room'} could not be reached safely.` });
+      return false;
     }
     this.onState?.({
       type: 'smart-720-tour',
@@ -290,7 +301,50 @@ export const smart720TourDirectorMethods = {
 
     if (this.smart720Phase === 'traveling') {
       if (this.path || this.directTravel) return true;
+
+      // A failed movement clears the active path. That is NOT arrival. The old
+      // behavior treated any cleared path as success and began the next 360
+      // presentation wherever the camera had stopped, causing the visible
+      // stuck -> retry/recover -> wrong-room-tour sequence.
+      if (this.stuck) {
+        const failedLabel = this.smart720CurrentLabel || 'the next room';
+        this.cancelSmart720Tour('navigation-stalled');
+        this.onState?.({ type: 'error', message: `The home tour paused before reaching ${failedLabel}. The camera has stayed at its last valid NavMesh position; select another room or retry the route.` });
+        return false;
+      }
+
+      const target = this.smart720PendingTarget;
+      const unit = Math.max(this.metersPerUnit || 1, 0.000001);
+      const targetDistance = target && this.position
+        ? Math.hypot(target.x - this.position.x, target.y - this.position.y, target.z - this.position.z) / unit
+        : Infinity;
+
+      // Arrival must be physically confirmed near the requested destination.
+      // If a path ended early without raising the stuck state, attempt a small
+      // number of explicit route retries instead of presenting the wrong place.
+      if (targetDistance > 0.42) {
+        if (target && this.smart720ArrivalRetries < this.smart720MaxArrivalRetries) {
+          this.smart720ArrivalRetries += 1;
+          const point = this._closestWalkPoint?.([target.x, target.y, target.z], 0.25);
+          const retryStarted = point && this.travelTo?.(
+            point,
+            this.smart720CurrentLabel || 'Next room',
+            { resolvedPoint: point },
+          );
+          if (retryStarted) {
+            this.onState?.({ type: 'smart-720-tour', active: true, phase: 'traveling', retry: this.smart720ArrivalRetries, maximumRetries: this.smart720MaxArrivalRetries, label: this.smart720CurrentLabel, stopIndex: this.smart720StopIndex, totalStops: this.smart720TotalStops });
+            return true;
+          }
+        }
+
+        const failedLabel = this.smart720CurrentLabel || 'the next room';
+        this.cancelSmart720Tour('arrival-not-confirmed');
+        this.onState?.({ type: 'error', message: `The home tour could not confirm arrival in ${failedLabel}. No room presentation was started at the wrong position.` });
+        return false;
+      }
+
       if (now < this.arrivalSettleUntil) return true;
+      this.smart720PendingTarget = null;
       this.smart720Phase = 'presentation';
       this._beginSmart720Presentation(now);
       return true;

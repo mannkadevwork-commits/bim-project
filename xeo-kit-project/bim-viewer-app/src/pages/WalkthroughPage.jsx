@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
-  ArrowLeft, Camera, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleHelp, Gauge,
+  ArrowLeft, Camera, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleHelp, DoorOpen, Gauge,
   Maximize2, Minimize2, Minus, Map, Move3d, MousePointer2, Play, Plus,
   RotateCcw, RotateCw, Settings2, Target, View, X,
 } from 'lucide-react';
@@ -185,6 +185,16 @@ export default function WalkthroughPage() {
   }, [walkthrough.immersivePresentationActive]);
 
   useEffect(() => {
+    if (walkthrough.homeTour?.phase === 'complete') {
+      setViewMode('overview');
+      setWalkMode('guided');
+      setSettingsOpen(false);
+      setViewsOpen(false);
+      setMoreOpen(false);
+    }
+  }, [walkthrough.homeTour?.phase]);
+
+  useEffect(() => {
     if (walkthrough.lookLocked === undefined) return;
     if (walkthrough.lookLocked) {
       setLockToast(true);
@@ -201,6 +211,12 @@ export default function WalkthroughPage() {
   const statusText = useMemo(() => {
     if (walkthrough.status === 'loading') return 'Loading walkthrough…';
     if (walkthrough.status === 'error') return walkthrough.message || 'Walkthrough unavailable';
+    if (walkthrough.homeTour?.active) {
+      const phaseLabel = walkthrough.homeTour.phase === 'presenting'
+        ? 'Room showcase'
+        : (['settling', 'composing'].includes(walkthrough.homeTour.phase) ? 'Framing room highlight' : 'Moving through home');
+      return `Home Tour · ${phaseLabel} · ${walkthrough.homeTour.label || 'Next room'}`;
+    }
     // When recovery fails, show its actionable error instead of masking it with
     // the generic stuck-state label. Successful recovery replaces it with the
     // runtime's "Recovered walk position." message.
@@ -221,7 +237,7 @@ export default function WalkthroughPage() {
     return walkthrough.lookLocked
       ? 'Explore · view locked · double-click to unlock'
       : 'Explore · move with W/A/S/D · move mouse to look';
-  }, [walkthrough.status, walkthrough.message, viewMode, effectiveWalkMode, walkthrough.lookLocked, walkthrough.immersive360Active, walkthrough.immersive360OfferAvailable, walkthrough.smart720Active, walkthrough.smart720OfferAvailable, walkthrough.smart720CurrentLabel]);
+  }, [walkthrough.status, walkthrough.message, walkthrough.homeTour, viewMode, effectiveWalkMode, walkthrough.lookLocked, walkthrough.immersive360Active, walkthrough.immersive360OfferAvailable, walkthrough.smart720Active, walkthrough.smart720OfferAvailable, walkthrough.smart720CurrentLabel]);
 
   const updatePresentationSettings = (patch) => {
     setPresentationSettings((previous) => mergePresentationSettings(previous, patch));
@@ -265,6 +281,20 @@ export default function WalkthroughPage() {
   const startSmart720 = () => {
     if (viewMode !== 'walk' || effectiveWalkMode !== 'guided' || !walkthrough.smart720OfferAvailable) return;
     walkthrough.startSmart720Tour();
+  };
+
+  const startHomeTour = () => {
+    if (walkthrough.homeTour?.active) {
+      walkthrough.stopHomeTour('home-tour-stop-button');
+      return;
+    }
+    if (viewMode !== 'walk' || effectiveWalkMode !== 'guided' || !walkthrough.areas?.length) return;
+    walkthrough.setHomeTourDoorOff(Boolean(walkthrough.homeTour?.doorOff ?? true));
+    walkthrough.startHomeTour();
+  };
+
+  const toggleHomeTourDoorOff = (event) => {
+    walkthrough.setHomeTourDoorOff(Boolean(event.target.checked));
   };
 
   const reset360View = () => walkthrough.resetImmersivePresentationView();
@@ -319,6 +349,14 @@ export default function WalkthroughPage() {
       <style>{LOCK_TOAST_CSS}</style>
       <div className="relative h-screen w-screen overflow-hidden bg-slate-950 text-white">
       <div ref={viewportRef} className="absolute inset-0" />
+
+      {walkthrough.homeTour?.active && walkthrough.homeTour?.phase === 'portal-transition' && (
+        <div
+          className="pointer-events-none absolute inset-0 z-[100] bg-black"
+          style={{ opacity: Math.max(0, Math.min(1, Number(walkthrough.homeTour.transitionOpacity) || 0)), transition: 'opacity 45ms linear' }}
+          aria-hidden="true"
+        />
+      )}
 
       <div className="pointer-events-none absolute inset-x-0 top-0 z-30 flex items-start justify-between p-4 md:p-5">
         <div className="pointer-events-auto flex items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/78 px-3.5 py-2.5 shadow-[0_18px_60px_rgba(0,0,0,.24)] backdrop-blur-2xl">
@@ -626,7 +664,7 @@ export default function WalkthroughPage() {
           <div className="space-y-2 text-xs leading-5 text-slate-400">
             <div><b className="text-slate-200">Guided:</b> click a circular floor destination to travel with a slow cinematic camera pan.</div>
             <div><b className="text-slate-200">360°:</b> drag horizontally or vertically to look around. Click an orange floor marker or choose a point from Rooms to move to another viewpoint; auto-rotation pauses while you interact.</div>
-            <div><b className="text-slate-200">Smart 720:</b> presents the curated customer-facing rooms one by one, using real NavMesh travel between them and a full 360° presentation at each stop.</div>
+            <div><b className="text-slate-200">Home Tour:</b> preflights every room, temporarily hides door leaves when Doors off is enabled, walks the NavMesh route to each room, slowly follows the route facing the direction of travel, settles on a room highlight, presents each room for a full 15 seconds, and ends with a whole-home overview.</div>
             <div><b className="text-slate-200">Explore:</b> W/A/S/D moves · mouse looks freely · Shift runs. Mouse movement is smoothed.</div>
             <div><b className="text-slate-200">Overview:</b> W/A/S/D pan · Q/E zoom · mouse orbit · wheel zoom · +/- keys zoom.</div>
             <div><b className="text-slate-200">Floor map:</b> glass map shows validated, reachable navigation destinations. Select a point to travel there, including while 360° mode is active.</div>
@@ -636,21 +674,26 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      {viewMode === 'walk' && effectiveWalkMode === 'guided' && !walkthrough.immersive360Active && (walkthrough.smart720OfferAvailable || walkthrough.immersive360OfferAvailable) && (
+      {viewMode === 'walk' && effectiveWalkMode === 'guided' && !walkthrough.immersive360Active && walkthrough.status === 'ready' && walkthrough.areas?.length > 0 && (
         <div className="absolute bottom-20 left-1/2 z-30 -translate-x-1/2">
-          <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/90 p-2 shadow-[0_18px_50px_rgba(0,0,0,.34)] backdrop-blur-2xl">
-            {walkthrough.smart720OfferAvailable && (
-              <button
-                type="button"
-                onClick={startSmart720}
-                className="group flex items-center gap-2 rounded-xl bg-[#ff914d] px-4 py-2.5 text-xs font-bold text-slate-950 shadow-[0_10px_28px_rgba(255,145,77,.18)] transition hover:bg-[#ff7a28]"
-                title="Start a room-to-room whole-home presentation tour"
-              >
-                <Play className="h-4 w-4" />
-                <span>Smart 720 Tour</span>
-              </button>
+          <div className="flex flex-wrap items-center justify-center gap-2 rounded-2xl border border-white/10 bg-slate-950/90 p-2 shadow-[0_18px_50px_rgba(0,0,0,.34)] backdrop-blur-2xl">
+            <button
+              type="button"
+              onClick={startHomeTour}
+              className={`group flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs font-bold shadow-[0_10px_28px_rgba(255,145,77,.18)] transition ${walkthrough.homeTour?.active ? 'bg-white text-slate-950 hover:bg-slate-200' : 'bg-[#ff914d] text-slate-950 hover:bg-[#ff7a28]'}`}
+              title="Automatically visit every room, frame its main furnishing, and finish with a whole-home overview"
+            >
+              {walkthrough.homeTour?.active ? <X className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+              <span>{walkthrough.homeTour?.active ? 'Stop Home Tour' : 'Start Home Tour'}</span>
+            </button>
+            {!walkthrough.homeTour?.active && (
+              <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 bg-white/[0.05] px-3 py-2.5 text-xs font-semibold text-slate-200" title="Temporarily hide door leaves during the tour; restore them when it ends">
+                <input type="checkbox" checked={Boolean(walkthrough.homeTour?.doorOff ?? true)} onChange={toggleHomeTourDoorOff} className="accent-[#ff914d]" />
+                <DoorOpen className="h-4 w-4 text-[#ff914d]" />
+                <span>Doors off</span>
+              </label>
             )}
-            {walkthrough.immersive360OfferAvailable && (
+            {!walkthrough.homeTour?.active && walkthrough.immersive360OfferAvailable && (
               <button
                 type="button"
                 onClick={openImmersive360}
@@ -731,6 +774,47 @@ export default function WalkthroughPage() {
           {touring ? <><StopCircle className="h-4 w-4" /> Stop</> : <><Play className="h-4 w-4" /> Tour</>}
         </button> */}
       </div>
+
+      {walkthrough.homeTour?.active && (
+        <div className="absolute bottom-28 left-1/2 z-40 w-[min(92vw,390px)] -translate-x-1/2 rounded-2xl border border-white/12 bg-slate-950/90 p-4 text-white shadow-[0_24px_70px_rgba(0,0,0,.42)] backdrop-blur-2xl">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-orange-200/85">HCI Home Tour</div>
+              <div className="mt-1 text-base font-semibold">{walkthrough.homeTour.label || (walkthrough.homeTour.phase === 'traveling' ? 'Moving to next room' : 'Preparing room')}</div>
+              <div className="mt-1 text-[11px] text-slate-300">
+                {walkthrough.homeTour.stopIndex || 0} of {walkthrough.homeTour.totalStops || walkthrough.areas.length} rooms
+                {walkthrough.homeTour.hero ? ` · Featuring ${walkthrough.homeTour.hero}` : ' · Room overview'}
+              </div>
+            </div>
+            <button type="button" onClick={() => walkthrough.stopHomeTour('home-tour-progress-stop')} className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.06] px-2.5 text-[11px] font-semibold text-white hover:bg-white/[0.12]">
+              <X className="h-3.5 w-3.5" /> Stop
+            </button>
+          </div>
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/10">
+            <div className="h-full rounded-full bg-gradient-to-r from-[#ff914d] to-[#ffd1b3] transition-[width] duration-300" style={{ width: `${Math.min(100, ((walkthrough.homeTour.visitedCount || 0) / Math.max(1, walkthrough.homeTour.totalStops || 1)) * 100)}%` }} />
+          </div>
+          <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
+            <span>
+              {walkthrough.homeTour.phase === 'presenting'
+                ? `15-second room showcase · ${Math.ceil(Math.max(0, Number(walkthrough.homeTour.remainingMs) || 0) / 1000)}s remaining`
+                : walkthrough.homeTour.phase === 'composing'
+                  ? 'Settling the camera on the room highlight'
+                  : walkthrough.homeTour.phase === 'settling'
+                    ? 'Preparing the room composition'
+                    : 'Slow, direction-aligned NavMesh travel'}
+            </span>
+            <span>{walkthrough.homeTour.doorOff ? `Doors off · ${walkthrough.homeTour.doorMeshesHidden || 0} leaves hidden` : 'Doors visible'}</span>
+          </div>
+        </div>
+      )}
+
+      {walkthrough.homeTour?.phase === 'failed' && walkthrough.homeTour.failure && (
+        <div className="absolute bottom-28 left-1/2 z-40 w-[min(92vw,430px)] -translate-x-1/2 rounded-2xl border border-rose-400/25 bg-slate-950/95 p-4 text-white shadow-2xl backdrop-blur-2xl">
+          <div className="text-xs font-bold text-rose-300">Home Tour stopped safely</div>
+          <p className="mt-1 text-xs leading-5 text-slate-300">{walkthrough.homeTour.failure}</p>
+          <div className="mt-3 text-[10px] text-slate-400">The tour stopped before completing all rooms. Door visibility has been restored. Review the navigation diagnostics before publishing this tour.</div>
+        </div>
+      )}
 
       {lockToast && (
         <div className="pointer-events-none absolute left-1/2 top-24 z-50 -translate-x-1/2" style={{ animation: 'walkLockFade 180ms ease-out' }}>

@@ -1,8 +1,10 @@
 import * as THREE from 'three';
 const IMMERSIVE_360_SPEED_RAD_PER_SEC = 0.038;
 const IMMERSIVE_360_DEFAULT_PITCH = -0.19; // ~11° down: reveals furniture and floor instead of over-weighting the ceiling.
-const IMMERSIVE_360_MIN_PITCH = -0.48;
-const IMMERSIVE_360_MAX_PITCH = 0.14;
+// Near-pole limits provide a true 360° × 180° live spherical view while
+// avoiding the exact Euler singularity at +/- 90 degrees.
+const IMMERSIVE_360_MIN_PITCH = -Math.PI / 2 + 0.035;
+const IMMERSIVE_360_MAX_PITCH = Math.PI / 2 - 0.035;
 const IMMERSIVE_360_MANUAL_RESUME_DELAY_MS = 3200;
 const IMMERSIVE_360_MANUAL_VELOCITY_DAMPING = 6.8;
 
@@ -17,66 +19,9 @@ export const immersive360DirectorMethods = {
     this.immersive360PointerDragging = false;
     this.immersive360YawVelocity = 0;
     this.immersive360Pitch = IMMERSIVE_360_DEFAULT_PITCH;
+    this.immersive360MinPitch = IMMERSIVE_360_MIN_PITCH;
+    this.immersive360MaxPitch = IMMERSIVE_360_MAX_PITCH;
     this.immersive360AutoSpeedRadPerSec = IMMERSIVE_360_SPEED_RAD_PER_SEC;
-  },
-
-  _findImmersivePresentationOrigin() {
-    if (!this.position) return null;
-
-    const unit = Math.max(this.metersPerUnit || 1, 1e-6);
-    const currentPoint = [this.position.x, this.position.y, this.position.z];
-    const currentOpenSpace = Number(this._presentationOpenSpaceScore?.(currentPoint) || 0);
-
-    // Most room-entry positions are already fine. Only move when the current
-    // camera is clearly cramped; this prevents a distracting teleport during
-    // normal presentation entry while rescuing wall/furniture-adjacent shots.
-    if (currentOpenSpace >= 0.55) return null;
-
-    const activeAreaId = this._getGuidedPresentationAreaId?.() || null;
-    const entries = [...(this.safeAnchorById?.entries?.() || [])]
-      .map(([id, entry]) => ({ id, ...entry }))
-      .filter((entry) => entry?.point && entry?.hotspot);
-
-    if (!entries.length) return null;
-
-    const sameArea = activeAreaId
-      ? entries.filter((entry) => entry.hotspot?.areaId === activeAreaId)
-      : entries;
-    const candidates = sameArea.length ? sameArea : entries;
-
-    let best = null;
-    for (const candidate of candidates) {
-      const openness = Number(candidate.openness || 0);
-      if (openness < 0.8) continue;
-      const distanceMeters = Math.hypot(
-        candidate.point.x - this.position.x,
-        candidate.point.z - this.position.z,
-      ) / unit;
-      if (distanceMeters > 6.0) continue;
-
-      const roleBonus = candidate.role === 'room-center' ? 1.35
-        : candidate.role === 'viewpoint' ? 1.15
-        : candidate.role === 'room-entrance' ? 0.7
-        : 0.25;
-      const score = openness * 2.4 + roleBonus - distanceMeters * 0.12;
-      if (!best || score > best.score) best = { ...candidate, score };
-    }
-
-    return best?.point || null;
-  },
-
-  _moveToImmersivePresentationOrigin(point) {
-    if (!point || !this.position) return false;
-    this.position.set(point.x, point.y, point.z);
-    this.currentPolyRef = point.polyRef || this.currentPolyRef;
-    this.lastMovementPosition.copy(this.position);
-    this.path = null;
-    this.pathIndex = 0;
-    this.pathVelocity?.set?.(0, 0, 0);
-    this.velocity?.set?.(0, 0, 0);
-    this.directTravel = null;
-    this._rememberNearestSafeAnchor?.(this.position, 'presentation');
-    return true;
   },
 
   setImmersive360(active, options = {}) {
@@ -118,11 +63,10 @@ export const immersive360DirectorMethods = {
       this.targetYaw = startYaw;
       this.guidedCompositionYaw = startYaw;
       this.guidedCompositionTargetYaw = startYaw;
-      const presentationOrigin = this._findImmersivePresentationOrigin?.();
-      if (presentationOrigin) {
-        this._moveToImmersivePresentationOrigin?.(presentationOrigin);
-      }
-
+      // Keep the camera at the physically reached room-entry position. The
+      // former presentation-origin helper could silently relocate the viewer
+      // several metres to a nearby safe anchor as soon as 360 mode opened. A
+      // presentation view may recompose yaw, but must never teleport the user.
       const composed = this._findBestGuidedComposition?.(
         this.position,
         this.lastMoveDirection,
@@ -265,8 +209,8 @@ export const immersive360DirectorMethods = {
     );
     this.immersive360Pitch = THREE.MathUtils.clamp(
       this.immersive360Pitch - dy * (this.lookSensitivity * 0.72),
-      IMMERSIVE_360_MIN_PITCH,
-      IMMERSIVE_360_MAX_PITCH,
+      this.immersive360MinPitch,
+      this.immersive360MaxPitch,
     );
     this.targetPitch = this.immersive360Pitch;
     this.immersive360ManualUntil = now + IMMERSIVE_360_MANUAL_RESUME_DELAY_MS;
@@ -319,8 +263,8 @@ export const immersive360DirectorMethods = {
 
     this.targetPitch = THREE.MathUtils.clamp(
       Number.isFinite(this.immersive360Pitch) ? this.immersive360Pitch : IMMERSIVE_360_DEFAULT_PITCH,
-      IMMERSIVE_360_MIN_PITCH,
-      IMMERSIVE_360_MAX_PITCH,
+      this.immersive360MinPitch,
+      this.immersive360MaxPitch,
     );
   },
 };
