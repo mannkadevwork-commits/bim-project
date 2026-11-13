@@ -12,6 +12,10 @@ const db = require('./db');
 const catalogRoutes = require('./catalog-routes');
 const adminRoutes = require('./admin-routes');
 const ifcEditorRoutes = require('./ifc-editor-routes');
+const {
+  getMissingSavedLayoutRenderArtifacts,
+  copySavedLayoutRenderArtifacts,
+} = require('./saved-layout-artifacts');
 
 const app = express();
 app.use(cors());
@@ -444,8 +448,11 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     if (!requireActiveProject(jobId, res)) return;
 
     const parentJobDir = path.join(jobsDir, jobId);
-    if (!fs.existsSync(path.join(parentJobDir, 'output.glb'))) {
-      return res.status(409).json({ error: 'Run the final 360 render before saving a layout.' });
+    const missingRenderArtifacts = getMissingSavedLayoutRenderArtifacts(parentJobDir);
+    if (missingRenderArtifacts.length) {
+      return res.status(409).json({
+        error: `Render snapshot is incomplete. Missing: ${missingRenderArtifacts.join(', ')}`,
+      });
     }
 
     const rawName = String(req.body?.name || '').trim();
@@ -480,18 +487,7 @@ app.post('/api/projects/:jobId/saved-layouts', renderUpload.single('thumbnail'),
     // original.ifc = kept for the normal project validation/continue-work flow.
     // project_state.json below = the authored editor state (materials, furniture,
     // structural edits, matrices, calibration, etc.).
-    [
-      'output.glb',
-      'navigation_surface.json',
-      'walk_areas.json',
-      'navigation_navmesh.bin',
-      'input.ifc',
-      'original.ifc',
-      'scene_frame.json',
-    ].forEach(fileName => {
-      const source = path.join(parentJobDir, fileName);
-      if (fs.existsSync(source)) fs.copyFileSync(source, path.join(renderJobDir, fileName));
-    });
+    copySavedLayoutRenderArtifacts(parentJobDir, renderJobDir);
 
     if (req.file?.buffer) fs.writeFileSync(path.join(renderJobDir, 'thumbnail.jpg'), req.file.buffer);
 
@@ -564,15 +560,7 @@ app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'
       return res.status(403).json({ error: 'The current working project is archived and cannot update a saved layout.' });
     }
 
-    const requiredFiles = [
-      'output.glb',
-      'navigation_surface.json',
-      'walk_areas.json',
-      'navigation_navmesh.bin',
-      'input.ifc',
-      'original.ifc',
-    ];
-    const missingFiles = requiredFiles.filter((fileName) => !fs.existsSync(path.join(sourceJobDir, fileName)));
+    const missingFiles = getMissingSavedLayoutRenderArtifacts(sourceJobDir);
     if (missingFiles.length) {
       return res.status(409).json({
         error: `Render snapshot is incomplete. Missing: ${missingFiles.join(', ')}`,
@@ -604,18 +592,8 @@ app.put('/api/saved-layouts/:layoutId/snapshot', renderUpload.single('thumbnail'
     newSnapshotDir = path.join(jobsDir, newRenderJobId);
     fs.mkdirSync(newSnapshotDir, { recursive: true });
 
-    requiredFiles.forEach((fileName) => {
-      fs.copyFileSync(
-        path.join(sourceJobDir, fileName),
-        path.join(newSnapshotDir, fileName)
-      );
-    });
-    // Calibration provenance is part of the frozen render snapshot. Keep it
-    // optional for legacy projects created before scene_frame.json existed.
-    const sourceSceneFramePath = path.join(sourceJobDir, 'scene_frame.json');
-    if (fs.existsSync(sourceSceneFramePath)) {
-      fs.copyFileSync(sourceSceneFramePath, path.join(newSnapshotDir, 'scene_frame.json'));
-    }
+    copySavedLayoutRenderArtifacts(sourceJobDir, newSnapshotDir);
+    // Optional scene_frame.json is copied by copySavedLayoutRenderArtifacts().
 
     if (req.file?.buffer) {
       fs.writeFileSync(path.join(newSnapshotDir, 'thumbnail.jpg'), req.file.buffer);
@@ -1954,12 +1932,6 @@ const RENDER_PIPELINE_SOURCE_FILES = [
     'compiler/glb-optimizer.ts',
     'compiler/navigation/WalkNavigationPipeline.ts',
     'compiler/navigation/RoomDetector.ts',
-    'compiler/navigation/RoomTopologyReconstructor.ts',
-    'compiler/navigation/RoomFootprintReconstructor.ts',
-    'compiler/navigation/RoomTypes.ts',
-    'compiler/navigation/RoomLevelAssociation.ts',
-    'compiler/room-analysis/RoomAnalysisService.ts',
-    'compiler/ceiling/CeilingAnalysisService.ts',
     'compiler/performanceReport.ts',
     'compiler/presentationManifest.ts',
 ];
