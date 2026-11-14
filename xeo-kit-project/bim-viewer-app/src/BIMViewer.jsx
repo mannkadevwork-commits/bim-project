@@ -25,6 +25,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { getFurnitureInRoom, isPositionInsideRoom } from './utils/roomFurniture';
+import { filterRenderableCeilingDesigns } from './engine/assets/ceilingRegistryValidation.mjs';
 
 const doorIntrinsicBoundsCache = new Map();
 
@@ -140,6 +141,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const [showRenderStudio, setShowRenderStudio] = useState(false);
   const [showReplaceAssetModal, setShowReplaceAssetModal] = useState(false);
   const [showCeilingDesigner, setShowCeilingDesigner] = useState(false);
+  const [ifcCeilingEntityIds, setIfcCeilingEntityIds] = useState([]);
   const [ceilingPlanContext, setCeilingPlanContext] = useState(null);
   const ceilingPlanCameraSnapshotRef = useRef(null);
   const [replaceTargetId, setReplaceTargetId] = useState(null);
@@ -396,16 +398,50 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     projectStateHydratedRef
   );
 
+  // Discover original IFC ceiling/roof entities after the main model has
+  // finished loading. The UI only offers hide/show controls when a real ceiling
+  // source exists in this model.
+  useEffect(() => {
+    if (!file) {
+      setIfcCeilingEntityIds([]);
+      return undefined;
+    }
+    if (engineState.isLoading) {
+      setIfcCeilingEntityIds([]);
+      return undefined;
+    }
+    let active = true;
+    const frame = window.requestAnimationFrame(() => {
+      if (!active) return;
+      const ids = engineActions.getCeilingEntityIds?.() || [];
+      setIfcCeilingEntityIds(Array.from(new Set(ids.map((id) => String(id)))));
+    });
+    return () => {
+      active = false;
+      window.cancelAnimationFrame(frame);
+    };
+  }, [file, jobId, engineState.isLoading]);
+
   // Room analysis and the engine are both initialized during render. Keep all
   // references to engineActions/engineState below the hook call to avoid the
   // temporal-dead-zone crash introduced by Room Editor V1.
   const syncRoomsActionRef = useRef(null);
   syncRoomsActionRef.current = engineActions.syncRooms;
+  const syncRoomCeilingsActionRef = useRef(null);
+  syncRoomCeilingsActionRef.current = engineActions.syncRoomCeilings;
 
   useEffect(() => {
     if (roomAnalysisState.status !== 'ready' || engineState.isLoading) return;
     syncRoomsActionRef.current?.(roomAnalysisState.rooms);
   }, [roomAnalysisState.status, roomAnalysisState.rooms, engineState.isLoading]);
+
+  useEffect(() => {
+    if (roomAnalysisState.status !== 'ready' || engineState.isLoading || !roomAnalysisState.analysis) return;
+    const ceilings = projectState.ceilingDesigns || projectState.ceilings || [];
+    syncRoomCeilingsActionRef.current?.(ceilings, roomAnalysisState.analysis).catch((error) => {
+      console.error('[BIMViewer] Could not validate saved ceilings against the current room registry:', error);
+    });
+  }, [roomAnalysisState.status, roomAnalysisState.analysis, engineState.isLoading, projectState.ceilingDesigns, projectState.ceilings]);
 
   const selectRoomInEditor = useCallback((room, { focus = true, viewPreset = 'auto', eyeHeight = 1.55 } = {}) => {
     if (!room) return;
@@ -794,6 +830,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     : null;
   const selectedIsLightFixture = selectedFurnitureItem?.isLightFixture === true || selectedFurnitureItem?.assetCategory === 'lighting';
   const designedCeilings = projectState.ceilingDesigns || projectState.ceilings || [];
+  const currentRoomRegistry = roomAnalysisState.status === 'ready' ? roomAnalysisState.analysis : null;
+  const renderableDesignedCeilings = filterRenderableCeilingDesigns(designedCeilings, currentRoomRegistry);
 
   const handleToggleSelectedLight = () => {
     if (!selectedIsLightFixture || !engineState.selectedAssetId) return;
@@ -899,26 +937,33 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   };
 
   const handleToggleDesignedCeilings = () => {
-    if (!designedCeilings.length) return;
-    const show = designedCeilings.every((ceiling) => ceiling.visible === false);
-    setRoomCeilingDesigns(designedCeilings.map((ceiling) => ({ ...ceiling, visible: show })));
+    if (!renderableDesignedCeilings.length) return;
+    const show = renderableDesignedCeilings.every((ceiling) => ceiling.visible === false);
+    const renderableIds = new Set(renderableDesignedCeilings.map((ceiling) => String(ceiling.id)));
+    setRoomCeilingDesigns(designedCeilings.map((ceiling) => (
+      renderableIds.has(String(ceiling.id)) ? { ...ceiling, visible: show } : ceiling
+    )));
   };
 
   const handleToggleCeiling = () => {
-    const ids = engineActions.getCeilingEntityIds();
-    if (!ids.length) {
-      setToastMessage('No IFC ceiling or roof elements were detected in this model.');
-      setTimeout(() => setToastMessage(null), 2600);
-      return;
-    }
+    const ids = ifcCeilingEntityIds.length ? ifcCeilingEntityIds : (engineActions.getCeilingEntityIds?.() || []).map(String);
+    if (!ids.length) return;
     const currentHidden = new Set((projectState.ceiling_hidden_entity_ids || []).map(String));
-    const showCeiling = ids.every((id) => currentHidden.has(String(id)));
-    const nextHiddenIds = showCeiling ? [] : ids;
+    const anyHidden = ids.some((id) => currentHidden.has(String(id)));
+    const showCeiling = anyHidden;
+    const idSet = new Set(ids.map(String));
+    const nextHiddenIds = showCeiling
+      ? Array.from(currentHidden).filter((id) => !idSet.has(String(id)))
+      : Array.from(new Set([...currentHidden, ...idSet]));
     engineActions.setCeilingEntityVisibility(ids, showCeiling);
     setCeilingHiddenEntityIds(nextHiddenIds);
-    setToastMessage(showCeiling ? 'Ceiling shown.' : `Hid ${ids.length} ceiling/roof elements.`);
+    setToastMessage(showCeiling ? 'Original model ceiling shown.' : 'Original model ceiling hidden.');
     setTimeout(() => setToastMessage(null), 2200);
   };
+
+  const hiddenIfcCeilings = new Set((projectState.ceiling_hidden_entity_ids || []).map(String));
+  const areIfcCeilingsHidden = ifcCeilingEntityIds.length > 0
+    && ifcCeilingEntityIds.some((id) => hiddenIfcCeilings.has(String(id)));
 
   const nativeReplaceDescriptor = (() => {
     const object = engineState.selectedObject;
@@ -1073,8 +1118,15 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     setWallSurfaceScope('both');
   }, [engineState.selectedObject?.id, engineState.selectedAssetId]);
 
-  const updateCursorTooltip = (clientX, clientY, offsetX, offsetY) => {
-    if (!tooltipRef.current || !engineActions.getCursorWorldPosition || !refs.viewerRef.current?.scene?.models) return;
+  const updateCursorTooltip = (clientX, clientY, offsetX, offsetY, showCoordinates = false) => {
+    if (!tooltipRef.current) return;
+    // Coordinate readout is useful for precision work, but should never follow
+    // the pointer during ordinary selection, placement or transform gestures.
+    if (!showCoordinates || engineState.isStretching || engineState.placementMode || engineState.isMeasuring
+      || !engineActions.getCursorWorldPosition || !refs.viewerRef.current?.scene?.models) {
+      tooltipRef.current.style.display = 'none';
+      return;
+    }
     const canvasPos = [offsetX, offsetY];
     let worldPos = null;
     try { worldPos = engineActions.getCursorWorldPosition(canvasPos); } catch (_) { worldPos = null; }
@@ -1084,7 +1136,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       tooltipRef.current.style.transform = `translate(${clientX + 15}px, ${clientY + 15}px)`;
       tooltipRef.current.innerHTML = `
         <div class="flex flex-col gap-0.5">
-          <span class="text-[9px] uppercase tracking-wider text-slate-500 font-bold mb-0.5 border-b border-slate-700 pb-0.5">3D World Grid</span>
+          <span class="text-[9px] uppercase tracking-wider text-slate-500 font-bold mb-0.5 border-b border-slate-700 pb-0.5">3D Coordinates · Alt</span>
           <span class="text-rose-400 font-medium">X: ${worldPos[0].toFixed(3)}</span>
           <span class="text-emerald-400 font-medium">Y: ${worldPos[1].toFixed(3)}</span>
           <span class="text-cyan-400 font-medium">Z: ${worldPos[2].toFixed(3)}</span>
@@ -1096,6 +1148,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   };
 
   const handlePointerDown = (e) => {
+    if (tooltipRef.current) tooltipRef.current.style.display = 'none';
     refs.canvasRef.current?.focus();
 
     const canvas = refs.canvasRef.current;
@@ -1118,10 +1171,10 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   };
   
   const handlePointerMove = (e) => {
-    updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY);
+    updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY, e.altKey);
   };
   
-  const handleDragOver = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; updateCursorTooltip(e.clientX, e.clientY, e.nativeEvent.offsetX, e.nativeEvent.offsetY); };
+  const handleDragOver = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; if (tooltipRef.current) tooltipRef.current.style.display = 'none'; };
   const handlePointerLeave = () => { if (tooltipRef.current) tooltipRef.current.style.display = 'none'; };
   const handleDragEnter = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
 
@@ -1427,9 +1480,8 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       {!showRenderStudio && engineState.activeStretchData && (
         <StretchTooltipOverlay 
           visible={true}
-          x={engineState.activeStretchData.x}
-          y={engineState.activeStretchData.y}
           label={engineState.activeStretchData.label}
+          rightOffset={isRightPanelOpen ? 356 : 16}
         />
       )}
       {/* TOOLTIP OVERLAY FOR EDITING */}
@@ -1512,6 +1564,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerLeave={handlePointerLeave}
+          onPointerCancel={handlePointerLeave}
           onDragEnter={handleDragEnter}
           onDragOver={handleDragOver}
           onDragLeave={handlePointerLeave}
@@ -1627,11 +1680,12 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             onCatalogSearchTermChange={setCatalogSearchTerm}
             activeRoomLabel={activeRoomLabel}
             projectState={projectState}
-            isCeilingHidden={(projectState.ceiling_hidden_entity_ids || []).length > 0}
+            isCeilingHidden={areIfcCeilingsHidden}
+            hasIfcCeilings={ifcCeilingEntityIds.length > 0}
             onToggleCeiling={handleToggleCeiling}
             onOpenCeilingDesigner={() => setShowCeilingDesigner(true)}
-            hasDesignedCeilings={designedCeilings.length > 0}
-            areDesignedCeilingsHidden={designedCeilings.length > 0 && designedCeilings.every((ceiling) => ceiling.visible === false)}
+            hasDesignedCeilings={renderableDesignedCeilings.length > 0}
+            areDesignedCeilingsHidden={renderableDesignedCeilings.length > 0 && renderableDesignedCeilings.every((ceiling) => ceiling.visible === false)}
             onToggleDesignedCeilings={handleToggleDesignedCeilings}
           />
         </div>
@@ -1680,7 +1734,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
               if (!count) setToastMessage('No matching boundary wall objects were found in the loaded IFC scene.');
               else setToastMessage(`Selected ${count} boundary wall${count === 1 ? '' : 's'}. Edit them individually or use multi-wall appearance controls.`);
             }}
-            hasDesignedCeiling={(projectState.ceilingDesigns || projectState.ceilings || []).some((item) => item?.roomId === (activeRoomContext || engineState.selectedRoom)?.id || item?.roomId === (activeRoomContext || engineState.selectedRoom)?.navigationRoomId)}
+            hasDesignedCeiling={renderableDesignedCeilings.some((item) => item?.roomId === (activeRoomContext || engineState.selectedRoom)?.id || item?.roomId === (activeRoomContext || engineState.selectedRoom)?.navigationRoomId)}
             selectedElements={engineState.selectedElements}
             multiSelectMode={engineState.multiSelectMode}
             onToggleMultiSelect={engineActions.toggleMultiSelectMode}
@@ -1743,8 +1797,6 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
             isMaxView={isMaxView}
             isFullscreen={isFullscreen}
             toggleBrowserFullscreen={toggleBrowserFullscreen}
-            isMeasuring={engineState.isMeasuring}
-            toggleMeasurementMode={engineActions.toggleMeasurementMode}
             isDarkMode={isDarkMode}
           />
         </div>

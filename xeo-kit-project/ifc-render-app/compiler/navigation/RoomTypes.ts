@@ -5,8 +5,11 @@ export type RoomSource =
   | "ifc-space-anchor-geodesic-v1"
   | "ifc-space-body-envelope-v1"
   | "ifc-space-step-profile-v1"
+  | "ifc-space-solid-v1"
   | "ifc-space-wall-constrained-geodesic-v2"
-  | "ifc-wall-planar-graph-v1";
+  | "ifc-wall-planar-graph-v1"
+  | "ifc-wall-topology-face-v1"
+  | "ifc-open-plan-semantic-zone-v1";
 
 export interface RoomPolygonPoint {
   x: number;
@@ -17,7 +20,7 @@ export interface RoomPolygonPoint {
 export interface RoomPortal {
   id: string;
   type: "door" | "opening";
-  source: "ifc-opening" | "hosted-glb-door";
+  source: "ifc-opening" | "ifc-door-geometry" | "hosted-glb-door";
   openingExpressId?: number | null;
   sourceFile?: string | null;
   center: RoomPolygonPoint;
@@ -77,6 +80,10 @@ export interface DetectedRoom {
   ceilingCandidates?: DetectedCeilingCandidate[];
   label: string;
   source: RoomSource;
+  /** Physical wall-bounded room or a logical zone inside an open-plan face. */
+  regionKind?: "physical-room" | "semantic-zone";
+  /** Shared connected floor-face id; multiple semantic zones may share it. */
+  physicalComponentId?: number;
   area: number;
   center: RoomPolygonPoint;
   polygon: RoomPolygonPoint[];
@@ -90,7 +97,16 @@ export interface DetectedRoom {
   ceilingElevationSource?: "ifc-overhead-surface" | "boundary-wall-top" | "fallback-estimate";
   ceilingConfidence?: number;
   /** How the room footprint was obtained. Anchor-derived boundaries remain inferred, not exact IFC space solids. */
-  boundarySource?: "ifc-space-step-profile" | "ifc-space-body-envelope" | "ifc-space-wall-constrained-geodesic" | "ifc-space-anchor-geodesic" | "wall-topology-grid" | "wall-face-reconstruction";
+  boundarySource?:
+    | "ifc-space-step-profile"
+    | "ifc-space-body-envelope"
+    | "ifc-space-solid-v1"
+    | "ifc-space-wall-constrained-geodesic"
+    | "ifc-space-anchor-geodesic"
+    | "wall-topology-grid"
+    | "wall-face-reconstruction"
+    | "ifc-wall-topology-face"
+    | "ifc-open-plan-semantic-zone";
   boundaryConfidence?: number;
   /** Native furniture and fixtures from the source IFC whose center lies inside this inferred room footprint. */
   elements?: DetectedRoomElement[];
@@ -190,11 +206,25 @@ export interface RoomDebugArtifact {
     floorLevelGroupCount?: number;
     analysedFloorLevelCount?: number;
     semanticSpaceCount?: number;
+    semanticSpaceAssignedToFloorCount?: number;
+    wallMaskCoverageRatio?: number;
+    activeLevelWallGeometryCount?: number;
     anchoredRoomCount?: number;
     resolvedAnchorCount?: number;
     anchorMappingId?: string;
+    anchorMaxSnapDistanceMeters?: number;
     roomCoverageRatio?: number;
-    roomReconstructionMethod?: "ifc-space-step-profile-v1" | "ifc-space-body-envelope-v1" | "ifc-space-wall-constrained-geodesic-v2" | "ifc-wall-planar-graph-v1" | "none";
+    roomReconstructionMethod?:
+      | "ifc-space-step-profile-v1"
+      | "ifc-space-body-envelope-v1"
+      | "ifc-space-solid-v1"
+      | "ifc-space-wall-constrained-geodesic-v2"
+      | "ifc-wall-planar-graph-v1"
+      | "ifc-wall-topology-components-and-open-zones-v1"
+      | "none";
+    physicalComponentCount?: number;
+    openPlanComponentCount?: number;
+    unanchoredComponentCount?: number;
     semanticMatchedSpaceCount?: number;
     unmatchedSemanticSpaces?: string[];
     wallAxisCount?: number;
@@ -209,6 +239,9 @@ export interface RoomDebugArtifact {
     nativeFurnitureGeometryCount?: number;
     nativeFurnitureAssignedCount?: number;
     sealedDoorCount: number;
+    /** Doors conservatively inferred from native IfcDoor geometry when IFC opening relationships are absent. */
+    inferredDoorGeometryCount?: number;
+    rejectedDoorGeometryCount?: number;
     portalCount: number;
   };
   warnings: string[];
@@ -223,5 +256,17 @@ export interface RoomDebugArtifact {
     components: RoomComponentDiagnostic[];
     roomBoundaryCandidates: RoomBoundaryWallDiagnostic[];
     doors: RoomDoorDiagnostic[];
+    anchors?: Array<{
+      key: string;
+      label: string;
+      resolved: boolean;
+      requestedPoint: { x: number; y: number } | null;
+      snappedPoint: { x: number; y: number } | null;
+      snapDistanceMeters: number | null;
+      maxSnapRadiusMeters?: number | null;
+      outsideFloorDistanceMeters?: number;
+      confidence?: number;
+      failureReason?: string | null;
+    }>;
   };
 }

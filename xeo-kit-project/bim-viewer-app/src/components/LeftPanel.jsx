@@ -21,7 +21,7 @@ export const LeftPanel = ({
   savedLayouts = [], savedLayoutsLoading = false, savedLayoutsError = null, onOpenSavedLayout,
   onEditSavedLayout, onDeleteSavedLayout, fileNameForLayoutMetadata, activeSavedLayout = null,
   activeTab = null, onActiveTabChange = null,
-  isCeilingHidden = false, onToggleCeiling = null, onOpenCeilingDesigner = null,
+  isCeilingHidden = false, hasIfcCeilings = false, onToggleCeiling = null, onOpenCeilingDesigner = null,
   hasDesignedCeilings = false, areDesignedCeilingsHidden = false, onToggleDesignedCeilings = null,
   catalogSearchTerm = '', onCatalogSearchTermChange = () => {}, activeRoomLabel = '',
 }) => {
@@ -193,6 +193,31 @@ export const LeftPanel = ({
 
       <div className={`flex-1 overflow-y-auto ${leftTab === 'explorer' ? 'block' : 'hidden'}`}>
         <div className="px-3 pt-3">
+          {(hasDesignedCeilings || hasIfcCeilings) && (
+            <section className="mb-3 rounded-2xl border border-orange-200/80 bg-gradient-to-br from-orange-50 via-white to-amber-50/70 p-3 shadow-sm dark:border-orange-500/25 dark:from-orange-500/10 dark:via-slate-900 dark:to-slate-900" aria-label="Ceiling visibility controls">
+              <div className="flex items-start gap-2.5">
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#ff914d]/15 text-[#d96b25] dark:text-orange-300"><Eye className="h-4 w-4" /></span>
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-[12px] font-bold text-slate-900 dark:text-white">Ceiling visibility</h3>
+                  <p className="mt-0.5 text-[10px] leading-4 text-slate-600 dark:text-slate-400">Temporarily hide a ceiling to work on the room below. Your design is not deleted.</p>
+                </div>
+              </div>
+              <div className="mt-3 grid grid-cols-1 gap-2">
+                {hasDesignedCeilings && (
+                  <button type="button" onClick={onToggleDesignedCeilings} className="flex w-full items-center justify-between gap-2 rounded-xl border border-orange-300/80 bg-white px-3 py-2.5 text-left text-[11px] font-bold text-slate-800 shadow-sm transition hover:border-orange-400 hover:bg-orange-50 dark:border-orange-500/30 dark:bg-slate-800/90 dark:text-slate-100 dark:hover:bg-orange-500/10" aria-label={areDesignedCeilingsHidden ? 'Show created ceiling' : 'Hide created ceiling'}>
+                    <span className="flex min-w-0 items-center gap-2"><Layers3 className="h-4 w-4 shrink-0 text-[#d96b25]" /><span>{areDesignedCeilingsHidden ? 'Show created ceiling' : 'Hide created ceiling'}</span></span>
+                    {areDesignedCeilingsHidden ? <Eye className="h-4 w-4 shrink-0 text-emerald-500" /> : <EyeOff className="h-4 w-4 shrink-0 text-slate-500" />}
+                  </button>
+                )}
+                {hasIfcCeilings && (
+                  <button type="button" onClick={onToggleCeiling} className="flex w-full items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-left text-[11px] font-semibold text-slate-700 shadow-sm transition hover:border-orange-300 hover:bg-orange-50 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-200 dark:hover:bg-slate-800" aria-label={isCeilingHidden ? 'Show original ceiling' : 'Hide original ceiling'}>
+                    <span className="flex min-w-0 items-center gap-2"><Eye className="h-4 w-4 shrink-0 text-slate-500" /><span>{isCeilingHidden ? 'Show original ceiling' : 'Hide original ceiling'}</span></span>
+                    {isCeilingHidden ? <Eye className="h-4 w-4 shrink-0 text-emerald-500" /> : <EyeOff className="h-4 w-4 shrink-0 text-slate-500" />}
+                  </button>
+                )}
+              </div>
+            </section>
+          )}
           {showQuickStart ? (
             <section className="hci-help-card rounded-2xl border border-orange-200/80 bg-gradient-to-br from-orange-50 via-white to-amber-50/70 p-3.5 shadow-sm dark:border-orange-500/20 dark:from-orange-500/10 dark:via-slate-900 dark:to-slate-900" aria-label="Quick start guide">
               <div className="flex items-center justify-between gap-2">
@@ -218,14 +243,10 @@ export const LeftPanel = ({
         </div>
         <div className="px-1 pb-3 pt-1">
           <div className="mx-3 mb-1 flex items-center justify-between gap-2">
-            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Building parts</span>
-            <button type="button" onClick={onOpenCeilingDesigner} disabled={!onOpenCeilingDesigner} className="inline-flex items-center gap-1.5 rounded-lg border border-orange-200 bg-orange-50 px-2.5 py-1.5 text-[10px] font-semibold text-orange-700 shadow-sm transition hover:border-orange-300 hover:bg-orange-100 disabled:opacity-50 dark:border-orange-500/30 dark:bg-orange-500/10 dark:text-orange-300" title="Automatically create ceilings fitted to detected rooms"><Layers3 className="h-3 w-3"/> Design ceiling</button>
+            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Model elements</span>
+            <button type="button" onClick={onOpenCeilingDesigner} disabled={!onOpenCeilingDesigner} className="inline-flex items-center gap-1.5 rounded-lg border border-orange-200 bg-orange-50 px-2.5 py-1.5 text-[10px] font-semibold text-orange-700 shadow-sm transition hover:border-orange-300 hover:bg-orange-100 disabled:opacity-50 dark:border-orange-500/30 dark:bg-orange-500/10 dark:text-orange-300" title="Create a ceiling design for detected rooms"><Layers3 className="h-3 w-3"/> Create ceiling</button>
           </div>
-          <div className="mx-3 mb-2 flex flex-wrap items-center gap-1.5">
-            {hasDesignedCeilings && <button type="button" onClick={onToggleDesignedCeilings} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[10px] font-semibold text-slate-600 shadow-sm transition hover:border-orange-300 hover:text-[#d96b25] dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"><Eye className="h-3 w-3"/>{areDesignedCeilingsHidden ? 'Show created' : 'Hide created'}</button>}
-            <button type="button" onClick={onToggleCeiling} disabled={!onToggleCeiling} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[10px] font-semibold text-slate-600 shadow-sm transition hover:border-orange-300 hover:text-[#d96b25] disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300" title="Temporarily hide or show IFC ceiling and roof elements">{isCeilingHidden ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}{isCeilingHidden ? 'Show IFC' : 'Hide IFC'}</button>
-          </div>
-          <div className="mx-3 mb-1 text-[10px] text-slate-400">Choose a building element to inspect</div>
+          <div className="mx-3 mb-1 text-[10px] leading-4 text-slate-400">Select a model element to view its details and editing options.</div>
           <div ref={treeRef} className="p-3 text-sm text-slate-700 dark:text-slate-300" />
         </div>
       </div>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { mergeRoomScopedCeilings } from './ceilingScopeUtils.mjs';
 import {
   X,
   Loader2,
@@ -23,6 +24,33 @@ const DEFAULT_COLOR = '#F4F1EA';
 const DEFAULT_DROP_METRES = 0;
 const DEFAULT_THICKNESS_METRES = 0.05;
 const CONFIDENCE_REVIEW_THRESHOLD = 0.6;
+
+function roomNeedsManualReview(room, analysis) {
+  if (!room) return false;
+  const confidence = safeNumber(room.confidence, 0);
+  const boundaryConfidence = safeNumber(room.boundaryConfidence, room.confidence || 0);
+  return room.regionKind === 'semantic-zone'
+    || room.boundarySource === 'ifc-wall-topology-face'
+    || confidence < 0.75
+    || boundaryConfidence < 0.75
+    || room.elevationSource !== 'ifc-overhead-surface'
+    || ['wall-face-reconstruction', 'ifc-space-wall-constrained-geodesic', 'ifc-space-anchor-geodesic', 'ifc-open-plan-semantic-zone'].includes(room.boundarySource)
+    || analysis?.units?.confidence === 'assumed-metre';
+}
+
+function findSavedCeilingForRoom(ceilings, room) {
+  const ids = new Set([room?.id, room?.navigationRoomId].filter(Boolean).map(String));
+  return (Array.isArray(ceilings) ? ceilings : []).find((ceiling) =>
+    [ceiling?.roomId, ceiling?.navigationRoomId].some((id) => id && ids.has(String(id))),
+  ) || null;
+}
+
+function findCurrentSavedCeilingForRoom(ceilings, room, analysis) {
+  const saved = findSavedCeilingForRoom(ceilings, room);
+  if (!saved) return null;
+  if (!analysis?.sourceFingerprint) return saved;
+  return saved.sourceModelFingerprint === analysis.sourceFingerprint ? saved : null;
+}
 
 const DEFAULT_CEILING_FINISH = {
   kind: 'color',
@@ -249,6 +277,7 @@ export const CeilingDesignerModal = ({
   const [error, setError] = useState('');
   const [loadedAt, setLoadedAt] = useState(null);
   const [confirmLowConfidence, setConfirmLowConfidence] = useState(false);
+  const [applyScope, setApplyScope] = useState('room');
   const [previewError, setPreviewError] = useState('');
   const [applyingCeiling, setApplyingCeiling] = useState(false);
   const requestVersionRef = useRef(0);
@@ -277,6 +306,12 @@ export const CeilingDesignerModal = ({
     [visibleRooms, selectedRoomId],
   );
 
+  const targetRooms = applyScope === 'floor' ? visibleRooms : (selectedRoom ? [selectedRoom] : []);
+  const invalidTargetRooms = targetRooms.filter((room) => normalizeBoundary(room?.boundary).outer.length < 3
+    || room?.validation?.selfIntersection === true
+    || room?.validation?.overlapsOtherRooms === true);
+  const scopeNeedsManualConfirmation = targetRooms.some((room) => roomNeedsManualReview(room, analysis));
+
   // Reopen a room's saved ceiling settings when the user selects a room that
   // already has a design. This prevents a simple edit from silently replacing
   // an existing finish/profile with the dialog defaults.
@@ -284,11 +319,7 @@ export const CeilingDesignerModal = ({
     if (!selectedRoomId) return;
     const room = rooms.find((item) => item.id === selectedRoomId);
     if (!room) return;
-    const saved = existingCeilings.find((item) => (
-      item?.roomId === room.id ||
-      item?.roomId === room.navigationRoomId ||
-      item?.navigationRoomId === room.navigationRoomId
-    ));
+    const saved = findCurrentSavedCeilingForRoom(existingCeilings, room, analysis);
     if (!saved) {
       // Do not carry another room's style/height into a room that has no saved
       // ceiling yet. Each room starts from the same safe architectural defaults.
@@ -325,7 +356,7 @@ export const CeilingDesignerModal = ({
       rgb: Array.isArray(savedFinish.rgb) ? savedFinish.rgb : rgbFromHex(savedFinish.color || DEFAULT_COLOR),
     });
     setFinishMode(finishKind);
-  }, [selectedRoomId, rooms, existingCeilings]);
+  }, [selectedRoomId, rooms, existingCeilings, analysis]);
 
   const architecturalColorMaterials = useMemo(() => {
     const builtIns = ARCHITECTURAL_CEILING_COLORS.map((item) => ({
@@ -461,12 +492,9 @@ export const CeilingDesignerModal = ({
 
   const previewDesign = useMemo(() => {
     if (!selectedRoom || !analysis) return null;
+    if (selectedRoom.validation?.selfIntersection === true || selectedRoom.validation?.overlapsOtherRooms === true) return null;
     try {
-      const savedCeiling = existingCeilings.find((item) => (
-        item?.roomId === selectedRoom.id ||
-        item?.roomId === selectedRoom.navigationRoomId ||
-        item?.navigationRoomId === selectedRoom.navigationRoomId
-      ));
+      const savedCeiling = findCurrentSavedCeilingForRoom(existingCeilings, selectedRoom, analysis);
       return buildCeilingDesign(selectedRoom, analysis, {
         structuralY: heightOverrides[selectedRoom.id] ?? selectedRoom.recommendedCeilingY,
         drop,
@@ -493,26 +521,17 @@ export const CeilingDesignerModal = ({
 
   useEffect(() => {
     setConfirmLowConfidence(false);
-  }, [selectedRoomId, selectedLevelId, drop, thickness, finish, profileType]);
+  }, [selectedRoomId, selectedLevelId, drop, thickness, finish, profileType, applyScope]);
 
   if (!open) return null;
 
   const confidence = safeNumber(selectedRoom?.confidence, 0);
   const boundaryConfidence = safeNumber(selectedRoom?.boundaryConfidence, selectedRoom?.confidence || 0);
-  const needsManualConfirmation = Boolean(selectedRoom && (
-    confidence < 0.75 ||
-    boundaryConfidence < 0.75 ||
-    selectedRoom.elevationSource !== 'ifc-overhead-surface' ||
-    selectedRoom.boundarySource === 'wall-face-reconstruction' ||
-    selectedRoom.boundarySource === 'ifc-space-wall-constrained-geodesic' ||
-    selectedRoom.boundarySource === 'ifc-space-anchor-geodesic' ||
-    analysis?.units?.confidence === 'assumed-metre'
-  ));
-  const selectedExistingCeiling = selectedRoom ? existingCeilings.find((item) => (
-    item?.roomId === selectedRoom.id ||
-    item?.roomId === selectedRoom.navigationRoomId ||
-    item?.navigationRoomId === selectedRoom.navigationRoomId
-  )) : null;
+  const selectedExistingCeiling = selectedRoom ? findSavedCeilingForRoom(existingCeilings, selectedRoom) : null;
+  const selectedExistingCeilingIsStale = Boolean(
+    selectedExistingCeiling && analysis?.sourceFingerprint
+    && selectedExistingCeiling.sourceModelFingerprint !== analysis.sourceFingerprint,
+  );
   const selectedStructuralY = selectedRoom
     ? safeNumber(heightOverrides[selectedRoom.id], selectedRoom.recommendedCeilingY)
     : 0;
@@ -543,26 +562,49 @@ export const CeilingDesignerModal = ({
   };
 
   const createCeiling = async (openLightingPlan = false) => {
-    if (!selectedRoom || !analysis || !previewDesign || applyingCeiling) return;
-    if (needsManualConfirmation && !confirmLowConfidence) return;
-    const next = [
-      ...existingCeilings.filter((ceiling) => (
-        ceiling?.roomId !== selectedRoom.id &&
-        ceiling?.roomId !== selectedRoom.navigationRoomId &&
-        ceiling?.navigationRoomId !== selectedRoom.navigationRoomId
-      )),
-      { ...previewDesign, visible: true },
-    ];
+    if (!selectedRoom || !analysis || !previewDesign || applyingCeiling || !targetRooms.length) return;
+    if (invalidTargetRooms.length) {
+      setError(`Cannot apply the ceiling to ${applyScope === 'floor' ? 'the whole floor' : 'this room'} because these room boundaries are invalid, self-intersecting or overlap another room: ${invalidTargetRooms.map((room) => room.label || room.id).join(', ')}. Re-analyse or correct those room boundaries first.`);
+      return;
+    }
+    if (scopeNeedsManualConfirmation && !confirmLowConfidence) return;
+
+    let next;
+    let created;
+    try {
+      const result = mergeRoomScopedCeilings(existingCeilings, targetRooms, (room) => {
+        const savedCeiling = findCurrentSavedCeilingForRoom(existingCeilings, room, analysis);
+        const structuralY = safeNumber(
+          heightOverrides[room.id],
+          safeNumber(savedCeiling?.elevation?.structuralY, safeNumber(room.recommendedCeilingY, safeNumber(room.floorY, 0) + 2.7)),
+        );
+        return buildCeilingDesign(room, analysis, {
+          structuralY,
+          drop,
+          thickness,
+          finish,
+          profileType,
+          openings: Array.isArray(savedCeiling?.openings) ? savedCeiling.openings : [],
+        });
+      });
+      next = result.ceilings;
+      created = result.created;
+    } catch (caught) {
+      setError(caught?.message || 'One or more room boundaries could not produce an independent ceiling. No ceiling changes were applied.');
+      return;
+    }
 
     setApplyingCeiling(true);
     setError('');
     try {
-      // onApply now resolves only after the real xeokit mesh has been created.
-      // Keep the preview alive until the committed mesh is ready, preventing the
-      // editor from briefly returning to an empty room after the user clicks Done.
+      // Each target is built from its own room boundary and stable room ID.
+      // The scope helper prepares the full array before commit, so a bad room
+      // cannot partially replace other room ceilings.
       await onApply?.(next);
       onClose?.();
-      if (openLightingPlan) onOpenLightingPlan?.(selectedRoom, next[next.length - 1]);
+      if (openLightingPlan && applyScope === 'room') {
+        onOpenLightingPlan?.(selectedRoom, created.find((item) => item.roomId === selectedRoom.id) || created[0]);
+      }
     } catch (caught) {
       setError(caught?.message || 'The ceiling could not be committed to the 3D scene. The preview has been kept so you can retry.');
     } finally {
@@ -591,12 +633,21 @@ export const CeilingDesignerModal = ({
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
           {analysis && (
-            <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-700 dark:bg-slate-800/50 md:grid-cols-5">
-              <div><span className="block text-[10px] text-slate-400">Detected rooms</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.roomCount ?? rooms.length}</strong></div>
+            <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-700 dark:bg-slate-800/50 md:grid-cols-5 xl:grid-cols-6">
+              <div><span className="block text-[10px] text-slate-400">Detected areas</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.roomCount ?? rooms.length}</strong></div>
+              <div><span className="block text-[10px] text-slate-400">Physical rooms</span><strong className="text-slate-800 dark:text-slate-100">{rooms.filter((room) => room.regionKind === 'physical-room').length}</strong></div>
+              <div><span className="block text-[10px] text-slate-400">Design zones</span><strong className="text-slate-800 dark:text-slate-100">{rooms.filter((room) => room.regionKind === 'semantic-zone').length}</strong></div>
               <div><span className="block text-[10px] text-slate-400">IFC space anchors</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.semanticSpaceCount ?? 0}</strong></div>
-              <div><span className="block text-[10px] text-slate-400">Candidate ceilings</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.candidateCeilingCount ?? 0}</strong></div>
+              <div><span className="block text-[10px] text-slate-400">Existing IFC ceilings</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.candidateCeilingCount ?? 0}</strong></div>
               <div><span className="block text-[10px] text-slate-400">IFC length unit</span><strong className="text-slate-800 dark:text-slate-100">{analysis.units?.sourceLengthUnit || 'Unknown'}</strong></div>
               <div><span className="block text-[10px] text-slate-400">Analysis cache</span><strong className="text-slate-800 dark:text-slate-100">{analysis.stats?.cacheHit ? 'Reused' : 'Fresh'}</strong></div>
+            </div>
+          )}
+
+          {analysis && Number(analysis.stats?.candidateCeilingCount || 0) === 0 && (
+            <div className="flex items-start gap-2 rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-sky-800 dark:border-sky-500/25 dark:bg-sky-500/10 dark:text-sky-200">
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>No existing IFC ceiling elements were found. You can still create a new ceiling from a validated room boundary below.</span>
             </div>
           )}
 
@@ -660,8 +711,23 @@ export const CeilingDesignerModal = ({
             <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(300px,0.9fr)]">
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
-                  <div className="text-xs font-bold uppercase tracking-wider text-slate-500">Rooms on this level ({visibleRooms.length})</div>
-                  <span className="text-[10px] text-slate-400">Select one room to preview</span>
+                  <div className="text-xs font-bold uppercase tracking-wider text-slate-500">Areas on this level ({visibleRooms.length})</div>
+                  <span className="text-[10px] text-slate-400">Select a room to preview</span>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-2.5 dark:border-slate-700 dark:bg-slate-800/40">
+                  <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">Apply ceiling to</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button type="button" onClick={() => setApplyScope('room')} aria-pressed={applyScope === 'room'} className={`rounded-lg border px-3 py-2 text-left transition ${applyScope === 'room' ? 'border-orange-400 bg-orange-50 text-orange-800 dark:bg-orange-500/10 dark:text-orange-200' : 'border-slate-200 text-slate-600 hover:border-slate-300 dark:border-slate-700 dark:text-slate-300'}`}>
+                      <span className="block text-[11px] font-bold">This area</span>
+                      <span className="mt-0.5 block text-[9px] opacity-75">Only update the selected area's ceiling</span>
+                    </button>
+                    <button type="button" onClick={() => setApplyScope('floor')} aria-pressed={applyScope === 'floor'} disabled={visibleRooms.length < 2} className={`rounded-lg border px-3 py-2 text-left transition disabled:cursor-not-allowed disabled:opacity-40 ${applyScope === 'floor' ? 'border-orange-400 bg-orange-50 text-orange-800 dark:bg-orange-500/10 dark:text-orange-200' : 'border-slate-200 text-slate-600 hover:border-slate-300 dark:border-slate-700 dark:text-slate-300'}`}>
+                      <span className="block text-[11px] font-bold">Entire floor · {visibleRooms.length} areas</span>
+                      <span className="mt-0.5 block text-[9px] opacity-75">Create an independent ceiling in every area</span>
+                    </button>
+                  </div>
+                  {applyScope === 'floor' && <p className="mt-2 text-[9px] leading-4 text-slate-500">The selected finish, profile and drop are applied to every valid area on this level. Each area keeps its own boundary, ID and ceiling height. Other floors are not changed. Open-plan design zones remain labelled as zones; no walls are created.</p>}
+                  {applyScope === 'floor' && invalidTargetRooms.length > 0 && <p className="mt-2 text-[10px] font-semibold text-rose-600 dark:text-rose-300">Cannot apply to the whole floor yet. Fix these boundaries or overlaps: {invalidTargetRooms.map((room) => room.label || room.id).join(', ')}.</p>}
                 </div>
                 <div className="max-h-[330px] space-y-2 overflow-y-auto pr-1">
                   {visibleRooms.map((room) => {
@@ -680,6 +746,7 @@ export const CeilingDesignerModal = ({
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <span className="text-sm font-bold text-slate-800 dark:text-slate-100">{room.label || room.id}</span>
+                              <span className={`rounded-full px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide ${room.regionKind === 'semantic-zone' ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'}`}>{room.regionKind === 'semantic-zone' ? 'Design zone' : 'Physical room'}</span>
                               {hasExisting && <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-[9px] font-bold text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300">Ceiling exists</span>}
                             </div>
                             <p className="mt-1 text-[10px] text-slate-500">{safeNumber(room.areaM2, 0).toFixed(2)} m² · Floor Y {safeNumber(room.floorY, 0).toFixed(2)} m</p>
@@ -710,6 +777,12 @@ export const CeilingDesignerModal = ({
 
                 {selectedRoom ? (
                   <>
+                    {selectedExistingCeilingIsStale && (
+                      <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-[10px] leading-4 text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span>This saved ceiling was created from an older room boundary. It has been kept in your project data but is not rendered. Applying a new ceiling will replace it using the current room outline.</span>
+                      </div>
+                    )}
                     <div className="rounded-lg bg-slate-50 p-3 text-xs dark:bg-slate-800/70">
                       <div className="flex justify-between gap-2"><span className="text-slate-500">Reference ceiling Y</span><strong className="text-slate-800 dark:text-slate-100">{safeNumber(selectedRoom.recommendedCeilingY, 0).toFixed(3)} m</strong></div>
                       <div className="mt-1 flex justify-between gap-2"><span className="text-slate-500">Proposed underside Y</span><strong className="text-slate-800 dark:text-slate-100">{finishedBottomY.toFixed(3)} m</strong></div>
@@ -837,10 +910,10 @@ export const CeilingDesignerModal = ({
                       {finishMode !== 'color' && !filteredFinishMaterials.length && materialLibraryLoading && <div className="flex items-center gap-2 text-[9px] text-slate-400"><span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-orange-500"/> Loading reusable finishes…</div>}
                     </section>
 
-                    {needsManualConfirmation && (
+                    {scopeNeedsManualConfirmation && (
                       <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-[10px] text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
                         <input type="checkbox" checked={confirmLowConfidence} onChange={(event) => setConfirmLowConfidence(event.target.checked)} className="mt-0.5 accent-orange-500"/>
-                        <span><strong>Confirm manual review.</strong> The room boundary is inferred and/or the ceiling elevation needs review. I have inspected the selected room footprint and proposed height in the 3D preview.</span>
+                        <span><strong>Confirm boundary review.</strong> {applyScope === 'floor' ? `One or more of the ${targetRooms.length} room boundaries or ceiling heights are inferred. I have reviewed every room outline and its proposed ceiling height before applying to the floor.` : 'The room boundary is inferred and/or the ceiling elevation needs review. I have inspected this room footprint and proposed height in the 3D preview.'}</span>
                       </label>
                     )}
 
@@ -865,25 +938,25 @@ export const CeilingDesignerModal = ({
         </div>
 
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 px-5 py-4 dark:border-slate-700">
-          <span className="text-xs text-slate-500">{selectedRoom ? `One room selected: ${selectedRoom.label || selectedRoom.id}` : 'Select a room to continue'}</span>
+          <span className="text-xs text-slate-500">{applyScope === 'floor' ? `Applying to ${targetRooms.length} areas on ${levels.find((level) => level.id === selectedLevelId)?.label || 'this floor'}` : selectedRoom ? `Selected: ${selectedRoom.label || selectedRoom.id}` : 'Select a room to continue'}</span>
           <div className="flex flex-wrap justify-end gap-2">
             <button type="button" onClick={onClose} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">Cancel</button>
             <button
               type="button"
               onClick={() => createCeiling(true)}
-              disabled={!selectedRoom || !previewDesign || Boolean(previewError) || loading || applyingCeiling || (needsManualConfirmation && !confirmLowConfidence)}
+              disabled={applyScope !== 'room' || !selectedRoom || !previewDesign || Boolean(previewError) || loading || applyingCeiling || (scopeNeedsManualConfirmation && !confirmLowConfidence)}
               className="inline-flex items-center gap-2 rounded-lg border border-orange-300 px-3 py-2 text-xs font-bold text-orange-700 hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-45 dark:border-orange-500/40 dark:text-orange-300 dark:hover:bg-orange-500/10"
-              title="Apply this ceiling and open its reflected ceiling plan"
+              title="Apply this room ceiling and open its reflected ceiling plan"
             >
               <Grid3X3 className="h-3.5 w-3.5"/>{applyingCeiling ? 'Applying ceiling…' : 'Apply & plan lighting'}
             </button>
             <button
               type="button"
               onClick={() => createCeiling(false)}
-              disabled={!selectedRoom || !previewDesign || Boolean(previewError) || loading || applyingCeiling || (needsManualConfirmation && !confirmLowConfidence)}
+              disabled={!selectedRoom || !previewDesign || !targetRooms.length || invalidTargetRooms.length > 0 || Boolean(previewError) || loading || applyingCeiling || (scopeNeedsManualConfirmation && !confirmLowConfidence)}
               className="inline-flex items-center gap-2 rounded-lg bg-[#ff914d] px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-[#f47f39] disabled:cursor-not-allowed disabled:opacity-45"
             >
-              <Check className="h-3.5 w-3.5"/>{applyingCeiling ? 'Applying ceiling…' : (selectedExistingCeiling ? 'Replace room ceiling' : 'Apply ceiling')}
+              <Check className="h-3.5 w-3.5"/>{applyingCeiling ? 'Applying ceiling…' : applyScope === 'floor' ? `Apply to ${visibleRooms.length} areas` : (selectedExistingCeiling ? 'Replace room ceiling' : 'Apply ceiling')}
             </button>
           </div>
         </footer>

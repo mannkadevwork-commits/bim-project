@@ -1424,6 +1424,10 @@ export async function compileScene(
       jobDirectory,
       inputIfcPath: hostedDoorBuild.inputPath,
       outputPath: path.join(jobDirectory, "presentation_rooms.json"),
+      // Publish the same semantic IfcSpace anchors consumed by the room
+      // diagnostics service. Without this flag production emitted zero named
+      // rooms even though the input IFC contained valid space placements.
+      useIfcSpaceAnchors: true,
     });
     const portalManifest = buildPresentationPortalManifest(
       roomArtifact,

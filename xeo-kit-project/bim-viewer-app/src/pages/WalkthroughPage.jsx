@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
-  ArrowLeft, Camera, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleHelp, DoorOpen, Gauge,
-  Maximize2, Minimize2, Minus, Map, Move3d, MousePointer2, Play, Plus,
+  ArrowLeft, Camera, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleHelp, Gauge,
+  Maximize2, Minimize2, Minus, Map, Move3d, MousePointer2, Pause, Play, Plus,
   RotateCcw, RotateCw, Settings2, Target, View, X,
 } from 'lucide-react';
 import { useWalkthroughEngine } from '../hooks/useWalkthroughEngine';
@@ -148,6 +148,7 @@ export default function WalkthroughPage() {
   const navigationPlan = walkthrough.navigationPlan || null;
   const navigationHotspots = navigationPlan?.hotspots || [];
   const effectiveWalkMode = walkthrough.walkMode || walkMode;
+  const homeTourActive = Boolean(walkthrough.homeTour?.active);
 
   useEffect(() => {
     if (!settingsReady) return;
@@ -185,6 +186,16 @@ export default function WalkthroughPage() {
   }, [walkthrough.immersivePresentationActive]);
 
   useEffect(() => {
+    if (!homeTourActive) return;
+    setRailOpen(false);
+    setSettingsOpen(false);
+    setViewsOpen(false);
+    setMoreOpen(false);
+    setHelpOpen(false);
+    setLockToast(false);
+  }, [homeTourActive]);
+
+  useEffect(() => {
     if (walkthrough.homeTour?.phase === 'complete') {
       setViewMode('overview');
       setWalkMode('guided');
@@ -212,10 +223,14 @@ export default function WalkthroughPage() {
     if (walkthrough.status === 'loading') return 'Loading walkthrough…';
     if (walkthrough.status === 'error') return walkthrough.message || 'Walkthrough unavailable';
     if (walkthrough.homeTour?.active) {
-      const phaseLabel = walkthrough.homeTour.phase === 'presenting'
-        ? 'Room showcase'
-        : (['settling', 'composing'].includes(walkthrough.homeTour.phase) ? 'Framing room highlight' : 'Moving through home');
-      return `Home Tour · ${phaseLabel} · ${walkthrough.homeTour.label || 'Next room'}`;
+      const phaseLabel = walkthrough.homeTour.phase === 'planning'
+        ? 'Planning safe route'
+        : walkthrough.homeTour.phase === 'revealing'
+          ? 'Framing room highlight'
+          : walkthrough.homeTour.phase === 'sweeping'
+            ? 'Showcasing room'
+            : 'Moving through home';
+      return `Home Tour · ${phaseLabel}${walkthrough.homeTour.label ? ` · ${walkthrough.homeTour.label}` : ''}`;
     }
     // When recovery fails, show its actionable error instead of masking it with
     // the generic stuck-state label. Successful recovery replaces it with the
@@ -288,7 +303,7 @@ export default function WalkthroughPage() {
       walkthrough.stopHomeTour('home-tour-stop-button');
       return;
     }
-    if (viewMode !== 'walk' || effectiveWalkMode !== 'guided' || !walkthrough.areas?.length) return;
+    if (viewMode !== 'walk' || effectiveWalkMode !== 'guided') return;
     walkthrough.setHomeTourDoorOff(Boolean(walkthrough.homeTour?.doorOff ?? true));
     walkthrough.startHomeTour();
   };
@@ -350,37 +365,34 @@ export default function WalkthroughPage() {
       <div className="relative h-screen w-screen overflow-hidden bg-slate-950 text-white">
       <div ref={viewportRef} className="absolute inset-0" />
 
-      {walkthrough.homeTour?.active && walkthrough.homeTour?.phase === 'portal-transition' && (
-        <div
-          className="pointer-events-none absolute inset-0 z-[100] bg-black"
-          style={{ opacity: Math.max(0, Math.min(1, Number(walkthrough.homeTour.transitionOpacity) || 0)), transition: 'opacity 45ms linear' }}
-          aria-hidden="true"
-        />
-      )}
-
       <div className="pointer-events-none absolute inset-x-0 top-0 z-30 flex items-start justify-between p-4 md:p-5">
         <div className="pointer-events-auto flex items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/78 px-3.5 py-2.5 shadow-[0_18px_60px_rgba(0,0,0,.24)] backdrop-blur-2xl">
           <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-[#ff914d]/30 bg-[#ff914d]/14">
             <Move3d className="h-4 w-4 text-[#ffad73]" />
           </div>
           <div>
-            <div className="text-sm font-semibold tracking-tight text-white">HCI Presentation</div>
+            <div className="text-sm font-semibold tracking-tight text-white">{homeTourActive ? 'HCI Home Tour' : 'HCI Presentation'}</div>
             <div
               className="max-w-[min(72vw,620px)] truncate text-[10px] uppercase tracking-[0.16em] text-slate-300"
               title={displayName || undefined}
             >
-              {viewMode === 'walk' ? (walkthrough.immersivePresentationActive ? '360° Home Presentation' : 'Interactive Walkthrough') : '3D Preview'} · {displayName || 'Loading…'}
+              {homeTourActive
+                ? `${displayName || 'Property presentation'} · CINEMATIC SHOWCASE`
+                : `${viewMode === 'walk' ? (walkthrough.immersivePresentationActive ? '360° Home Presentation' : 'Interactive Walkthrough') : '3D Preview'} · ${displayName || 'Loading…'}`}
             </div>
           </div>
         </div>
 
         <div className="pointer-events-auto flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/20 p-1 backdrop-blur-md">
-          <div className="hidden items-center gap-2 rounded-full border border-white/12 bg-slate-950/70 px-3 py-2 text-[11px] text-slate-200 shadow-xl backdrop-blur-xl sm:flex">
-            <span className="h-1.5 w-1.5 rounded-full bg-[#ff914d] shadow-[0_0_10px_rgba(255,145,77,.8)]" />
-            {viewMode === 'walk'
-              ? (walkthrough.smart720Active ? 'Smart 720 tour' : (walkthrough.immersive360Active ? '360° presentation' : (effectiveWalkMode === 'guided' ? 'Guided presentation' : 'Explore mode')))
-              : 'Overview'}
-          </div>
+          {!homeTourActive && (
+            <div className="hidden items-center gap-2 rounded-full border border-white/12 bg-slate-950/70 px-3 py-2 text-[11px] text-slate-200 shadow-xl backdrop-blur-xl sm:flex">
+              <span className="h-1.5 w-1.5 rounded-full bg-[#ff914d] shadow-[0_0_10px_rgba(255,145,77,.8)]" />
+              {viewMode === 'walk'
+                ? (walkthrough.smart720Active ? 'Smart 720 tour' : (walkthrough.immersive360Active ? '360° presentation' : (effectiveWalkMode === 'guided' ? 'Guided presentation' : 'Explore mode')))
+                : 'Overview'}
+            </div>
+          )}
+          {homeTourActive && <div className="hidden rounded-full border border-[#ff914d]/25 bg-[#ff914d]/10 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-[#ffd1b3] sm:block">Sales presentation</div>}
           <IconButton
             title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
             onClick={toggleFullscreen}
@@ -408,7 +420,7 @@ export default function WalkthroughPage() {
         </div>
       )} */}
 
-      {viewMode === 'walk' && presentationSettings.interface.showFloorMap && walkthrough.immersivePresentationActive && !railOpen && (
+      {!homeTourActive && viewMode === 'walk' && presentationSettings.interface.showFloorMap && walkthrough.immersivePresentationActive && !railOpen && (
         <button
           type="button"
           onClick={() => setRailOpen(true)}
@@ -424,7 +436,7 @@ export default function WalkthroughPage() {
         </button>
       )}
 
-      {viewMode === 'walk' && presentationSettings.interface.showFloorMap && (
+      {!homeTourActive && viewMode === 'walk' && presentationSettings.interface.showFloorMap && (
         <div className="absolute left-4 top-20 z-30 w-[300px] overflow-hidden rounded-[24px] border border-white/10 bg-slate-950/54 shadow-[0_28px_90px_rgba(0,0,0,.32)] backdrop-blur-2xl sm:w-[310px]">
           <button
             type="button"
@@ -506,7 +518,7 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      {viewMode === 'walk' && walkthrough.stuck && walkthrough.recoveryAvailable && (
+      {!homeTourActive && viewMode === 'walk' && walkthrough.stuck && walkthrough.recoveryAvailable && (
         <div className="absolute bottom-24 left-5 z-40 w-[290px] rounded-2xl border border-[#ff914d]/25 bg-slate-950/88 p-3 shadow-2xl backdrop-blur-xl">
           <div className="text-xs font-semibold text-white">Need a safe position?</div>
           <div className="mt-1 text-[11px] leading-4 text-slate-400">The current location has limited navigation clearance. We’ll try a continuous walkable route first, then return you to a previously validated safe floor marker if needed.</div>
@@ -514,7 +526,7 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      {viewMode === 'walk' && effectiveWalkMode === 'explore' && (
+      {!homeTourActive && viewMode === 'walk' && effectiveWalkMode === 'explore' && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
           <div className="h-2.5 w-2.5 rounded-full border border-white/75 bg-white/10 shadow-[0_0_16px_rgba(255,255,255,.4)]" />
         </div>
@@ -529,7 +541,7 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      <div className="pointer-events-auto absolute bottom-5 right-5 z-30 flex items-center gap-1 rounded-2xl border border-white/10 bg-slate-950/78 p-1.5 text-white shadow-xl backdrop-blur-2xl">
+      {!homeTourActive && <div className="pointer-events-auto absolute bottom-5 right-5 z-30 flex items-center gap-1 rounded-2xl border border-white/10 bg-slate-950/78 p-1.5 text-white shadow-xl backdrop-blur-2xl">
         <span className="px-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Light</span>
         {[
           ['day', 'Day'], ['evening', 'Evening'], ['night', 'Night'],
@@ -538,9 +550,9 @@ export default function WalkthroughPage() {
         ))}
         <span className="mx-1 h-5 w-px bg-white/10" />
         <button type="button" title="Presentation settings" aria-label="Presentation settings" onClick={() => setSettingsOpen((open) => !open)} className={`flex h-8 w-8 items-center justify-center rounded-xl transition ${settingsOpen ? 'bg-[#ff914d]/20 text-[#ffd1b3]' : 'text-slate-300 hover:bg-white/[0.08]'}`}><Settings2 className="h-4 w-4" /></button>
-      </div>
+      </div>}
 
-      {settingsOpen && (
+      {settingsOpen && !homeTourActive && (
         <div className="absolute bottom-24 right-5 z-40 max-h-[72vh] w-[min(92vw,420px)] overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/94 p-4 text-white shadow-2xl backdrop-blur-2xl">
           <div className="mb-4 flex items-start justify-between gap-3">
             <div>
@@ -635,7 +647,7 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      {viewsOpen && (
+      {viewsOpen && !homeTourActive && (
         <div className="absolute bottom-24 left-1/2 z-40 min-w-[210px] -translate-x-1/2 rounded-2xl border border-white/10 bg-slate-950/92 p-2 shadow-2xl backdrop-blur-2xl">
           <div className="px-3 pb-2 pt-1 text-[11px] uppercase tracking-[0.16em] text-slate-500">Camera view</div>
           {[
@@ -650,7 +662,7 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      {moreOpen && (
+      {moreOpen && !homeTourActive && (
         <div className="absolute bottom-24 left-1/2 z-40 min-w-[220px] -translate-x-1/2 rounded-2xl border border-white/10 bg-slate-950/92 p-2 shadow-2xl backdrop-blur-2xl">
           <button type="button" onClick={() => { walkthrough.fitView(); setMoreOpen(false); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-sm text-slate-200 hover:bg-white/[0.06]"><Target className="h-4 w-4" /> Fit model</button>
           <button type="button" onClick={() => { setSettingsOpen(true); setMoreOpen(false); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-sm text-slate-200 hover:bg-white/[0.06]"><Gauge className="h-4 w-4" /> Walk sensitivity & height</button>
@@ -658,13 +670,13 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      {helpOpen && (
+      {helpOpen && !homeTourActive && (
         <div className="absolute bottom-24 right-5 z-40 w-[300px] rounded-2xl border border-white/10 bg-slate-950/92 p-4 text-sm text-slate-300 shadow-2xl backdrop-blur-2xl">
           <div className="mb-3 flex items-center justify-between"><span className="font-semibold text-white">Walkthrough help</span><IconButton title="Close help" onClick={() => setHelpOpen(false)}><X className="h-4 w-4" /></IconButton></div>
           <div className="space-y-2 text-xs leading-5 text-slate-400">
             <div><b className="text-slate-200">Guided:</b> click a circular floor destination to travel with a slow cinematic camera pan.</div>
             <div><b className="text-slate-200">360°:</b> drag horizontally or vertically to look around. Click an orange floor marker or choose a point from Rooms to move to another viewpoint; auto-rotation pauses while you interact.</div>
-            <div><b className="text-slate-200">Home Tour:</b> preflights every room, temporarily hides door leaves when Doors off is enabled, walks the NavMesh route to each room, slowly follows the route facing the direction of travel, settles on a room highlight, presents each room for a full 15 seconds, and ends with a whole-home overview.</div>
+            <div><b className="text-slate-200">Home Tour:</b> builds a complete backend-validated NavMesh route through every navigation area, follows the saved camera path, then composes a top-to-bottom reveal toward the room’s sofa, bed or other hero feature. A slow adaptive pan covers the room’s visible design subjects and advances as soon as the composition is complete, instead of making a blind 360° spin or waiting through an extra fixed hold.</div>
             <div><b className="text-slate-200">Explore:</b> W/A/S/D moves · mouse looks freely · Shift runs. Mouse movement is smoothed.</div>
             <div><b className="text-slate-200">Overview:</b> W/A/S/D pan · Q/E zoom · mouse orbit · wheel zoom · +/- keys zoom.</div>
             <div><b className="text-slate-200">Floor map:</b> glass map shows validated, reachable navigation destinations. Select a point to travel there, including while 360° mode is active.</div>
@@ -674,41 +686,27 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      {viewMode === 'walk' && effectiveWalkMode === 'guided' && !walkthrough.immersive360Active && walkthrough.status === 'ready' && walkthrough.areas?.length > 0 && (
-        <div className="absolute bottom-20 left-1/2 z-30 -translate-x-1/2">
-          <div className="flex flex-wrap items-center justify-center gap-2 rounded-2xl border border-white/10 bg-slate-950/90 p-2 shadow-[0_18px_50px_rgba(0,0,0,.34)] backdrop-blur-2xl">
+      {!homeTourActive && viewMode === 'walk' && effectiveWalkMode === 'guided' && !walkthrough.immersive360Active && walkthrough.status === 'ready' && (
+        <div className="absolute bottom-20 left-1/2 z-30 w-[min(92vw,440px)] -translate-x-1/2">
+          <div className="flex items-center justify-between gap-4 rounded-2xl border border-white/10 bg-slate-950/88 px-4 py-3 shadow-[0_22px_70px_rgba(0,0,0,.38)] backdrop-blur-2xl">
+            <div className="min-w-0">
+              <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-orange-200/85">Cinematic home tour</div>
+              <div className="mt-1 truncate text-xs font-semibold text-white">Present the complete property</div>
+              <div className="mt-0.5 text-[10px] text-slate-400">Slow room panoramas · guided room-to-room movement</div>
+            </div>
             <button
               type="button"
               onClick={startHomeTour}
-              className={`group flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs font-bold shadow-[0_10px_28px_rgba(255,145,77,.18)] transition ${walkthrough.homeTour?.active ? 'bg-white text-slate-950 hover:bg-slate-200' : 'bg-[#ff914d] text-slate-950 hover:bg-[#ff7a28]'}`}
-              title="Automatically visit every room, frame its main furnishing, and finish with a whole-home overview"
+              className="flex h-10 shrink-0 items-center gap-2 rounded-xl bg-[#ff914d] px-4 text-xs font-bold text-slate-950 shadow-[0_10px_28px_rgba(255,145,77,.18)] transition hover:bg-[#ff7a28]"
+              title="Start the cinematic Home Tour"
             >
-              {walkthrough.homeTour?.active ? <X className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-              <span>{walkthrough.homeTour?.active ? 'Stop Home Tour' : 'Start Home Tour'}</span>
+              <Play className="h-4 w-4" /> Start tour
             </button>
-            {!walkthrough.homeTour?.active && (
-              <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 bg-white/[0.05] px-3 py-2.5 text-xs font-semibold text-slate-200" title="Temporarily hide door leaves during the tour; restore them when it ends">
-                <input type="checkbox" checked={Boolean(walkthrough.homeTour?.doorOff ?? true)} onChange={toggleHomeTourDoorOff} className="accent-[#ff914d]" />
-                <DoorOpen className="h-4 w-4 text-[#ff914d]" />
-                <span>Doors off</span>
-              </label>
-            )}
-            {!walkthrough.homeTour?.active && walkthrough.immersive360OfferAvailable && (
-              <button
-                type="button"
-                onClick={openImmersive360}
-                className="group flex items-center gap-2 rounded-xl border border-[#ff914d]/28 bg-white/[0.05] px-3.5 py-2.5 text-xs font-semibold text-white transition hover:border-[#ff914d]/48 hover:bg-white/[0.09]"
-                title="Explore a full 360° view from the current destination"
-              >
-                <RotateCw className="h-4 w-4 text-[#ff914d] transition group-hover:rotate-45" />
-                <span>Explore 360°</span>
-              </button>
-            )}
           </div>
         </div>
       )}
 
-      {walkthrough.immersivePresentationActive && (
+      {!homeTourActive && walkthrough.immersivePresentationActive && (
         <div className="absolute bottom-[92px] left-1/2 z-30 flex -translate-x-1/2 items-center gap-1 rounded-2xl border border-white/10 bg-slate-950/72 p-1.5 shadow-[0_22px_65px_rgba(0,0,0,.32)] backdrop-blur-2xl">
           <button type="button" onClick={() => setRailOpen((v) => !v)} className="flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold text-slate-200 transition hover:bg-white/[0.08]">
             <Map className="h-4 w-4 text-[#ff914d]" /> Rooms
@@ -725,7 +723,7 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      <div className="absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1 rounded-[22px] border border-white/12 bg-slate-950/84 p-1.5 shadow-[0_24px_70px_rgba(0,0,0,.36)] backdrop-blur-2xl">
+      {!homeTourActive && <div className="absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1 rounded-[22px] border border-white/12 bg-slate-950/84 p-1.5 shadow-[0_24px_70px_rgba(0,0,0,.36)] backdrop-blur-2xl">
         <IconButton
           title={viewMode === 'walk' ? 'Exit first-person view' : 'Back to renderer'}
           onClick={() => {
@@ -773,50 +771,85 @@ export default function WalkthroughPage() {
         {/* <button type="button" onClick={handleTour} disabled={!areas.length} className={`flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition ${touring ? 'bg-white text-slate-950' : 'bg-[#ff914d] text-slate-950 hover:bg-[#ff7a28]'}`}>
           {touring ? <><StopCircle className="h-4 w-4" /> Stop</> : <><Play className="h-4 w-4" /> Tour</>}
         </button> */}
-      </div>
+      </div>}
 
-      {walkthrough.homeTour?.active && (
-        <div className="absolute bottom-28 left-1/2 z-40 w-[min(92vw,390px)] -translate-x-1/2 rounded-2xl border border-white/12 bg-slate-950/90 p-4 text-white shadow-[0_24px_70px_rgba(0,0,0,.42)] backdrop-blur-2xl">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-orange-200/85">HCI Home Tour</div>
-              <div className="mt-1 text-base font-semibold">{walkthrough.homeTour.label || (walkthrough.homeTour.phase === 'traveling' ? 'Moving to next room' : 'Preparing room')}</div>
-              <div className="mt-1 text-[11px] text-slate-300">
-                {walkthrough.homeTour.stopIndex || 0} of {walkthrough.homeTour.totalStops || walkthrough.areas.length} rooms
-                {walkthrough.homeTour.hero ? ` · Featuring ${walkthrough.homeTour.hero}` : ' · Room overview'}
+      {homeTourActive && (
+        <>
+          <div className="pointer-events-none absolute left-1/2 top-[84px] z-30 w-[min(92vw,430px)] -translate-x-1/2">
+            <div className="rounded-2xl border border-white/10 bg-slate-950/72 px-4 py-3 text-white shadow-[0_18px_60px_rgba(0,0,0,.25)] backdrop-blur-2xl">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-orange-200/85">{walkthrough.homeTour.phase === 'planning' ? 'Preparing your tour' : `Room ${Math.max(1, walkthrough.homeTour.stopIndex || 1)} of ${Math.max(1, walkthrough.homeTour.totalStops || 1)}`}</div>
+                  <div className="mt-1 truncate text-sm font-semibold text-white">{walkthrough.homeTour.label || (walkthrough.homeTour.phase === 'planning' ? 'Preparing your home tour' : 'Your property')}</div>
+                </div>
+                <div className="shrink-0 text-[10px] font-medium text-slate-300">
+                  {walkthrough.homeTour.paused ? 'Paused' : walkthrough.homeTour.phase === 'planning' ? 'Preparing route' : walkthrough.homeTour.phase === 'traveling' ? 'Moving to room' : walkthrough.homeTour.phase === 'revealing' ? 'Room reveal' : 'Slow panorama'}
+                </div>
+              </div>
+              <div className="mt-3 h-1 overflow-hidden rounded-full bg-white/10">
+                <div className="h-full rounded-full bg-gradient-to-r from-[#ff914d] to-[#ffd1b3] transition-[width] duration-500" style={{ width: `${Math.min(100, (Math.max(0, Number(walkthrough.homeTour.stopIndex) || 0) / Math.max(1, Number(walkthrough.homeTour.totalStops) || 1)) * 100)}%` }} />
               </div>
             </div>
-            <button type="button" onClick={() => walkthrough.stopHomeTour('home-tour-progress-stop')} className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.06] px-2.5 text-[11px] font-semibold text-white hover:bg-white/[0.12]">
-              <X className="h-3.5 w-3.5" /> Stop
-            </button>
           </div>
-          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/10">
-            <div className="h-full rounded-full bg-gradient-to-r from-[#ff914d] to-[#ffd1b3] transition-[width] duration-300" style={{ width: `${Math.min(100, ((walkthrough.homeTour.visitedCount || 0) / Math.max(1, walkthrough.homeTour.totalStops || 1)) * 100)}%` }} />
+
+          <div className="absolute bottom-6 left-1/2 z-40 w-[min(94vw,610px)] -translate-x-1/2 rounded-[26px] border border-white/12 bg-slate-950/88 p-3 text-white shadow-[0_28px_90px_rgba(0,0,0,.48)] backdrop-blur-2xl sm:p-4">
+            <div className="flex items-center justify-between gap-3 px-1">
+              <div className="min-w-0">
+                <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-orange-200/85">HCI · CINEMATIC PRESENTATION</div>
+                <div className="mt-1 truncate text-xs font-medium text-slate-300">
+                  {walkthrough.homeTour.paused ? 'Tour paused · your place is saved' : walkthrough.homeTour.phase === 'planning' ? 'Preparing a safe route through the property' : walkthrough.homeTour.phase === 'traveling' ? 'Travelling smoothly to the next room' : walkthrough.homeTour.phase === 'revealing' ? 'Composing the room view' : 'Enjoy the slow 360° room panorama'}
+                </div>
+              </div>
+              <button type="button" onClick={() => walkthrough.stopHomeTour('home-tour-end-presentation')} className="flex h-9 shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-white/[0.055] px-3 text-[11px] font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.1]" title="End Home Tour">
+                <X className="h-3.5 w-3.5" /> <span className="hidden sm:inline">End tour</span>
+              </button>
+            </div>
+
+            <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+              <button
+                type="button"
+                onClick={() => walkthrough.previousHomeTourRoom()}
+                disabled={!walkthrough.homeTour.canPreviousRoom || walkthrough.homeTour.phase === 'planning'}
+                className="flex h-11 items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.055] px-2 text-[11px] font-semibold text-slate-200 transition hover:bg-white/[0.11] disabled:cursor-not-allowed disabled:opacity-30 sm:px-3"
+                title="Return to the previous room"
+              >
+                <ChevronLeft className="h-4 w-4" /> <span className="hidden sm:inline">Previous room</span><span className="sm:hidden">Previous</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => walkthrough.toggleHomeTourPause()}
+                disabled={walkthrough.homeTour.phase === 'planning'}
+                className="flex h-12 min-w-[132px] items-center justify-center gap-2 rounded-xl bg-[#ff914d] px-5 text-xs font-bold text-slate-950 shadow-[0_10px_30px_rgba(255,145,77,.22)] transition hover:bg-[#ff7a28] disabled:cursor-not-allowed disabled:opacity-40"
+                title={walkthrough.homeTour.paused ? 'Resume Home Tour' : 'Pause Home Tour'}
+              >
+                {walkthrough.homeTour.paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
+                {walkthrough.homeTour.paused ? 'Resume' : 'Pause'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => walkthrough.nextHomeTourRoom()}
+                disabled={!walkthrough.homeTour.canNextRoom || walkthrough.homeTour.phase === 'planning'}
+                className="flex h-11 items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.055] px-2 text-[11px] font-semibold text-slate-200 transition hover:bg-white/[0.11] disabled:cursor-not-allowed disabled:opacity-30 sm:px-3"
+                title={walkthrough.homeTour.phase === 'traveling' ? 'Skip this room after the current safe arrival' : 'Move to the next room'}
+              >
+                <span className="hidden sm:inline">Next room</span><span className="sm:hidden">Next</span><ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
           </div>
-          <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
-            <span>
-              {walkthrough.homeTour.phase === 'presenting'
-                ? `15-second room showcase · ${Math.ceil(Math.max(0, Number(walkthrough.homeTour.remainingMs) || 0) / 1000)}s remaining`
-                : walkthrough.homeTour.phase === 'composing'
-                  ? 'Settling the camera on the room highlight'
-                  : walkthrough.homeTour.phase === 'settling'
-                    ? 'Preparing the room composition'
-                    : 'Slow, direction-aligned NavMesh travel'}
-            </span>
-            <span>{walkthrough.homeTour.doorOff ? `Doors off · ${walkthrough.homeTour.doorMeshesHidden || 0} leaves hidden` : 'Doors visible'}</span>
-          </div>
-        </div>
+        </>
       )}
 
-      {walkthrough.homeTour?.phase === 'failed' && walkthrough.homeTour.failure && (
+      {!homeTourActive && walkthrough.homeTour?.phase === 'failed' && walkthrough.homeTour.failure && (
         <div className="absolute bottom-28 left-1/2 z-40 w-[min(92vw,430px)] -translate-x-1/2 rounded-2xl border border-rose-400/25 bg-slate-950/95 p-4 text-white shadow-2xl backdrop-blur-2xl">
-          <div className="text-xs font-bold text-rose-300">Home Tour stopped safely</div>
+          <div className="text-xs font-bold text-amber-200">Home Tour is temporarily unavailable</div>
           <p className="mt-1 text-xs leading-5 text-slate-300">{walkthrough.homeTour.failure}</p>
-          <div className="mt-3 text-[10px] text-slate-400">The tour stopped before completing all rooms. Door visibility has been restored. Review the navigation diagnostics before publishing this tour.</div>
+          <div className="mt-3 text-[10px] text-slate-400">Your model and walkthrough are safe to use. Door visibility has been restored.</div>
         </div>
       )}
 
-      {lockToast && (
+      {lockToast && !homeTourActive && (
         <div className="pointer-events-none absolute left-1/2 top-24 z-50 -translate-x-1/2" style={{ animation: 'walkLockFade 180ms ease-out' }}>
           <div className="rounded-full border border-white/10 bg-slate-950/82 px-4 py-2 text-xs font-medium text-white shadow-2xl backdrop-blur-xl">
             {walkthrough.lookLocked ? 'View locked · double-click to unlock' : 'View unlocked · free look restored'}
@@ -824,15 +857,15 @@ export default function WalkthroughPage() {
         </div>
       )}
 
-      <div className="pointer-events-none absolute left-1/2 top-16 z-20 -translate-x-1/2">
+      {!homeTourActive && <div className="pointer-events-none absolute left-1/2 top-16 z-20 -translate-x-1/2">
         <div className={`rounded-full border px-4 py-2 text-xs font-medium shadow-xl backdrop-blur-xl ${walkthrough.immersivePresentationActive ? 'border-white/10 bg-slate-950/72 text-white' : 'border-white/10 bg-slate-950/82 text-slate-100'}`}>
           {walkthrough.immersivePresentationActive
             ? `${walkthrough.immersivePresentationLabel || 'Room'} · ${walkthrough.smart720Active ? 'guided 360 tour' : '360° view'}`
             : statusText}
         </div>
-      </div>
+      </div>}
 
-      {walkthrough.immersivePresentationActive && !settingsOpen && (
+      {!homeTourActive && walkthrough.immersivePresentationActive && !settingsOpen && (
         <div className="absolute bottom-28 right-6 z-30 w-[270px] rounded-2xl border border-white/10 bg-slate-950/82 p-3 text-white shadow-2xl backdrop-blur-2xl">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">

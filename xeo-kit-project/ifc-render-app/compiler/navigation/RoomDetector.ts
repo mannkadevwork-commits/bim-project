@@ -16,11 +16,14 @@ import {
   IFCPROJECT,
   IFCSPACE,
 } from "web-ifc";
-import type { DetectedRoom, DetectedRoomElement, RoomDebugArtifact, RoomPortal, RoomPolygonPoint } from "./RoomTypes";
+import type { DetectedRoom, DetectedRoomElement, RoomDebugArtifact, RoomDoorDiagnostic, RoomPortal, RoomPolygonPoint } from "./RoomTypes";
 import { makeComponentDiagnostics, makeDoorDiagnostic, makeRoomBoundaryCandidateDiagnostics } from "./RoomDiagnostics";
 import type { RoomFootprintAnchor } from "./RoomFootprintReconstructor";
+import { reconstructRoomsFromWallTopology, shouldUseTopologyRoomRegions } from "./RoomTopologyReconstructor";
 import { createDoorGapClosureFootprint, reconstructRoomsFromWallFootprints, polygonArea as planarPolygonArea } from "./RoomPlanarGraph";
-import { readIfcStepSpaceFootprints } from "./IfcStepSpaceFootprints";
+import { readIfcStepDoorPlacements, readIfcStepSpaceFootprints, type StepDoorPlacement } from "./IfcStepSpaceFootprints";
+import { findInteriorDoorSideSamples, inferDoorWallMatch, type DoorWallMatch } from "./DoorGeometryInference";
+import { parseIfcSpaceSafeCameraCenter } from "./IfcSpaceAnchorMetadata";
 
 interface Point2 {
   x: number;
@@ -110,7 +113,16 @@ interface Component {
   polygon?: Point2[];
   holes?: Point2[][];
   anchor?: ResolvedRoomAnchor;
-  reconstructionSource?: "ifc-space-step-profile-v1" | "ifc-space-body-envelope-v1" | "ifc-space-wall-constrained-geodesic-v2" | "wall-face-reconstruction";
+  reconstructionSource?:
+    | "ifc-space-step-profile-v1"
+    | "ifc-space-body-envelope-v1"
+    | "ifc-space-solid-v1"
+    | "ifc-space-wall-constrained-geodesic-v2"
+    | "wall-face-reconstruction"
+    | "ifc-wall-topology-face-v1"
+    | "ifc-open-plan-semantic-zone-v1";
+  regionKind?: "physical-room" | "semantic-zone";
+  physicalComponentId?: number;
   boundaryWallIds?: string[];
   semanticSpaces?: ResolvedRoomAnchor[];
   confidence?: number;
@@ -431,6 +443,14 @@ function collectIfcSpaceAnchors(
     const globalId = lineGlobalId(line);
     const name = String(getWrappedValue(line?.LongName) || lineName(line) || `IFC Space ${expressId}`).trim();
     const description = String(getWrappedValue(line?.Description) || "").trim();
+    const safeCenter = parseIfcSpaceSafeCameraCenter(description);
+    // Prefer the explicitly authored, unit-qualified plan anchor when an IFC
+    // exporter leaves every IfcSpace ObjectPlacement at (0, 0, 0). Description
+    // metadata is in source IFC X/Y metres and must be converted exactly once
+    // to the viewer's X/Z plane (viewer Z = -IFC Y). Normal placement remains
+    // the fallback for standards-compliant IFC files without this metadata.
+    const anchorX = safeCenter ? safeCenter.sourceX : placement?.x;
+    const anchorY = safeCenter ? -safeCenter.sourceY : placement?.z;
     anchors.push({
       key: globalId || `${sourceFile}:${expressId}`,
       label: name,
@@ -441,13 +461,14 @@ function collectIfcSpaceAnchors(
       // Preserve every IfcSpace identity even when its ObjectPlacement is
       // missing or malformed. The planar graph reports it as unmatched rather
       // than silently dropping it from semantic coverage diagnostics.
-      x: placement?.x ?? Number.NaN,
-      y: placement?.z ?? Number.NaN,
+      x: anchorX ?? Number.NaN,
+      y: anchorY ?? Number.NaN,
       elevationY: placement?.y ?? Number.NaN,
       description,
+      positionSource: safeCenter ? "ifc-description-safe-camera-center" : "ifc-object-placement",
       hasGeometryRepresentation: lineRefId(line, "Representation") != null,
-      sourceX: scaledRawPlacement?.x,
-      sourceY: scaledRawPlacement?.y,
+      sourceX: safeCenter?.sourceX ?? scaledRawPlacement?.x,
+      sourceY: safeCenter?.sourceY ?? scaledRawPlacement?.y,
     });
   }
   return anchors;
@@ -683,6 +704,13 @@ function ifcToFrontend(p: Point2, floorY: number): RoomPolygonPoint {
 
 function pointDistance(a: Point2, b: Point2): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function isWalkableFloorPoint(grid: Grid, point: Point2): boolean {
+  const [i, j] = worldToGrid(grid, point);
+  if (i < 0 || j < 0 || i >= grid.width || j >= grid.height) return false;
+  const index = j * grid.width + i;
+  return grid.floor[index] === 1 && grid.blocked[index] === 0;
 }
 
 function elementFromLine(ifc: IfcAPI, modelId: number, expressId: number, sourceFile: string, prefix: string): ElementFootprint | null {
@@ -1128,7 +1156,13 @@ function createRoomObjects(
           ? "ifc-space-step-profile-v1"
           : component.reconstructionSource === "ifc-space-body-envelope-v1"
             ? "ifc-space-body-envelope-v1"
-            : "ifc-space-wall-constrained-geodesic-v2",
+            : component.reconstructionSource === "ifc-wall-topology-face-v1"
+              ? "ifc-wall-topology-face-v1"
+              : component.reconstructionSource === "ifc-open-plan-semantic-zone-v1"
+                ? "ifc-open-plan-semantic-zone-v1"
+                : "ifc-space-wall-constrained-geodesic-v2",
+      regionKind: component.regionKind,
+      physicalComponentId: component.physicalComponentId,
       area: Number(component.area.toFixed(4)),
       center: ifcToFrontend({ x: cx, y: cy }, floorY),
       polygon: outer.map((p) => ifcToFrontend(p, floorY)),
@@ -1156,7 +1190,11 @@ function createRoomObjects(
           ? "ifc-space-step-profile"
           : component.reconstructionSource === "ifc-space-body-envelope-v1"
             ? "ifc-space-body-envelope"
-            : "ifc-space-wall-constrained-geodesic",
+            : component.reconstructionSource === "ifc-wall-topology-face-v1"
+              ? "ifc-wall-topology-face"
+              : component.reconstructionSource === "ifc-open-plan-semantic-zone-v1"
+                ? "ifc-open-plan-semantic-zone"
+                : "ifc-space-wall-constrained-geodesic",
       // IFCSPACE placements provide room identity and seed points, not exact
       // boundaries. A body-envelope fallback remains explicitly low-confidence.
       boundaryConfidence: component.confidence ?? (roomAnchor ? 0.55 : (component.touchesBoundary ? 0.55 : 0.82)),
@@ -1505,6 +1543,7 @@ export class RoomDetector {
     const ifc = new IfcAPI();
     await ifc.Init();
     const models: SourceModel[] = [];
+    const modelUnitsByPath = new Map<string, ReturnType<typeof readIfcLengthUnitFromModel>>();
     const openedModelIds: number[] = [];
 
     const warnings: string[] = [];
@@ -1533,12 +1572,14 @@ export class RoomDetector {
       const baseId = ifc.OpenModel(await bytesFor(inputIfcPath), { COORDINATE_TO_ORIGIN: false });
       openedModelIds.push(baseId);
       const lengthUnitInfo = readIfcLengthUnitFromModel(ifc, baseId);
+      modelUnitsByPath.set(inputIfcPath, lengthUnitInfo);
       if (lengthUnitInfo.warning) warnings.push(lengthUnitInfo.warning);
       models.push({ label: path.basename(inputIfcPath), filePath: inputIfcPath, modelId: baseId, hiddenWallGlobalIds: hiddenWallIds });
 
       for (const [replacementPath] of replacementSources) {
         const modelId = ifc.OpenModel(await bytesFor(replacementPath), { COORDINATE_TO_ORIGIN: false });
         openedModelIds.push(modelId);
+        modelUnitsByPath.set(replacementPath, readIfcLengthUnitFromModel(ifc, modelId));
         models.push({
           label: path.basename(replacementPath),
           filePath: replacementPath,
@@ -1656,6 +1697,17 @@ export class RoomDetector {
         semanticDoors.push(...links.doors);
       }
 
+      // IfcDoor placements are a geometry source in their own right. Some IFC
+      // exporters omit IfcOpeningElement and both void/fill relationships, but
+      // still publish the door's placement, OverallWidth and Body profile.
+      const stepDoorPlacements: Array<{ sourceFile: string; door: StepDoorPlacement }> = [];
+      for (const model of models) {
+        const units = modelUnitsByPath.get(model.filePath) ?? readIfcLengthUnitFromModel(ifc, model.modelId);
+        const parsed = readIfcStepDoorPlacements(model.filePath, units.toMeters);
+        warnings.push(...parsed.diagnostics.map((message) => `${model.label}: ${message}`));
+        for (const door of parsed.doors.values()) stepDoorPlacements.push({ sourceFile: model.label, door });
+      }
+
       if (!slabElements.length) warnings.push("No IfcSlab geometry was found; room domain could not use a slab footprint.");
       if (!wallElements.length) throw new Error("RoomDetector: no wall geometry found.");
       if (!slabElements.length) throw new Error("RoomDetector: no slab geometry found.");
@@ -1690,6 +1742,15 @@ export class RoomDetector {
       const floorPoints = selectedFloorSlabs.flatMap((slab) => slab.points);
       const actualFloorY = selectedLevel?.elevation ?? Math.min(...slabElements.map((slab) => slab.maxY).filter(Number.isFinite));
       if (!Number.isFinite(actualFloorY)) throw new Error("RoomDetector: could not resolve a valid floor elevation.");
+      const semanticSpaceIds = options.useIfcSpaceAnchors && models.length
+        ? idsWithType(ifc, models[0].modelId, IFCSPACE)
+        : [];
+      const semanticSpaceAnchors = options.useIfcSpaceAnchors && models.length
+        ? collectIfcSpaceAnchors(ifc, models[0].modelId, models[0].label, lengthUnitInfo.toMeters)
+        : [];
+      const semanticSpaceAnchorsOnLevel = semanticSpaceAnchors.filter((anchor) =>
+        !Number.isFinite(anchor.elevationY) || Math.abs(Number(anchor.elevationY) - actualFloorY) <= 0.45,
+      );
 
       // Walls from other storeys must not be projected into the selected level's
       // room raster. Keep the full wall set separately for semantic relationships.
@@ -1710,6 +1771,81 @@ export class RoomDetector {
       // those rooms. This keeps physical room semantics separate from walkability.
       for (const wall of wallElements) rasterizePolygon(grid, wall.points, grid.blocked);
 
+      const doorGapClosureWalls: Array<{ id: string; points: Point2[] }> = [];
+      const inferredDoorMatches: DoorWallMatch[] = [];
+      const inferredDoorFailures = new Map<string, string>();
+      const semanticLinkedDoorKeys = new Set(semanticOpenings
+        .filter((opening) => opening.doorExpressId != null)
+        .map((opening) => `${opening.sourceFile}:${opening.doorExpressId}`));
+      for (const record of stepDoorPlacements) {
+        const key = `${record.sourceFile}:${record.door.expressId}`;
+        if (semanticLinkedDoorKeys.has(key)) continue;
+        const result = inferDoorWallMatch({
+          sourceFile: record.sourceFile,
+          expressId: record.door.expressId,
+          globalId: record.door.globalId,
+          name: record.door.name,
+          placementOrigin: record.door.placementOrigin,
+          widthAxis: record.door.localWidthAxis,
+          widthMeters: record.door.widthMeters,
+          heightMeters: record.door.heightMeters,
+        }, wallElements.map((wall) => ({
+          key: wall.key,
+          sourceFile: wall.sourceFile,
+          expressId: wall.expressId,
+          globalId: wall.globalId,
+          name: wall.name,
+          points: wall.points,
+          center: wall.center,
+          minY: wall.minY,
+          maxY: wall.maxY,
+          sizeX: wall.sizeX,
+          sizeY: wall.sizeY,
+        })), { floorElevation: actualFloorY });
+        if (!result.match) {
+          inferredDoorFailures.set(key, result.failureReason ?? "door-wall-match-failed");
+          continue;
+        }
+
+        const sideSamples = findInteriorDoorSideSamples(
+          result.match.center,
+          result.match.normal,
+          result.match.wallThickness,
+          (point) => isWalkableFloorPoint(grid, point),
+        );
+        if (!sideSamples) {
+          inferredDoorFailures.set(key, "door-does-not-have-walkable-floor-on-both-sides");
+          continue;
+        }
+        // Do not require two IfcSpace placements to be known before closing an
+        // internal door gap. That creates a circular dependency: the room
+        // detector needs the wall closed to discover distinct room components,
+        // but previously required distinct room anchors before it would close
+        // the wall. Two walkable samples on opposite sides of a wall-aligned
+        // door are the conservative precondition here. After segmentation, a
+        // portal is emitted only if the samples resolve to two different room
+        // components. Exterior doors normally fail because the outside sample
+        // is not inside the slab's walkable floor mask.
+
+        // The seal is aligned to the actual IFC door width axis, rather than
+        // guessing horizontal/vertical from an axis-aligned wall bounding box.
+        rasterizePolygon(grid, result.match.sealPolygon, grid.blocked);
+        const closure = createDoorGapClosureFootprint(
+          { id: result.match.wall.globalId ?? result.match.wall.key, points: result.match.wall.points },
+          result.match.center,
+          result.match.widthMeters,
+          `door-gap:ifc-door-geometry:${record.door.globalId ?? record.door.expressId}`,
+        );
+        if (closure) doorGapClosureWalls.push(closure);
+        inferredDoorMatches.push(result.match);
+      }
+      if (inferredDoorMatches.length) {
+        warnings.push(`Inferred ${inferredDoorMatches.length} internal door opening(s) from IfcDoor placement/width and aligned host-wall geometry; exterior/ambiguous doors were not sealed. Each inferred opening will be emitted as a portal only if reconstructed room components differ on its two sides.`);
+      }
+      if (inferredDoorFailures.size) {
+        warnings.push(`${inferredDoorFailures.size} IfcDoor geometry fallback candidate(s) were rejected: ${Array.from(inferredDoorFailures.entries()).map(([key, reason]) => `${key} (${reason})`).join(", ")}.`);
+      }
+
       const sealableOpenings = semanticOpenings
         .filter((opening) => opening.doorExpressId != null || DOOR_MATCH_NAME.test(opening.openingName))
         .map((opening) => {
@@ -1724,7 +1860,6 @@ export class RoomDetector {
         })
         .filter((value): value is { opening: SemanticOpening; door: SemanticDoor | null; placement: Point3 } => Boolean(value?.placement));
 
-      const doorGapClosureWalls: Array<{ id: string; points: Point2[] }> = [];
       for (const sealed of sealableOpenings) {
         const hostWallGlobalId = sealed.opening.hostWallGlobalId;
         const wall = hostWallGlobalId
@@ -1785,15 +1920,6 @@ export class RoomDetector {
       // Geometry-first room reconstruction. Wall footprints create a planar
       // graph; closed faces are the physical rooms. IFC space placements only
       // annotate those faces after the graph has already produced them.
-      const semanticSpaceIds = options.useIfcSpaceAnchors && models.length
-        ? idsWithType(ifc, models[0].modelId, IFCSPACE)
-        : [];
-      const semanticSpaceAnchors = options.useIfcSpaceAnchors && models.length
-        ? collectIfcSpaceAnchors(ifc, models[0].modelId, models[0].label, lengthUnitInfo.toMeters)
-        : [];
-      const semanticSpaceAnchorsOnLevel = semanticSpaceAnchors.filter((anchor) =>
-        !Number.isFinite(anchor.elevationY) || Math.abs(Number(anchor.elevationY) - actualFloorY) <= 0.45,
-      );
       // Read source STEP profiles first. This path is independent of WebIFC's
       // GetLine wrappers and StreamAllMeshes output, so a missing semantic mesh
       // cannot suppress valid IfcSpace geometry.
@@ -1896,6 +2022,49 @@ export class RoomDetector {
         maxSemanticAssociationDistanceM: 3.25,
       });
       warnings.push(...roomGraph.warnings);
+
+      // The planar wall graph is the highest-confidence physical boundary
+      // source. The floor-grid topology solver runs for every floor, including
+      // models without usable IfcSpace anchors: it can publish only independently
+      // wall-enclosed geometry-derived rooms in that case. When semantic anchors
+      // exist, it can also partition connected open-plan faces into labelled zones.
+      // Compute the floor-grid room registry even when the wall graph has some
+      // closed faces or semantic spaces are missing. A coarse wall face can
+      // contain several IFC semantic spaces in an open-plan area; an incomplete
+      // planar graph can also miss physical faces. Only prefer the grid result
+      // when it adds valid regions and retains at least 85% walkable-floor coverage.
+      const topologyReconstruction = reconstructRoomsFromWallTopology({
+        floorPolygon: slabHull,
+        anchors: semanticSpaceAnchorsOnLevel.map((anchor) => ({
+          ...anchor,
+          explicitPolygon: explicitSpacePolygons.get(anchor.key) || null,
+        })),
+        grid,
+        explicitSpacePolygons: Object.fromEntries(explicitSpacePolygons.entries()),
+        // IFC space ObjectPlacement origins are often placed on/near a
+        // wall or an internal reference point rather than the walkable
+        // cell centre. Snap progressively up to 1.5 m, but only while the
+        // requested point remains inside the actual slab footprint. The
+        // resolver records the actual offset and reduces confidence.
+        maxAnchorSnapMeters: 1.5,
+      });
+      const useTopologyRegions = Boolean(topologyReconstruction?.regions.length)
+        && shouldUseTopologyRoomRegions(
+          roomGraph.faces.length,
+          topologyReconstruction!.regions.length,
+          topologyReconstruction!.coverageRatio,
+        );
+      if (useTopologyRegions) {
+        const reason = roomGraph.faces.length === 0
+          ? "Wall planar graph produced no closed faces"
+          : `Semantic floor partition improved ${roomGraph.faces.length} wall face(s) to ${topologyReconstruction!.regions.length} room/zone target(s)`;
+        const geometryOnlyRoomCount = topologyReconstruction!.regions.filter((region) => region.anchor.synthetic).length;
+        const ifcAnchoredRegionCount = topologyReconstruction!.regions.length - geometryOnlyRoomCount;
+        warnings.push(
+          `${reason}. Reconstructed ${topologyReconstruction!.regions.length} room/zone areas from ${topologyReconstruction!.physicalComponentCount} disconnected floor components (${ifcAnchoredRegionCount} IFC-anchored and ${geometryOnlyRoomCount} geometry-derived); ${topologyReconstruction!.openPlanComponentCount} connected component(s) contain inferred open-plan zones, not physical partitions.`,
+        );
+        warnings.push(...topologyReconstruction!.warnings);
+      }
       if (!semanticSpaceIds.length) {
         warnings.push("No IfcSpace entities were found. Physical rooms are still generated from closed wall geometry and receive editable generated names.");
       }
@@ -1903,7 +2072,7 @@ export class RoomDetector {
       const components: Component[] = [];
       const anchorByComponent = new Map<number, ResolvedRoomAnchor>();
       grid.room.fill(-1);
-      for (const face of roomGraph.faces) {
+      for (const face of (useTopologyRegions ? [] : roomGraph.faces)) {
         const polygon = face.polygon;
         const cells = gridCellsInsidePolygon(grid, polygon);
         const semanticAssignments: ResolvedRoomAnchor[] = face.semanticSpaces.map((space) => ({
@@ -1953,32 +2122,102 @@ export class RoomDetector {
         for (const cell of cells) grid.room[cell] = id;
       }
 
-      const semanticMatchedSpaceCount = roomGraph.faces.reduce((sum, face) => sum + face.semanticSpaces.length, 0);
-      const anchoredRoomCount = roomGraph.faces.filter((face) => face.semanticSpaces.length > 0).length;
-      const roomCoverageRatio = roomGraph.faces.length
-        ? Math.min(1, roomGraph.faces.reduce((sum, face) => sum + face.areaM2, 0) / Math.max(0.001, planarPolygonArea(slabHull)))
+      if (useTopologyRegions && topologyReconstruction?.regions.length) {
+        grid.room.fill(-1);
+        for (const region of topologyReconstruction.regions) {
+          const cells = region.cells;
+          let minI = grid.width - 1;
+          let minJ = grid.height - 1;
+          let maxI = 0;
+          let maxJ = 0;
+          for (const cell of cells) {
+            const i = cell % grid.width;
+            const j = Math.floor(cell / grid.width);
+            minI = Math.min(minI, i);
+            minJ = Math.min(minJ, j);
+            maxI = Math.max(maxI, i);
+            maxJ = Math.max(maxJ, j);
+          }
+          const anchor: ResolvedRoomAnchor = {
+            ...region.anchor,
+            snappedX: region.anchor.snappedX,
+            snappedY: region.anchor.snappedY,
+            snapDistanceMeters: region.anchor.snapDistanceMeters,
+            associationMethod: pointInsidePolygon(
+              { x: region.anchor.x, y: region.anchor.y },
+              region.polygon,
+            ) ? "inside-room-polygon" : "nearest-room-polygon",
+          };
+          const id = components.length;
+          const hasIfcSemanticIdentity = !region.anchor.synthetic;
+          const component: Component = {
+            id,
+            cells,
+            area: region.areaM2,
+            // The selected centre is always a walkable cell. For synthetic
+            // wall-enclosed components it is a geometry-derived interior point,
+            // not an IFC semantic anchor.
+            center: { x: anchor.snappedX, y: anchor.snappedY },
+            minI: cells.length ? minI : 0,
+            maxI: cells.length ? maxI : 0,
+            minJ: cells.length ? minJ : 0,
+            maxJ: cells.length ? maxJ : 0,
+            touchesBoundary: false,
+            polygon: region.polygon,
+            holes: region.holes,
+            boundaryWallIds: [],
+            semanticSpaces: hasIfcSemanticIdentity ? [anchor] : [],
+            anchor: hasIfcSemanticIdentity ? anchor : undefined,
+            reconstructionSource: region.source,
+            regionKind: region.regionKind,
+            physicalComponentId: region.physicalComponentId,
+            confidence: region.confidence,
+          };
+          components.push(component);
+          if (hasIfcSemanticIdentity) anchorByComponent.set(id, anchor);
+          for (const cell of cells) grid.room[cell] = id;
+        }
+      }
+
+      const semanticMatchedSpaceCount = components.reduce((sum, component) => sum + (component.semanticSpaces?.length || 0), 0);
+      const anchoredRoomCount = components.filter((component) => Boolean(component.semanticSpaces?.length)).length;
+      const roomCoverageRatio = components.length
+        ? Math.min(1, components.reduce((sum, component) => sum + component.area, 0) / Math.max(0.001, planarPolygonArea(slabHull)))
         : 0;
       const totalWalkableCells = grid.floor.reduce((sum, value, index) => sum + (value && !grid.blocked[index] ? 1 : 0), 0);
       const assignedRoomCells = components.reduce((sum, component) => sum + component.cells.length, 0);
+      const topologyResolvedAnchors = useTopologyRegions && topologyReconstruction
+        ? topologyReconstruction.resolvedAnchors
+        : [];
+      const topologyResolvedAnchorKeys = new Set(topologyResolvedAnchors.map((anchor) => anchor.key));
+      const unmatchedSemanticSpaces = useTopologyRegions
+        ? semanticSpaceAnchorsOnLevel.filter((anchor) => !topologyResolvedAnchorKeys.has(anchor.key)).map((anchor) => anchor.label)
+        : roomGraph.unmatchedSemanticSpaces;
       const anchorPartition = {
-        resolvedAnchors: semanticSpaceAnchorsOnLevel.filter((anchor) => !roomGraph.unmatchedSemanticSpaces.includes(anchor.label)),
-        mappingId: "semantic-polygon-association",
+        resolvedAnchors: useTopologyRegions && topologyReconstruction
+          ? topologyReconstruction.resolvedAnchors
+          : semanticSpaceAnchorsOnLevel.filter((anchor) => !roomGraph.unmatchedSemanticSpaces.includes(anchor.label)),
+        mappingId: useTopologyRegions && topologyReconstruction ? topologyReconstruction.mappingId : "semantic-polygon-association",
         partitioned: components.length > 1,
       };
       const reconstruction = {
         regions: components,
-        warnings: roomGraph.warnings,
-        coverageRatio: totalWalkableCells ? assignedRoomCells / totalWalkableCells : 0,
+        warnings: [...roomGraph.warnings, ...(useTopologyRegions && topologyReconstruction ? topologyReconstruction.warnings : [])],
+        coverageRatio: useTopologyRegions && topologyReconstruction
+          ? topologyReconstruction.coverageRatio
+          : (totalWalkableCells ? assignedRoomCells / totalWalkableCells : 0),
         method: components.length
-          ? (roomGraph.wallGraphFaceCount > 0
+          ? (useTopologyRegions && topologyReconstruction
+            ? topologyReconstruction.method
+            : roomGraph.wallGraphFaceCount > 0
             ? "ifc-wall-planar-graph-v1" as const
             : (components.every((component) => component.reconstructionSource === "ifc-space-step-profile-v1")
               ? "ifc-space-step-profile-v1" as const
               : "ifc-space-body-envelope-v1" as const))
           : "none" as const,
-        floorAreaM2: planarPolygonArea(slabHull),
-        totalWalkableCells,
-        assignedWalkableCells: assignedRoomCells,
+        floorAreaM2: useTopologyRegions && topologyReconstruction ? topologyReconstruction.floorAreaM2 : planarPolygonArea(slabHull),
+        totalWalkableCells: useTopologyRegions && topologyReconstruction ? topologyReconstruction.totalWalkableCells : totalWalkableCells,
+        assignedWalkableCells: useTopologyRegions && topologyReconstruction ? topologyReconstruction.assignedWalkableCells : assignedRoomCells,
       };
 
       const boundaryWallsByComponent = new Map<number, string[]>();
@@ -2080,6 +2319,49 @@ export class RoomDetector {
         });
       }
 
+      const inferredDoorPortalByKey = new Map<string, { roomA: string | null; roomB: string | null; sampleSweep: ReturnType<typeof sampleDoorSides>; failureReason: string | null }>();
+      for (const match of inferredDoorMatches) {
+        const sampleSweep = sampleDoorSides(
+          match.center,
+          match.normal,
+          match.wallThickness,
+          grid,
+          components,
+          componentToRoom,
+        );
+        const pair = sampleSweep.find((sample) => Boolean(sample.roomA && sample.roomB && sample.roomA !== sample.roomB));
+        const key = `${match.door.sourceFile}:${match.door.expressId}`;
+        if (!pair || !pair.roomA || !pair.roomB) {
+          inferredDoorPortalByKey.set(key, {
+            roomA: null,
+            roomB: null,
+            sampleSweep,
+            failureReason: "door-side-samples-do-not-resolve-to-two-distinct-reconstructed-rooms",
+          });
+          continue;
+        }
+        inferredDoorPortalByKey.set(key, { roomA: pair.roomA, roomB: pair.roomB, sampleSweep, failureReason: null });
+        const portalId = `portal-ifc-door-geometry-${match.door.sourceFile}-${match.door.expressId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+        portals.push({
+          id: portalId,
+          type: "door",
+          source: "ifc-door-geometry",
+          openingExpressId: null,
+          sourceFile: match.door.sourceFile,
+          center: ifcToFrontend(match.center, actualFloorY),
+          roomA: pair.roomA,
+          roomB: pair.roomB,
+          hostWallId: match.wall.globalId ?? match.wall.key,
+          doorExpressId: match.door.expressId,
+          doorGlobalId: match.door.globalId,
+          normal: [match.normal.x, 0, match.normal.y],
+          width: match.widthMeters,
+          height: match.heightMeters,
+          wallThickness: match.wallThickness,
+          associationMethod: "door-geometry-match",
+        });
+      }
+
       const portalByRoom = new Map<string, string[]>();
       for (const portal of portals) {
         for (const roomId of [portal.roomA, portal.roomB]) {
@@ -2169,8 +2451,49 @@ export class RoomDetector {
         });
       });
 
+      const inferredDoorDiagnostics: RoomDoorDiagnostic[] = stepDoorPlacements
+        .filter((record) => !semanticLinkedDoorKeys.has(`${record.sourceFile}:${record.door.expressId}`))
+        .map((record) => {
+          const key = `${record.sourceFile}:${record.door.expressId}`;
+          const match = inferredDoorMatches.find((candidate) => candidate.door.sourceFile === record.sourceFile && candidate.door.expressId === record.door.expressId) ?? null;
+          const portalState = inferredDoorPortalByKey.get(key);
+          const center = match?.center ?? record.door.openingCenter;
+          const sampleSweep = (portalState?.sampleSweep ?? []).map((sample) => ({
+            offset: sample.offset,
+            sampleA: point2ToRoomPoint(sample.sampleA, actualFloorY),
+            sampleB: point2ToRoomPoint(sample.sampleB, actualFloorY),
+            componentA: sample.componentA,
+            componentB: sample.componentB,
+            roomA: sample.roomA,
+            roomB: sample.roomB,
+          }));
+          const failureReason = portalState?.failureReason
+            ?? inferredDoorFailures.get(key)
+            ?? (match ? "door-portal-diagnostic-unavailable" : "door-wall-match-not-attempted");
+          return makeDoorDiagnostic({
+            sourceFile: record.sourceFile,
+            doorExpressId: record.door.expressId,
+            doorGlobalId: record.door.globalId,
+            openingExpressId: null,
+            openingGlobalId: null,
+            hostWallExpressId: match?.wall.expressId ?? null,
+            hostWallGlobalId: match?.wall.globalId ?? null,
+            resolvedActiveHostWallGlobalId: match?.wall.globalId ?? null,
+            resolvedActiveHostWallSourceFile: match?.wall.sourceFile ?? null,
+            resolvedHostWallResolution: match ? "active" : null,
+            center: ifcToFrontend(center, actualFloorY),
+            wallNormal: match?.normal ?? null,
+            wallSize: match ? { x: match.wall.sizeX, y: match.wall.sizeY } : null,
+            doorWidth: record.door.widthMeters,
+            sampleSweep,
+            portalCandidate: Boolean(portalState?.roomA && portalState?.roomB),
+            failureReason: portalState?.failureReason ?? (portalState ? null : failureReason),
+          });
+        });
+
       const blockedCellCount = grid.blocked.reduce((sum, value) => sum + (value ? 1 : 0), 0);
       const floorCellCount = grid.floor.reduce((sum, value) => sum + (value ? 1 : 0), 0);
+      const blockedFloorCellCount = grid.blocked.reduce((sum, value, index) => sum + (value && grid.floor[index] ? 1 : 0), 0);
       const artifact: RoomDebugArtifact = {
         version: 1,
         units: {
@@ -2195,14 +2518,18 @@ export class RoomDetector {
           floorPointCount: floorPoints.length,
           floorCellCount,
           blockedCellCount,
+          wallMaskCoverageRatio: floorCellCount ? Number((blockedFloorCellCount / floorCellCount).toFixed(4)) : 0,
+          activeLevelWallGeometryCount: wallElements.length,
           componentCount: components.length,
           retainedRoomCount: rooms.length,
           floorLevelGroupCount: levelGroups.length || 1,
           analysedFloorLevelCount: 1,
           semanticSpaceCount: semanticSpaceIds.length,
+          semanticSpaceAssignedToFloorCount: semanticSpaceAnchorsOnLevel.length,
           anchoredRoomCount,
           resolvedAnchorCount: semanticMatchedSpaceCount,
           anchorMappingId: anchorPartition.mappingId,
+          anchorMaxSnapDistanceMeters: Number(Math.max(0, ...(topologyReconstruction?.resolvedAnchors || []).map((anchor) => Number(anchor.snapDistanceMeters) || 0)).toFixed(4)),
           roomCoverageRatio: Number(roomCoverageRatio.toFixed(4)),
           roomReconstructionMethod: reconstruction.method,
           floorDomainAreaM2: Number(reconstruction.floorAreaM2.toFixed(4)),
@@ -2210,17 +2537,22 @@ export class RoomDetector {
           totalWalkableRoomCells: reconstruction.totalWalkableCells,
           assignedWalkableRoomCells: reconstruction.assignedWalkableCells,
           semanticMatchedSpaceCount,
-          unmatchedSemanticSpaces: roomGraph.unmatchedSemanticSpaces,
+          unmatchedSemanticSpaces,
           wallAxisCount: roomGraph.wallAxisCount,
           wallGraphNodeCount: roomGraph.graphNodeCount,
           wallGraphEdgeCount: roomGraph.graphEdgeCount,
           wallGraphFaceCount: roomGraph.wallGraphFaceCount,
+          physicalComponentCount: useTopologyRegions && topologyReconstruction ? topologyReconstruction.physicalComponentCount : undefined,
+          openPlanComponentCount: useTopologyRegions && topologyReconstruction ? topologyReconstruction.openPlanComponentCount : undefined,
+          unanchoredComponentCount: useTopologyRegions && topologyReconstruction ? topologyReconstruction.unanchoredComponentCount : undefined,
           nativeFurnitureSemanticCount,
           nativeFurnitureGeometryCount: nativeFurnitureElements.length,
           nativeFurnitureAssignedCount: assignedNativeFurnitureCount,
           // Count all openings intentionally sealed for room partitioning,
-          // including hosted GLB door openings identified by their opening name.
-          sealedDoorCount: sealableOpenings.length,
+          // including semantic opening relationships and geometry-validated IfcDoors.
+          sealedDoorCount: sealableOpenings.length + inferredDoorMatches.length,
+          inferredDoorGeometryCount: inferredDoorMatches.length,
+          rejectedDoorGeometryCount: inferredDoorFailures.size,
           portalCount: portals.length,
         },
         warnings,
@@ -2234,7 +2566,8 @@ export class RoomDetector {
         diagnostics: {
           components: componentDiagnostics,
           roomBoundaryCandidates,
-          doors: doorDiagnostics,
+          doors: [...doorDiagnostics, ...inferredDoorDiagnostics],
+          anchors: topologyReconstruction?.anchorDiagnostics || [],
         },
       };
 

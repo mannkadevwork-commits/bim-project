@@ -1,55 +1,35 @@
-import * as THREE from 'three';
 import {
-  buildCinematicTourOrder,
-  routePolylineLength,
-  resolveHomeTourRoomLabel,
-  sortRoomStopCandidates,
-  HOME_TOUR_ROOM_HOLD_MS,
-  HOME_TOUR_COMPOSITION_SETTLE_MS,
-  HOME_TOUR_MAX_STEP_METERS,
+  HOME_TOUR_CAMERA_PITCH,
+  HOME_TOUR_CRUISE_SPEED_MPS,
+  HOME_TOUR_FIXED_FOV_DEGREES,
+  HOME_TOUR_HERO_REVEAL_MS,
+  HOME_TOUR_LOOK_AHEAD_METERS,
+  HOME_TOUR_PRESENTATION_BASE_PITCH,
+  HOME_TOUR_ROUTE_REQUEST_TIMEOUT_MS,
+  HOME_TOUR_SWEEP_SAMPLE_COUNT,
+  resolveHomeTourSubjectZone,
+  HOME_TOUR_TOP_REVEAL_PITCH,
+  advanceHomeTourPolyline,
+  buildHomeTourPresentationShot,
+  buildLocalHomeTourRoute,
+  getHomeTourExpectedAreas,
+  homeTourLookAheadDirection,
+  isHomeTourRouteComplete,
+  homeTourRevealPose,
+  homeTourRoomSweepPose,
+  homeTourPausedCameraPose,
+  selectHomeTourCompositionHeading,
   homeTourYawFromDirection,
-  homeTourAngleLerp,
-  homeTourCameraDirection,
-  homeTourSpeedForDistance,
 } from './homeTourPlan.js';
 
-const HOME_TOUR_ARRIVAL_TOLERANCE_METERS = 0.42;
-const HOME_TOUR_WAYPOINT_TOLERANCE_METERS = 0.13;
-const HOME_TOUR_CAMERA_TRAVEL_PITCH = -0.055;
-const HOME_TOUR_CAMERA_SWEEP_DEGREES = 2.4;
-const HOME_TOUR_STALL_REFRESH_MS = 620;
-const HOME_TOUR_STALL_TRANSITION_MS = 1350;
-const HOME_TOUR_PORTAL_FADE_MS = 760;
-const HOME_TOUR_PORTAL_SWITCH_AT = 0.48;
-const HOME_TOUR_UI_INTERVAL_MS = 45;
-
-const ROLE_PRIORITY = {
-  viewpoint: 0,
-  'room-center': 1,
-  'room-entrance': 2,
-  transition: 3,
-  walkpoint: 4,
+const finitePoint = (point) => {
+  const values = Array.isArray(point) ? point : [point?.x, point?.y, point?.z];
+  return values.length >= 3 && values.slice(0, 3).every((value) => Number.isFinite(Number(value)))
+    ? { x: Number(values[0]), y: Number(values[1]), z: Number(values[2]) }
+    : null;
 };
 
-function pointFromHotspot(hotspot) {
-  const resolved = hotspot?.resolvedWalkPoint;
-  if (resolved && [resolved.x, resolved.y, resolved.z].every(Number.isFinite)) {
-    return { x: resolved.x, y: resolved.y, z: resolved.z, polyRef: resolved.polyRef || 0 };
-  }
-  const raw = hotspot?.position;
-  if (!Array.isArray(raw) || raw.length < 3) return null;
-  const [x, y, z] = raw.slice(0, 3).map(Number);
-  return [x, y, z].every(Number.isFinite) ? { x, y, z, polyRef: 0 } : null;
-}
-
-function distanceXZ(a, b) {
-  return Math.hypot(Number(a?.x) - Number(b?.x), Number(a?.z) - Number(b?.z));
-}
-
-function smooth01(value) {
-  const t = THREE.MathUtils.clamp(value, 0, 1);
-  return t * t * (3 - 2 * t);
-}
+const distance3D = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 
 export const homeTourDirectorMethods = {
   _resetHomeTourState() {
@@ -59,49 +39,54 @@ export const homeTourDirectorMethods = {
     this.homeTourStopIndex = 0;
     this.homeTourTotalStops = 0;
     this.homeTourCurrentStop = null;
-    this.homeTourExpectedPoint = null;
     this.homeTourMotion = null;
-    this.homeTourHoldUntil = 0;
-    this.homeTourLastUiAt = 0;
+    this.homeTourRoute = null;
+    this.homeTourRouteController = null;
     this.homeTourFailure = null;
+    this.homeTourVisitedAreaIds = new Set();
+    this.homeTourLastUiAt = 0;
+    this.homeTourRevealStartedAt = 0;
+    this.homeTourSweepStartedAt = 0;
+    this.homeTourRevealFromYaw = 0;
+    this.homeTourShot = null;
+    this.homeTourHeroName = null;
+    this.homeTourRemainingMs = 0;
+    this.homeTourPaused = false;
+    this.homeTourPausedAt = 0;
+    this.homeTourPausedBaseYaw = 0;
+    this.homeTourPausedBasePitch = HOME_TOUR_PRESENTATION_BASE_PITCH;
+    this.homeTourAdvanceAfterArrival = false;
+    this.homeTourTotalDistanceMeters = 0;
     this.homeTourDoorOff = true;
     this.homeTourDoorVisibility = new Map();
     this.homeTourDoorExpressIds = new Set();
     this.homeTourDoorMeshesHidden = 0;
-    this.homeTourVisitedAreaIds = new Set();
-    this.homeTourLastHeroName = null;
-    this.homeTourTransition = null;
-    this.homeTourTransitionOpacity = 0;
-    this.homeTourLastMoveDirection = new THREE.Vector3();
-    this.homeTourLastMoveAt = 0;
-    this.homeTourRouteRefreshCount = 0;
-    this.homeTourAimYaw = null;
-    this.homeTourAimPitch = HOME_TOUR_CAMERA_TRAVEL_PITCH;
-    this.homeTourCompositionUntil = 0;
-    this.homeTourPresentationStartedAt = 0;
+    this.homeTourFixedFovApplied = false;
   },
 
   _emitHomeTourState(extra = {}) {
-    const currentIsRoom = this.homeTourCurrentStop?.kind === 'room';
-    const visitedCount = this.homeTourVisitedAreaIds?.size || 0;
-    const progress = this.homeTourActive && currentIsRoom && !this.homeTourVisitedAreaIds.has(this.homeTourCurrentStop?.areaId)
-      ? Math.min(this.homeTourTotalStops, visitedCount + 1)
-      : visitedCount;
+    const activeStopIndex = this.homeTourActive && this.homeTourStops.length
+      ? Math.min(this.homeTourTotalStops, this.homeTourStopIndex + 1)
+      : this.homeTourVisitedAreaIds.size;
+    const canControlStops = Boolean(this.homeTourActive && this.homeTourPhase !== 'planning');
     this.onState?.({
       type: 'home-tour',
       active: Boolean(this.homeTourActive),
       phase: this.homeTourPhase,
-      stopIndex: progress,
+      stopIndex: activeStopIndex,
       totalStops: this.homeTourTotalStops,
       label: this.homeTourCurrentStop?.label || null,
       areaId: this.homeTourCurrentStop?.areaId || null,
-      hero: this.homeTourLastHeroName,
+      hero: this.homeTourHeroName || null,
       doorOff: this.homeTourDoorOff,
       doorMeshesHidden: this.homeTourDoorMeshesHidden || 0,
-      visitedCount,
+      visitedCount: this.homeTourVisitedAreaIds?.size || 0,
+      remainingMs: this.homeTourRemainingMs || 0,
+      paused: Boolean(this.homeTourPaused),
+      canPreviousRoom: canControlStops && this.homeTourStopIndex > 0,
+      canNextRoom: canControlStops && this.homeTourStopIndex < this.homeTourTotalStops - 1 && !this.homeTourAdvanceAfterArrival,
+      totalDistanceMeters: this.homeTourTotalDistanceMeters || 0,
       failure: this.homeTourFailure,
-      transitionOpacity: this.homeTourTransitionOpacity || 0,
-      transitionReason: this.homeTourTransition?.reason || null,
       ...extra,
     });
   },
@@ -119,7 +104,6 @@ export const homeTourDirectorMethods = {
 
   _applyHomeTourDoorVisibility(hidden) {
     if (!this.model) return 0;
-
     if (!hidden) {
       for (const [object, previousVisible] of this.homeTourDoorVisibility.entries()) {
         if (object) object.visible = previousVisible;
@@ -152,154 +136,132 @@ export const homeTourDirectorMethods = {
     return hiddenCount;
   },
 
-  _resolveHomeTourAreaStop(area) {
-    if (!area?.id || !Array.isArray(area.center) || area.center.length < 3) return null;
-    const areaHotspots = (this.hotspots || [])
-      .filter((hotspot) => hotspot?.areaId === area.id && Array.isArray(hotspot.position));
-    const ordered = sortRoomStopCandidates(areaHotspots);
-    const candidates = [];
-    const seen = [];
+  _isHomeTourSubjectVisible(subject) {
+    if (!subject?.center || subject.visible === false || (subject.object && !subject.object.visible)) return false;
+    if (typeof this._raycastPresentationOccluder !== 'function'
+      || typeof this.position?.clone !== 'function'
+      || typeof subject.center?.clone !== 'function') return true;
 
-    for (const hotspot of ordered) {
-      const raw = pointFromHotspot(hotspot);
-      // Re-snap every serialized hotspot against the NavMesh loaded for this
-      // exact job. A resolved point from an older compiler run can carry stale
-      // coordinates/poly refs even when its JSON still looks valid.
-      const snapped = raw && this._closestWalkPoint(raw, 0.95);
-      const point = snapped ? { ...snapped, validatedByNavMesh: true } : null;
-      if (!point) continue;
-      if (seen.some((entry) => distanceXZ(entry, point) < 0.22 * Math.max(this.metersPerUnit || 1, 1e-6))) continue;
-      seen.push(point);
-      candidates.push({
-        point,
-        hotspot,
-        role: hotspot.presentationRole || 'room-center',
-        clearanceMeters: Number(hotspot.clearanceMeters) || 0,
-        displayOrder: Number(hotspot.displayOrder) || 999,
-      });
-    }
+    const unit = Math.max(this.metersPerUnit || 1, 1e-6);
+    const eye = this.position.clone();
+    eye.y += (this.eyeHeight + this.heightOffset) * unit;
+    const toTarget = subject.center.clone().sub(eye);
+    const targetDistance = toTarget.length();
+    if (!Number.isFinite(targetDistance) || targetDistance < 1e-5) return true;
 
-    // A room center is a fallback, not an assumption that its centroid is the
-    // best camera position. Prefer a curated viewpoint with more clearance.
-    const snappedCenter = this._closestWalkPoint(area.center, 1.15);
-    const center = snappedCenter ? { ...snappedCenter, validatedByNavMesh: true } : null;
-    if (center && !seen.some((entry) => distanceXZ(entry, center) < 0.22 * Math.max(this.metersPerUnit || 1, 1e-6))) {
-      candidates.push({
-        point: center,
-        hotspot: null,
-        role: 'room-center',
-        clearanceMeters: 0,
-        displayOrder: 999,
-      });
-    }
-    if (!candidates.length) return null;
-
-    candidates.sort((a, b) => {
-      const roleA = ROLE_PRIORITY[a.role] ?? 8;
-      const roleB = ROLE_PRIORITY[b.role] ?? 8;
-      // Prefer a real room viewpoint or interior center over a doorway marker.
-      // Clearance is the tie-breaker within a role; otherwise the tour tends
-      // to stop at the threshold and frame a door jamb instead of the room.
-      return (roleA - roleB) || (b.clearanceMeters - a.clearanceMeters) || (a.displayOrder - b.displayOrder);
-    });
-
-    const best = candidates[0];
-    const fallbackLabel = area.label || best.hotspot?.areaLabel || best.hotspot?.label || `Room ${area.id}`;
-    const fallbackHotspot = best.hotspot || {
-      id: `home-tour-${area.id}`,
-      areaId: area.id,
-      areaLabel: fallbackLabel,
-      label: fallbackLabel,
-      position: [best.point.x, best.point.y, best.point.z],
-      resolvedWalkPoint: best.point,
-      presentationRole: 'room-center',
-    };
-
-    return {
-      id: `home-tour-${area.id}`,
-      areaId: area.id,
-      label: fallbackLabel,
-      hotspot: fallbackHotspot,
-      point: best.point,
-      candidates,
-      kind: 'room',
-    };
+    const hit = this._raycastPresentationOccluder(eye, toTarget.clone().normalize(), targetDistance);
+    if (!hit) return true;
+    const belongsToSubject = hit.object === subject.object || subject.meshObjects?.includes(hit.object);
+    const tolerance = Math.max(0.32 * unit, targetDistance * 0.12);
+    return Boolean(belongsToSubject || hit.distance >= targetDistance - tolerance);
   },
 
-  _computeHomeTourRoute(from, stop) {
-    if (!this.query || !from || !stop?.candidates?.length) return null;
-    let best = null;
-    for (const candidate of stop.candidates) {
-      const point = candidate.point;
-      let result = null;
-      try {
-        result = this.query.computePath(
-          { x: from.x, y: from.y, z: from.z },
-          { x: point.x, y: point.y, z: point.z },
-          { filter: this.filter, maxPathSize: 512, maxStraightPathSize: 512 },
-        );
-      } catch (_) {
-        result = null;
-      }
-      const status = this._inspectPathEndpoint(result, point, 0.32);
-      if (!status.complete) continue;
-      const length = routePolylineLength(result.path, from);
-      if (!Number.isFinite(length)) continue;
-      if (!best || length < best.length) {
-        best = { complete: true, path: result.path.map((p) => ({ x: p.x, y: p.y, z: p.z })), length, candidate };
-      }
-    }
-    return best;
-  },
-
-  _buildHomeTourPlan() {
-    // Interactive floor-map areas are filtered to those with at least one
-    // displayable hotspot. Home Tour uses the original compiler-authored area
-    // list as well, so one rejected marker cannot silently remove a whole room.
-    const areas = Array.isArray(this.homeTourAreaSource) && this.homeTourAreaSource.length
-      ? this.homeTourAreaSource
-      : (Array.isArray(this.walkAreas) ? this.walkAreas : []);
-    if (!areas.length || !this.query || !this.position) {
-      return { ok: false, reason: 'This floor does not contain validated room presentation anchors.' };
-    }
-
-    const stops = areas.map((area) => this._resolveHomeTourAreaStop(area));
-    if (stops.some((stop) => !stop)) {
-      const missing = areas.filter((_, index) => !stops[index]).map((area) => area.label || area.id);
-      return {
-        ok: false,
-        reason: `No safe on-floor presentation position could be validated for: ${missing.join(', ')}. No room was removed from the tour.`,
-      };
-    }
-
+  _resolveHomeTourPresentation(stop) {
+    const unit = Math.max(this.metersPerUnit || 1, 1e-6);
     const origin = { x: this.position.x, y: this.position.y, z: this.position.z };
-    const ordered = buildCinematicTourOrder({
-      stops,
+    const areas = (Array.isArray(this.homeTourAreaSource) && this.homeTourAreaSource.length
+      ? this.homeTourAreaSource
+      : this.walkAreas || []);
+    const allSubjects = (Array.isArray(this.presentationSubjects) ? this.presentationSubjects : [])
+      .filter((subject) => subject?.center && [subject.center.x, subject.center.y, subject.center.z].every(Number.isFinite))
+      .map((subject) => {
+        const ownershipPoint = subject.basePosition || subject.center;
+        const assignedAreaId = resolveHomeTourSubjectZone(ownershipPoint, areas, {
+          metersPerUnit: unit,
+          maxDistanceMeters: 4.5,
+          minSeparationMeters: 0.5,
+        });
+        return {
+          subject,
+          assignedAreaId,
+          distance: Math.hypot(subject.center.x - origin.x, subject.center.z - origin.z),
+          areaDistance: Math.hypot(subject.center.x - stop.point.x, subject.center.z - stop.point.z),
+        };
+      })
+      .filter((entry) => entry.distance >= 0.65 * unit && entry.distance <= 8.5 * unit && entry.areaDistance <= 8.5 * unit);
+
+    const visibleSubjects = allSubjects.filter((entry) => this._isHomeTourSubjectVisible(entry.subject));
+    // Do not trust the old nearest-center areaId attached during generic
+    // presentation indexing. Recompute ownership with a separation margin and
+    // never pull an ambiguous subject through a doorway from an adjacent zone.
+    const roomPool = visibleSubjects.filter((entry) => entry.assignedAreaId === String(stop.areaId));
+    const currentYaw = Number.isFinite(this.currentYaw) ? this.currentYaw : this.targetYaw;
+    // The route tangent often points straight into the wall at the end of a
+    // corridor. Re-compose the shot at the stop using structural raycasts and
+    // only objects that passed this zone's ownership + visibility checks.
+    const composition = selectHomeTourCompositionHeading({
       origin,
-      routeBetween: (from, stop) => this._computeHomeTourRoute(from, stop),
+      currentYaw,
+      subjects: roomPool.map((entry) => ({
+        id: entry.subject.id,
+        center: {
+          x: entry.subject.center.x,
+          y: entry.subject.center.y,
+          z: entry.subject.center.z,
+        },
+        priority: entry.subject.heroPriority || (entry.subject.role === 'furniture' ? 9 : 5),
+      })),
+      opennessScore: (yaw) => this._headingWallGuardScore?.(this.position, yaw) ?? 0,
+      opennessAvailable: Boolean(this.model),
+      sampleCount: HOME_TOUR_SWEEP_SAMPLE_COUNT,
     });
-    if (!ordered.ok) return ordered;
-    return { ok: true, stops: ordered.ordered, totalStops: ordered.totalStops };
+    const heroEntry = composition.subjectId
+      ? roomPool.find((entry) => String(entry.subject.id) === composition.subjectId) || null
+      : null;
+    const hero = heroEntry ? {
+      id: heroEntry.subject.id,
+      name: heroEntry.subject.name || heroEntry.subject.role || 'Room highlight',
+      areaId: heroEntry.assignedAreaId,
+      center: {
+        x: heroEntry.subject.center.x,
+        y: heroEntry.subject.center.y,
+        z: heroEntry.subject.center.z,
+      },
+    } : null;
+    const roomSubjects = roomPool.map((entry) => ({
+      id: entry.subject.id,
+      name: entry.subject.name || entry.subject.role || 'Room element',
+      priority: entry.subject.heroPriority || (entry.subject.role === 'furniture' ? 9 : 5),
+      center: {
+        x: entry.subject.center.x,
+        y: entry.subject.center.y,
+        z: entry.subject.center.z,
+      },
+    }));
+
+    // When no room-owned element is trustworthy, keep the arrival heading
+    // from the safe route tangent. A coarse area center can sit behind a wall,
+    // so it must not become an automatic camera target.
+    const shot = buildHomeTourPresentationShot({
+      origin,
+      eyeHeightMeters: (this.eyeHeight || 1.68) + (this.heightOffset || 0),
+      metersPerUnit: unit,
+      currentYaw: Number.isFinite(composition.yaw) ? composition.yaw : currentYaw,
+      hero,
+      fallbackTarget: null,
+      subjects: roomSubjects,
+      headingSamples: composition.headingSamples,
+      opennessReliable: composition.opennessReliable,
+    });
+    return shot ? { ...shot, heroSubject: heroEntry?.subject || null } : null;
   },
 
-  startHomeTour() {
+  async startHomeTour() {
     if (this.homeTourActive) return false;
     if (this.viewMode !== 'walk') {
       this.homeTourFailure = 'Enter the 3D walkthrough before starting Home Tour.';
-      this._emitHomeTourState({ phase: 'failed', failure: this.homeTourFailure });
+      this.homeTourPhase = 'failed';
+      this._emitHomeTourState({ failure: this.homeTourFailure });
       this.onState?.({ type: 'home-tour-error', message: this.homeTourFailure });
       return false;
     }
-    // Home Tour owns presentation camera choreography; switch to Guided
-    // automatically instead of making the user configure a prerequisite.
-    if (this.walkMode !== 'guided') this.setWalkMode?.('guided');
-    if (!this.query || !this.position) {
-      this.homeTourFailure = 'The floor navigation data is not ready. Reload the walkthrough and try again.';
-      this._emitHomeTourState({ phase: 'failed', failure: this.homeTourFailure });
-      this.onState?.({ type: 'home-tour-error', message: this.homeTourFailure });
+    if (!this.jobId || !this.apiBaseUrl || !this.position) {
+      this._failHomeTour('The current project or walkthrough camera is not ready for Home Tour.');
       return false;
     }
 
+    // Finish any other presentation mode before owning the walkthrough camera.
+    if (this.walkMode !== 'guided') this.setWalkMode?.('guided');
     this.cancelSmart720Tour?.('home-tour-start');
     this.exitImmersivePresentation?.();
     this.path = null;
@@ -315,57 +277,299 @@ export const homeTourDirectorMethods = {
     this.guidedTourNextAt = 0;
     this.guidedTourAdvanceLock = true;
     this.guidedManualActive = false;
-    this.guidedManualYawUntil = 0;
     this.guidedApproachActive = false;
     this.guidedRevealActive = false;
     this.guidedShotSubject = null;
     this.guidedShotSubjectId = null;
     this.guidedShotSubjectUntil = 0;
 
-    // Reacquire the camera's current NavMesh polygon before preflight. This
-    // avoids starting the dedicated follower with a stale polyRef left by a
-    // prior room-selection or view transition.
-    const startAnchor = this._closestWalkPoint(this.position, 0.65);
-    if (startAnchor) {
-      this.position.set(startAnchor.x, startAnchor.y, startAnchor.z);
-      this.currentPolyRef = startAnchor.polyRef || this.currentPolyRef;
-      this.lastMovementPosition?.copy?.(this.position);
+    this.homeTourActive = true;
+    this.homeTourPhase = 'planning';
+    this.homeTourFailure = null;
+    this.homeTourStops = [];
+    this.homeTourStopIndex = 0;
+    this.homeTourTotalStops = 0;
+    this.homeTourCurrentStop = null;
+    this.homeTourMotion = null;
+    this.homeTourRoute = null;
+    this.homeTourVisitedAreaIds = new Set();
+    this.homeTourRemainingMs = 0;
+    this.homeTourPaused = false;
+    this.homeTourPausedAt = 0;
+    this.homeTourPausedBaseYaw = 0;
+    this.homeTourPausedBasePitch = HOME_TOUR_PRESENTATION_BASE_PITCH;
+    this.homeTourAdvanceAfterArrival = false;
+    this.homeTourLastUiAt = 0;
+    this.homeTourTotalDistanceMeters = 0;
+    this.homeTourFixedFovApplied = false;
+    this.currentPitch = HOME_TOUR_CAMERA_PITCH;
+    this.targetPitch = HOME_TOUR_CAMERA_PITCH;
+    this.pitch = HOME_TOUR_CAMERA_PITCH;
+    this.homeTourRouteController = new AbortController();
+    const signal = this.homeTourRouteController.signal;
+    this._emitHomeTourState({ phase: 'planning' });
+
+    try {
+      const origin = { x: this.position.x, y: this.position.y, z: this.position.z };
+      let payload = null;
+      let backendFailure = null;
+      let routeRequestTimedOut = false;
+      const routeRequestTimeout = setTimeout(() => {
+        routeRequestTimedOut = true;
+        this.homeTourRouteController?.abort?.();
+      }, HOME_TOUR_ROUTE_REQUEST_TIMEOUT_MS);
+      try {
+        const response = await fetch(
+          `${this.apiBaseUrl.replace(/\/$/, '')}/api/projects/${encodeURIComponent(this.jobId)}/home-tour/route`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ origin }),
+            signal,
+            cache: 'no-store',
+          },
+        );
+        const responsePayload = await response.json().catch(() => ({}));
+        if (!response.ok || !responsePayload?.success) {
+          const details = Array.isArray(responsePayload?.unreachableAreas) && responsePayload.unreachableAreas.length
+            ? ` Unreachable area IDs: ${responsePayload.unreachableAreas.join(', ')}.`
+            : '';
+          throw new Error(`${responsePayload?.error || `Home Tour route request failed (${response.status}).`}${details}`);
+        }
+        payload = responsePayload;
+      } catch (error) {
+        if ((!routeRequestTimedOut && signal.aborted) || !this.homeTourActive) return false;
+        backendFailure = routeRequestTimedOut
+          ? new Error(`Home Tour route service timed out after ${HOME_TOUR_ROUTE_REQUEST_TIMEOUT_MS}ms.`)
+          : error;
+      } finally {
+        clearTimeout(routeRequestTimeout);
+      }
+      if (routeRequestTimedOut) payload = null;
+      if (!this.homeTourActive) return false;
+
+      const expectedTourAreas = getHomeTourExpectedAreas(
+        Array.isArray(this.homeTourAreaSource) && this.homeTourAreaSource.length
+          ? this.homeTourAreaSource
+          : (Array.isArray(this.walkAreas) ? this.walkAreas : []),
+        this.hotspots,
+      );
+      if (payload?.route && !isHomeTourRouteComplete(payload.route, expectedTourAreas)) {
+        console.warn('[HCI Home Tour] Backend returned a stale or incomplete route. Rebuilding from the loaded NavMesh.', {
+          jobId: this.jobId,
+          expectedAreaIds: expectedTourAreas.map((area) => String(area?.id || '')).filter(Boolean),
+          receivedAreaIds: Array.isArray(payload.route.stops)
+            ? payload.route.stops.map((stop) => String(stop?.areaId || ''))
+            : [],
+          receivedStopCount: Array.isArray(payload.route.stops) ? payload.route.stops.length : 0,
+        });
+        backendFailure = new Error('The backend route did not cover every loaded navigation zone.');
+        payload = null;
+      }
+
+      if (!payload) {
+        // The GLB, hotspots, and serialized NavMesh are already loaded in the
+        // walkthrough. If the dedicated API is temporarily unavailable (or an
+        // older backend has not yet received the Home Tour route), build the
+        // exact same complete-path contract from that in-memory NavMesh. This
+        // is a resilience fallback, not a straight-line or teleport fallback.
+        const localPlan = buildLocalHomeTourRoute({
+          areas: this.homeTourAreaSource,
+          hotspots: this.hotspots,
+          origin,
+          metersPerUnit: this.metersPerUnit,
+          query: this.query,
+          filter: this.filter,
+        });
+        if (!localPlan.ok) {
+          console.error('[HCI Home Tour] Backend route unavailable and local NavMesh fallback failed.', {
+            jobId: this.jobId,
+            backendError: backendFailure?.message || 'Unknown backend error',
+            localError: localPlan.error,
+            code: localPlan.code,
+            unreachableAreas: localPlan.unreachableAreas || [],
+          });
+          throw new Error('We could not validate a continuous route through every room. Your walkthrough is still available; please try again after the navigation data has been repaired.');
+        }
+        payload = {
+          success: true,
+          route: localPlan.route,
+          cacheHit: false,
+          routeSource: 'local-navmesh-fallback',
+        };
+        console.warn('[HCI Home Tour] Using the loaded NavMesh because the Home Tour API was unavailable.', {
+          jobId: this.jobId,
+          backendError: backendFailure?.message || 'Unknown backend error',
+          rooms: localPlan.route.areaCount,
+        });
+      }
+
+      if (!this.homeTourActive || (signal.aborted && !routeRequestTimedOut)) return false;
+
+      const route = payload.route;
+      if (!isHomeTourRouteComplete(route, expectedTourAreas)) {
+        throw new Error('The Home Tour itinerary does not cover every navigation zone with a complete, safe path. No movement was started.');
+      }
+      const metersPerUnit = Number(route.metersPerUnit);
+      if (!Number.isFinite(metersPerUnit) || metersPerUnit <= 0) {
+        throw new Error('The backend Home Tour route is missing its physical scene scale.');
+      }
+
+      const stops = route.stops.map((stop, index) => {
+        const point = finitePoint(stop?.point);
+        const path = Array.isArray(stop?.route) ? stop.route.map(finitePoint) : [];
+        if (!point || !path.length || path.some((entry) => !entry)) {
+          throw new Error(`The Home Tour route for ${stop?.label || `area ${index + 1}`} is malformed.`);
+        }
+        return {
+          areaId: String(stop.areaId || `area-${index + 1}`),
+          label: String(stop.label || `Area ${index + 1}`),
+          point,
+          path,
+          routeLengthMeters: Number(stop.routeLengthMeters) || 0,
+          role: String(stop.role || 'room-center'),
+        };
+      });
+
+      this.homeTourRoute = route;
+      this.homeTourStops = stops;
+      this.homeTourTotalStops = stops.length;
+      this.homeTourTotalDistanceMeters = Number(route.totalDistanceMeters) || 0;
+      this.metersPerUnit = metersPerUnit;
+      // The backend has validated and snapped this exact origin on the same
+      // serialized NavMesh used to construct every leg.
+      this.position.set(route.origin.x, route.origin.y, route.origin.z);
+      if (this.homeTourDoorOff) this._applyHomeTourDoorVisibility(true);
+      this.homeTourRouteController = null;
+      this._emitHomeTourState({
+        phase: 'traveling',
+        cacheHit: Boolean(payload.cacheHit),
+        routeSource: payload.routeSource || route.source || 'backend',
+        totalDistanceMeters: this.homeTourTotalDistanceMeters,
+      });
+      this._startHomeTourNextLeg(performance.now());
+      return true;
+    } catch (error) {
+      if (signal.aborted || !this.homeTourActive) return false;
+      this._failHomeTour(error?.message || 'Home Tour route planning failed.');
+      return false;
+    }
+  },
+
+  _resumeHomeTourForCommand(now = performance.now()) {
+    if (!this.homeTourPaused) return false;
+    const pausedFor = Math.max(0, now - (Number(this.homeTourPausedAt) || now));
+    if (this.homeTourPhase === 'revealing') this.homeTourRevealStartedAt += pausedFor;
+    if (this.homeTourPhase === 'sweeping') this.homeTourSweepStartedAt += pausedFor;
+    this.homeTourPaused = false;
+    this.homeTourPausedAt = 0;
+    this.homeTourPausedBaseYaw = 0;
+    this.homeTourPausedBasePitch = HOME_TOUR_PRESENTATION_BASE_PITCH;
+    return true;
+  },
+
+  toggleHomeTourPause() {
+    if (!this.homeTourActive || this.homeTourPhase === 'planning') return false;
+    const now = performance.now();
+    if (this.homeTourPaused) {
+      this._resumeHomeTourForCommand(now);
+    } else {
+      this.homeTourPaused = true;
+      this.homeTourPausedAt = now;
+      this.homeTourPausedBaseYaw = Number.isFinite(this.currentYaw)
+        ? this.currentYaw
+        : (Number.isFinite(this.targetYaw) ? this.targetYaw : 0);
+      this.homeTourPausedBasePitch = Number.isFinite(this.currentPitch)
+        ? this.currentPitch
+        : (Number.isFinite(this.targetPitch) ? this.targetPitch : HOME_TOUR_PRESENTATION_BASE_PITCH);
+    }
+    this._emitHomeTourState({ paused: this.homeTourPaused });
+    return this.homeTourPaused;
+  },
+
+  nextHomeTourRoom() {
+    if (!this.homeTourActive || this.homeTourPhase === 'planning') return false;
+    if (this.homeTourStopIndex >= this.homeTourTotalStops - 1 || this.homeTourAdvanceAfterArrival) return false;
+    const now = performance.now();
+    this._resumeHomeTourForCommand(now);
+
+    if (this.homeTourPhase === 'traveling') {
+      // Do not splice unrelated paths or teleport from mid-corridor. Finish the
+      // already validated leg, then bypass its room presentation and continue.
+      this.homeTourAdvanceAfterArrival = true;
+      this._emitHomeTourState({ phase: 'traveling', advanceAfterArrival: true });
+      return true;
     }
 
-    const plan = this._buildHomeTourPlan();
-    if (!plan.ok) {
-      this.homeTourActive = false;
-      this.homeTourPhase = 'failed';
-      this.homeTourFailure = plan.reason;
-      this._emitHomeTourState({ failure: plan.reason });
-      this.onState?.({ type: 'home-tour-error', message: plan.reason });
+    if (!['revealing', 'sweeping'].includes(this.homeTourPhase)) return false;
+    this.homeTourAdvanceAfterArrival = false;
+    this.homeTourStopIndex += 1;
+    return this._startHomeTourNextLeg(now);
+  },
+
+  previousHomeTourRoom() {
+    if (!this.homeTourActive || this.homeTourPhase === 'planning' || this.homeTourStopIndex <= 0) return false;
+    const now = performance.now();
+    this._resumeHomeTourForCommand(now);
+
+    const currentIndex = this.homeTourStopIndex;
+    const previousStop = this.homeTourStops[currentIndex - 1];
+    if (!previousStop?.point) return false;
+    const unit = Math.max(this.metersPerUnit || 1, 1e-6);
+    let reversePath = [];
+
+    if (this.homeTourPhase === 'traveling') {
+      const motion = this.homeTourMotion;
+      if (!motion?.path?.length) return false;
+      // Reverse only the corridor section already traversed. This remains on
+      // the previously validated NavMesh polyline; no Euclidean shortcut.
+      reversePath = [
+        { x: this.position.x, y: this.position.y, z: this.position.z },
+        ...motion.path.slice(0, Math.max(1, Math.min(motion.index, motion.path.length))).reverse(),
+      ];
+    } else if (['revealing', 'sweeping'].includes(this.homeTourPhase)) {
+      const currentStop = this.homeTourStops[currentIndex];
+      if (!Array.isArray(currentStop?.path) || currentStop.path.length < 2) return false;
+      reversePath = currentStop.path.slice().reverse().map((point) => ({ x: point.x, y: point.y, z: point.z }));
+      reversePath[0] = { x: this.position.x, y: this.position.y, z: this.position.z };
+    } else {
       return false;
     }
 
-    this.homeTourActive = true;
-    this.homeTourPhase = 'preflight-complete';
-    this.homeTourStops = [...plan.stops];
-    this.homeTourStopIndex = 0;
-    this.homeTourTotalStops = plan.totalStops;
-    this.homeTourCurrentStop = null;
-    this.homeTourExpectedPoint = null;
-    this.homeTourMotion = null;
-    this.homeTourHoldUntil = 0;
-    this.homeTourLastUiAt = 0;
-    this.homeTourFailure = null;
-    this.homeTourVisitedAreaIds = new Set();
-    this.homeTourLastHeroName = null;
-    this.homeTourTransition = null;
-    this.homeTourTransitionOpacity = 0;
-    this.homeTourLastMoveAt = performance.now();
-    this.homeTourRouteRefreshCount = 0;
-    this.homeTourAimYaw = null;
-    this.homeTourAimPitch = HOME_TOUR_CAMERA_TRAVEL_PITCH;
-    this.homeTourCompositionUntil = 0;
-    this.homeTourPresentationStartedAt = 0;
-    if (this.homeTourDoorOff) this._applyHomeTourDoorVisibility(true);
-    this._emitHomeTourState({ phase: 'preflight-complete' });
-    this._startHomeTourNextLeg(performance.now());
+    const dedupedPath = [];
+    for (const point of reversePath) {
+      if (!finitePoint(point)) return false;
+      if (!dedupedPath.length || distance3D(dedupedPath[dedupedPath.length - 1], point) > 1e-4 * unit) {
+        dedupedPath.push(finitePoint(point));
+      }
+    }
+    if (!dedupedPath.length) return false;
+    const endpointError = distance3D(dedupedPath[dedupedPath.length - 1], previousStop.point);
+    if (endpointError > 0.24 * unit) {
+      console.warn('[HCI Home Tour] Previous-room corridor did not end at the previous validated stop.', {
+        endpointErrorMeters: endpointError / unit,
+        previousAreaId: previousStop.areaId,
+      });
+      return false;
+    }
+
+    this.homeTourAdvanceAfterArrival = false;
+    this.homeTourStopIndex = currentIndex - 1;
+    this.homeTourCurrentStop = previousStop;
+    this.homeTourShot = null;
+    this.homeTourHeroName = null;
+    this.homeTourMotion = {
+      path: dedupedPath,
+      index: dedupedPath.length > 1 ? 1 : dedupedPath.length,
+      lastDirection: null,
+    };
+    this.homeTourPhase = 'traveling';
+    this.homeTourRemainingMs = 0;
+    this.path = null;
+    this.pathIndex = 0;
+    this.velocity?.set?.(0, 0, 0);
+    this._emitHomeTourState({ phase: 'traveling', direction: 'previous', routeLengthMeters: previousStop.routeLengthMeters });
+    if (dedupedPath.length <= 1) this._arriveHomeTourStop(now);
     return true;
   },
 
@@ -374,677 +578,236 @@ export const homeTourDirectorMethods = {
     if (this.homeTourStopIndex >= this.homeTourStops.length) return this._finishHomeTour();
 
     const stop = this.homeTourStops[this.homeTourStopIndex];
-    if (!stop?.point || !stop?.areaId) {
-      return this._failHomeTour(`Home Tour has no validated camera anchor for ${stop?.label || 'the next room'}.`);
+    if (!stop?.point || !Array.isArray(stop.path) || !stop.path.length) {
+      return this._failHomeTour(`The precomputed route is missing a validated stop for ${stop?.label || 'the next area'}.`);
+    }
+
+    const pathStart = stop.path[0];
+    const unit = Math.max(this.metersPerUnit || 1, 1e-6);
+    if (distance3D(this.position, pathStart) > 0.24 * unit) {
+      return this._failHomeTour(`The next route leg does not connect to the current camera position (${stop.label}). The tour stopped safely.`);
     }
 
     this.homeTourCurrentStop = stop;
-    this.homeTourExpectedPoint = stop.point;
-    this.activeHotspotId = stop.hotspot?.id || null;
-    this.guidedPresentationAreaId = stop.areaId;
-    this.guidedTourLastAreaId = stop.areaId;
-    this.guidedTourArmed = false;
-    this.guidedTourNextAt = 0;
-    this.guidedTourAdvanceLock = true;
-    this.guidedTransitionKind = 'room-crossing';
-    this.guidedApproachActive = false;
-    this.guidedRevealActive = false;
-    this.guidedShotSubject = null;
-    this.guidedShotSubjectId = null;
-    this.guidedShotSubjectUntil = 0;
-    this.homeTourLastHeroName = null;
-    this.homeTourRouteRefreshCount = 0;
-
-    const fromSnap = this._closestWalkPoint(this.position, 0.35);
-    if (fromSnap) {
-      this.position.set(fromSnap.x, fromSnap.y, fromSnap.z);
-      this.currentPolyRef = fromSnap.polyRef || this.currentPolyRef;
-    }
-    const from = { x: this.position.x, y: this.position.y, z: this.position.z };
-    const route = this._computeHomeTourRoute(from, stop);
-    const unit = Math.max(this.metersPerUnit || 1, 1e-6);
-    const alreadyAtStop = distanceXZ(from, stop.point) <= HOME_TOUR_ARRIVAL_TOLERANCE_METERS * unit;
-    if (alreadyAtStop) {
-      this._arriveHomeTourStop(now);
-      return true;
-    }
-    if (route?.complete && route.path?.length >= 2 && route.length > 0.28 * unit) {
-      this.homeTourCurrentStop = { ...stop, point: route.candidate.point };
-      this.homeTourExpectedPoint = route.candidate.point;
-      this.homeTourMotion = {
-        path: route.path,
-        index: 1,
-        polyRef: fromSnap?.polyRef || this.currentPolyRef || 0,
-        target: route.candidate.point,
-        speed: 0,
-        cameraDirection: new THREE.Vector3(
-          route.path[1].x - from.x,
-          0,
-          route.path[1].z - from.z,
-        ).normalize(),
-        actualMoveDirection: new THREE.Vector3(),
-        lastActualMoveAt: now,
-        noProgressMs: 0,
-        progressWindowMs: 0,
-        progressWindowDistance: 0,
-        lastProgressAt: now,
-        lastPosition: from,
-        routeRefreshUsed: false,
-        lastPolyReacquireAt: 0,
-        startedAt: now,
-      };
-      this.path = route.path;
-      this.pathIndex = 0;
-      this.pathVelocity?.set?.(0, 0, 0);
-      this.velocity?.set?.(0, 0, 0);
-      this.homeTourPhase = 'traveling';
-      this._emitHomeTourState({
-        phase: 'traveling',
-        routeLengthMeters: Number((route.length / Math.max(this.metersPerUnit || 1, 1e-6)).toFixed(2)),
-        transitionMode: 'navmesh-walk',
-      });
-      return true;
-    }
-
-    // A disconnected or degenerate route does not stop the presentation. A
-    // room-specific anchor is validated independently and entered by a short
-    // fade-through transition rather than a visible teleport or wall clipping.
-    const target = route?.candidate?.point || stop.point;
-    const validated = this._closestWalkPoint(target, 0.45);
-    if (!validated) return this._failHomeTour(`No safe presentation anchor remains available for ${stop.label}.`);
-    this.homeTourCurrentStop = { ...stop, point: validated };
-    this.homeTourExpectedPoint = validated;
-    this._beginHomeTourPortalTransition(now, 'no-complete-navmesh-route', validated);
-    return true;
-  },
-
-  _refreshHomeTourRoute(now, reason = 'local-progress-refresh') {
-    const motion = this.homeTourMotion;
-    const stop = this.homeTourCurrentStop;
-    if (!motion || !stop || motion.routeRefreshUsed) return false;
-    // Consume the one refresh allowance even when local snapping fails; do not
-    // hammer the NavMesh query every frame while the camera is stalled.
-    motion.routeRefreshUsed = true;
-
-    const snapped = this._closestWalkPoint(this.position, 0.16);
-    if (!snapped || Math.hypot(snapped.x - this.position.x, snapped.y - this.position.y, snapped.z - this.position.z) > 0.12 * Math.max(this.metersPerUnit || 1, 1e-6)) {
-      return false;
-    }
-    this.position.set(snapped.x, snapped.y, snapped.z);
-    this.currentPolyRef = snapped.polyRef || this.currentPolyRef;
-
-    const route = this._computeHomeTourRoute(snapped, stop);
-    if (!route?.complete || !route.path?.length) return false;
-
-    motion.path = route.path;
-    motion.index = route.path.length > 1 ? 1 : 0;
-    motion.polyRef = snapped.polyRef || this.currentPolyRef || motion.polyRef;
-    motion.target = route.candidate.point;
-    motion.speed = 0;
-    const firstRoutePoint = route.path[Math.min(1, route.path.length - 1)];
-    motion.cameraDirection = new THREE.Vector3(
-      firstRoutePoint.x - snapped.x,
-      0,
-      firstRoutePoint.z - snapped.z,
-    ).normalize();
-    motion.actualMoveDirection = new THREE.Vector3();
-    motion.lastActualMoveAt = now;
-    motion.noProgressMs = 0;
-    motion.progressWindowMs = 0;
-    motion.progressWindowDistance = 0;
-    motion.lastPolyReacquireAt = now;
-    motion.lastProgressAt = now;
-    motion.lastPosition = { x: snapped.x, y: snapped.y, z: snapped.z };
-    this.homeTourExpectedPoint = motion.target;
-    this.homeTourCurrentStop = { ...stop, point: motion.target };
-    this.path = motion.path;
+    this.homeTourShot = null;
+    this.homeTourHeroName = null;
+    this.homeTourMotion = {
+      path: stop.path,
+      index: stop.path.length > 1 ? 1 : stop.path.length,
+      lastDirection: null,
+    };
+    this.homeTourPhase = 'traveling';
+    this.homeTourRemainingMs = 0;
+    this.path = null;
     this.pathIndex = 0;
-    this.homeTourRouteRefreshCount += 1;
-    this.onState?.({ type: 'home-tour-diagnostic', event: reason, routeRefreshes: this.homeTourRouteRefreshCount });
+    this.velocity?.set?.(0, 0, 0);
+
+    const firstTarget = stop.path[Math.min(1, stop.path.length - 1)];
+    if (firstTarget) {
+      const yaw = homeTourYawFromDirection(firstTarget.x - this.position.x, firstTarget.z - this.position.z);
+      if (Number.isFinite(yaw)) this.targetYaw = yaw;
+    }
+    this.targetPitch = HOME_TOUR_CAMERA_PITCH;
+    this._emitHomeTourState({
+      phase: 'traveling',
+      routeLengthMeters: stop.routeLengthMeters,
+      legIndex: this.homeTourStopIndex,
+    });
+
+    if (stop.path.length <= 1) this._arriveHomeTourStop(now);
     return true;
   },
 
   _advanceHomeTourMotion(dt, now) {
     const motion = this.homeTourMotion;
-    if (!motion || !this.query) return false;
+    if (!motion) return this._failHomeTour('Home Tour lost its active, precomputed camera path.');
     const unit = Math.max(this.metersPerUnit || 1, 1e-6);
-    const waypointTolerance = HOME_TOUR_WAYPOINT_TOLERANCE_METERS * unit;
-
-    while (motion.index < motion.path.length) {
-      const waypoint = motion.path[motion.index];
-      if (distanceXZ(this.position, waypoint) > waypointTolerance) break;
-      motion.index += 1;
-    }
-
-    if (motion.index >= motion.path.length) {
-      const remaining = Math.hypot(
-        this.position.x - motion.target.x,
-        this.position.y - motion.target.y,
-        this.position.z - motion.target.z,
-      );
-      if (remaining <= HOME_TOUR_ARRIVAL_TOLERANCE_METERS * unit) {
-        this._arriveHomeTourStop(now);
-        return true;
-      }
-      if (this._refreshHomeTourRoute(now, 'straight-path-endpoint-short')) return true;
-      this._beginHomeTourPortalTransition(now, 'path-ended-before-room-anchor', motion.target);
-      return true;
-    }
-
-    const waypoint = motion.path[motion.index];
-    const dx = waypoint.x - this.position.x;
-    const dz = waypoint.z - this.position.z;
-    const distance = Math.hypot(dx, dz);
-    if (distance < 1e-5) {
-      motion.index += 1;
-      return true;
-    }
-
-    // Smooth acceleration with a controlled slowdown as the actual destination
-    // nears. Every movement request is a small Detour surface-constrained step.
-    const finalDistance = Math.hypot(motion.target.x - this.position.x, motion.target.z - this.position.z);
-    const finalDistanceMeters = finalDistance / unit;
-    const targetSpeed = homeTourSpeedForDistance(finalDistanceMeters) * unit;
-    // Gentle acceleration, a relaxed architectural walking pace, and a slow
-    // final approach. The old 8 mm minimum step accidentally overrode slow speed.
-    motion.speed += (targetSpeed - motion.speed) * (1 - Math.exp(-2.2 * dt));
-    const stepLength = Math.min(
-      distance,
-      HOME_TOUR_MAX_STEP_METERS * unit,
-      Math.max(0.001 * unit, motion.speed * dt),
-    );
-    const desired = {
-      x: this.position.x + (dx / distance) * stepLength,
-      y: this.position.y,
-      z: this.position.z + (dz / distance) * stepLength,
-    };
-
-    const from = { x: this.position.x, y: this.position.y, z: this.position.z };
-    let polyRef = motion.polyRef || this.currentPolyRef || 0;
-    const resolveCurrentPolygon = () => {
-      const resolved = this._resolveMovementPolygon?.(from);
-      if (!resolved?.polyRef || !resolved.point) return null;
-      const correction = Math.hypot(
-        resolved.point.x - from.x,
-        resolved.point.y - from.y,
-        resolved.point.z - from.z,
-      );
-      if (correction > 0.18 * unit) return null;
-      return { polyRef: resolved.polyRef, point: resolved.point, correction };
-    };
-
-    let moved = null;
-    const moveStep = (ref, startPoint) => this.query.moveAlongSurface(ref, startPoint, desired, {
-      filter: this.filter,
-      maxVisitedSize: 128,
+    const step = HOME_TOUR_CRUISE_SPEED_MPS * unit * Math.min(0.05, Math.max(0, dt));
+    const advanced = advanceHomeTourPolyline({
+      position: { x: this.position.x, y: this.position.y, z: this.position.z },
+      path: motion.path,
+      index: motion.index,
+      distance: step,
     });
-
-    if (!polyRef) {
-      const resolved = resolveCurrentPolygon();
-      if (resolved) {
-        polyRef = resolved.polyRef;
-        if (resolved.correction > 0.0005 * unit) {
-          this.position.set(resolved.point.x, resolved.point.y, resolved.point.z);
-          from.x = resolved.point.x; from.y = resolved.point.y; from.z = resolved.point.z;
-        }
-      }
+    if (advanced.invalid || !finitePoint(advanced.position)) {
+      return this._failHomeTour('Home Tour received an invalid point in its precomputed route.');
     }
 
-    if (polyRef) {
-      try { moved = moveStep(polyRef, from); } catch (_) { moved = null; }
-    }
+    this.position.set(advanced.position.x, advanced.position.y, advanced.position.z);
+    motion.index = advanced.index;
+    if (advanced.direction) motion.lastDirection = advanced.direction;
 
-    // Detour can reject a stale cached polygon ref even though the camera is
-    // still on a valid nearby polygon. Reacquire locally and repeat this same
-    // sub-step once, matching the runtime's normal movement safety contract.
-    if ((!moved?.success || !moved.resultPosition)
-      && now - (motion.lastPolyReacquireAt || 0) >= 180) {
-      motion.lastPolyReacquireAt = now;
-      const resolved = resolveCurrentPolygon();
-      if (resolved) {
-        polyRef = resolved.polyRef;
-        motion.polyRef = polyRef;
-        motion.lastPolyReacquireAt = now;
-        this.currentPolyRef = polyRef;
-        if (resolved.correction > 0.0005 * unit) {
-          this.position.set(resolved.point.x, resolved.point.y, resolved.point.z);
-          from.x = resolved.point.x; from.y = resolved.point.y; from.z = resolved.point.z;
-        }
-        try { moved = moveStep(polyRef, from); } catch (_) { moved = null; }
-        this.onState?.({ type: 'home-tour-diagnostic', event: 'local-poly-ref-reacquired' });
-      }
+    const lookDirection = homeTourLookAheadDirection(
+      motion.path,
+      motion.index,
+      this.position,
+      HOME_TOUR_LOOK_AHEAD_METERS * unit,
+    ) || motion.lastDirection;
+    if (lookDirection) {
+      const yaw = homeTourYawFromDirection(lookDirection.x, lookDirection.z);
+      if (Number.isFinite(yaw)) this.targetYaw = yaw;
     }
+    this.targetPitch = HOME_TOUR_CAMERA_PITCH;
 
-    let movedDistance = 0;
-    if (moved?.success && moved.resultPosition
-      && [moved.resultPosition.x, moved.resultPosition.y, moved.resultPosition.z].every(Number.isFinite)) {
-      movedDistance = Math.hypot(
-        moved.resultPosition.x - from.x,
-        moved.resultPosition.y - from.y,
-        moved.resultPosition.z - from.z,
-      );
-      if (movedDistance > 0.00025 * unit) {
-        this.position.set(moved.resultPosition.x, moved.resultPosition.y, moved.resultPosition.z);
-        const visited = Array.isArray(moved.visited) ? moved.visited : [];
-        // Prefer Detour's resulting polygon ref. The final visited polygon can
-        // describe the corridor traversal, not necessarily the landed polygon.
-        motion.polyRef = moved.resultPolyRef || moved.polyRef || moved.ref
-          || (visited.length ? visited[visited.length - 1] : 0)
-          || polyRef;
-        this.currentPolyRef = motion.polyRef || this.currentPolyRef;
-        this.lastMoveDirection.set(this.position.x - from.x, 0, this.position.z - from.z);
-        if (this.lastMoveDirection.lengthSq() > 1e-8) {
-          this.lastMoveDirection.normalize();
-          // Record the movement actually accepted by Detour after surface
-          // constraints. This is the camera-heading authority: it cannot point
-          // behind the camera when a waypoint cursor advances or is clamped.
-          motion.actualMoveDirection ||= new THREE.Vector3();
-          motion.actualMoveDirection.copy(this.lastMoveDirection);
-          motion.lastActualMoveAt = now;
-        }
-        motion.lastPosition = { x: this.position.x, y: this.position.y, z: this.position.z };
-      }
+    if (now - this.homeTourLastUiAt >= 300) {
+      this.homeTourLastUiAt = now;
+      this._emitHomeTourState({
+        phase: 'traveling',
+        legProgress: motion.path.length > 1 ? motion.index / (motion.path.length - 1) : 1,
+      });
     }
-
-    // A tiny clamped move must not reset the watchdog every frame. Measure
-    // progress over a short rolling window; normal tour movement is ~1.2 m/s,
-    // so 3.5 cm per 350 ms is a deliberately forgiving minimum.
-    motion.progressWindowMs = (motion.progressWindowMs || 0) + dt * 1000;
-    motion.progressWindowDistance = (motion.progressWindowDistance || 0) + movedDistance;
-    if (motion.progressWindowMs >= 350) {
-      if (motion.progressWindowDistance >= 0.035 * unit) {
-        motion.noProgressMs = 0;
-        motion.lastProgressAt = now;
-      } else {
-        motion.noProgressMs += motion.progressWindowMs;
-      }
-      motion.progressWindowMs = 0;
-      motion.progressWindowDistance = 0;
-    }
-
-    // Exactly one local corridor refresh is allowed. If it still cannot make
-    // meaningful progress, use the room's prevalidated anchor under a short
-    // full-frame fade. The client never watches the camera push against a wall.
-    if (motion.noProgressMs >= HOME_TOUR_STALL_REFRESH_MS && !motion.routeRefreshUsed) {
-      if (this._refreshHomeTourRoute(now, 'local-navmesh-corridor-refresh')) return true;
-    }
-    if (motion.noProgressMs >= HOME_TOUR_STALL_TRANSITION_MS) {
-      this._beginHomeTourPortalTransition(now, 'local-navmesh-corridor-unavailable', motion.target);
-      return true;
-    }
-
-    this.homeTourMotion = motion;
-    this.path = motion.path;
-    this.pathIndex = Math.max(0, motion.index - 1);
-    this.homeTourLastMoveDirection.copy(this.lastMoveDirection);
+    if (advanced.finished) this._arriveHomeTourStop(now);
     return true;
   },
 
   _arriveHomeTourStop(now = performance.now()) {
     const stop = this.homeTourCurrentStop;
-    const finalAnchor = stop?.point && this._closestWalkPoint(stop.point, 0.55);
-    if (finalAnchor && distanceXZ(this.position, finalAnchor) <= HOME_TOUR_ARRIVAL_TOLERANCE_METERS * Math.max(this.metersPerUnit || 1, 1e-6)) {
-      this.position.set(finalAnchor.x, finalAnchor.y, finalAnchor.z);
-      this.currentPolyRef = finalAnchor.polyRef || this.currentPolyRef;
-    }
+    if (!stop) return this._failHomeTour('Home Tour reached a route endpoint without a room stop.');
+
+    this.position.set(stop.point.x, stop.point.y, stop.point.z);
     this.homeTourMotion = null;
-    this.path = null;
-    this.pathIndex = 0;
-    this.pathVelocity?.set?.(0, 0, 0);
-    this.velocity?.set?.(0, 0, 0);
-    this.lastMovementPosition?.copy?.(this.position);
-    this.arrivalSettleUntil = now + 220;
-    this.homeTourPhase = 'settling';
-    this.homeTourHoldUntil = now + 220;
-    this.guidedShotSubject = null;
-    this.guidedShotSubjectId = null;
-    this.guidedShotSubjectUntil = 0;
-    this._emitHomeTourState({ phase: 'settling', label: stop?.label || 'Room' });
-  },
-
-  _beginHomeTourPortalTransition(now, reason, rawTarget) {
-    // First try a fresh spatial query. If that query is locally unavailable,
-    // retain the point that was already validated while building this tour's
-    // stop list. That prevents a transient query failure from ending the tour.
-    const freshlyValidated = this._closestWalkPoint(rawTarget, 1.35)
-      || this._closestWalkPoint(this.homeTourCurrentStop?.point, 1.35);
-    const previouslyValidated = rawTarget?.validatedByNavMesh
-      ? rawTarget
-      : (this.homeTourCurrentStop?.point?.validatedByNavMesh ? this.homeTourCurrentStop.point : null);
-    const target = freshlyValidated || previouslyValidated;
-    if (!target || ![target.x, target.y, target.z].every(Number.isFinite)) {
-      return this._failHomeTour(`No validated room presentation anchor is available for ${this.homeTourCurrentStop?.label || 'the next room'}.`);
-    }
-
-    this.homeTourMotion = null;
-    this.path = null;
-    this.pathIndex = 0;
-    this.pathVelocity?.set?.(0, 0, 0);
-    this.velocity?.set?.(0, 0, 0);
-    this.homeTourTransition = {
-      startedAt: now,
-      durationMs: HOME_TOUR_PORTAL_FADE_MS,
-      switchAt: HOME_TOUR_PORTAL_SWITCH_AT,
-      target,
-      switched: false,
-      reason,
-    };
-    this.homeTourTransitionOpacity = 0;
-    this.homeTourPhase = 'portal-transition';
-    this._emitHomeTourState({ phase: 'portal-transition', transitionMode: 'fade-through', transitionOpacity: 0 });
-    return true;
-  },
-
-  _updateHomeTourPortalTransition(now) {
-    const transition = this.homeTourTransition;
-    if (!transition) return false;
-    const progress = THREE.MathUtils.clamp((now - transition.startedAt) / transition.durationMs, 0, 1);
-    const fadeOut = smooth01(progress / transition.switchAt);
-    const fadeIn = 1 - smooth01((progress - transition.switchAt) / (1 - transition.switchAt));
-    this.homeTourTransitionOpacity = progress <= transition.switchAt ? fadeOut : fadeIn;
-
-    if (!transition.switched && progress >= transition.switchAt) {
-      transition.switched = true;
-      const target = transition.target;
-      // Camera position changes only while the presentation viewport is fully
-      // occluded. This is a deliberate cinematic doorway cut, not a visible warp.
-      this.position.set(target.x, target.y, target.z);
-      this.currentPolyRef = target.polyRef || this.currentPolyRef;
-      this.lastMovementPosition?.copy?.(this.position);
-      this.homeTourExpectedPoint = target;
-      this.guidedApproachActive = false;
-      this.guidedRevealActive = false;
-      this.guidedShotSubject = null;
-      this.guidedShotSubjectId = null;
-      this.guidedShotSubjectUntil = 0;
-    }
-
-    if (now - this.homeTourLastUiAt >= HOME_TOUR_UI_INTERVAL_MS || progress >= 1) {
+    if (this.homeTourAdvanceAfterArrival) {
+      this.homeTourAdvanceAfterArrival = false;
+      this.homeTourShot = null;
+      this.homeTourHeroName = null;
+      this.homeTourStopIndex += 1;
+      this.homeTourPhase = 'traveling';
       this.homeTourLastUiAt = now;
-      this._emitHomeTourState({
-        phase: 'portal-transition',
-        transitionMode: 'fade-through',
-        transitionOpacity: this.homeTourTransitionOpacity,
-        transitionReason: transition.reason,
-      });
+      this._emitHomeTourState({ phase: 'traveling', skippedPresentationAreaId: stop.areaId });
+      return this._startHomeTourNextLeg(now);
     }
-
-    if (progress >= 1) {
-      this.homeTourTransition = null;
-      this.homeTourTransitionOpacity = 0;
-      this.homeTourPhase = 'settling';
-      this.homeTourHoldUntil = now + 260;
-      this._emitHomeTourState({ phase: 'settling', transitionOpacity: 0 });
-    }
-    return true;
-  },
-
-  _selectHomeTourHero(areaId) {
-    const subjects = Array.isArray(this.presentationSubjects) ? this.presentationSubjects : [];
-    const unit = Math.max(this.metersPerUnit || 1, 1e-6);
-    const origin = this.position;
-    const eye = new THREE.Vector3(
-      origin.x,
-      origin.y + (this.eyeHeight + this.heightOffset) * unit,
-      origin.z,
-    );
-    const areaSource = Array.isArray(this.homeTourAreaSource) && this.homeTourAreaSource.length
-      ? this.homeTourAreaSource
-      : this.walkAreas;
-    const area = (areaSource || []).find((item) => item?.id === areaId);
-    const areaCenter = Array.isArray(area?.center) && area.center.length >= 3
-      ? area.center.slice(0, 3).map(Number)
-      : (area?.center && [area.center.x, area.center.y, area.center.z].every((value) => Number.isFinite(Number(value)))
-        ? [Number(area.center.x), Number(area.center.y), Number(area.center.z)]
-        : null);
-    const areaCandidates = subjects.filter((subject) => subject?.areaId === areaId && subject.center && subject.visible !== false);
-    // Optimized presentation jobs sometimes have sparse/ambiguous area IDs.
-    // Keep nearby semantic assets as candidates even when one low-value item
-    // happens to carry the exact area ID; the room's sofa/bed/table should win.
-    const nearbyFallback = areaCenter
-      ? subjects.filter((subject) => subject?.center && subject.visible !== false
-        && Math.hypot(subject.center.x - Number(areaCenter[0]), subject.center.z - Number(areaCenter[2])) <= 5.5 * unit)
-      : [];
-    const pool = [...new Map([...areaCandidates, ...nearbyFallback].map((subject) => [subject.id || subject.object?.uuid || subject, subject])).values()];
-    let best = null;
-
-    for (const subject of pool) {
-      if (subject.object && !subject.object.visible) continue;
-      if (!['furniture', 'fixture', 'decor', 'lighting', 'object'].includes(subject.role)) continue;
-      const dx = subject.center.x - origin.x;
-      const dz = subject.center.z - origin.z;
-      const distance = Math.hypot(dx, dz);
-      if (distance < 0.45 * unit || distance > 9 * unit) continue;
-      const direction = new THREE.Vector3(subject.center.x - eye.x, subject.center.y - eye.y, subject.center.z - eye.z);
-      const distance3d = direction.length();
-      let occluded = false;
-      if (distance3d > 1e-5) {
-        const hit = this._raycastPresentationOccluder?.(eye, direction.normalize(), distance3d);
-        const belongs = Boolean(hit && (hit.object === subject.object || subject.meshObjects?.includes(hit.object)));
-        if (hit && !belongs && hit.distance < distance3d - Math.max(0.22 * unit, distance3d * 0.10)) occluded = true;
-      }
-      if (occluded) continue;
-
-      const name = String(subject.name || '').toLowerCase();
-      const isHero = /(sofa|couch|sectional|bed|daybed|dining|dinning|kitchen island|wardrobe|cabinet|television unit)/.test(name);
-      const semanticWeight = isHero ? 14 : 0;
-      const roleWeight = Number(subject.heroPriority) || ({ furniture: 8, fixture: 4.5, decor: 1.8, lighting: 1.2, object: 0.8 }[subject.role] || 0.8);
-      const distanceQuality = 1 - Math.min(Math.abs(distance - 2.7 * unit) / (6.0 * unit), 1);
-      const sizeQuality = Math.min(Math.log1p((subject.radius || 0.5 * unit) / unit * 2), 1.4);
-      const score = semanticWeight + roleWeight + (subject.areaId === areaId ? 6 : 0) + distanceQuality * 2.2 + sizeQuality;
-      if (!best || score > best.score) best = { subject, score };
-    }
-    return best?.subject || null;
-  },
-
-  _beginHomeTourRoomPresentation(now = performance.now()) {
-    const stop = this.homeTourCurrentStop;
-    if (!stop || stop.kind !== 'room') return this._failHomeTour('Home Tour lost its current room identity.');
-
-    const hero = this._selectHomeTourHero(stop.areaId);
-    this.guidedShotSubject = hero;
-    this.guidedShotSubjectId = hero?.id || hero?.object?.uuid || null;
-    this.homeTourLastHeroName = hero?.name || null;
-    stop.label = resolveHomeTourRoomLabel({
-      areaId: stop.areaId,
-      fallbackLabel: stop.label,
-      heroName: hero?.name || '',
-      areas: (Array.isArray(this.homeTourAreaSource) && this.homeTourAreaSource.length)
-        ? this.homeTourAreaSource
-        : this.walkAreas,
-      subjects: this.presentationSubjects,
-    });
-
-    const heroYaw = hero ? this._yawToGuidedSubject(this.position, hero) : null;
-    const heroPitch = hero ? this._pitchToGuidedSubject(this.position, hero) : null;
-    let fallbackYaw = null;
-    if (!Number.isFinite(heroYaw)) {
-      const composition = this._findBestGuidedComposition?.(
-        this.position,
-        this.homeTourLastMoveDirection,
-        this.currentYaw,
-      );
-      fallbackYaw = Number.isFinite(composition?.yaw) ? composition.yaw : null;
-    }
-
-    this.homeTourAimYaw = Number.isFinite(heroYaw)
-      ? heroYaw
-      : (Number.isFinite(fallbackYaw)
-        ? fallbackYaw
-        : (Number.isFinite(this.currentYaw) ? this.currentYaw : 0));
-    this.homeTourAimPitch = Number.isFinite(heroPitch)
-      ? THREE.MathUtils.clamp(heroPitch, THREE.MathUtils.degToRad(-22), THREE.MathUtils.degToRad(1))
-      : -0.075;
-    this.guidedCompositionTargetYaw = this.homeTourAimYaw;
-    this.guidedCompositionYaw = this.currentYaw;
-    this.guidedYawCenter = this.homeTourAimYaw;
-    this.targetYaw = this.homeTourAimYaw;
-    this.targetPitch = this.homeTourAimPitch;
-    this.guidedShotSubjectUntil = Number.POSITIVE_INFINITY;
-
-    // Give the camera time to settle onto the hero before the advertised
-    // 15-second room dwell begins. The dwell timer starts after composition.
-    this.homeTourPhase = 'composing';
-    this.homeTourCompositionUntil = now + HOME_TOUR_COMPOSITION_SETTLE_MS;
-    this.homeTourPresentationStartedAt = 0;
-    this.homeTourHoldUntil = 0;
     this.homeTourVisitedAreaIds.add(stop.areaId);
+    this.homeTourShot = this._resolveHomeTourPresentation(stop);
+    this.homeTourHeroName = this.homeTourShot?.hero?.name || null;
+    this.homeTourPhase = 'revealing';
+    this.homeTourRevealStartedAt = now;
+    this.homeTourSweepStartedAt = 0;
+    this.homeTourRevealFromYaw = Number.isFinite(this.currentYaw) ? this.currentYaw : this.targetYaw;
+    this.homeTourRemainingMs = HOME_TOUR_HERO_REVEAL_MS + (this.homeTourShot?.sweepDurationMs || 0);
+    this.targetPitch = HOME_TOUR_TOP_REVEAL_PITCH;
+    this.homeTourLastUiAt = now;
     this._emitHomeTourState({
-      phase: 'composing',
-      hero: this.homeTourLastHeroName,
-      compositionMs: HOME_TOUR_COMPOSITION_SETTLE_MS,
-      holdMs: HOME_TOUR_ROOM_HOLD_MS,
+      phase: 'revealing',
+      hero: this.homeTourHeroName,
+      remainingMs: this.homeTourRemainingMs,
+      revealMs: HOME_TOUR_HERO_REVEAL_MS,
+      sweepMs: this.homeTourShot?.sweepDurationMs || 0,
+      subjects: this.homeTourShot?.relevantSubjectCount || 0,
     });
     return true;
-  },
-
-  /**
-   * Home Tour owns its own camera heading. During travel it faces the actual
-   * next NavMesh segment (not the generic path cursor, which can be one node
-   * behind and turn the camera backwards at corners). During a room stop it
-   * holds the selected hero with only a subtle, slow cinematic drift.
-   */
-  _updateHomeTourCameraHeading(now = performance.now(), dt = this._lastDt || 0.016) {
-    if (!this.homeTourActive) return false;
-
-    if (this.homeTourPhase === 'traveling' && this.homeTourMotion?.path?.length) {
-      const motion = this.homeTourMotion;
-      const path = motion.path;
-      const unit = Math.max(this.metersPerUnit || 1, 1e-6);
-      const index = THREE.MathUtils.clamp(motion.index, 0, path.length - 1);
-      const waypoint = path[index];
-      let dx = Number(waypoint?.x) - this.position.x;
-      let dz = Number(waypoint?.z) - this.position.z;
-      let length = Math.hypot(dx, dz);
-
-      if (length < 0.025 * unit && index + 1 < path.length) {
-        dx = path[index + 1].x - this.position.x;
-        dz = path[index + 1].z - this.position.z;
-        length = Math.hypot(dx, dz);
-      }
-
-      if (length > 1e-6) {
-        const routeDirection = new THREE.Vector3(dx / length, 0, dz / length);
-        // Look slightly into the next segment near a corner, but keep this
-        // anticipation small so the camera does not turn before the body.
-        if (index + 1 < path.length) {
-          const nextDx = path[index + 1].x - waypoint.x;
-          const nextDz = path[index + 1].z - waypoint.z;
-          const nextLength = Math.hypot(nextDx, nextDz);
-          if (nextLength > 1e-6) {
-            const blend = THREE.MathUtils.clamp((0.65 * unit - length) / (0.65 * unit), 0, 1) * 0.14;
-            routeDirection.lerp(new THREE.Vector3(nextDx / nextLength, 0, nextDz / nextLength), blend).normalize();
-          }
-        }
-
-        // The movement vector returned by moveAlongSurface is authoritative.
-        // If Detour clamps sideways against a wall, the camera follows the
-        // accepted displacement instead of continuing to stare down the ideal
-        // (but currently blocked) route tangent.
-        const actual = motion.actualMoveDirection;
-        const actualIsFresh = actual?.lengthSq?.() > 1e-8 && now - (motion.lastActualMoveAt || 0) < 240;
-        const desiredDirection = homeTourCameraDirection(
-          routeDirection.x,
-          routeDirection.z,
-          actual?.x,
-          actual?.z,
-          actualIsFresh,
-        ) || { x: routeDirection.x, z: routeDirection.z };
-
-        const desiredYaw = homeTourYawFromDirection(desiredDirection.x, desiredDirection.z);
-        const currentDirection = motion.cameraDirection?.lengthSq?.() > 1e-8
-          ? motion.cameraDirection
-          : desired;
-        const currentYaw = homeTourYawFromDirection(currentDirection.x, currentDirection.z);
-        const headingYaw = Number.isFinite(currentYaw)
-          ? homeTourAngleLerp(currentYaw, desiredYaw, 1 - Math.exp(-5.2 * dt))
-          : desiredYaw;
-        // Convert the circular yaw back to a forward vector. This avoids the
-        // zero-vector normalization that occurs when linear vector lerp crosses
-        // an exact 180-degree reversal.
-        motion.cameraDirection = new THREE.Vector3(-Math.sin(headingYaw), 0, -Math.cos(headingYaw));
-        this.homeTourLastMoveDirection.copy(motion.cameraDirection);
-        if (Number.isFinite(headingYaw)) this.targetYaw = headingYaw;
-      }
-      this.targetPitch = HOME_TOUR_CAMERA_TRAVEL_PITCH;
-      return true;
-    }
-
-    if (this.homeTourPhase === 'composing' || this.homeTourPhase === 'presenting') {
-      const baseYaw = Number.isFinite(this.homeTourAimYaw) ? this.homeTourAimYaw : this.currentYaw;
-      const elapsed = this.homeTourPhase === 'presenting'
-        ? Math.max(0, now - this.homeTourPresentationStartedAt)
-        : 0;
-      const phase = this.homeTourPhase === 'presenting'
-        ? THREE.MathUtils.clamp(elapsed / HOME_TOUR_ROOM_HOLD_MS, 0, 1)
-        : 0;
-      // A subtle two-sided sweep keeps the shot alive without losing the hero.
-      const sweep = Math.sin(phase * Math.PI * 2) * THREE.MathUtils.degToRad(HOME_TOUR_CAMERA_SWEEP_DEGREES);
-      this.targetYaw = baseYaw + sweep;
-      this.targetPitch = this.homeTourAimPitch + Math.sin(phase * Math.PI * 2) * 0.003;
-      return true;
-    }
-
-    if (this.homeTourPhase === 'settling' && this.homeTourLastMoveDirection?.lengthSq?.() > 1e-8) {
-      const yaw = homeTourYawFromDirection(this.homeTourLastMoveDirection.x, this.homeTourLastMoveDirection.z);
-      if (Number.isFinite(yaw)) this.targetYaw = yaw;
-      this.targetPitch = HOME_TOUR_CAMERA_TRAVEL_PITCH;
-      return true;
-    }
-
-    return false;
   },
 
   _updateHomeTour(now = performance.now(), dt = this._lastDt || 0.016) {
     if (!this.homeTourActive) return false;
+    if (this.homeTourPhase === 'planning') return true;
+    if (this.homeTourPaused) {
+      const ambientPose = homeTourPausedCameraPose(now - this.homeTourPausedAt, {
+        baseYaw: this.homeTourPausedBaseYaw,
+        basePitch: this.homeTourPausedBasePitch,
+      });
+      this.targetYaw = ambientPose.yaw;
+      this.targetPitch = ambientPose.pitch;
+      return true;
+    }
 
     if (this.homeTourPhase === 'traveling') {
       this._advanceHomeTourMotion(dt, now);
       return true;
     }
 
-    if (this.homeTourPhase === 'portal-transition') {
-      this._updateHomeTourPortalTransition(now);
-      return true;
-    }
+    if (this.homeTourPhase === 'revealing') {
+      const shot = this.homeTourShot;
+      const elapsed = Math.max(0, now - this.homeTourRevealStartedAt);
+      const progress = Math.max(0, Math.min(1, elapsed / HOME_TOUR_HERO_REVEAL_MS));
+      const pose = homeTourRevealPose(progress, {
+        fromYaw: this.homeTourRevealFromYaw,
+        toYaw: shot?.heroYaw ?? this.homeTourRevealFromYaw,
+        heroPitch: shot?.heroPitch ?? HOME_TOUR_PRESENTATION_BASE_PITCH,
+      });
+      this.targetYaw = pose.yaw;
+      this.targetPitch = pose.pitch;
+      this.homeTourRemainingMs = Math.max(0, HOME_TOUR_HERO_REVEAL_MS - elapsed)
+        + (shot?.sweepDurationMs || 0);
 
-    if (this.homeTourPhase === 'settling') {
-      if (now < this.homeTourHoldUntil) return true;
-      this._beginHomeTourRoomPresentation(now);
-      return true;
-    }
-
-    if (this.homeTourPhase === 'composing') {
-      if (now < this.homeTourCompositionUntil) return true;
-      this.homeTourPhase = 'presenting';
-      this.homeTourPresentationStartedAt = now;
-      this.homeTourHoldUntil = now + HOME_TOUR_ROOM_HOLD_MS;
-      this.guidedShotSubjectUntil = this.homeTourHoldUntil + 500;
-      this._emitHomeTourState({ phase: 'presenting', holdMs: HOME_TOUR_ROOM_HOLD_MS, remainingMs: HOME_TOUR_ROOM_HOLD_MS });
-      return true;
-    }
-
-    if (this.homeTourPhase === 'presenting') {
-      if (now - this.homeTourLastUiAt >= 250) {
+      if (now - this.homeTourLastUiAt >= 250 || progress >= 1) {
         this.homeTourLastUiAt = now;
-        this._emitHomeTourState({ remainingMs: Math.max(0, this.homeTourHoldUntil - now) });
+        this._emitHomeTourState({
+          phase: 'revealing',
+          hero: this.homeTourHeroName,
+          remainingMs: this.homeTourRemainingMs,
+          revealProgress: progress,
+        });
       }
-      if (now < this.homeTourHoldUntil) return true;
-      this.homeTourStopIndex += 1;
-      this._startHomeTourNextLeg(now);
+      if (progress >= 1) {
+        this.homeTourPhase = 'sweeping';
+        this.homeTourSweepStartedAt = now;
+        this.homeTourRemainingMs = shot?.sweepDurationMs || 0;
+        this._emitHomeTourState({
+          phase: 'sweeping',
+          hero: this.homeTourHeroName,
+          remainingMs: this.homeTourRemainingMs,
+          sweepProgress: 0,
+        });
+      }
+      return true;
+    }
+
+    if (this.homeTourPhase === 'sweeping') {
+      const shot = this.homeTourShot;
+      const duration = Math.max(1_000, Number(shot?.sweepDurationMs) || 1_000);
+      const elapsed = Math.max(0, now - this.homeTourSweepStartedAt);
+      const progress = Math.max(0, Math.min(1, elapsed / duration));
+      const sweep = homeTourRoomSweepPose(progress, {
+        rotationRadians: shot?.sweepRotationRadians ?? Math.PI * 2,
+        direction: shot?.sweepDirection ?? 1,
+        targets: shot?.panoramaTargets || [],
+        basePitch: shot?.sweepBasePitch ?? shot?.heroPitch ?? HOME_TOUR_PRESENTATION_BASE_PITCH,
+      });
+      this.targetYaw = (shot?.heroYaw ?? this.homeTourRevealFromYaw) + sweep.yawOffset;
+      this.targetPitch = sweep.pitch;
+      this.homeTourRemainingMs = Math.max(0, duration - elapsed);
+
+      if (now - this.homeTourLastUiAt >= 250 || progress >= 1) {
+        this.homeTourLastUiAt = now;
+        this._emitHomeTourState({
+          phase: 'sweeping',
+          hero: this.homeTourHeroName,
+          remainingMs: this.homeTourRemainingMs,
+          sweepProgress: progress,
+        });
+      }
+      if (progress >= 1) {
+        // The camera has completed the content-aware arc and returned to the
+        // hero. Advance immediately; there is no additional 10/12-second hold.
+        this.homeTourStopIndex += 1;
+        this._startHomeTourNextLeg(now);
+      }
       return true;
     }
     return true;
   },
 
   _failHomeTour(message) {
-    if (!this.homeTourActive) return false;
+    this.homeTourRouteController?.abort?.();
+    this.homeTourRouteController = null;
     this.homeTourActive = false;
+    this.homeTourPaused = false;
+    this.homeTourPausedAt = 0;
+    this.homeTourAdvanceAfterArrival = false;
     this.homeTourPhase = 'failed';
-    this.homeTourFailure = message || 'Home Tour could not complete.';
+    // Keep actionable technical detail in developer diagnostics, not in the
+    // customer-facing walkthrough. A partial/unsafe tour must never be implied
+    // to have completed successfully.
+    console.error('[HCI Home Tour] Tour could not continue safely.', {
+      jobId: this.jobId || null,
+      reason: String(message || 'Unknown Home Tour failure'),
+      visitedAreas: this.homeTourVisitedAreaIds?.size || 0,
+      totalAreas: this.homeTourTotalStops || 0,
+    });
+    this.homeTourFailure = 'The complete Home Tour could not be prepared for this model. Your walkthrough is still available; choose a destination from the floor map to continue.';
     this.homeTourMotion = null;
-    this.homeTourTransition = null;
-    this.homeTourTransitionOpacity = 0;
+    this.homeTourRoute = null;
+    this.homeTourRemainingMs = 0;
     this.path = null;
     this.pathIndex = 0;
     this.pathVelocity?.set?.(0, 0, 0);
@@ -1066,15 +829,21 @@ export const homeTourDirectorMethods = {
 
   stopHomeTour(reason = 'manual-stop') {
     if (!this.homeTourActive) {
+      this.homeTourRouteController?.abort?.();
+      this.homeTourRouteController = null;
       this._applyHomeTourDoorVisibility(false);
-      this.homeTourTransitionOpacity = 0;
       return false;
     }
+    this.homeTourRouteController?.abort?.();
+    this.homeTourRouteController = null;
     this.homeTourActive = false;
+    this.homeTourPaused = false;
+    this.homeTourPausedAt = 0;
+    this.homeTourAdvanceAfterArrival = false;
     this.homeTourPhase = 'cancelled';
     this.homeTourMotion = null;
-    this.homeTourTransition = null;
-    this.homeTourTransitionOpacity = 0;
+    this.homeTourRoute = null;
+    this.homeTourRemainingMs = 0;
     this.path = null;
     this.pathIndex = 0;
     this.pathVelocity?.set?.(0, 0, 0);
@@ -1087,7 +856,7 @@ export const homeTourDirectorMethods = {
     this.guidedTourNextAt = 0;
     this.guidedTourAdvanceLock = false;
     this._applyHomeTourDoorVisibility(false);
-    this._emitHomeTourState({ cancelled: true, reason, transitionOpacity: 0 });
+    this._emitHomeTourState({ cancelled: true, reason });
     this.onState?.({ type: 'stuck', available: false });
     this.onState?.({ type: 'travel', active: false });
     return true;
@@ -1096,10 +865,13 @@ export const homeTourDirectorMethods = {
   _finishHomeTour() {
     if (!this.homeTourActive) return false;
     this.homeTourActive = false;
+    this.homeTourPaused = false;
+    this.homeTourPausedAt = 0;
+    this.homeTourAdvanceAfterArrival = false;
     this.homeTourPhase = 'complete';
     this.homeTourMotion = null;
-    this.homeTourTransition = null;
-    this.homeTourTransitionOpacity = 0;
+    this.homeTourRemainingMs = 0;
+    this.homeTourRouteController = null;
     this.path = null;
     this.pathIndex = 0;
     this.guidedTourArmed = false;
@@ -1109,7 +881,7 @@ export const homeTourDirectorMethods = {
     this.stuck = false;
     this.recoveryAvailable = false;
     this._applyHomeTourDoorVisibility(false);
-    this._emitHomeTourState({ completed: true, visitedCount: this.homeTourVisitedAreaIds.size, transitionOpacity: 0 });
+    this._emitHomeTourState({ completed: true, visitedCount: this.homeTourVisitedAreaIds.size });
     this.onState?.({ type: 'stuck', available: false });
     this.onState?.({ type: 'travel', active: false });
     this.fitView?.();

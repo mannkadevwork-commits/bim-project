@@ -56,6 +56,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
   const viewerRef = useRef(null);
   const lightFixtureControllerRef = useRef(null);
   const roomCeilingControllerRef = useRef(null);
+  const roomRegistryRef = useRef(null);
+  useEffect(() => {
+    roomRegistryRef.current = null;
+  }, [jobId]);
   const roomSelectionControllerRef = useRef(null);
   const selectRoomBoundaryWallsRef = useRef(null);
   const selectPlacedAssetRef = useRef(null);
@@ -875,12 +879,12 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       // Ceiling geometry is independent of catalogue furniture restoration.
       // Sync it immediately, rather than hiding it behind potentially slow GLB loads.
       const ceilingsNow = projectState?.ceilingDesigns || projectState?.ceilings || [];
-      roomCeilingControllerRef.current?.sync(ceilingsNow).catch((error) => {
+      roomCeilingControllerRef.current?.sync(ceilingsNow, roomRegistryRef.current).catch((error) => {
         console.error('[BIM Engine] Could not sync room ceilings before furniture restore:', error);
       });
       restoreProjectStateToScene(projectState).then(() => {
         const latestState = projectStateRef.current || projectState;
-        roomCeilingControllerRef.current?.sync(latestState?.ceilingDesigns || latestState?.ceilings || []).catch((error) => {
+        roomCeilingControllerRef.current?.sync(latestState?.ceilingDesigns || latestState?.ceilings || [], roomRegistryRef.current).catch((error) => {
           console.error('[BIM Engine] Could not sync room ceilings after furniture restore:', error);
         });
       }).catch(error => {
@@ -2755,7 +2759,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           if (!isCurrentLoad()) return;
           isModelLoadedRef.current = true;
           await restoreProjectStateToScene(projectStateRef.current);
-          roomCeilingControllerRef.current?.sync(projectStateRef.current?.ceilingDesigns || projectStateRef.current?.ceilings || []).catch((error) => {
+          roomCeilingControllerRef.current?.sync(projectStateRef.current?.ceilingDesigns || projectStateRef.current?.ceilings || [], roomRegistryRef.current).catch((error) => {
             console.error('[BIM Engine] Could not sync restored room ceilings:', error);
           });
           if (!isCurrentLoad()) return;
@@ -3003,10 +3007,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       },
       previewRoomCeiling: (design) => roomCeilingControllerRef.current?.preview(design) ?? false,
       clearRoomCeilingPreview: () => roomCeilingControllerRef.current?.clearPreview(),
-      syncRoomCeilings: (ceilings) => {
+      syncRoomCeilings: (ceilings, roomRegistry) => {
         const controller = roomCeilingControllerRef.current;
+        if (roomRegistry !== undefined) roomRegistryRef.current = roomRegistry;
         if (!controller) return Promise.reject(new Error('The 3D ceiling controller is not ready yet.'));
-        return controller.sync(Array.isArray(ceilings) ? ceilings : []);
+        return controller.sync(Array.isArray(ceilings) ? ceilings : [], roomRegistryRef.current);
       },
       getCeilingEntityIds: () => findCeilingEntities(viewerRef.current, currentModelRef.current).map((entity) => entity.id),
       setCeilingEntityVisibility: (entityIds, visible) => {

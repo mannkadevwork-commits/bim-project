@@ -1,4 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { positionPopoverInViewport } from './positionPopoverInViewport.mjs';
 import { Move, RotateCw, Scaling, Lock, Unlock, MoreHorizontal, Trash2, Palette, CircleHelp, CopyPlus, Square, Diamond, Box, Search, X, Check, Eye, Crosshair, RefreshCw } from 'lucide-react';
 
 const QUICK_COLORS = ['#FFFFFF', '#000000', '#E74C3C', '#3498DB', '#F5DEB3', '#7F8C8D'];
@@ -34,159 +36,89 @@ export const TransformModeTooltip = ({
   isDarkMode = true,
   resizeSubmode = 'face',
   onResizeSubmodeChange,
-  anchorX = 0,
-  anchorY = 0,
 }) => {
   const [showMore, setShowMore] = useState(false);
   const [materialMode, setMaterialMode] = useState('color');
   const [showHelp, setShowHelp] = useState(false);
   const [materialSearch, setMaterialSearch] = useState('');
   const [lastPickedMaterial, setLastPickedMaterial] = useState(null);
-  const [placement, setPlacement] = useState({ left: 0, top: 0, above: true });
+  const [placement] = useState({ above: false });
   const [helpPlacement, setHelpPlacement] = useState({ left: 0, top: 0, side: 'below' });
-  const [morePlacement, setMorePlacement] = useState({ left: 0, top: 0, side: 'below' });
+  const [morePlacement, setMorePlacement] = useState({ left: 0, top: 0, side: 'above', maxHeight: 360 });
   const selectionKey = selectedElements.map((item) => item?.id).filter(Boolean).join('|');
   const moreRef = useRef(null);
+  const moreButtonRef = useRef(null);
   const toolbarRef = useRef(null);
   const helpRef = useRef(null);
+  const helpButtonRef = useRef(null);
 
-  useEffect(() => {
-    if (isMultiSelection) setShowMore(true);
-    const updatePlacement = () => {
-      const rect = toolbarRef.current?.getBoundingClientRect();
-      if (!rect) return;
 
-      const gap = 52;
-      const margin = 12;
-      const width = rect.width;
-      const height = rect.height;
+  const getViewportRect = () => {
+    const viewport = window.visualViewport;
+    const left = Number.isFinite(viewport?.offsetLeft) ? viewport.offsetLeft : 0;
+    const top = Number.isFinite(viewport?.offsetTop) ? viewport.offsetTop : 0;
+    const width = Number.isFinite(viewport?.width) ? viewport.width : window.innerWidth;
+    const height = Number.isFinite(viewport?.height) ? viewport.height : window.innerHeight;
+    return { left, top, width, height };
+  };
 
-      let left = anchorX + 18;
-      let above = true;
-      let top = anchorY - height - gap;
+  const positionAnchoredPopover = (anchorRef, popoverRef, setState, preferredSide = 'above', requestedMaxHeight = 560) => {
+    const anchor = anchorRef.current?.getBoundingClientRect();
+    const popover = popoverRef.current?.getBoundingClientRect();
+    if (!anchor || !popover) return;
+    const intrinsicContentHeight = popoverRef.current?.scrollHeight;
+    const position = positionPopoverInViewport({
+      anchor,
+      popover: { ...popover, contentHeight: intrinsicContentHeight },
+      viewport: getViewportRect(),
+      preferredSide,
+      requestedMaxHeight,
+    });
+    if (position) setState(position);
+  };
 
-      if (left + width > window.innerWidth - margin) left = Math.max(margin, window.innerWidth - width - margin);
-      if (left < margin) left = margin;
-
-      if (top < margin) {
-        above = false;
-        top = anchorY + gap;
-      }
-
-      if (!above && top + height > window.innerHeight - margin) {
-        top = Math.max(margin, window.innerHeight - height - margin);
-      }
-
-      setPlacement({ left, top, above });
-    };
-
-    updatePlacement();
-    window.addEventListener('resize', updatePlacement);
-    window.addEventListener('scroll', updatePlacement, true);
-    return () => {
-      window.removeEventListener('resize', updatePlacement);
-      window.removeEventListener('scroll', updatePlacement, true);
-    };
-  }, [anchorX, anchorY, showMore, showHelp, isNative, assetName, isMultiSelection]);
-
-  useLayoutEffect(() => {
-    const positionPopover = (node, setState, preferredSide = 'below') => {
-      const toolbar = toolbarRef.current?.getBoundingClientRect();
-      const popover = node?.getBoundingClientRect();
-      if (!toolbar || !popover) return;
-
-      const margin = 10;
-      const gap = 10;
-      const aboveSpace = toolbar.top - margin;
-      const belowSpace = window.innerHeight - toolbar.bottom - margin;
-
-      let side;
-      if (preferredSide === 'above' && aboveSpace >= popover.height + gap) side = 'above';
-      else if (preferredSide === 'below' && belowSpace >= popover.height + gap) side = 'below';
-      else if (belowSpace >= popover.height + gap) side = 'below';
-      else side = 'above';
-
-      let top = side === 'above'
-        ? toolbar.top - popover.height - gap
-        : toolbar.bottom + gap;
-
-      top = Math.max(margin, Math.min(top, window.innerHeight - popover.height - margin));
-
-      let left = toolbar.right - popover.width;
-      left = Math.max(margin, Math.min(left, window.innerWidth - popover.width - margin));
-
-      setState({ left, top, side });
-    };
-
-    if (showHelp) {
-      const frame = requestAnimationFrame(() => positionPopover(helpRef.current, setHelpPlacement, placement.above ? 'above' : 'below'));
-      return () => cancelAnimationFrame(frame);
-    }
-    return undefined;
-  }, [showHelp, placement]);
+  const positionMorePopover = () => positionAnchoredPopover(moreButtonRef, moreRef, setMorePlacement, 'above', 560);
+  const positionHelpPopover = () => positionAnchoredPopover(helpButtonRef, helpRef, setHelpPlacement, placement.above ? 'above' : 'below', 460);
 
   useLayoutEffect(() => {
     if (!showMore) return undefined;
-    const frame = requestAnimationFrame(() => {
-      positionMorePopover();
-    });
+    const frame = requestAnimationFrame(positionMorePopover);
     return () => cancelAnimationFrame(frame);
-  }, [showMore, placement]);
+  }, [showMore, placement, materialMode, materialSearch]);
 
-  const positionMorePopover = () => {
-    const toolbar = toolbarRef.current?.getBoundingClientRect();
-    const popover = moreRef.current?.getBoundingClientRect();
-    if (!toolbar || !popover) return;
-
-    const margin = 10;
-    const gap = 10;
-    const aboveSpace = toolbar.top - margin;
-    const belowSpace = window.innerHeight - toolbar.bottom - margin;
-    const side = belowSpace >= popover.height + gap || aboveSpace < popover.height + gap ? 'below' : 'above';
-    let top = side === 'below' ? toolbar.bottom + gap : toolbar.top - popover.height - gap;
-    top = Math.max(margin, Math.min(top, window.innerHeight - popover.height - margin));
-    let left = toolbar.right - popover.width;
-    left = Math.max(margin, Math.min(left, window.innerWidth - popover.width - margin));
-    setMorePlacement({ left, top, side });
-  };
+  useLayoutEffect(() => {
+    if (!showHelp) return undefined;
+    const frame = requestAnimationFrame(positionHelpPopover);
+    return () => cancelAnimationFrame(frame);
+  }, [showHelp, placement]);
 
   useEffect(() => {
+    if (!showHelp && !showMore) return undefined;
+    let frame = 0;
     const handler = () => {
-      if (showHelp) {
-        const frame = requestAnimationFrame(() => {
-          const toolbar = toolbarRef.current?.getBoundingClientRect();
-          const popover = helpRef.current?.getBoundingClientRect();
-          if (!toolbar || !popover) return;
-          const margin = 10;
-          const gap = 10;
-          const aboveSpace = toolbar.top - margin;
-          const belowSpace = window.innerHeight - toolbar.bottom - margin;
-          const side = aboveSpace >= popover.height + gap && placement.above ? 'above' : (belowSpace >= popover.height + gap ? 'below' : 'above');
-          let top = side === 'above' ? toolbar.top - popover.height - gap : toolbar.bottom + gap;
-          top = Math.max(margin, Math.min(top, window.innerHeight - popover.height - margin));
-          let left = toolbar.right - popover.width;
-          left = Math.max(margin, Math.min(left, window.innerWidth - popover.width - margin));
-          setHelpPlacement({ left, top, side });
-        });
-        return () => cancelAnimationFrame(frame);
-      }
-      if (showMore) {
-        positionMorePopover();
-      }
-      return undefined;
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        if (showMore) positionMorePopover();
+        if (showHelp) positionHelpPopover();
+      });
     };
-
     window.addEventListener('resize', handler);
     window.addEventListener('scroll', handler, true);
+    window.visualViewport?.addEventListener('resize', handler);
+    window.visualViewport?.addEventListener('scroll', handler);
     return () => {
+      if (frame) cancelAnimationFrame(frame);
       window.removeEventListener('resize', handler);
       window.removeEventListener('scroll', handler, true);
+      window.visualViewport?.removeEventListener('resize', handler);
+      window.visualViewport?.removeEventListener('scroll', handler);
     };
   }, [showHelp, showMore, placement]);
 
   useEffect(() => {
     setMaterialSearch('');
     setLastPickedMaterial(null);
+    setShowMore(false);
   }, [assetName, selectionCount, isMultiSelection, selectionKey]);
 
   useEffect(() => {
@@ -196,7 +128,7 @@ export const TransformModeTooltip = ({
   useEffect(() => {
     if (!showMore) return undefined;
     const handleOutsidePointer = (event) => {
-      if (!toolbarRef.current?.contains(event.target)) setShowMore(false);
+      if (!toolbarRef.current?.contains(event.target) && !moreRef.current?.contains(event.target)) setShowMore(false);
     };
     const handleKeyDown = (event) => {
       if (event.key === 'Escape') setShowMore(false);
@@ -269,13 +201,12 @@ export const TransformModeTooltip = ({
   return (
     <div
       ref={toolbarRef}
-      className="fixed z-[120] pointer-events-none"
-      style={{ left: placement.left, top: placement.top }}
+      className="fixed bottom-[108px] left-1/2 z-[120] max-w-[calc(100vw-24px)] -translate-x-1/2 pointer-events-none"
       aria-label="Transform toolbar"
     >
       <div className={`relative ${placement.above ? 'origin-bottom-left' : 'origin-top-left'}`}>
         <div
-          className="flex items-center gap-1.5 px-2 py-2 rounded-2xl bg-[#0b1322]/96 border border-slate-700/80 shadow-[0_18px_50px_rgba(0,0,0,0.45)] backdrop-blur-2xl pointer-events-auto"
+          className="flex max-w-[calc(100vw-24px)] items-center gap-1.5 overflow-x-auto overscroll-x-contain rounded-2xl border border-slate-700/80 bg-[#0b1322]/96 px-2 py-2 shadow-[0_18px_50px_rgba(0,0,0,0.45)] backdrop-blur-2xl pointer-events-auto"
           onPointerDown={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
@@ -342,6 +273,19 @@ export const TransformModeTooltip = ({
 
           <div className="w-px h-7 bg-slate-700/70 mx-0.5" />
 
+          {onFocusSelection && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onFocusSelection(); }}
+              className="flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-emerald-400/25 bg-emerald-500/10 px-2.5 text-emerald-200 transition hover:border-emerald-300/50 hover:bg-emerald-500/18 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ff914d]"
+              title="Focus item — centre the selected object in the 3D view"
+              aria-label="Focus selected item"
+            >
+              <Crosshair className="h-4 w-4" />
+              <span className="whitespace-nowrap text-[9px] font-bold">Focus item</span>
+            </button>
+          )}
+
           {!isMultiSelection && <button
             type="button"
             onClick={(e) => { e.stopPropagation(); if (isNative && onIsolate) onIsolate(); }}
@@ -397,18 +341,6 @@ export const TransformModeTooltip = ({
             </button>
           )}
 
-          {onFocusSelection && (
-            <button
-              type="button"
-              onClick={(e) => { e.stopPropagation(); onFocusSelection(); }}
-              className="flex h-10 w-9 shrink-0 items-center justify-center rounded-xl border border-transparent text-slate-300 transition hover:border-slate-700 hover:bg-white/5 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ff914d]"
-              title="Center the camera on the selected element"
-              aria-label="Focus selected element"
-            >
-              <Crosshair className="h-4 w-4" />
-            </button>
-          )}
-
           {onOpen360Walkthrough && (
             <button
               type="button"
@@ -423,16 +355,20 @@ export const TransformModeTooltip = ({
           )}
 
           <button
+            ref={moreButtonRef}
             type="button"
-            onClick={(e) => { e.stopPropagation(); setShowMore((v) => !v); }}
+            onClick={(e) => { e.stopPropagation(); setShowMore((v) => !v); setShowHelp(false); }}
             className={`flex items-center justify-center hci-transform-action w-10 h-10 rounded-xl border border-transparent ${showMore ? 'bg-white/8 text-white ring-1 ring-slate-600/70' : 'text-slate-400 hover:text-white hover:bg-white/6 hover:border-slate-700'}`}
             title="More options"
             aria-expanded={showMore}
+            aria-controls="transform-more-panel"
           >
-            <MoreHorizontal className="w-5 h-5" />
+            <MoreHorizontal className="w-4 h-4" />
+            <span className="text-[9px] font-bold">More</span>
           </button>
 
           <button
+            ref={helpButtonRef}
             type="button"
             onClick={(e) => { e.stopPropagation(); setShowHelp((v) => !v); setShowMore(false); }}
             className={`flex items-center justify-center hci-transform-action hci-transform-action--help w-9 h-9 rounded-xl border border-transparent ${showHelp ? 'bg-cyan-400/12 text-cyan-300 ring-1 ring-cyan-300/35' : 'text-cyan-300/75 hover:text-cyan-200 hover:bg-cyan-400/10 hover:border-cyan-300/20'}`}
@@ -492,12 +428,12 @@ export const TransformModeTooltip = ({
           </div>
         )}
 
-        {showHelp && (
+        {showHelp && typeof document !== 'undefined' && createPortal(
           <div
             ref={helpRef}
             id="transform-help-panel"
             className={`fixed z-[160] w-[286px] p-3 rounded-2xl backdrop-blur-2xl border shadow-[0_18px_50px_rgba(0,0,0,0.5)] pointer-events-auto ${isDarkMode ? 'bg-[#07111d]/98 border-slate-700 text-slate-200' : 'bg-white/98 border-slate-200 text-slate-700'}`}
-            style={{ left: helpPlacement.left, top: helpPlacement.top }}
+            style={{ left: helpPlacement.left, top: helpPlacement.top, maxHeight: `${helpPlacement.maxHeight || 460}px`, overflowY: 'auto' }}
             onPointerDown={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
           >
@@ -530,14 +466,16 @@ export const TransformModeTooltip = ({
               </div>
               <HelpRow tone="unlock" icon={<Unlock className="w-4 h-4" />} title="Unlock" text="Convert a native IFC element into an editable isolated object." isDarkMode={isDarkMode} />
             </div>
-          </div>
+          </div>,
+          document.body,
         )}
 
-        {showMore && (
+        {showMore && typeof document !== 'undefined' && createPortal(
           <div
+            id="transform-more-panel"
             ref={moreRef}
             className="fixed z-[160] flex flex-col overflow-hidden rounded-2xl border border-slate-700 bg-[#0b1322]/[0.98] shadow-[0_18px_50px_rgba(0,0,0,0.5)] backdrop-blur-2xl pointer-events-auto"
-            style={{ left: morePlacement.left, top: morePlacement.top, width: 'min(330px, calc(100vw - 20px))', maxHeight: 'calc(100vh - 20px)' }}
+            style={{ position: 'fixed', left: morePlacement.left, top: morePlacement.top, width: morePlacement.width || 'min(360px, calc(100vw - 24px))', maxHeight: `${morePlacement.maxHeight || 560}px`, overflowY: 'auto', overscrollBehavior: 'contain' }}
             onPointerDown={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
           >
@@ -661,15 +599,10 @@ export const TransformModeTooltip = ({
                 <Trash2 className="h-4 w-4" /> Delete element
               </button>
             )}
-          </div>
+          </div>,
+          document.body,
         )}
 
-        {!showHelp && !showMore && (
-          <div
-            className={`absolute w-3 h-3 rotate-45 bg-[#0b1322] border-slate-700/80 ${placement.above ? 'left-5 -bottom-1.5 border-r border-b' : 'left-5 -top-1.5 border-l border-t'}`}
-            aria-hidden="true"
-          />
-        )}
       </div>
     </div>
   );

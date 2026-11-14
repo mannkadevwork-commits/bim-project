@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { reconstructRoomsFromWallTopology } from "./RoomTopologyReconstructor";
+import { reconstructRoomsFromWallTopology, shouldUseTopologyRoomRegions } from "./RoomTopologyReconstructor";
 import type { RoomFloorGrid, RoomFootprintAnchor, RoomPlanPoint } from "./RoomFootprintReconstructor";
 
 function createGrid(widthMeters: number, heightMeters: number, cellSize = 0.05): RoomFloorGrid {
@@ -148,6 +148,31 @@ test("no semantic anchors never creates a fake whole-floor room", () => {
   assert.equal(result.method, "none");
 });
 
+
+test("wall-enclosed physical rooms are still published when the IFC contains no usable semantic anchors", () => {
+  const grid = createGrid(6, 4, 0.1);
+  // Closed exterior shell and one full-height internal partition. Every
+  // physical component is bounded by wall-mask cells, rather than merely by
+  // the outer floor raster boundary.
+  blockRect(grid, 0, 0, 0.2, 4);
+  blockRect(grid, 5.8, 0, 6, 4);
+  blockRect(grid, 0, 0, 6, 0.2);
+  blockRect(grid, 0, 3.8, 6, 4);
+  blockRect(grid, 2.9, 0.2, 3.1, 3.8);
+  const result = reconstructRoomsFromWallTopology({
+    floorPolygon: [{ x: 0, y: 0 }, { x: 6, y: 0 }, { x: 6, y: 4 }, { x: 0, y: 4 }],
+    anchors: [],
+    grid,
+  });
+
+  assert.equal(result.physicalComponentCount, 2);
+  assert.equal(result.regions.length, 2);
+  assert.ok(result.regions.every((region) => region.regionKind === "physical-room"));
+  assert.ok(result.regions.every((region) => region.anchor.synthetic === true));
+  assert.ok(result.regions.every((region) => region.wallBoundaryRatio >= 0.72));
+  assert.equal(result.resolvedAnchors.length, 0, "geometry-derived rooms must not be counted as IFC semantic matches");
+});
+
 test("a door-lintel seal separates adjacent rooms while an open doorway remains one connected face", () => {
   const createDoorGrid = (sealDoor: boolean) => {
     const grid = createGrid(6, 4, 0.1);
@@ -175,3 +200,12 @@ test("a door-lintel seal separates adjacent rooms while an open doorway remains 
   assert.ok(sealed.regions.every((region) => region.source === "ifc-wall-topology-face-v1"));
 });
 
+
+
+test("prefers semantic zones when they add room stops without sacrificing floor coverage", () => {
+  assert.equal(shouldUseTopologyRoomRegions(6, 9, 0.98), true);
+  assert.equal(shouldUseTopologyRoomRegions(0, 4, 0.70), true);
+  assert.equal(shouldUseTopologyRoomRegions(6, 6, 0.99), false);
+  assert.equal(shouldUseTopologyRoomRegions(6, 9, 0.72), false);
+  assert.equal(shouldUseTopologyRoomRegions(6, 0, 1), false);
+});

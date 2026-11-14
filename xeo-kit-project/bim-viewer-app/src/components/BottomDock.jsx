@@ -6,7 +6,6 @@ import {
   Minimize,
   Maximize,
   Trash2,
-  Ruler,
 } from 'lucide-react';
 
 export const BottomDock = ({
@@ -17,8 +16,6 @@ export const BottomDock = ({
   isMaxView,
   isFullscreen,
   toggleBrowserFullscreen,
-  isMeasuring,
-  toggleMeasurementMode,
   isDarkMode = true,
 }) => {
   const shell = isDarkMode
@@ -37,20 +34,6 @@ export const BottomDock = ({
       <button type="button" onClick={onAdd} className={`${button} ${idle}`} title="Import or open a building model" aria-label="Import model">
         <Plus className="h-4.5 w-4.5 shrink-0" />
         <span className={label}>Import model</span>
-      </button>
-
-      {separator}
-
-      <button
-        type="button"
-        onClick={toggleMeasurementMode}
-        aria-pressed={!!isMeasuring}
-        className={`${button} ${isMeasuring ? 'bg-[#ff914d] text-white shadow-md shadow-orange-500/20' : idle}`}
-        title="Measure distances in the model"
-        aria-label="Measure distances"
-      >
-        <Ruler className="h-4.5 w-4.5 shrink-0" />
-        <span className={label}>Measure</span>
       </button>
 
       {separator}
