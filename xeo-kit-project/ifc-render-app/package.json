@@ -27,6 +27,7 @@
     "typescript": "^7.0.2"
   },
   "scripts": {
-    "test:room-planar-graph": "tsx --test compiler/navigation/RoomPlanarGraph.test.ts"
+    "test:room-planar-graph": "tsx --test compiler/navigation/RoomPlanarGraph.test.ts",
+    "test:home-tour": "node --test compiler/home-tour/HomeTourPlanner.test.mjs compiler/home-tour/HomeTourRouteService.test.mjs"
   }
 }

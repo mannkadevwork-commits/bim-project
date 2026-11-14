@@ -1052,6 +1052,52 @@ app.post('/api/projects/:jobId/save', (req, res) => {
     }
 });
 
+// Home Tour has its own route contract and planner. It reads the compiled
+// Recast NavMesh and returns complete, ordered room-to-room legs; it never
+// changes the interactive Explore/Guided navigation runtime.
+app.post('/api/projects/:jobId/home-tour/route', async (req, res) => {
+    const { jobId } = req.params;
+    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(jobId)) {
+        return res.status(400).json({ success: false, error: 'Invalid project id.' });
+    }
+    if (!requireActiveProject(jobId, res)) return;
+
+    const origin = req.body?.origin;
+    const originValues = Array.isArray(origin)
+        ? origin.slice(0, 3)
+        : [origin?.x, origin?.y, origin?.z];
+    if (originValues.length !== 3 || !originValues.every(value => typeof value === 'number' && Number.isFinite(value))) {
+        return res.status(400).json({ success: false, error: 'Home Tour requires a finite numeric camera origin {x, y, z}.' });
+    }
+
+    const jobDirectory = path.resolve(jobsDir, jobId);
+    const jobsRoot = path.resolve(jobsDir);
+    if (!jobDirectory.startsWith(`${jobsRoot}${path.sep}`)) {
+        return res.status(400).json({ success: false, error: 'Invalid project path.' });
+    }
+
+    try {
+        const { buildHomeTourRoute } = await import('./compiler/home-tour/HomeTourRouteService.mjs');
+        const result = await buildHomeTourRoute({
+            jobDirectory,
+            jobId,
+            origin: { x: originValues[0], y: originValues[1], z: originValues[2] },
+        });
+        res.set('Cache-Control', 'no-store');
+        return res.json(result);
+    } catch (error) {
+        const status = Number(error?.statusCode) || 500;
+        console.error(`[HomeTour] Route planning failed for ${jobId}:`, error?.message || error);
+        return res.status(status).json({
+            success: false,
+            code: error?.code || 'HOME_TOUR_ROUTE_FAILED',
+            error: error?.message || 'Home Tour route planning failed.',
+            unreachableAreas: Array.isArray(error?.unreachableAreas) ? error.unreachableAreas : [],
+            reachableStops: Array.isArray(error?.reachableStops) ? error.reachableStops : [],
+        });
+    }
+});
+
 // Versioned room/ceiling analysis API. The legacy /ceiling-rooms route below
 // remains for older editor builds; new clients use this versioned contract.
 function resolveLocalTsxCli() {

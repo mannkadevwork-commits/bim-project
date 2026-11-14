@@ -49,6 +49,29 @@ test("anchor resolver refuses a semantic point several metres outside the floor"
   assert.ok(result.warnings.some((warning) => warning.includes("No generic whole-floor room")));
 });
 
+
+test("semantic space anchors adaptively snap near wall-blocked cells with reduced confidence", () => {
+  const grid = createGrid(0, 0, 60, 40, 0.1);
+  // Simulate the IfcSpace placement being authored over a wall/reference
+  // strip; the nearest usable floor cell is deliberately more than 0.35 m away.
+  for (let j = 0; j < grid.height; j++) {
+    const y = grid.minY + (j + 0.5) * grid.cellSize;
+    for (let i = 0; i < grid.width; i++) {
+      const x = grid.minX + (i + 0.5) * grid.cellSize;
+      if (x >= 1.2 && x <= 2.8 && y >= 1.2 && y <= 2.8) grid.blocked[j * grid.width + i] = 1;
+    }
+  }
+  const floor: RoomPlanPoint[] = [{ x: 0, y: 0 }, { x: 6, y: 0 }, { x: 6, y: 4 }, { x: 0, y: 4 }];
+  const result = resolveRoomSeeds([{ key: "room-a", label: "Room A", x: 2, y: 2 }], floor, grid, 1.5);
+  assert.equal(result.seeds.length, 1);
+  assert.ok(result.seeds[0].snapDistance > 0.35);
+  assert.ok(result.seeds[0].snapDistance <= 1.5);
+  const diagnostic = result.anchorDiagnostics[0];
+  assert.ok(diagnostic, "the semantic anchor should have a diagnostic record");
+  assert.equal(diagnostic.resolved, true);
+  assert.ok(Number(diagnostic.confidence) < 0.82);
+});
+
 test("plan geometry primitives preserve area and containment", () => {
   const rectangle: RoomPlanPoint[] = [
     { x: 1, y: 2 }, { x: 5, y: 2 }, { x: 5, y: 4 }, { x: 1, y: 4 },

@@ -330,17 +330,17 @@ export const ViewportToolbar = ({
         <div className={`flex max-w-[calc(100vw-1.5rem)] flex-nowrap items-center gap-1 overflow-x-auto overscroll-x-contain rounded-2xl border px-2 py-2 backdrop-blur-2xl pointer-events-auto ${shell}`}>
           <button type="button" className={item(transformMode === 'select')} onClick={onSelect} title="Select an object to inspect or edit it" aria-label="Select an object">
             <MousePointer2 className="h-4.5 w-4.5" />
-            <span className="hidden 2xl:inline text-[11px] font-semibold">Select</span>
+            <span className="hidden xl:inline text-[11px] font-semibold">Select</span>
           </button>
 
           <button type="button" className={item(roomsOpen)} onClick={onOpenRooms} title="Browse and select rooms" aria-label="Open room browser">
             {roomsLoading ? <Loader2 className="h-4.5 w-4.5 animate-spin" /> : <DoorOpen className="h-4.5 w-4.5" />}
-            <span className="hidden 2xl:inline text-[11px] font-semibold">Rooms{roomCount ? ` (${roomCount})` : ''}</span>
+            <span className="hidden xl:inline text-[11px] font-semibold">Rooms &amp; zones{roomCount ? ` (${roomCount})` : ''}</span>
           </button>
 
           <button type="button" className={item(navMode === 'planView')} onClick={() => onNavMode?.(navMode === 'planView' ? 'orbit' : 'planView')} title="Lock the camera to a top-down floor plan" aria-label="Toggle plan view">
             <Grid2X2 className="h-4.5 w-4.5" />
-            <span className="hidden 2xl:inline text-[11px] font-semibold">Plan</span>
+            <span className="hidden xl:inline text-[11px] font-semibold">Floor plan</span>
           </button>
 
           <button
@@ -350,7 +350,7 @@ export const ViewportToolbar = ({
             aria-label={navMode === 'firstPerson' ? 'Switch to orbit controls' : 'Walk through the model'}
           >
             {navMode === 'firstPerson' ? <Orbit className="h-4.5 w-4.5" /> : navMode === 'planView' ? <Orbit className="h-4.5 w-4.5" /> : <Footprints className="h-4.5 w-4.5" />}
-            <span className="hidden 2xl:inline text-[11px] font-semibold">{navMode === 'firstPerson' || navMode === 'planView' ? 'Orbit' : 'Walk'}</span>
+            <span className="hidden xl:inline text-[11px] font-semibold">{navMode === 'firstPerson' || navMode === 'planView' ? '3D view' : 'Walk'}</span>
           </button>
 
           <div ref={cameraRef} className="relative flex items-center">
@@ -365,6 +365,7 @@ export const ViewportToolbar = ({
               aria-expanded={cameraOpen}
             >
               <Camera className="h-4.5 w-4.5" />
+              <span className="hidden xl:inline text-[11px] font-semibold">Views</span>
             </button>
           </div>
 
@@ -380,7 +381,7 @@ export const ViewportToolbar = ({
             aria-keyshortcuts="Control+Z Meta+Z"
           >
             <Undo2 className="h-4.5 w-4.5" />
-            <span className="hidden 2xl:inline text-[11px] font-semibold">Undo</span>
+            <span className="hidden xl:inline text-[11px] font-semibold">Undo</span>
           </button>
           <button
             type="button"
@@ -392,7 +393,7 @@ export const ViewportToolbar = ({
             aria-keyshortcuts="Control+Y Control+Shift+Z Meta+Y Meta+Shift+Z"
           >
             <Redo2 className="h-4.5 w-4.5" />
-            <span className="hidden 2xl:inline text-[11px] font-semibold">Redo</span>
+            <span className="hidden xl:inline text-[11px] font-semibold">Redo</span>
           </button>
 
           <button
@@ -403,7 +404,7 @@ export const ViewportToolbar = ({
             aria-label="Perspective view"
           >
             <Box className="h-4 w-4" />
-            <span className="hidden 2xl:inline">Perspective</span><span className="2xl:hidden">3D</span>
+            <span className="hidden xl:inline">Perspective</span><span className="xl:hidden">3D</span>
           </button>
 
           <button
@@ -414,16 +415,18 @@ export const ViewportToolbar = ({
             aria-label="Flat technical view"
           >
             <Grid2X2 className="h-4 w-4" />
-            <span className="hidden 2xl:inline">Flat view</span><span className="2xl:hidden">Flat</span>
+            <span className="hidden xl:inline">Flat view</span><span className="xl:hidden">Flat</span>
           </button>
 
           <div className={`mx-0.5 h-8 w-px ${divider}`} />
 
           <button type="button" className={item(isMeasuring)} onClick={onMeasure} title="Measure distances in the model" aria-label="Measure distances">
             <Ruler className="h-4.5 w-4.5" />
+            <span className="hidden xl:inline text-[11px] font-semibold">Measure</span>
           </button>
           <button type="button" className={item(isClipping)} onClick={onClip} title="Create a cutaway view to see inside the building" aria-label="Cutaway view">
             <Slice className="h-4.5 w-4.5" />
+            <span className="hidden xl:inline text-[11px] font-semibold">Cutaway</span>
           </button>
         </div>
       </div>

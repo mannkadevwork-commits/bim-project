@@ -26,6 +26,19 @@ export interface StepSpaceFootprint {
   representation: "Body" | "FootPrint";
 }
 
+export interface StepDoorPlacement {
+  expressId: number;
+  globalId: string | null;
+  name: string;
+  /** Global plan position of the IfcDoor ObjectPlacement origin (usually the left jamb). */
+  placementOrigin: StepRoomPoint;
+  /** Opening centre computed from the placement origin + half OverallWidth along local X. */
+  openingCenter: StepRoomPoint;
+  widthMeters: number | null;
+  heightMeters: number | null;
+  localWidthAxis: StepRoomPoint;
+}
+
 type StepRef = { ref: number };
 type StepValue = null | number | string | StepRef | StepValue[];
 interface StepEntity {
@@ -346,4 +359,67 @@ export function readIfcStepSpaceFootprints(
     diagnostics.push(`${missing.length} IfcSpace entity/entities do not expose a supported explicit FootPrint/Body profile in source STEP (${missing.join(", ")}); these spaces remain eligible for wall-graph association.`);
   }
   return { footprints, diagnostics };
+}
+
+/**
+ * Read IfcDoor placements/dimensions without depending on WebIFC wrapper
+ * traversal. Several real-world exports omit IfcOpeningElement and the
+ * RelVoids/RelFills relationships, but still contain valid IfcDoor placements.
+ */
+export function readIfcStepDoorPlacements(
+  filePath: string,
+  unitToMeters = 1,
+): { doors: Map<number, StepDoorPlacement>; diagnostics: string[] } {
+  const diagnostics: string[] = [];
+  const doors = new Map<number, StepDoorPlacement>();
+  if (!filePath || !fs.existsSync(filePath)) {
+    return { doors, diagnostics: ["IFC STEP door-placement fallback skipped: source file path is unavailable."] };
+  }
+
+  let entities: Map<number, StepEntity>;
+  try {
+    entities = parseEntities(fs.readFileSync(filePath, "utf8"));
+  } catch (error: any) {
+    return { doors, diagnostics: [`IFC STEP door-placement fallback could not parse source: ${String(error?.message || error)}`] };
+  }
+
+  const { readLocalPlacement } = createStepReader(entities);
+  const safeScale = Number.isFinite(unitToMeters) && unitToMeters > 0 ? unitToMeters : 1;
+  let doorCount = 0;
+  for (const entity of entities.values()) {
+    if (entity.type !== "IFCDOOR") continue;
+    doorCount++;
+    // IFC4 IfcDoor attributes include Tag between Representation and the
+    // optional OverallHeight/OverallWidth values.
+    const frame = readLocalPlacement(ref(entity.args[5]));
+    if (!frame) continue;
+    const height = numberValue(entity.args[8]);
+    const width = numberValue(entity.args[9]);
+    const widthMeters = Number.isFinite(width) && width > 0 ? width * safeScale : null;
+    const rawWidthAxis = { x: frame.xAxis.x, y: -frame.xAxis.y };
+    const axisLength = Math.hypot(rawWidthAxis.x, rawWidthAxis.y);
+    if (!Number.isFinite(axisLength) || axisLength < 1e-6) continue;
+    const localWidthAxis = { x: rawWidthAxis.x / axisLength, y: rawWidthAxis.y / axisLength };
+    const placementOrigin = { x: frame.origin.x * safeScale, y: -frame.origin.y * safeScale };
+    const halfWidth = (widthMeters ?? 0) * 0.5;
+    doors.set(entity.id, {
+      expressId: entity.id,
+      globalId: typeof entity.args[0] === "string" ? entity.args[0] : null,
+      name: typeof entity.args[2] === "string" ? entity.args[2] : `Door ${entity.id}`,
+      placementOrigin,
+      // The IfcDoor swept rectangle profile is centred at OverallWidth / 2
+      // from its placement origin. Store the opening centre separately so
+      // callers cannot accidentally sample/close the gap at the hinge corner.
+      openingCenter: {
+        x: placementOrigin.x + localWidthAxis.x * halfWidth,
+        y: placementOrigin.y + localWidthAxis.y * halfWidth,
+      },
+      widthMeters,
+      heightMeters: Number.isFinite(height) && height > 0 ? height * safeScale : null,
+      localWidthAxis,
+    });
+  }
+
+  diagnostics.push(`IFC STEP door-placement fallback inspected ${doorCount} IfcDoor entities and recovered ${doors.size} placements.`);
+  return { doors, diagnostics };
 }

@@ -123,7 +123,7 @@ export const RoomMapNavigator = ({
           <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#ff914d]/15 text-[#ff914d]"><MapPinned className="h-4 w-4" /></span>
           <div className="min-w-0">
             <h3 className="text-[11px] font-bold">Floor map</h3>
-            <p className={`text-[9px] ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{visibleRooms.length} rooms · select to enter</p>
+            <p className={`text-[9px] ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{visibleRooms.length} areas · select to enter</p>
           </div>
         </div>
         {availableLevels.length > 1 && (
@@ -144,20 +144,29 @@ export const RoomMapNavigator = ({
         )}
       </header>
 
-      {status === 'ready' && analysis?.stats && (
-        <div className={`px-3 pb-2 text-[8px] ${isDarkMode ? 'text-slate-500' : 'text-slate-500'}`}>
-          IFC spaces {Number(analysis.stats.semanticSpaceCount || 0)} · storey assigned {Number(analysis.stats.semanticSpaceAssignedToFloorCount || 0)} · floor-grid snapped {Number(analysis.stats.resolvedAnchorCount || 0)} · room regions {rooms.length}
-          {Number.isFinite(Number(analysis.stats.semanticSpaceMedianDatumOffsetMeters)) && analysis.stats.semanticSpaceMedianDatumOffsetMeters !== null && Math.abs(Number(analysis.stats.semanticSpaceMedianDatumOffsetMeters)) > 0.001
-            ? ` · datum offset ${Number(analysis.stats.semanticSpaceMedianDatumOffsetMeters).toFixed(2)} m`
-            : ''}
-        </div>
-      )}
-      {status === 'ready' && analysis?.stats && Number(analysis.stats.semanticSpaceCount || 0) > rooms.length && (
-        <div className="mx-3 mb-2 rounded-md border border-amber-500/30 bg-amber-500/[0.08] px-2 py-1.5 text-[9px] leading-4 text-amber-500">
-          Room reconstruction incomplete. {Number(analysis.stats.resolvedAnchorCount || 0)} of {Number(analysis.stats.semanticSpaceAssignedToFloorCount || 0)} storey-assigned spaces snapped to walkable floor cells. Wall mask covers {Math.round((Number(analysis.stats.wallMaskCoverageRatio) || 0) * 100)}% of floor cells; active wall geometry {Number(analysis.stats.activeLevelWallGeometryCount || 0)} / {Number(analysis.stats.totalWallGeometryCount || 0)}.
-          {analysis.stats.anchorSnapDiagnostics?.filter((item) => item.status !== 'snapped').slice(0, 3).map((item) => ` ${item.label}: ${item.status}${item.distanceToFloorMeters == null ? '' : ` (${Number(item.distanceToFloorMeters).toFixed(2)} m from floor domain)`}.`).join('')}
-        </div>
-      )}
+      {status === 'ready' && analysis?.stats && (() => {
+        const semanticSpaceCount = Number(analysis.stats.semanticSpaceCount || 0);
+        const floorSpaceCount = Number(analysis.stats.semanticSpaceAssignedToFloorCount || 0);
+        const matchedSpaceCount = Number(analysis.stats.semanticMatchedSpaceCount ?? analysis.stats.resolvedAnchorCount ?? 0);
+        const semanticZoneCount = visibleRooms.filter((room) => room.regionKind === 'semantic-zone').length;
+        const physicalRoomCount = visibleRooms.length - semanticZoneCount;
+        const anchorDiagnostics = Array.isArray(analysis.anchorDiagnostics) ? analysis.anchorDiagnostics : [];
+        const unresolved = anchorDiagnostics.filter((item) => !item.resolved);
+        const incomplete = floorSpaceCount > 0 && matchedSpaceCount < floorSpaceCount;
+        const wallMaskCoverage = Math.round(Math.max(0, Math.min(1, Number(analysis.stats.wallMaskCoverageRatio) || 0)) * 100);
+        const activeWallCount = Number(analysis.stats.activeLevelWallGeometryCount || 0);
+        return (
+          <div className={`px-3 pb-2 text-[8px] ${isDarkMode ? 'text-slate-500' : 'text-slate-500'}`}>
+            <p>IFC spaces {semanticSpaceCount} · this floor {floorSpaceCount} · aligned {matchedSpaceCount} · {physicalRoomCount} rooms · {semanticZoneCount} zones</p>
+            {incomplete && (
+              <div className="mt-1.5 rounded-md border border-amber-500/30 bg-amber-500/[0.08] px-2 py-1.5 text-[9px] leading-4 text-amber-500">
+                {matchedSpaceCount} of {floorSpaceCount} IFC space anchors aligned to this floor. The map still includes independently reconstructed physical regions; unresolved labels are not silently merged. {activeWallCount} active wall elements contributed to the boundary analysis, with {wallMaskCoverage}% wall-mask coverage of the floor grid.
+                {unresolved.length > 0 && <details className="mt-1"><summary className="cursor-pointer font-semibold">Show {unresolved.length} unresolved space labels</summary><div className="mt-1 space-y-0.5">{unresolved.map((item) => <p key={item.key}>{item.label}: {String(item.failureReason || 'unresolved').replaceAll('-', ' ')}{Number.isFinite(Number(item.outsideFloorDistanceMeters)) ? ` · ${Number(item.outsideFloorDistanceMeters).toFixed(2)} m from floor` : ''}</p>)}</div></details>}
+              </div>
+            )}
+          </div>
+        );
+      })()}
       <div className={`mx-2 overflow-hidden rounded-lg border ${isDarkMode ? 'border-slate-700 bg-[#0a1220]' : 'border-slate-200 bg-slate-50'}`}>
         {status === 'loading' && rooms.length === 0 ? (
           <div className={`flex h-[150px] flex-col items-center justify-center gap-2 px-5 text-center text-[10px] ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>

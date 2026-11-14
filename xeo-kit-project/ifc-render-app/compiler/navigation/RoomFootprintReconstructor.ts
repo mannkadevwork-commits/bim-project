@@ -1,11 +1,8 @@
 /**
- * Legacy IFC-space anchor/grid reconstruction.
- *
- * Retained for compatibility with older diagnostics and for the shared
- * RoomFootprintAnchor type. RoomDetector no longer calls this algorithm to
- * create room regions: current room existence and boundaries are derived by
- * RoomPlanarGraph from IFC wall footprints, then semantic spaces are matched
- * to the already-created physical faces.
+ * Shared floor-grid geometry primitives and semantic-anchor resolver used by
+ * the canonical room-topology reconstruction pipeline. IFC space placements
+ * are hints, not boundaries: anchors are snapped conservatively to walkable
+ * floor cells and then partitioned only inside wall-constrained components.
  */
 
 export interface RoomPlanPoint {
@@ -22,11 +19,15 @@ export interface RoomFootprintAnchor {
   expressId?: number;
   elevationY?: number;
   description?: string;
+  /** Source used for the requested plan point; useful for reproducible diagnostics. */
+  positionSource?: "ifc-description-safe-camera-center" | "ifc-object-placement";
   hasGeometryRepresentation?: boolean;
   /** IFC source plan coordinates, already converted to metres. */
   sourceX?: number;
   sourceY?: number;
   explicitPolygon?: RoomPlanPoint[] | null;
+  /** True for geometry-derived labels such as "Room 1"; not an IFC semantic identity. */
+  synthetic?: boolean;
 }
 
 export interface RoomFloorGrid {
@@ -50,7 +51,13 @@ export interface ReconstructedRoomFootprint {
   holes: RoomPlanPoint[][];
   cells: number[];
   areaM2: number;
-  source: "ifc-space-solid-v1" | "ifc-space-wall-constrained-geodesic-v2";
+  source:
+    | "ifc-space-solid-v1"
+    | "ifc-space-wall-constrained-geodesic-v2"
+    | "ifc-wall-topology-face-v1"
+    | "ifc-open-plan-semantic-zone-v1";
+  physicalComponentId?: number;
+  regionKind?: "physical-room" | "semantic-zone";
   confidence: number;
   wallBoundaryRatio: number;
 }
@@ -66,9 +73,28 @@ export interface RoomFootprintReconstructionResult {
   warnings: string[];
   floorAreaM2: number;
   coverageRatio: number;
-  method: "ifc-space-solid-v1" | "ifc-space-wall-constrained-geodesic-v2" | "none";
+  method:
+    | "ifc-space-solid-v1"
+    | "ifc-space-wall-constrained-geodesic-v2"
+    | "ifc-wall-topology-components-and-open-zones-v1"
+    | "none";
   totalWalkableCells: number;
   assignedWalkableCells: number;
+  anchorDiagnostics?: RoomAnchorResolutionDiagnostic[];
+}
+
+export interface RoomAnchorResolutionDiagnostic {
+  key: string;
+  label: string;
+  resolved: boolean;
+  positionSource?: RoomFootprintAnchor["positionSource"];
+  requestedPoint: RoomPlanPoint | null;
+  snappedPoint: RoomPlanPoint | null;
+  snapDistanceMeters: number | null;
+  maxSnapRadiusMeters?: number | null;
+  outsideFloorDistanceMeters?: number | null;
+  confidence?: number;
+  failureReason?: "missing-placement" | "outside-floor-domain" | "no-walkable-cell-within-tolerance" | null;
 }
 
 const EPSILON = 1e-8;
@@ -146,6 +172,14 @@ function centroid(points: RoomPlanPoint[]): RoomPlanPoint {
 }
 
 function candidateMappings(anchors: RoomFootprintAnchor[]): Array<{ id: string; map: (x: number, y: number) => RoomPlanPoint }> {
+  const hasViewerCoordinates = anchors.length > 0 && anchors.every((anchor) =>
+    Number.isFinite(anchor.x) && Number.isFinite(anchor.y),
+  );
+  // RoomDetector already converts IfcSpace placements into the viewer X/Z
+  // plane. Those coordinates are authoritative; source IFC coordinates are
+  // retained only for diagnostics and must not override the converted point.
+  if (hasViewerCoordinates) return [{ id: "viewer-world-xz", map: (x, y) => ({ x, y }) }];
+
   const hasSourceCoordinates = anchors.length > 0 && anchors.every((anchor) =>
     Number.isFinite(anchor.sourceX) && Number.isFinite(anchor.sourceY),
   );
@@ -162,7 +196,7 @@ function candidateMappings(anchors: RoomFootprintAnchor[]): Array<{ id: string; 
   ];
 }
 
-function gridCellCenter(grid: RoomFloorGrid, index: number): RoomPlanPoint {
+export function gridCellCenter(grid: RoomFloorGrid, index: number): RoomPlanPoint {
   const i = index % grid.width;
   const j = Math.floor(index / grid.width);
   return {
@@ -194,17 +228,23 @@ function nearestWalkableCell(
   return best;
 }
 
-interface ResolvedSeed {
+export interface ResolvedRoomSeed {
   anchor: RoomFootprintAnchor;
   point: RoomPlanPoint;
   seedIndex: number;
   snapDistance: number;
+  snapRadiusMeters: number;
+  outsideFloorDistanceMeters: number;
 }
+
+type ResolvedSeed = ResolvedRoomSeed;
 
 interface MappingCandidate {
   id: string;
   seeds: ResolvedSeed[];
   score: number;
+  mappedPoints: Map<string, RoomPlanPoint>;
+  failures: Map<string, { point: RoomPlanPoint; outsideFloorDistanceMeters: number; reason: "outside-floor-domain" | "no-walkable-cell-within-tolerance" }>;
 }
 
 function resolveSeeds(
@@ -212,39 +252,89 @@ function resolveSeeds(
   floorPolygon: RoomPlanPoint[],
   grid: RoomFloorGrid,
   maxSnapDistance: number,
-): { seeds: ResolvedSeed[]; mappingId: string; warnings: string[] } {
+): {
+  seeds: ResolvedSeed[];
+  mappingId: string;
+  warnings: string[];
+  mappedPoints: Map<string, RoomPlanPoint>;
+  failures: Map<string, { point: RoomPlanPoint; outsideFloorDistanceMeters: number; reason: "outside-floor-domain" | "no-walkable-cell-within-tolerance" }>;
+} {
   const warnings: string[] = [];
   const valid = anchors.filter((anchor) => anchor && String(anchor.label || "").trim() &&
     (Number.isFinite(anchor.x) && Number.isFinite(anchor.y) ||
       Number.isFinite(anchor.sourceX) && Number.isFinite(anchor.sourceY)));
-  if (!valid.length) return { seeds: [], mappingId: "none", warnings: ["No usable IfcSpace placement anchors were found."] };
+  if (!valid.length) return {
+    seeds: [], mappingId: "none", warnings: ["No usable IfcSpace placement anchors were found."],
+    mappedPoints: new Map(), failures: new Map(),
+  };
 
+  const cappedMaxSnap = Math.min(1.5, Math.max(0.25, Number(maxSnapDistance) || DEFAULT_ANCHOR_SNAP_METERS));
+  const snapRadii = Array.from(new Set([0.25, 0.45, 0.75, 1.0, cappedMaxSnap]
+    .map((radius) => Math.min(cappedMaxSnap, radius)))).sort((a, b) => a - b);
   const candidates: MappingCandidate[] = [];
   for (const mapping of candidateMappings(valid)) {
     const mapped = valid.map((anchor) => {
-      const sourceX = Number.isFinite(anchor.sourceX) ? Number(anchor.sourceX) : anchor.x;
-      const sourceY = Number.isFinite(anchor.sourceY) ? Number(anchor.sourceY) : anchor.y;
+      const hasViewerPoint = mapping.id === "viewer-world-xz"
+        && Number.isFinite(anchor.x) && Number.isFinite(anchor.y);
+      const sourceX = hasViewerPoint ? anchor.x : (Number.isFinite(anchor.sourceX) ? Number(anchor.sourceX) : anchor.x);
+      const sourceY = hasViewerPoint ? anchor.y : (Number.isFinite(anchor.sourceY) ? Number(anchor.sourceY) : anchor.y);
       return { anchor, point: mapping.map(sourceX, sourceY) };
     });
-    // Only attempt a tiny correction for numerical/frame-origin noise. A large
-    // translation is not inferred: that would hide a real source/scene mismatch.
     const occupied = new Set<number>();
     const seeds: ResolvedSeed[] = [];
+    const mappedPoints = new Map<string, RoomPlanPoint>();
+    const failures = new Map<string, { point: RoomPlanPoint; outsideFloorDistanceMeters: number; reason: "outside-floor-domain" | "no-walkable-cell-within-tolerance" }>();
     let totalSnapDistance = 0;
     let outsideFloor = 0;
+
     for (const item of mapped) {
+      mappedPoints.set(item.anchor.key, item.point);
       const outsideDistance = distanceToPolygon(item.point, floorPolygon);
-      if (outsideDistance > 0.001) outsideFloor++;
-      const snapped = nearestWalkableCell(grid, item.point, maxSnapDistance, occupied);
-      if (!snapped) continue;
+      if (outsideDistance > 0.20) {
+        outsideFloor++;
+        failures.set(item.anchor.key, {
+          point: item.point,
+          outsideFloorDistanceMeters: outsideDistance,
+          reason: "outside-floor-domain",
+        });
+        continue;
+      }
+
+      let snapped: ReturnType<typeof nearestWalkableCell> = null;
+      let snapRadiusMeters = cappedMaxSnap;
+      for (const radius of snapRadii) {
+        snapped = nearestWalkableCell(grid, item.point, radius, occupied);
+        if (snapped) {
+          snapRadiusMeters = radius;
+          break;
+        }
+      }
+      if (!snapped) {
+        failures.set(item.anchor.key, {
+          point: item.point,
+          outsideFloorDistanceMeters: outsideDistance,
+          reason: "no-walkable-cell-within-tolerance",
+        });
+        continue;
+      }
+
       occupied.add(snapped.index);
       totalSnapDistance += snapped.distance;
-      seeds.push({ anchor: item.anchor, point: item.point, seedIndex: snapped.index, snapDistance: snapped.distance });
+      seeds.push({
+        anchor: item.anchor,
+        point: item.point,
+        seedIndex: snapped.index,
+        snapDistance: snapped.distance,
+        snapRadiusMeters,
+        outsideFloorDistanceMeters: outsideDistance,
+      });
     }
     const mappingPreference = mapping.id === "ifc-z-up-to-viewer-xz" ? 0.01 : 0;
     candidates.push({
       id: mapping.id,
       seeds,
+      mappedPoints,
+      failures,
       score: seeds.length * 10000 - totalSnapDistance * 100 - outsideFloor * 25 + mappingPreference,
     });
   }
@@ -254,23 +344,77 @@ function resolveSeeds(
   if (!best?.seeds.length) {
     return {
       seeds: [], mappingId: best?.id || "none",
-      warnings: [`None of the ${valid.length} IFC space anchors could be snapped to walkable floor cells within ${maxSnapDistance.toFixed(2)} m. No generic whole-floor room was created.`],
+      warnings: [`None of the ${valid.length} IFC space anchors could be aligned to walkable floor cells within ${cappedMaxSnap.toFixed(2)} m. No generic whole-floor room was created.`],
+      mappedPoints: best?.mappedPoints || new Map(),
+      failures: best?.failures || new Map(),
     };
   }
 
   if (best.seeds.length < valid.length) {
     const resolved = new Set(best.seeds.map((seed) => seed.anchor.key));
     const missing = valid.filter((anchor) => !resolved.has(anchor.key)).map((anchor) => anchor.label);
-    warnings.push(`${best.seeds.length} of ${valid.length} IFC room anchors aligned to the floor. Unresolved spaces: ${missing.join(", ")}. Check the project origin and floor-level assignment.`);
+    warnings.push(`${best.seeds.length} of ${valid.length} IFC room anchors aligned to the floor. Unresolved spaces: ${missing.join(", ")}. Check the placement, floor-level assignment and wall mask.`);
   }
   if (best.id !== "ifc-z-up-to-viewer-xz" && best.id !== "viewer-world-xz") {
     warnings.push(`IFC room placements required the alternate plan mapping "${best.id}". Review room overlays before making structural changes.`);
   }
   const farSeeds = best.seeds.filter((seed) => seed.snapDistance > 0.35);
   if (farSeeds.length) {
-    warnings.push(`${farSeeds.length} IFC room anchor(s) were snapped more than 0.35 m to nearby walkable floor cells. Their semantic room identities were retained; inspect the room centres.`);
+    warnings.push(`${farSeeds.length} IFC space anchor(s) needed an adaptive snap greater than 0.35 m (maximum ${cappedMaxSnap.toFixed(2)} m). Their identity was retained with reduced boundary confidence; review their room regions before structural edits.`);
   }
-  return { seeds: best.seeds, mappingId: best.id, warnings };
+  return { seeds: best.seeds, mappingId: best.id, warnings, mappedPoints: best.mappedPoints, failures: best.failures };
+}
+
+/**
+ * Resolve semantic IfcSpace placements to distinct walkable floor cells.
+ * Unlike the legacy footprint routine, this resolver never assigns an
+ * unanchored disconnected island to the nearest room.
+ */
+export function resolveRoomSeeds(
+  anchors: RoomFootprintAnchor[],
+  floorPolygon: RoomPlanPoint[],
+  grid: RoomFloorGrid,
+  maxSnapDistance: number,
+): {
+  seeds: ResolvedRoomSeed[];
+  mappingId: string;
+  warnings: string[];
+  anchorDiagnostics: RoomAnchorResolutionDiagnostic[];
+} {
+  const resolved = resolveSeeds(anchors, floorPolygon, grid, maxSnapDistance);
+  const byKey = new Map(resolved.seeds.map((seed) => [seed.anchor.key, seed]));
+  const anchorDiagnostics = (anchors || []).map((anchor) => {
+    const seed = byKey.get(anchor.key);
+    const failure = resolved.failures.get(anchor.key);
+    const requestedPoint = resolved.mappedPoints.get(anchor.key) || (
+      Number.isFinite(anchor.x) && Number.isFinite(anchor.y)
+        ? { x: anchor.x, y: anchor.y }
+        : Number.isFinite(anchor.sourceX) && Number.isFinite(anchor.sourceY)
+          ? { x: Number(anchor.sourceX), y: Number(anchor.sourceY) }
+          : null
+    );
+    const distance = seed?.snapDistance ?? null;
+    const confidence = distance == null
+      ? 0
+      : distance <= 0.35 ? 0.98
+        : distance <= 0.75 ? 0.82
+          : distance <= 1.0 ? 0.68
+            : 0.5;
+    return {
+      key: anchor.key,
+      label: anchor.label,
+      resolved: Boolean(seed),
+      positionSource: anchor.positionSource,
+      requestedPoint,
+      snappedPoint: seed ? { x: gridCellCenter(grid, seed.seedIndex).x, y: gridCellCenter(grid, seed.seedIndex).y } : null,
+      snapDistanceMeters: seed ? Number(seed.snapDistance.toFixed(4)) : null,
+      maxSnapRadiusMeters: seed ? seed.snapRadiusMeters : Math.min(1.5, Math.max(0.25, Number(maxSnapDistance) || DEFAULT_ANCHOR_SNAP_METERS)),
+      outsideFloorDistanceMeters: Number((seed?.outsideFloorDistanceMeters ?? failure?.outsideFloorDistanceMeters ?? 0).toFixed(4)),
+      confidence,
+      failureReason: seed ? null : (failure?.reason || "missing-placement") as RoomAnchorResolutionDiagnostic["failureReason"],
+    };
+  });
+  return { ...resolved, anchorDiagnostics };
 }
 
 interface HeapEntry {
@@ -319,7 +463,7 @@ class MinHeap {
   }
 }
 
-function traceRegionLoops(grid: RoomFloorGrid, cells: number[]): RoomPlanPoint[][] {
+export function traceRegionLoops(grid: RoomFloorGrid, cells: number[]): RoomPlanPoint[][] {
   const cellSet = new Set(cells);
   const edges = new Map<string, { a: [number, number]; b: [number, number] }>();
   const has = (i: number, j: number) => i >= 0 && j >= 0 && i < grid.width && j < grid.height && cellSet.has(j * grid.width + i);
@@ -391,7 +535,7 @@ function traceRegionLoops(grid: RoomFloorGrid, cells: number[]): RoomPlanPoint[]
   return loops.sort((a, b) => polygonArea(b) - polygonArea(a));
 }
 
-function wallBoundaryRatio(grid: RoomFloorGrid, cells: number[], owner: Int32Array, regionId: number): number {
+export function wallBoundaryRatio(grid: RoomFloorGrid, cells: number[], owner: Int32Array, regionId: number): number {
   let boundaryEdges = 0;
   let wallEdges = 0;
   const directions = [[0, -1], [1, 0], [0, 1], [-1, 0]] as const;

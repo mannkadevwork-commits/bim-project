@@ -29,6 +29,7 @@ export const immersivePresentationDirectorMethods = {
   },
 
   enterImmersivePresentation(options = {}) {
+    if (this.homeTourActive) this.stopHomeTour?.('immersive-presentation-start');
     if (this.viewMode !== 'walk') return false;
     if (this.immersivePresentationActive && this.immersive360Active) return true;
 

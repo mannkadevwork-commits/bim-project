@@ -70,7 +70,7 @@ const CONFIG = {
   },
 };
 
-export const StretchTooltipOverlay = ({ visible, x, y, label }) => {
+export const StretchTooltipOverlay = ({ visible, label, rightOffset = 16 }) => {
   if (!visible || !label) return null;
 
   const parsed = parseStretchLabel(label);
@@ -79,11 +79,8 @@ export const StretchTooltipOverlay = ({ visible, x, y, label }) => {
 
   return (
     <div
-      className="fixed pointer-events-none z-[9999] min-w-[190px] max-w-[280px] rounded-2xl border border-white/10 bg-slate-950/95 px-3 py-2.5 text-white shadow-[0_14px_40px_rgba(0,0,0,0.48)] backdrop-blur-xl transition-all duration-75 animate-in fade-in zoom-in-95"
-      style={{
-        left: `${x + 20}px`,
-        top: `${y - 18}px`,
-      }}
+      className="fixed pointer-events-none z-[50] min-w-[190px] max-w-[min(280px,calc(100vw-32px))] rounded-2xl border border-white/10 bg-slate-950/95 px-3 py-2.5 text-white shadow-[0_14px_40px_rgba(0,0,0,0.48)] backdrop-blur-xl transition-all duration-75 animate-in fade-in zoom-in-95"
+      style={{ right: `${Math.max(12, Number(rightOffset) || 16)}px`, top: '82px' }}
     >
       <div className="flex items-start gap-2.5">
         <div className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border ${config.tone}`}>

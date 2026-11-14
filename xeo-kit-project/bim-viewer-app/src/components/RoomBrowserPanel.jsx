@@ -42,19 +42,27 @@ export const RoomBrowserPanel = ({
     : 'border-slate-200 bg-white/96 text-slate-800 shadow-slate-900/15';
   const muted = isDarkMode ? 'text-slate-400' : 'text-slate-500';
   const semanticSpaceCount = Number(analysis?.stats?.semanticSpaceCount) || 0;
+  const semanticSpaceAssignedToFloorCount = Number(analysis?.stats?.semanticSpaceAssignedToFloorCount) || 0;
+  const expectedFloorSemanticSpaceCount = semanticSpaceAssignedToFloorCount || semanticSpaceCount;
   const matchedSemanticSpaceCount = Number(analysis?.stats?.semanticMatchedSpaceCount ?? analysis?.stats?.resolvedAnchorCount) || 0;
   const unmatchedSemanticSpaces = Array.isArray(analysis?.stats?.unmatchedSemanticSpaces) ? analysis.stats.unmatchedSemanticSpaces : [];
   const nativeFurnitureCount = Number(analysis?.stats?.nativeFurnitureAssignedCount) || 0;
-  const segmentationDegraded = rooms.length === 0 || (semanticSpaceCount > 0 && matchedSemanticSpaceCount < semanticSpaceCount);
+  const semanticZoneCount = rooms.filter((room) => room.regionKind === 'semantic-zone').length;
+  const physicalRoomCount = Math.max(0, rooms.length - semanticZoneCount);
+  const anchorDiagnostics = Array.isArray(analysis?.anchorDiagnostics) ? analysis.anchorDiagnostics : [];
+  const unresolvedAnchors = anchorDiagnostics.filter((anchor) => !anchor.resolved);
+  const segmentationDegraded = rooms.length === 0 || (expectedFloorSemanticSpaceCount > 0 && matchedSemanticSpaceCount < expectedFloorSemanticSpaceCount);
   const reconstructionMethod = String(analysis?.stats?.roomReconstructionMethod || 'none');
   const roomCoverage = Math.max(0, Math.min(1, Number(analysis?.stats?.roomFootprintCoverageRatio ?? analysis?.stats?.roomCoverageRatio) || 0));
   const methodLabel = reconstructionMethod === 'ifc-wall-planar-graph-v1'
     ? 'IFC wall planar graph'
-    : reconstructionMethod === 'ifc-space-wall-constrained-geodesic-v2'
-      ? 'Legacy anchor/grid reconstruction'
-    : reconstructionMethod === 'ifc-space-body-envelope-v1'
-      ? 'IFC body envelope · review'
-      : 'Room reconstruction unavailable';
+    : reconstructionMethod === 'ifc-wall-topology-components-and-open-zones-v1'
+      ? 'Wall-constrained rooms + semantic zones'
+      : reconstructionMethod === 'ifc-space-wall-constrained-geodesic-v2'
+        ? 'IFC space anchors + wall-constrained grid'
+        : reconstructionMethod === 'ifc-space-body-envelope-v1'
+          ? 'IFC body envelope · review required'
+          : 'Room reconstruction unavailable';
   const input = isDarkMode
     ? 'border-slate-700 bg-slate-950/70 text-white placeholder:text-slate-500'
     : 'border-slate-200 bg-slate-50 text-slate-900 placeholder:text-slate-400';
@@ -69,8 +77,8 @@ export const RoomBrowserPanel = ({
         <div className="flex min-w-0 items-center gap-2.5">
           <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#ff914d]/15 text-[#ff914d]"><DoorOpen className="h-4.5 w-4.5" /></span>
           <div className="min-w-0">
-            <h3 className="text-sm font-bold">Rooms</h3>
-            <p className={`text-[10px] ${muted}`}>{status === 'loading' ? 'Analysing room boundaries…' : `${rooms.length} detected room${rooms.length === 1 ? '' : 's'}`}</p>
+            <h3 className="text-sm font-bold">Rooms &amp; zones</h3>
+            <p className={`text-[10px] ${muted}`}>{status === 'loading' ? 'Analysing room boundaries…' : `${rooms.length} detected area${rooms.length === 1 ? '' : 's'}`}</p>
           </div>
         </div>
         <button type="button" onClick={onClose} className={`rounded-lg p-1.5 ${muted} hover:bg-white/10`} aria-label="Close room browser"><X className="h-4 w-4" /></button>
@@ -93,7 +101,7 @@ export const RoomBrowserPanel = ({
         <div className={`mx-3 mt-2 rounded-xl border p-2.5 ${segmentationDegraded ? 'border-amber-500/30 bg-amber-500/[0.08]' : isDarkMode ? 'border-slate-700/70 bg-slate-900/50' : 'border-slate-200 bg-slate-50'}`}>
           <div className="flex items-center justify-between gap-2">
             <span className={`text-[10px] font-semibold ${segmentationDegraded ? 'text-amber-500' : muted}`}>
-              {semanticSpaceCount ? `${semanticSpaceCount} IFC labels · ${matchedSemanticSpaceCount} matched · ${rooms.length} physical rooms` : `${rooms.length} physical rooms`}
+              {`${rooms.length} detected areas · ${physicalRoomCount} physical rooms · ${semanticZoneCount} design zones`}{expectedFloorSemanticSpaceCount ? ` · ${matchedSemanticSpaceCount}/${expectedFloorSemanticSpaceCount} floor IFC labels matched` : ''}
             </span>
             {analysis.stats?.cacheHit && <span className={`text-[9px] ${muted}`}>Cached</span>}
           </div>
@@ -102,19 +110,34 @@ export const RoomBrowserPanel = ({
               <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
               {rooms.length === 0
                 ? 'No closed physical room boundaries were reconstructed from the active floor walls. Inspect missing wall connections and floor-level assignment.'
-                : `${matchedSemanticSpaceCount} of ${semanticSpaceCount} IFC space labels matched a physical room. The unmatched labels need review; room count is not expected to equal the IFC space count.`}
+                : `${matchedSemanticSpaceCount} of ${expectedFloorSemanticSpaceCount} IFC space labels assigned to this floor were associated with room regions. The remaining labels need review; physical room count is not expected to equal the IFC space count.`}
               {unmatchedSemanticSpaces.length > 0 && <span className="mt-1 block">Unmatched: {unmatchedSemanticSpaces.join(', ')}</span>}
             </p>
           ) : semanticSpaceCount > 0 ? (
             <p className="mt-1.5 flex items-start gap-1.5 text-[10px] leading-4 text-emerald-500">
               <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0" />
-              All {semanticSpaceCount} IFC space labels are associated with wall-bounded geometry. Multiple labels may share one open-plan room; no synthetic wall is created to force a one-to-one match.
+              All {expectedFloorSemanticSpaceCount || semanticSpaceCount} IFC space labels assigned to this floor are associated with room regions. Open-plan design zones are inferred subdivisions, not newly created physical walls.
             </p>
           ) : null}
           {analysis.stats?.roomReconstructionMethod && (
             <p className={`mt-1.5 text-[9px] ${muted}`}>Method: {methodLabel} · walkable-grid mapping {Math.round(roomCoverage * 100)}% · {Number(analysis.stats?.wallAxisCount) || 0} wall axes · {Number(analysis.stats?.wallGraphFaceCount) || rooms.length} graph faces</p>
           )}
           {nativeFurnitureCount > 0 && <p className={`mt-1.5 text-[9px] ${muted}`}>{nativeFurnitureCount} native IFC furniture/fixture element(s) assigned to detected rooms.</p>}
+          {anchorDiagnostics.length > 0 && (
+            <details className={`mt-2 rounded-lg border p-2 ${isDarkMode ? 'border-slate-700/70 bg-slate-950/40' : 'border-slate-200 bg-white'}`}>
+              <summary className="cursor-pointer text-[9px] font-semibold">IFC space alignment · {anchorDiagnostics.length - unresolvedAnchors.length}/{anchorDiagnostics.length} aligned</summary>
+              <div className="mt-2 max-h-32 space-y-1.5 overflow-y-auto">
+                {anchorDiagnostics.map((anchor) => (
+                  <div key={anchor.key || anchor.label} className="flex items-start justify-between gap-2 text-[9px]">
+                    <span className="min-w-0 truncate">{anchor.label}</span>
+                    <span className={`shrink-0 ${anchor.resolved ? 'text-emerald-500' : 'text-rose-500'}`}>
+                      {anchor.resolved ? `${Number(anchor.snapDistanceMeters || 0).toFixed(2)} m snap` : String(anchor.failureReason || 'unresolved').replaceAll('-', ' ')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
           {analysis.sourceIfcFileName && <p className={`mt-1 text-[9px] ${muted}`}>Source: {analysis.sourceIfcFileName} · {Number(analysis.sourceIfcSizeBytes || 0).toLocaleString()} bytes · IFC SHA {String(analysis.sourceIfcSha256 || '').slice(0, 12) || '—'}</p>}
         </div>
       )}
@@ -126,12 +149,13 @@ export const RoomBrowserPanel = ({
         {status === 'error' && (
           <div className="rounded-xl border border-rose-400/20 bg-rose-500/10 p-3">
             <div className="flex items-center gap-2 text-xs font-semibold text-rose-500"><AlertTriangle className="h-4 w-4" /> Room analysis failed</div>
-            <p className={`mt-2 text-[10px] leading-4 ${muted}`}>{error || 'The backend could not detect rooms in this project.'}</p>
-            <button type="button" onClick={onRetry} className="mt-3 inline-flex items-center gap-2 rounded-lg bg-[#ff914d] px-3 py-2 text-[10px] font-bold text-white"><RefreshCw className="h-3 w-3" /> Retry analysis</button>
+            <p className={`mt-2 text-[10px] leading-4 ${muted}`}>We couldn't build reliable room outlines from this model yet. The floor geometry is available, but one or more room boundaries need review.</p>
+            {error && <details className="mt-2 rounded-lg border border-slate-700/70 p-2"><summary className="cursor-pointer text-[9px] font-semibold text-slate-300">Technical details</summary><p className={`mt-2 whitespace-pre-wrap text-[9px] leading-4 ${muted}`}>{error}</p></details>}
+            <button type="button" onClick={onRetry} className="mt-3 inline-flex items-center gap-2 rounded-lg bg-[#ff914d] px-3 py-2 text-[10px] font-bold text-white"><RefreshCw className="h-3 w-3" /> Retry room detection</button>
           </div>
         )}
         {status === 'ready' && visibleRooms.length === 0 && (
-          <div className={`px-4 py-8 text-center text-xs ${muted}`}>{rooms.length ? 'No rooms match this search.' : 'No closed room footprints were detected in this IFC.'}</div>
+          <div className={`px-4 py-8 text-center text-xs ${muted}`}>{rooms.length ? 'No rooms match this search.' : 'No usable room boundaries were reconstructed. Review the analysis details or retry detection.'}</div>
         )}
         {visibleRooms.map((room, index) => {
           const isSelected = room.id === selectedRoomId;
@@ -146,7 +170,10 @@ export const RoomBrowserPanel = ({
             >
               <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[10px] font-bold ${isSelected ? 'bg-[#ff914d] text-white' : isDarkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>{String(index + 1).padStart(2, '0')}</span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-xs font-bold">{name}</span>
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="block truncate text-xs font-bold">{name}</span>
+                  <span className={`shrink-0 rounded px-1.5 py-0.5 text-[8px] font-bold uppercase ${room.regionKind === 'semantic-zone' ? 'bg-amber-500/10 text-amber-500' : 'bg-slate-500/10 text-slate-400'}`}>{room.regionKind === 'semantic-zone' ? 'Zone' : 'Room'}</span>
+                </span>
                 <span className={`mt-1 flex flex-wrap items-center gap-x-2 text-[10px] ${muted}`}>
                   <span>{formatArea(room.areaM2)}</span>
                   <span>·</span>

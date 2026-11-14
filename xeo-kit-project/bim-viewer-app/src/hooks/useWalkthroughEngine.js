@@ -9,8 +9,10 @@ import { immersive360DirectorMethods } from './walkthrough/immersive360Director.
 import { immersivePresentationDirectorMethods } from './walkthrough/immersivePresentationDirector.js';
 import { immersiveSceneDirectorMethods } from './walkthrough/immersiveSceneDirector.js';
 import { smart720TourDirectorMethods } from './walkthrough/smart720TourDirector.js';
+import { homeTourDirectorMethods } from './walkthrough/homeTourDirector.js';
 import { WalkthroughPerformanceMonitor } from './walkthrough/WalkthroughPerformanceMonitor.js';
 import { DEFAULT_PRESENTATION_SETTINGS, normalizePresentationSettings, resolveQualityProfile } from './walkthrough/presentationSettings.js';
+import { HOME_TOUR_FIXED_FOV_DEGREES, homeTourCameraTurnRate } from './walkthrough/homeTourPlan.js';
 
 const DEFAULT_SPEEDS = { walk: 1.65, run: 3.2 };
 const GUIDED_AUTO_TRAVEL_SPEED_SCALE = 0.70; // ~1.15 m/s at the default physical scale.
@@ -34,6 +36,8 @@ class WalkRuntime {
   constructor({ canvas, onState }) {
     this.canvas = canvas;
     this.onState = onState;
+    this.jobId = null;
+    this.apiBaseUrl = null;
     this.presentationSettings = normalizePresentationSettings(DEFAULT_PRESENTATION_SETTINGS);
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0xf4f6f8);
@@ -73,6 +77,10 @@ class WalkRuntime {
     this.query = null;
     this.filter = null;
     this.walkAreas = [];
+    // Preserve the compiler-authored room areas separately from displayable
+    // hotspots so Home Tour can still validate a room-centre stop when every
+    // hotspot in that room is rejected by the interactive destination filter.
+    this.homeTourAreaSource = [];
     this.hotspots = [];
     this.presentationRooms = [];
     this.presentationSpaces = [];
@@ -215,6 +223,7 @@ class WalkRuntime {
     this._resetImmersivePresentationState();
     this._resetImmersiveSceneState();
     this._resetSmart720TourState();
+    this._resetHomeTourState();
     this.portalClickSuppressedUntil = 0;
     this.stuck = false;
     this.recoveryAvailable = false;
@@ -270,6 +279,9 @@ class WalkRuntime {
       const key = e.key.toLowerCase();
       const activeTag = document.activeElement?.tagName;
       if (['INPUT', 'TEXTAREA', 'SELECT'].includes(activeTag)) return;
+      if (this.homeTourActive && ['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'shift'].includes(key)) {
+        this.stopHomeTour('manual-keyboard-input');
+      }
 
       // L cycles the presentation lighting independently of overview/walk state.
       if (key === 'l') {
@@ -288,6 +300,7 @@ class WalkRuntime {
         if (e.key === '-' || e.key === '_') { e.preventDefault(); this.zoom(-1); }
       }
       if (e.key === 'Escape') {
+        if (this.homeTourActive) this.stopHomeTour('escape-key');
         this.onState?.({ type: 'escape' });
       }
     };
@@ -295,6 +308,7 @@ class WalkRuntime {
     this.onContextMenu = (e) => e.preventDefault();
     this.onPointerDown = (e) => {
       if (e.button !== 0 || this.viewMode !== 'walk') return;
+      if (this.homeTourActive) this.stopHomeTour('manual-pointer-input');
       this.pointerDownAt = performance.now();
 
       if (this.immersive360Active) {
@@ -476,11 +490,13 @@ class WalkRuntime {
   };
 
   async load(jobId, baseUrl) {
+    this.jobId = String(jobId || '');
+    this.apiBaseUrl = String(baseUrl || '').replace(/\/$/, '');
     const loadStartedAt = performance.now();
     const jobBase = `${baseUrl.replace(/\/$/, '')}/jobs/${encodeURIComponent(jobId)}`;
     this.onState?.({ type: 'loading', value: true });
 
-    const [surfacePayload, hotspotsPayload, topologyPayload, navBuffer, gltf, projectStatePayload] = await Promise.all([
+    const [surfacePayload, hotspotsPayload, topologyPayload, doorDebugPayload, navBuffer, gltf, projectStatePayload] = await Promise.all([
       fetch(`${jobBase}/navigation_surface.json`, { cache: 'no-store' }).then(this._assertJson('navigation_surface.json')),
       fetch(`${jobBase}/walk_hotspots.json`, { cache: 'no-store' }).then(this._assertJson('walk_hotspots.json')).catch((error) => {
         console.warn('[Walkthrough] walk_hotspots.json unavailable; no destinations will be shown.', error);
@@ -490,6 +506,9 @@ class WalkRuntime {
         console.warn('[Walkthrough] presentation_portals.json unavailable; using hotspot-only navigation.', error);
         return { rooms: [], portals: [] };
       }),
+      fetch(`${jobBase}/room_topology_debug.json`, { cache: 'no-store' })
+        .then((response) => { if (!response.ok) throw new Error(`room_topology_debug.json returned ${response.status}`); return response.json(); })
+        .catch(() => null),
       fetch(`${jobBase}/navigation_navmesh.bin`, { cache: 'no-store' }).then(async (r) => {
         if (!r.ok) throw new Error(`navigation_navmesh.bin returned ${r.status}`);
         return new Uint8Array(await r.arrayBuffer());
@@ -539,6 +558,12 @@ class WalkRuntime {
     this.presentationRooms = Array.isArray(topologyPayload?.rooms)
       ? topologyPayload.rooms.filter((room) => Array.isArray(room?.center) && room.center.length >= 3)
       : [];
+    // Home Tour stops are the curated NAVIGATION ZONES from walk_hotspots.json,
+    // never the reconstructed architectural rooms. Room reconstruction can
+    // collapse (e.g. one 142 m2 "Living Room" for a six-zone apartment) and must
+    // not decide how many stops the tour has. presentationRooms stay available as
+    // optional labels only. Guided/Explore keep using walkAreas, unaffected.
+    this.homeTourAreaSource = semanticAreas;
     this.presentationSpaces = Array.isArray(topologyPayload?.spaces)
       ? topologyPayload.spaces.filter((space) => space?.id && Array.isArray(space?.center) && space.center.length >= 3)
       : [];
@@ -548,6 +573,8 @@ class WalkRuntime {
       ? topologyPayload.portals.filter((portal) => portal?.id && Array.isArray(portal?.center) && portal.center.length >= 3)
       : [];
     this.presentationPortalById = new Map(this.presentationPortals.map((portal) => [portal.id, portal]));
+    const doorDiagnostics = Array.isArray(doorDebugPayload?.diagnostics?.doors) ? doorDebugPayload.diagnostics.doors : [];
+    this.homeTourDoorExpressIds = new Set(doorDiagnostics.map((door) => Number(door?.doorExpressId)).filter(Number.isFinite));
 
     this.model = gltf.scene;
     this.model.updateMatrixWorld(true);
@@ -2011,6 +2038,7 @@ class WalkRuntime {
 
   async navigateToHotspot(hotspot) {
     if (!hotspot || this.viewMode !== 'walk') return false;
+    if (this.homeTourActive) this.stopHomeTour('manual-destination-selection');
     if (this.path || this.directTravel) return false;
 
     // Normalize map records back to the runtime's canonical hotspot whenever
@@ -2549,6 +2577,7 @@ class WalkRuntime {
 
   setWalkMode(mode) {
     const next = mode === 'explore' ? 'explore' : 'guided';
+    if (this.homeTourActive && next !== this.walkMode) this.stopHomeTour('walk-mode-change');
     if (next === this.walkMode) return;
     this.walkMode = next;
 
@@ -2598,6 +2627,7 @@ class WalkRuntime {
 
   setViewMode(mode) {
     const next = mode === 'overview' ? 'overview' : 'walk';
+    if (this.homeTourActive && next !== this.viewMode) this.stopHomeTour('view-mode-change');
     if (next === this.viewMode) return;
     this.viewMode = next;
     if (next === 'overview') {
@@ -2766,6 +2796,7 @@ if (name === 'top') {
   }
 
   stopTravel() {
+    if (this.homeTourActive) { this.stopHomeTour('stop-travel'); return; }
     this.path = null;
     this.pathIndex = 0;
     this.pathReplanAttempts = 0;
@@ -2964,7 +2995,11 @@ if (name === 'top') {
       if (moved < 0.0002 * Math.max(1, this.metersPerUnit)) {
         this.blockedTime += dt;
         if (this.blockedTime > 0.65) {
-          if (this._replanStalledRoute()) return;
+          if (!this.homeTourActive && this._replanStalledRoute()) return;
+          if (this.homeTourActive) {
+            this._failHomeTour(`The NavMesh movement corridor to ${this.homeTourCurrentStop?.label || 'the next room'} stopped progressing. Home Tour ended here without retries or relocation.`);
+            return;
+          }
           // Keep the camera at the last valid NavMesh position. Do not silently
           // divert to another hotspot when the selected path cannot be followed.
           this.path = null;
@@ -3479,7 +3514,7 @@ if (name === 'top') {
       if (/(sofa|couch|sectional|bed|daybed|armchair|recliner|lounge chair)/.test(lower)) {
         return { role: 'furniture', heroPriority: 9.6 };
       }
-      if (/(dining table|coffee table|side table|desk|table|chair|stool|bench|ottoman|wardrobe|closet|dresser|cabinet|bookcase|bookshelf|tv stand|television unit|kitchen island)/.test(lower)) {
+      if (/(dining|dinning|coffee table|side table|desk|table|chair|stool|bench|ottoman|wardrobe|closet|dresser|cabinet|bookcase|bookshelf|tv stand|television unit|kitchen island)/.test(lower)) {
         return { role: 'furniture', heroPriority: 7.3 };
       }
       if (/(sink|toilet|bathtub|bath|shower|basin|vanity|hob|oven|fridge|refrigerator|appliance)/.test(lower)) {
@@ -3627,7 +3662,7 @@ if (name === 'top') {
       } else if (/(tv|television)/.test(nameLower)) {
         defaultAimHeight = 1.28;
         matchRadiusMeters = 0.9;
-      } else if (/(dining table|desk|table|island)/.test(nameLower)) {
+      } else if (/(dining|dinning|desk|table|island)/.test(nameLower)) {
         defaultAimHeight = 0.68;
         matchRadiusMeters = 1.25;
       } else if (/(toilet|sink|bathtub|shower|basin|vanity)/.test(nameLower)) {
@@ -3730,7 +3765,8 @@ if (name === 'top') {
       raycaster.far = Number.isFinite(maxDistance) ? Math.max(0, maxDistance) : Infinity;
       raycaster.set(origin, direction);
       if (this.presentationOccluders?.length) {
-        hit = raycaster.intersectObjects(this.presentationOccluders, false)[0] || null;
+        const visibleOccluders = this.presentationOccluders.filter((object) => object?.visible);
+        hit = raycaster.intersectObjects(visibleOccluders, false)[0] || null;
       } else {
         // Keep compatibility with older / unusual models whose structural nodes
         // do not use the production naming convention.
@@ -4288,12 +4324,14 @@ if (name === 'top') {
   _syncCamera() {
     const smoothing = 1 - Math.exp(-this.lookSmoothing * (this._lastDt || 0.016));
     const dt = this._lastDt || 0.016;
+    const now = performance.now();
     const isTravelling = Boolean(this.path?.length || this.directTravel);
 
-    // Guided mode is a presentation camera: it slowly pans continuously, not
-    // only while travelling. Phase 8 adds two higher-priority cinematic states:
-    // a final-approach reveal and a short arrival settle.
-    if (this.immersive360Active) {
+    // Home Tour owns its heading and pitch. The generic Guided composition
+    // director must not replace the backend-route tangent or panorama sweep.
+    if (this.homeTourActive) {
+      this.guidedTravelRotating = false;
+    } else if (this.immersive360Active) {
       this.guidedTravelRotating = false;
       // 360 has its own architectural pitch. Do not overwrite it with the
       // nearly-level Guided pitch on every camera-sync frame.
@@ -4303,8 +4341,6 @@ if (name === 'top') {
         0.14,
       );
     } else if (this.walkMode === 'guided' && this.guidedAutoRotate) {
-      const now = performance.now();
-
       if (!this.guidedManualActive && this.arrivalSettleUntil > now) {
         const totalMs = Math.max(1, this.guidedArrivalSettleDurationMs);
         const elapsedMs = Math.max(0, now - this.guidedArrivalSettleStartedAt);
@@ -4469,30 +4505,63 @@ if (name === 'top') {
       }
     }
 
-    this.currentYaw = THREE.MathUtils.lerp(this.currentYaw, this.targetYaw, smoothing);
-    this.currentPitch = THREE.MathUtils.lerp(this.currentPitch, this.targetPitch, smoothing);
+    // Yaw is circular. Ordinary linear interpolation can rotate almost 360°
+    // when the desired heading crosses the -PI / +PI seam, which looked like a
+    // reverse-facing camera in the recorded Home Tour. Use shortest-arc
+    // interpolation with a deliberately slower response for cinematic travel.
+    const homeTourTurnRate = this.homeTourActive ? homeTourCameraTurnRate(this.homeTourPhase) : 0;
+    const homeTourCameraPaused = Boolean(this.homeTourActive && this.homeTourPaused);
+    if (this.homeTourActive) {
+      // Pausing freezes route and presentation clocks, not the rendered camera.
+      // A separate low-rate V-shaped ambient pose keeps the customer focused on
+      // the current room while avoiding a completely static paused frame.
+      const turnRate = homeTourCameraPaused ? homeTourCameraTurnRate('paused') : homeTourTurnRate;
+      const pitchRate = homeTourCameraPaused ? 0.48 : 8.0;
+      this.currentYaw = this._angleLerp(this.currentYaw, this.targetYaw, 1 - Math.exp(-turnRate * dt));
+      this.currentPitch = THREE.MathUtils.lerp(
+        this.currentPitch,
+        this.targetPitch,
+        1 - Math.exp(-pitchRate * dt),
+      );
+    } else {
+      this.currentYaw = THREE.MathUtils.lerp(this.currentYaw, this.targetYaw, smoothing);
+      this.currentPitch = THREE.MathUtils.lerp(this.currentPitch, this.targetPitch, smoothing);
+    }
     this.yaw = this.currentYaw;
     this.pitch = this.currentPitch;
 
-    const fovKey = this._currentPresentationFovKey();
-    const configuredFov = Number(this.presentationSettings?.camera?.[fovKey]) || this.fov || DEFAULT_FOV_DEGREES;
-    const settledGuidedDestination = this.viewMode === 'walk'
-      && this.walkMode === 'guided'
-      && !this.immersive360Active
-      && !isTravelling
-      && Boolean(this.activeHotspotId || this.guidedShotSubject);
-    const targetFov = Math.min(
-      88,
-      configuredFov + (settledGuidedDestination ? GUIDED_ARRIVAL_FOV_BOOST_DEGREES : 0),
-    );
-    const nextFov = THREE.MathUtils.lerp(
-      this.camera.fov || configuredFov,
-      targetFov,
-      1 - Math.exp(-2.0 * dt),
-    );
-    if (Math.abs(nextFov - this.camera.fov) > 0.025) {
-      this.camera.fov = nextFov;
-      this.camera.updateProjectionMatrix();
+    if (this.homeTourActive) {
+      // The Home Tour uses one fixed lens from first movement through the final
+      // room. Switching between travel/showcase FOVs created visible zoom
+      // breathing at every stop and made small camera turns feel like a zoom.
+      if (!this.homeTourFixedFovApplied || Math.abs(this.camera.fov - HOME_TOUR_FIXED_FOV_DEGREES) > 0.01 || this.camera.zoom !== 1) {
+        this.camera.fov = HOME_TOUR_FIXED_FOV_DEGREES;
+        this.camera.zoom = 1;
+        this.camera.updateProjectionMatrix();
+        this.homeTourFixedFovApplied = true;
+      }
+    } else {
+      this.homeTourFixedFovApplied = false;
+      const fovKey = this._currentPresentationFovKey();
+      const configuredFov = Number(this.presentationSettings?.camera?.[fovKey]) || this.fov || DEFAULT_FOV_DEGREES;
+      const settledGuidedDestination = this.viewMode === 'walk'
+        && this.walkMode === 'guided'
+        && !this.immersive360Active
+        && !isTravelling
+        && Boolean(this.activeHotspotId || this.guidedShotSubject);
+      const targetFov = Math.min(
+        88,
+        configuredFov + (settledGuidedDestination ? GUIDED_ARRIVAL_FOV_BOOST_DEGREES : 0),
+      );
+      const nextFov = THREE.MathUtils.lerp(
+        this.camera.fov || configuredFov,
+        targetFov,
+        1 - Math.exp(-2.0 * dt),
+      );
+      if (Math.abs(nextFov - this.camera.fov) > 0.025) {
+        this.camera.fov = nextFov;
+        this.camera.updateProjectionMatrix();
+      }
     }
 
     const baseH = this.eyeHeight * this.metersPerUnit + this.heightOffset * this.metersPerUnit;
@@ -4625,8 +4694,12 @@ if (name === 'top') {
     this._updateSmart720Offer?.();
     this._updateImmersiveSceneSwitch?.(now);
     if (this.viewMode === 'walk') {
-      this._updateMovement(dt);
-      this._syncCamera();
+      // Home Tour owns its physical follower while active. Do not run the
+      // generic movement watchdog/path smoother in parallel: it can consume
+      // or clear the same path and create false arrivals/stalls.
+      if (this.homeTourActive) this._updateHomeTour?.(now, dt);
+      else this._updateMovement(dt);
+      if (this.viewMode === 'walk') this._syncCamera();
     } else {
       this._updateOverviewKeys(dt);
       this.orbitControls.autoRotate = this.autoRotate;
@@ -4647,6 +4720,7 @@ if (name === 'top') {
   }
 
   dispose() {
+    if (this.homeTourActive || this.homeTourDoorVisibility?.size) this.stopHomeTour('runtime-dispose');
     this.running = false;
     this.performanceMonitor?.dispose();
     cancelAnimationFrame(this.animationFrame);
@@ -4696,6 +4770,7 @@ Object.assign(
   immersivePresentationDirectorMethods,
   immersiveSceneDirectorMethods,
   smart720TourDirectorMethods,
+  homeTourDirectorMethods,
 );
 
 export function useWalkthroughEngine({ containerRef, jobId }) {
@@ -4736,6 +4811,11 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
     smart720CurrentLabel: null,
     smart720StopIndex: 0,
     smart720TotalStops: 0,
+    homeTour: {
+      active: false, phase: 'idle', stopIndex: 0, totalStops: 0, label: null, areaId: null,
+      doorOff: true, doorMeshesHidden: 0, visitedCount: 0, remainingMs: 0, paused: false,
+      canPreviousRoom: false, canNextRoom: false, failure: null,
+    },
   });
 
   useEffect(() => {
@@ -4812,6 +4892,19 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
           smart720TotalStops: Number(event.totalStops) || prev.smart720TotalStops,
           smart720OfferAvailable: Boolean(event.active) ? false : prev.smart720OfferAvailable,
         }));
+        if (event.type === 'home-tour') setState((prev) => ({
+          ...prev,
+          homeTour: { ...prev.homeTour, ...event },
+          stuck: false, recoveryAvailable: false,
+          message: ['complete', 'cancelled'].includes(event.phase) ? '' : prev.message,
+        }));
+        if (event.type === 'home-tour-door-off') setState((prev) => ({
+          ...prev, homeTour: { ...prev.homeTour, doorOff: Boolean(event.value), doorMeshesHidden: Number(event.hiddenCount) || 0 },
+        }));
+        if (event.type === 'home-tour-error') setState((prev) => ({
+          ...prev, message: '', stuck: false, recoveryAvailable: false,
+          homeTour: { ...prev.homeTour, active: false, phase: 'failed', failure: event.message || 'Home Tour could not complete.' },
+        }));
         if (event.type === 'view-mode') setState((prev) => ({
           ...prev,
           immersive360OfferAvailable: event.mode === 'walk' ? !prev.immersive360Active : false,
@@ -4867,6 +4960,12 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
   const setImmersive360AutoRotate = useCallback((value) => runtimeRef.current?.setImmersive360AutoRotate(value), []);
   const switchImmersiveScene = useCallback((direction) => runtimeRef.current?.switchImmersiveScene(direction), []);
   const startSmart720Tour = useCallback(() => runtimeRef.current?.startSmart720Tour(), []);
+  const startHomeTour = useCallback(() => runtimeRef.current?.startHomeTour(), []);
+  const stopHomeTour = useCallback((reason) => runtimeRef.current?.stopHomeTour(reason), []);
+  const toggleHomeTourPause = useCallback(() => runtimeRef.current?.toggleHomeTourPause(), []);
+  const previousHomeTourRoom = useCallback(() => runtimeRef.current?.previousHomeTourRoom(), []);
+  const nextHomeTourRoom = useCallback(() => runtimeRef.current?.nextHomeTourRoom(), []);
+  const setHomeTourDoorOff = useCallback((value) => runtimeRef.current?.setHomeTourDoorOff(value), []);
   return {
     ...state,
     travelTo,
@@ -4893,5 +4992,11 @@ export function useWalkthroughEngine({ containerRef, jobId }) {
     setImmersive360AutoRotate,
     switchImmersiveScene,
     startSmart720Tour,
+    startHomeTour,
+    stopHomeTour,
+    toggleHomeTourPause,
+    previousHomeTourRoom,
+    nextHomeTourRoom,
+    setHomeTourDoorOff,
   };
 }

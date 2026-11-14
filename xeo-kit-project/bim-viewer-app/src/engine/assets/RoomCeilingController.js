@@ -5,6 +5,7 @@ import { PhongMaterial } from '@xeokit/xeokit-sdk/src/viewer/scene/materials/Pho
 import { Texture } from '@xeokit/xeokit-sdk/src/viewer/scene/materials/Texture.js';
 import { sRGBEncoding } from '@xeokit/xeokit-sdk/src/viewer/scene/constants/constants.js';
 import { ShapeUtils, Vector2 } from 'three';
+import { validateCeilingAgainstRoomRegistry } from './ceilingRegistryValidation.mjs';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 const DEFAULT_FINISH = '#F3F1EB';
@@ -291,6 +292,7 @@ export const createRoomCeilingController = (viewer) => {
   let entryGeneration = 0;
   let previewGeneration = 0;
   let previewEntry = null;
+  let currentRoomRegistry = null;
   if (!scene) return { sync: () => Promise.resolve(0), preview: () => false, clearPreview: () => {}, destroy: () => {} };
 
   const destroyEntry = (entry) => {
@@ -450,10 +452,20 @@ export const createRoomCeilingController = (viewer) => {
     return entry;
   };
 
-  const sync = (ceilings = []) => {
-    const next = new Map((Array.isArray(ceilings) ? ceilings : [])
-      .filter((item) => item?.id && (Array.isArray(item.boundary?.outer) || Array.isArray(item.polygon)))
-      .map((item) => [String(item.id), item]));
+  const sync = (ceilings = [], roomRegistry) => {
+    if (roomRegistry !== undefined) currentRoomRegistry = roomRegistry;
+    const next = new Map();
+    (Array.isArray(ceilings) ? ceilings : []).forEach((item) => {
+      if (!item?.id || (!Array.isArray(item.boundary?.outer) && !Array.isArray(item.polygon))) return;
+      const eligibility = validateCeilingAgainstRoomRegistry(item, currentRoomRegistry);
+      if (!eligibility.valid) {
+        console.warn('[CeilingDesigner] Kept saved ceiling in project data but skipped rendering because its room boundary is no longer current:', {
+          id: item.id, roomId: item.roomId || null, reason: eligibility.reason,
+        });
+        return;
+      }
+      next.set(String(item.id), item);
+    });
     const pending = [];
 
     // Remove stale committed ceilings first. Preview meshes are owned separately

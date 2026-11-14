@@ -4,8 +4,8 @@ import { createHash } from "crypto";
 import { RoomDetector } from "../navigation/RoomDetector";
 import type { DetectedRoom, RoomDebugArtifact, RoomPolygonPoint } from "../navigation/RoomTypes";
 
-const ROOM_ANALYSIS_SCHEMA_VERSION = 2;
-const ROOM_DETECTOR_VERSION = "hci-room-wall-planar-graph-v6-ifc-step-space-profile-fallback-2026-11";
+const ROOM_ANALYSIS_SCHEMA_VERSION = 4;
+const ROOM_DETECTOR_VERSION = "hci-room-boundary-registry-v9-ifcspace-description-safe-centers-2026-11";
 
 export interface RoomAnalysisOptions {
   jobDirectory: string;
@@ -21,6 +21,8 @@ export interface RoomAnalysisRoom {
   label: string;
   levelId: string;
   source: string;
+  regionKind: "physical-room" | "semantic-zone";
+  physicalComponentId: number | null;
   areaM2: number;
   boundary: {
     outer: Array<{ x: number; z: number }>;
@@ -34,7 +36,7 @@ export interface RoomAnalysisRoom {
     areaM2: number;
     perimeterM: number;
   };
-  geometrySource: "ifc-space-step-profile" | "ifc-space-body-envelope" | "ifc-space-boundary" | "wall-face-reconstruction" | "inferred-wall-grid" | "designer-override";
+  geometrySource: "ifc-space-step-profile" | "ifc-space-body-envelope" | "ifc-space-boundary" | "wall-face-reconstruction" | "wall-topology-grid" | "inferred-wall-grid" | "designer-override";
   validation: {
     closedBoundary: boolean;
     selfIntersection: boolean;
@@ -82,15 +84,20 @@ export interface RoomAnalysisResponse {
     analysisStatus: "analysed" | "detected-not-segmented";
   }>;
   rooms: RoomAnalysisRoom[];
+  anchorDiagnostics: NonNullable<RoomDebugArtifact["diagnostics"]["anchors"]>;
   warnings: string[];
   stats: {
     roomCount: number;
     floorLevelGroupCount: number;
     analysedFloorLevelCount: number;
     semanticSpaceCount: number;
+    semanticSpaceAssignedToFloorCount: number;
+    wallMaskCoverageRatio: number;
+    activeLevelWallGeometryCount: number;
     anchoredRoomCount: number;
     resolvedAnchorCount: number;
     anchorMappingId: string;
+    anchorMaxSnapDistanceMeters: number;
     roomCoverageRatio: number;
     roomReconstructionMethod: string;
     floorDomainAreaM2: number;
@@ -263,8 +270,13 @@ function buildRoom(room: DetectedRoom): RoomAnalysisRoom {
   if (room.boundarySource === "ifc-space-body-envelope") {
     diagnostics.push("Boundary is a convex envelope of the IFC space body mesh, not a validated exact room boundary. It may overfill concavities or voids and requires manual review.");
   }
+  if (room.boundarySource === "ifc-open-plan-semantic-zone" || room.regionKind === "semantic-zone") {
+    diagnostics.push("This is a logical design zone inferred from an IFC semantic-space anchor inside an open-plan physical floor component. It is not a separate wall-enclosed room and must not be treated as a structural partition. Review its extent before applying room-specific finishes or ceilings.");
+  }
   if (room.boundarySource === "wall-face-reconstruction") {
     diagnostics.push("Boundary is inferred from a planar graph of IFC wall footprints and inset to the room-facing wall sides. Review complex junctions before structural edits.");
+  } else if (room.boundarySource === "ifc-wall-topology-face") {
+    diagnostics.push("Boundary is reconstructed from walkable floor cells constrained by structural wall geometry. Review door gaps, wall junctions and open-plan boundaries before structural edits.");
   } else if (room.boundarySource === "ifc-space-wall-constrained-geodesic" || room.boundarySource === "ifc-space-anchor-geodesic") {
     diagnostics.push("This room footprint is inferred from an IFC space anchor and wall-constrained floor grid. Review the outline before making structural changes.");
   }
@@ -284,7 +296,9 @@ function buildRoom(room: DetectedRoom): RoomAnalysisRoom {
       : room.boundarySource === "ifc-space-body-envelope" ? "ifc-space-body-envelope"
         : room.boundarySource === "ifc-space-wall-constrained-geodesic" || room.boundarySource === "ifc-space-anchor-geodesic"
           ? "ifc-space-boundary"
-          : "inferred-wall-grid";
+          : room.boundarySource === "ifc-wall-topology-face"
+            ? "wall-topology-grid"
+            : "inferred-wall-grid";
   const elements = Array.isArray(room.elements) ? room.elements : [];
 
   return {
@@ -293,6 +307,8 @@ function buildRoom(room: DetectedRoom): RoomAnalysisRoom {
     label: room.label || room.semanticSpace?.name || room.id,
     levelId: room.levelId || `level_${Math.round(floorY * 100)}`,
     source: room.source,
+    regionKind: room.regionKind || "physical-room",
+    physicalComponentId: Number.isFinite(room.physicalComponentId) ? Number(room.physicalComponentId) : null,
     areaM2,
     boundary: geometryBoundary,
     geometry: { boundary: geometryBoundary, areaM2, perimeterM },
@@ -397,15 +413,20 @@ function createResponse(
     },
     levels,
     rooms,
+    anchorDiagnostics: Array.isArray(artifact.diagnostics?.anchors) ? artifact.diagnostics.anchors : [],
     warnings: Array.from(new Set(artifact.warnings || [])),
     stats: {
       roomCount: rooms.length,
       floorLevelGroupCount: Number(artifact.stats?.floorLevelGroupCount) || levels.length || 1,
       analysedFloorLevelCount: Number(artifact.stats?.analysedFloorLevelCount) || 1,
       semanticSpaceCount,
+      semanticSpaceAssignedToFloorCount: Number(artifact.stats?.semanticSpaceAssignedToFloorCount) || 0,
+      wallMaskCoverageRatio: Number(artifact.stats?.wallMaskCoverageRatio) || 0,
+      activeLevelWallGeometryCount: Number(artifact.stats?.activeLevelWallGeometryCount) || 0,
       anchoredRoomCount: Number(artifact.stats?.anchoredRoomCount) || 0,
       resolvedAnchorCount: Number(artifact.stats?.resolvedAnchorCount) || 0,
       anchorMappingId: String(artifact.stats?.anchorMappingId || "none"),
+      anchorMaxSnapDistanceMeters: Number(artifact.stats?.anchorMaxSnapDistanceMeters) || 0,
       roomCoverageRatio: Number(artifact.stats?.roomCoverageRatio) || 0,
       roomReconstructionMethod: String(artifact.stats?.roomReconstructionMethod || "none"),
       floorDomainAreaM2: Number(artifact.stats?.floorDomainAreaM2) || 0,

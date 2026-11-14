@@ -4,7 +4,7 @@ import { RoomAnalysisService } from "../room-analysis/RoomAnalysisService";
 import type { RoomAnalysisRoom, RoomAnalysisResponse } from "../room-analysis/RoomAnalysisService";
 
 const ANALYSIS_SCHEMA_VERSION = 6;
-const DETECTOR_VERSION = "hci-ceiling-canonical-room-registry-v1-2026-11";
+const DETECTOR_VERSION = "hci-ceiling-canonical-room-registry-v2-room-anchor-coordinates-2026-11";
 
 export interface CeilingAnalysisOptions {
   jobDirectory: string;

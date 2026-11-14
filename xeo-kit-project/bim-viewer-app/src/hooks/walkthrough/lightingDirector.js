@@ -250,6 +250,11 @@ export class LightingDirector {
     this.targetMode = 'day';
     this.transitionSeconds = 0.75;
     this.transitionElapsed = this.transitionSeconds;
+    this.dynamicTimeActive = false;
+    this.timeOfDayHours = 12;
+    this.targetTimeOfDayHours = 12;
+    this.solarShadowElapsed = 0;
+    this.solarShadowRefreshPending = false;
 
     this.model = null;
     this.modelCenter = new THREE.Vector3();
@@ -561,10 +566,120 @@ export class LightingDirector {
     this.fillLight.intensity = current.fill.intensity;
     this.rimLight.color.copy(current.rimColor);
     this.rimLight.intensity = current.rim.intensity;
+    this.keyLight.castShadow = Boolean(this.renderer.shadowMap.enabled);
     this._applyPracticalIntensity(current);
     this._refreshLightRig();
 
     if (refreshShadows && this.staticShadowPrepared) this.renderer.shadowMap.needsUpdate = true;
+  }
+
+
+  _lightingModeForHour(hours) {
+    if (hours >= 19.25 || hours < 6.5) return 'night';
+    if (hours >= 16.25) return 'evening';
+    return 'day';
+  }
+
+  setTimeOfDay(hours) {
+    const value = Number(hours);
+    if (!Number.isFinite(value)) return this.targetTimeOfDayHours;
+    const next = THREE.MathUtils.clamp(value, 6, 22);
+    this.dynamicTimeActive = true;
+    this.targetTimeOfDayHours = next;
+    this.targetMode = this._lightingModeForHour(next);
+    this.transitionElapsed = this.transitionSeconds;
+    this.solarShadowElapsed = 0.18;
+    this.solarShadowRefreshPending = true;
+    this.onChange?.(this.getState());
+    return next;
+  }
+
+  _applySolarTime(hours, dt = 0) {
+    if (!this.model) return;
+    const hour = THREE.MathUtils.clamp(Number(hours) || 12, 6, 22);
+    const sunrise = 6.0;
+    const sunset = 19.25;
+    const progress = THREE.MathUtils.clamp((hour - sunrise) / (sunset - sunrise), 0, 1);
+    const daylight = Math.max(0, Math.sin(progress * Math.PI));
+    const goldenMorning = Math.exp(-Math.pow((hour - 7.35) / 1.35, 2));
+    const goldenEvening = Math.exp(-Math.pow((hour - 17.65) / 1.75, 2));
+    const golden = THREE.MathUtils.clamp(Math.max(goldenMorning, goldenEvening), 0, 1);
+    const night = 1 - daylight;
+
+    // Approximate sun arc in the model's X/Z world plane. This changes the
+    // actual directional-light vector, not just the colour/intensity preset.
+    const elevation = THREE.MathUtils.degToRad(2 + daylight * 58);
+    const azimuth = THREE.MathUtils.lerp(-1.95, 1.18, progress);
+    const sunDirection = new THREE.Vector3(
+      Math.cos(azimuth) * Math.cos(elevation),
+      Math.sin(elevation),
+      Math.sin(azimuth) * Math.cos(elevation),
+    ).normalize();
+    const span = Math.max(this.modelSize.x, this.modelSize.z, 8);
+    const sunDistance = Math.max(span * 2.0, 17);
+    this.keyLight.position.copy(this.modelCenter).addScaledVector(sunDirection, sunDistance);
+    this.keyLight.target.position.copy(this.modelCenter);
+    this.keyLight.target.updateMatrixWorld?.();
+
+    const dayColor = new THREE.Color(0xfff1dc);
+    const goldenColor = new THREE.Color(0xffae6b);
+    const nightColor = new THREE.Color(0x8ea9d2);
+    const sunColor = dayColor.clone().lerp(goldenColor, golden * 0.78).lerp(nightColor, night * 0.88);
+    this.keyLight.color.copy(sunColor);
+    this.keyLight.intensity = 0.055 + daylight * 1.72 + golden * 0.16;
+    this.keyLight.castShadow = daylight > 0.045 && this.renderer.shadowMap.enabled;
+
+    const skyDay = new THREE.Color(0xf3f7ff);
+    const skyNight = new THREE.Color(0x5f789c);
+    const groundDay = new THREE.Color(0x51483f);
+    const groundNight = new THREE.Color(0x171d2a);
+    this.hemisphere.color.copy(skyDay).lerp(skyNight, night * 0.92);
+    this.hemisphere.groundColor.copy(groundDay).lerp(groundNight, night);
+    this.hemisphere.intensity = 0.12 + daylight * 0.34;
+
+    const fillDay = new THREE.Color(0xc8ddf4);
+    const fillNight = new THREE.Color(0x617ba5);
+    this.fillLight.color.copy(fillDay).lerp(fillNight, night);
+    this.fillLight.intensity = 0.10 + daylight * 0.25;
+    this.rimLight.color.copy(new THREE.Color(0xf7fbff)).lerp(goldenColor, golden * 0.52).lerp(nightColor, night * 0.75);
+    this.rimLight.intensity = 0.035 + daylight * 0.045 + golden * 0.055;
+
+    const environment = 0.15 + daylight * 0.34 + golden * 0.025;
+    if ('environmentIntensity' in this.scene) {
+      this.scene.environmentIntensity = environment * this.presentationOverrides.environmentMultiplier;
+    }
+    this.renderer.toneMappingExposure = (0.80 + daylight * 0.12 + golden * 0.035) * this.presentationOverrides.exposureMultiplier;
+    this.scene.background.set(daylight > 0.05 ? 0xdce6f0 : 0x101a2a);
+    this.scene.background.lerp(goldenColor, golden * 0.045);
+
+    const practicalGain = 0.035 + night * 0.72 + golden * 0.20;
+    this.practicalLights.forEach((light) => {
+      if (light.userData?.hciFixtureLight) {
+        const base = Number(light.userData.hciFixtureBaseIntensity || 0);
+        const authoredColor = light.userData.hciFixtureBaseColor || goldenColor;
+        light.color.copy(authoredColor).lerp(goldenColor, golden * 0.18);
+        light.intensity = base * practicalGain;
+      } else {
+        light.color.copy(new THREE.Color(0xffc98f));
+        light.intensity = practicalGain * 0.56;
+      }
+    });
+
+    this.mode = this._lightingModeForHour(hour);
+    this.targetMode = this.mode;
+
+    // The renderer uses manual shadow-map updates for performance. During a
+    // moving sun, refresh at a bounded cadence instead of recomputing shadows
+    // on every slider/input frame; always refresh once when the sun settles.
+    this.solarShadowElapsed += Math.max(0, dt);
+    const sunIsMoving = Math.abs(this.targetTimeOfDayHours - this.timeOfDayHours) > 0.015;
+    const refreshMovingSun = sunIsMoving && this.solarShadowElapsed >= 0.18;
+    const refreshSettledSun = !sunIsMoving && this.solarShadowRefreshPending;
+    if (this.staticShadowPrepared && this.renderer.shadowMap.enabled && (refreshMovingSun || refreshSettledSun)) {
+      this.renderer.shadowMap.needsUpdate = true;
+      this.solarShadowElapsed = 0;
+      if (refreshSettledSun) this.solarShadowRefreshPending = false;
+    }
   }
 
 
@@ -575,20 +690,27 @@ export class LightingDirector {
       exposureMultiplier: THREE.MathUtils.clamp(Number.isFinite(exposureMultiplier) ? exposureMultiplier : 1, 0.75, 1.25),
       environmentMultiplier: THREE.MathUtils.clamp(Number.isFinite(environmentMultiplier) ? environmentMultiplier : 1, 0.5, 1.5),
     };
-    // Apply immediately to the currently visible profile while preserving any
-    // in-progress interpolation between Day / Evening / Night.
-    const current = profile(this.mode);
-    if ('environmentIntensity' in this.scene) {
-      this.scene.environmentIntensity = current.environmentIntensity * this.presentationOverrides.environmentMultiplier;
+    // Keep the continuous solar profile live when users change exposure or
+    // environment strength from the presentation settings panel.
+    if (this.dynamicTimeActive) {
+      this._applySolarTime(this.timeOfDayHours, 0);
+    } else {
+      const current = profile(this.mode);
+      if ('environmentIntensity' in this.scene) {
+        this.scene.environmentIntensity = current.environmentIntensity * this.presentationOverrides.environmentMultiplier;
+      }
+      this.renderer.toneMappingExposure = current.exposure * this.presentationOverrides.exposureMultiplier;
     }
-    this.renderer.toneMappingExposure = current.exposure * this.presentationOverrides.exposureMultiplier;
     this.onChange?.(this.getState());
   }
 
   setMode(mode, { immediate = false } = {}) {
     const next = Object.prototype.hasOwnProperty.call(LIGHTING_MODES, mode) ? mode : 'day';
-    if (next === this.targetMode && !immediate) return next;
+    if (next === this.targetMode && !immediate && !this.dynamicTimeActive) return next;
+    this.dynamicTimeActive = false;
     this.targetMode = next;
+    this.targetTimeOfDayHours = next === 'day' ? 12 : next === 'evening' ? 17.25 : 21;
+    this.timeOfDayHours = this.targetTimeOfDayHours;
 
     if (immediate) {
       this._applyInstant(next);
@@ -606,10 +728,19 @@ export class LightingDirector {
 
   getState() {
     const p = profile(this.targetMode);
-    return { mode: this.mode, targetMode: this.targetMode, label: p.label, icon: p.icon };
+    return { mode: this.mode, targetMode: this.targetMode, label: p.label, icon: p.icon, timeOfDayHours: this.targetTimeOfDayHours };
   }
 
   update(dt) {
+    if (this.dynamicTimeActive) {
+      const delta = this.targetTimeOfDayHours - this.timeOfDayHours;
+      const response = 3.2;
+      this.timeOfDayHours += delta * (1 - Math.exp(-response * Math.max(dt, 0.001)));
+      if (Math.abs(this.targetTimeOfDayHours - this.timeOfDayHours) < 0.005) this.timeOfDayHours = this.targetTimeOfDayHours;
+      this._applySolarTime(this.timeOfDayHours, dt);
+      return;
+    }
+
     if (this.transitionElapsed >= this.transitionSeconds) return;
 
     this.transitionElapsed = Math.min(

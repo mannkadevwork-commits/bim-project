@@ -227,6 +227,25 @@ function polygonCentroid(polygon: RoomPlanPoint[]): RoomPlanPoint {
   return { x: x / (3 * twiceArea), y: y / (3 * twiceArea) };
 }
 
+/**
+ * Prefer semantic floor-grid regions over coarser wall faces only when they
+ * add real room/zone targets and still cover most of the walkable floor. This
+ * lets open-plan IFC spaces become separate presentation stops without allowing
+ * a lower-coverage fallback to discard otherwise valid physical room faces.
+ */
+export function shouldUseTopologyRoomRegions(
+  wallGraphFaceCount: number,
+  topologyRegionCount: number,
+  coverageRatio: number,
+  minimumCoverageRatio = 0.85,
+): boolean {
+  if (!Number.isFinite(topologyRegionCount) || topologyRegionCount <= 0) return false;
+  if (!Number.isFinite(wallGraphFaceCount) || wallGraphFaceCount <= 0) return true;
+  return topologyRegionCount > wallGraphFaceCount
+    && Number.isFinite(coverageRatio)
+    && coverageRatio >= minimumCoverageRatio;
+}
+
 export interface WallTopologyReconstructionOptions {
   floorPolygon: RoomPlanPoint[];
   anchors: RoomFootprintAnchor[];
@@ -279,13 +298,7 @@ export function reconstructRoomsFromWallTopology(
   const resolved = resolveRoomSeeds(options.anchors || [], floorPolygon, grid, maxSnap);
   const warnings = [...resolved.warnings];
   if (!resolved.seeds.length) {
-    return {
-      ...empty(resolved.mappingId, [...warnings, "No IFC room anchor could be associated with a physical floor face."]),
-      totalWalkableCells: topology.totalWalkableCells,
-      anchorDiagnostics: resolved.anchorDiagnostics,
-      physicalComponentCount: topology.components.length,
-      unanchoredComponentCount: topology.components.length,
-    };
+    warnings.push("No IFC semantic space anchor could be snapped to a walkable cell. The detector will still publish only floor components that are independently enclosed by wall geometry; unbounded areas remain unassigned.");
   }
 
   const seedsByComponent = new Map<number, Array<{ seed: ResolvedRoomSeed; seedOwner: number }>>();
@@ -332,12 +345,6 @@ export function reconstructRoomsFromWallTopology(
       topology.componentByCell,
     );
     for (const [seedOwner, cells] of split) regionCellsBySeed.set(seedOwner, cells);
-  }
-
-  if (unanchoredComponentCount) {
-    warnings.push(
-      `${unanchoredComponentCount} disconnected floor component(s) had no matching IFC space anchor and were left unassigned instead of being merged into another room.`,
-    );
   }
 
   const owner = new Int32Array(grid.floor.length);
@@ -394,10 +401,85 @@ export function reconstructRoomsFromWallTopology(
       cells,
       areaM2: explicitPolygon.length >= 3 ? polygonArea(explicitPolygon) : areaM2,
       source,
+      physicalComponentId: componentId,
+      regionKind: componentSeedCount > 1 ? "semantic-zone" : "physical-room",
       confidence,
       wallBoundaryRatio: boundaryRatio,
     });
     resolvedAnchors.push(anchor);
+  }
+
+  // Publish wall-enclosed physical components even when IFC semantic anchors
+  // are missing or cannot be aligned. This is a geometry-derived room, not a
+  // guessed semantic label: it is emitted only when the floor-grid boundary
+  // is substantially supported by blocked wall cells. Open/unbounded islands
+  // remain unassigned, preserving the no-fabricated-room rule.
+  const anchoredComponentIds = new Set(seedsByComponent.keys());
+  let fallbackRoomIndex = 1;
+  for (const component of topology.components) {
+    if (anchoredComponentIds.has(component.id)) continue;
+    const areaM2 = component.cells.length * grid.cellSize * grid.cellSize;
+    if (areaM2 < 1.0) continue;
+
+    const fallbackRegionId = resolved.seeds.length + component.id + 1;
+    for (const cell of component.cells) owner[cell] = fallbackRegionId;
+    const boundaryRatio = wallBoundaryRatio(grid, component.cells, owner, fallbackRegionId);
+    if (boundaryRatio < 0.72) {
+      for (const cell of component.cells) owner[cell] = -1;
+      continue;
+    }
+
+    const loops = traceRegionLoops(grid, component.cells);
+    const outer = loops[0] || [];
+    if (outer.length < 3) {
+      for (const cell of component.cells) owner[cell] = -1;
+      warnings.push(`Unlabelled floor component ${component.id + 1} has strong wall adjacency but its boundary could not be vectorized; it remains unassigned.`);
+      continue;
+    }
+    const holes = loops.slice(1).filter((loop) => pointInPlanPolygon(polygonCentroid(loop), outer));
+    const geometricCenter = polygonCentroid(outer);
+    const safeCell = component.cells.reduce((best, cell) => {
+      const point = gridCellCenter(grid, cell);
+      const bestPoint = gridCellCenter(grid, best);
+      return Math.hypot(point.x - geometricCenter.x, point.y - geometricCenter.y)
+        < Math.hypot(bestPoint.x - geometricCenter.x, bestPoint.y - geometricCenter.y) ? cell : best;
+    }, component.cells[0]);
+    const center = gridCellCenter(grid, safeCell);
+    const label = `Room ${fallbackRoomIndex++}`;
+    const anchor: RoomFootprintAnchor & { snappedX: number; snappedY: number; snapDistanceMeters: number } = {
+      key: `physical-component:${component.id}`,
+      label,
+      x: center.x,
+      y: center.y,
+      snappedX: center.x,
+      snappedY: center.y,
+      snapDistanceMeters: 0,
+      hasGeometryRepresentation: false,
+      synthetic: true,
+    };
+    regions.push({
+      anchor,
+      polygon: outer,
+      holes,
+      cells: component.cells,
+      areaM2,
+      source: "ifc-wall-topology-face-v1",
+      physicalComponentId: component.id,
+      regionKind: "physical-room",
+      confidence: Math.max(0.52, Math.min(0.88, 0.50 + boundaryRatio * 0.38)),
+      wallBoundaryRatio: boundaryRatio,
+    });
+    warnings.push(`${label} was reconstructed from an independently wall-enclosed floor component without an IFC IfcSpace label. Review its boundary before applying structural edits.`);
+  }
+
+  if (unanchoredComponentCount) {
+    const publishedFallbackCount = regions.filter((region) => region.anchor.synthetic).length;
+    const unassignedCount = Math.max(0, unanchoredComponentCount - publishedFallbackCount);
+    if (unassignedCount > 0) {
+      warnings.push(
+        `${unassignedCount} disconnected floor component(s) had no matching IFC space anchor and did not meet the wall-enclosure confidence threshold; they were left unassigned instead of being merged into another room.`,
+      );
+    }
   }
 
   grid.room.fill(-1);
