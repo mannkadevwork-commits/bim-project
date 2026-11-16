@@ -198,7 +198,7 @@ export const RoomPropertiesPanel = ({
         {roomFurniture.length ? (
           <div className="space-y-2">
             {roomFurniture.map((item) => {
-              const protectedItem = Boolean(item.doorHostWallId || item.isNativeIsolation || item.nativeSourceId);
+              const protectedItem = Boolean(item.doorHostWallId || item.windowHostWallId || item.isNativeIsolation || item.nativeSourceId);
               const fileType = String(item.fileType || item.file_type || 'asset').toUpperCase();
               return (
                 <div key={item.instanceId} className={`rounded-xl border p-2.5 ${isDarkMode ? 'border-slate-700/80 bg-slate-950/35' : 'border-slate-200 bg-white'}`}>

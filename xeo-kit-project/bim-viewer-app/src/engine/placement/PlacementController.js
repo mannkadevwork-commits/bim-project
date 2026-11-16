@@ -1,4 +1,5 @@
 import { WALL_IFC_CLASSES } from '../utils/constants';
+import { classifyWallHost, createWallHostPlacement, isVerticalWallNormal } from './wallHostPlacement.mjs';
 
 export const resolveCollisionFreePosition = (pos, projectStateRef, minDistance = 0.9) => {
   const furniture = projectStateRef.current.furniture || [];
@@ -53,6 +54,90 @@ export const getWallSnapData = (viewerRef, canvasPos) => {
     wallNormal: [...normal],
     wallEntityId: wallPick.entity.id,
     wallEntityModelId: wallPick.entity.model?.id ?? null,
+  };
+};
+
+
+
+const resolveWallStandoff = (asset = {}) => {
+  const explicit = Number(asset.wallMountOffset ?? asset.wall_mount_offset);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.min(0.35, explicit);
+  const dimensions = asset.dimensions || asset.size || {};
+  const depth = Number(
+    asset.wallMountDepth ?? asset.wall_mount_depth ??
+    asset.depth ?? dimensions.depth ?? dimensions.z ??
+    (Array.isArray(dimensions) ? dimensions[2] : NaN)
+  );
+  return Number.isFinite(depth) && depth > 0 ? Math.min(0.35, Math.max(0.02, depth / 2 + 0.012)) : 0.06;
+};
+
+/**
+ * Resolve a reusable IFC/GLB wall host from a xeokit surface pick.
+ * This is intentionally separate from getWallSnapData(): legacy door insertion
+ * retains its existing IFC-only backend contract until the new opening adapter
+ * is implemented.
+ */
+export const getWallHostData = (viewerRef, canvasPos, asset = {}) => {
+  const viewer = viewerRef?.current;
+  if (!viewer || !canvasPos) return null;
+
+  let wallPick = null;
+  try {
+    wallPick = viewer.scene.pick({ canvasPos, pickSurface: true });
+  } catch (_) {
+    return null;
+  }
+
+  const entity = wallPick?.entity;
+  const position = wallPick?.worldPos;
+  const normal = wallPick?.worldNormal;
+  if (!entity || !position || !normal || !isVerticalWallNormal(normal)) return null;
+
+  const metaObject = viewer.metaScene?.metaObjects?.[entity.id] ||
+    viewer.metaScene?.metaObjects?.[String(entity.id)] || null;
+  const model = entity.model || viewer.scene?.models?.[entity.modelId] || null;
+  const modelMeta = {
+    ...(model?._assetMeta || {}),
+    fileType: model?._assetMeta?.fileType || model?._assetMeta?.assetFormat || model?.fileType || null,
+    name: model?._assetMeta?.name || model?.name || null,
+  };
+  const classification = classifyWallHost({
+    entityId: entity.id,
+    entityName: metaObject?.name || entity.name || entity.id,
+    entityType: metaObject?.type || metaObject?.ifcType || entity.type,
+    modelMeta,
+    aabb: entity.aabb || entity.worldAABB || entity.bounds || null,
+    allowGeometricFallback: true,
+  });
+  if (!classification.accepted) return null;
+
+  const isGLBAsset = String(asset.file_type || asset.fileType || asset.url || '').toLowerCase().includes('glb');
+  const forwardAxis = asset.wallMountForwardAxis || asset.wall_mount_forward_axis || (isGLBAsset ? '-Z' : '+Z');
+  const placement = createWallHostPlacement({
+    position,
+    normal,
+    entityId: entity.id,
+    modelId: model?.id || entity.modelId || null,
+    globalId: metaObject && /^ifc/i.test(String(metaObject.type || metaObject.ifcType || ''))
+      ? (metaObject.globalId || metaObject.id || entity.id)
+      : null,
+    hostType: classification.hostType,
+    bounds: classification.bounds,
+    confidence: classification.confidence,
+    reason: classification.reason,
+    forwardAxis,
+    standoff: resolveWallStandoff(asset),
+  });
+  if (!placement) return null;
+
+  return {
+    ...placement,
+    wallEntityId: String(entity.id),
+    wallEntityModelId: model?.id || entity.modelId || null,
+    wallGlobalId: metaObject && /^ifc/i.test(String(metaObject.type || metaObject.ifcType || ''))
+      ? String(metaObject.globalId || metaObject.id || entity.id)
+      : null,
+    snapped: true,
   };
 };
 

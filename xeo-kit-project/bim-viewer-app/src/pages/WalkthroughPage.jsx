@@ -46,6 +46,8 @@ export default function WalkthroughPage() {
   const [walkMode, setWalkMode] = useState('guided');
   const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
   const [displayName, setDisplayName] = useState('');
+  const [homeTourControlsVisible, setHomeTourControlsVisible] = useState(true);
+  const homeTourControlsTimerRef = useRef(null);
 
 
   useEffect(() => {
@@ -194,6 +196,41 @@ export default function WalkthroughPage() {
     setHelpOpen(false);
     setLockToast(false);
   }, [homeTourActive]);
+
+  useEffect(() => {
+    if (homeTourControlsTimerRef.current) clearTimeout(homeTourControlsTimerRef.current);
+    if (!homeTourActive) {
+      setHomeTourControlsVisible(true);
+      return undefined;
+    }
+
+    const paused = Boolean(walkthrough.homeTour?.paused);
+    const revealControls = () => {
+      setHomeTourControlsVisible(true);
+      if (homeTourControlsTimerRef.current) clearTimeout(homeTourControlsTimerRef.current);
+      // Keep controls available while paused. During playback, tuck the buttons
+      // away after inactivity but leave the room title and progress visible.
+      if (!paused) {
+        homeTourControlsTimerRef.current = setTimeout(() => {
+          setHomeTourControlsVisible(false);
+        }, 5200);
+      }
+    };
+
+    revealControls();
+    window.addEventListener('pointermove', revealControls, { passive: true });
+    window.addEventListener('pointerdown', revealControls, { passive: true });
+    window.addEventListener('keydown', revealControls);
+    window.addEventListener('touchstart', revealControls, { passive: true });
+
+    return () => {
+      window.removeEventListener('pointermove', revealControls);
+      window.removeEventListener('pointerdown', revealControls);
+      window.removeEventListener('keydown', revealControls);
+      window.removeEventListener('touchstart', revealControls);
+      if (homeTourControlsTimerRef.current) clearTimeout(homeTourControlsTimerRef.current);
+    };
+  }, [homeTourActive, walkthrough.homeTour?.paused]);
 
   useEffect(() => {
     if (walkthrough.homeTour?.phase === 'complete') {
@@ -773,73 +810,111 @@ export default function WalkthroughPage() {
         </button> */}
       </div>}
 
-      {homeTourActive && (
-        <>
-          <div className="pointer-events-none absolute left-1/2 top-[84px] z-30 w-[min(92vw,430px)] -translate-x-1/2">
-            <div className="rounded-2xl border border-white/10 bg-slate-950/72 px-4 py-3 text-white shadow-[0_18px_60px_rgba(0,0,0,.25)] backdrop-blur-2xl">
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-orange-200/85">{walkthrough.homeTour.phase === 'planning' ? 'Preparing your tour' : `Room ${Math.max(1, walkthrough.homeTour.stopIndex || 1)} of ${Math.max(1, walkthrough.homeTour.totalStops || 1)}`}</div>
-                  <div className="mt-1 truncate text-sm font-semibold text-white">{walkthrough.homeTour.label || (walkthrough.homeTour.phase === 'planning' ? 'Preparing your home tour' : 'Your property')}</div>
+      {homeTourActive && (() => {
+        const tour = walkthrough.homeTour || {};
+        const totalStops = Math.max(1, Number(tour.totalStops) || 1);
+        const stopIndex = Math.max(1, Math.min(totalStops, Number(tour.stopIndex) || 1));
+        const phaseProgress = tour.phase === 'traveling'
+          ? 0.12 + (Math.max(0, Math.min(1, Number(tour.legProgress) || 0)) * 0.58)
+          : tour.phase === 'revealing'
+            ? 0.70 + (Math.max(0, Math.min(1, Number(tour.revealProgress) || 0)) * 0.16)
+            : tour.phase === 'sweeping'
+              ? 0.86 + (Math.max(0, Math.min(1, Number(tour.sweepProgress) || 0)) * 0.14)
+              : 0;
+        const phaseLabel = tour.paused
+          ? 'Paused'
+          : tour.phase === 'planning'
+            ? 'Preparing route'
+            : tour.phase === 'traveling'
+              ? 'On the way'
+              : tour.phase === 'revealing'
+                ? 'Room reveal'
+                : 'Room showcase';
+
+        return (
+          <div className="pointer-events-none absolute left-1/2 top-[82px] z-50 w-[min(94vw,620px)] -translate-x-1/2">
+            <div className="pointer-events-auto rounded-[20px] border border-white/15 bg-slate-950/76 px-3 py-2.5 text-white shadow-[0_16px_54px_rgba(0,0,0,.34)] backdrop-blur-2xl sm:px-4">
+              <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
+                <div className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-[#ff914d]/25 bg-[#ff914d]/12 sm:flex">
+                  <Move3d className="h-4 w-4 text-[#ffb17e]" />
                 </div>
-                <div className="shrink-0 text-[10px] font-medium text-slate-300">
-                  {walkthrough.homeTour.paused ? 'Paused' : walkthrough.homeTour.phase === 'planning' ? 'Preparing route' : walkthrough.homeTour.phase === 'traveling' ? 'Moving to room' : walkthrough.homeTour.phase === 'revealing' ? 'Room reveal' : 'Slow panorama'}
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="shrink-0 text-[9px] font-bold uppercase tracking-[0.18em] text-orange-200/90">HCI TOUR</span>
+                    <span className="h-1 w-1 shrink-0 rounded-full bg-white/30" />
+                    <span className="truncate text-[10px] text-slate-300">{displayName || 'Property presentation'}</span>
+                    <span className="ml-auto hidden shrink-0 text-[9px] font-medium text-slate-400 sm:inline">{phaseLabel}</span>
+                  </div>
+                  <div className="mt-0.5 flex min-w-0 items-baseline gap-2">
+                    <span className="truncate text-xs font-semibold text-white sm:text-[13px]">{tour.label || (tour.phase === 'planning' ? 'Preparing your tour' : 'Property walkthrough')}</span>
+                    <span className="shrink-0 text-[10px] font-semibold tabular-nums text-slate-400">{String(stopIndex).padStart(2, '0')} / {String(totalStops).padStart(2, '0')}</span>
+                  </div>
+                </div>
+                <div className={`mx-0.5 hidden h-8 w-px shrink-0 bg-white/10 transition-opacity duration-300 sm:block ${homeTourControlsVisible ? 'opacity-100' : 'opacity-0'}`} />
+                <div
+                  aria-hidden={!homeTourControlsVisible}
+                  className={`flex shrink-0 items-center gap-1 transition-[opacity,transform] duration-500 ${homeTourControlsVisible ? 'translate-y-0 opacity-100' : 'pointer-events-none -translate-y-1 opacity-0'}`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => walkthrough.previousHomeTourRoom()}
+                    disabled={!tour.canPreviousRoom || tour.phase === 'planning'}
+                    tabIndex={homeTourControlsVisible ? 0 : -1}
+                    className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.045] text-slate-200 transition hover:border-white/20 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-25"
+                    title="Previous room"
+                    aria-label="Previous room"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => walkthrough.toggleHomeTourPause()}
+                    disabled={tour.phase === 'planning'}
+                    tabIndex={homeTourControlsVisible ? 0 : -1}
+                    className="flex h-9 min-w-9 items-center justify-center gap-1.5 rounded-xl bg-[#ff914d] px-3 text-slate-950 shadow-[0_6px_20px_rgba(255,145,77,.18)] transition hover:bg-[#ff7a28] disabled:cursor-not-allowed disabled:opacity-40"
+                    title={tour.paused ? 'Resume Home Tour' : 'Pause Home Tour'}
+                    aria-label={tour.paused ? 'Resume Home Tour' : 'Pause Home Tour'}
+                  >
+                    {tour.paused ? <Play className="h-3.5 w-3.5 fill-current" /> : <Pause className="h-3.5 w-3.5 fill-current" />}
+                    <span className="hidden text-[10px] font-bold sm:inline">{tour.paused ? 'Resume' : 'Pause'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => walkthrough.nextHomeTourRoom()}
+                    disabled={!tour.canNextRoom || tour.phase === 'planning'}
+                    tabIndex={homeTourControlsVisible ? 0 : -1}
+                    className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.045] text-slate-200 transition hover:border-white/20 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-25"
+                    title="Next room"
+                    aria-label="Next room"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => walkthrough.stopHomeTour('home-tour-end-presentation')}
+                    tabIndex={homeTourControlsVisible ? 0 : -1}
+                    className="ml-0.5 flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.045] text-slate-300 transition hover:border-rose-300/30 hover:bg-rose-400/10 hover:text-rose-200"
+                    title="End tour"
+                    aria-label="End Home Tour"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
                 </div>
               </div>
-              <div className="mt-3 h-1 overflow-hidden rounded-full bg-white/10">
-                <div className="h-full rounded-full bg-gradient-to-r from-[#ff914d] to-[#ffd1b3] transition-[width] duration-500" style={{ width: `${Math.min(100, (Math.max(0, Number(walkthrough.homeTour.stopIndex) || 0) / Math.max(1, Number(walkthrough.homeTour.totalStops) || 1)) * 100)}%` }} />
+              <div className="mt-2 flex gap-1" aria-label={`Tour progress: room ${stopIndex} of ${totalStops}`}>
+                {Array.from({ length: totalStops }, (_, index) => {
+                  const fill = index < stopIndex - 1 ? 100 : index === stopIndex - 1 ? phaseProgress * 100 : 0;
+                  return (
+                    <div key={`home-tour-progress-${index}`} className="h-[3px] min-w-0 flex-1 overflow-hidden rounded-full bg-white/10">
+                      <div className="h-full rounded-full bg-gradient-to-r from-[#ff914d] to-[#ffd4b7] transition-[width] duration-300" style={{ width: `${Math.max(0, Math.min(100, fill))}%` }} />
+                    </div>
+                  );
+                })}
               </div>
             </div>
           </div>
-
-          <div className="absolute bottom-6 left-1/2 z-40 w-[min(94vw,610px)] -translate-x-1/2 rounded-[26px] border border-white/12 bg-slate-950/88 p-3 text-white shadow-[0_28px_90px_rgba(0,0,0,.48)] backdrop-blur-2xl sm:p-4">
-            <div className="flex items-center justify-between gap-3 px-1">
-              <div className="min-w-0">
-                <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-orange-200/85">HCI · CINEMATIC PRESENTATION</div>
-                <div className="mt-1 truncate text-xs font-medium text-slate-300">
-                  {walkthrough.homeTour.paused ? 'Tour paused · your place is saved' : walkthrough.homeTour.phase === 'planning' ? 'Preparing a safe route through the property' : walkthrough.homeTour.phase === 'traveling' ? 'Travelling smoothly to the next room' : walkthrough.homeTour.phase === 'revealing' ? 'Composing the room view' : 'Enjoy the slow 360° room panorama'}
-                </div>
-              </div>
-              <button type="button" onClick={() => walkthrough.stopHomeTour('home-tour-end-presentation')} className="flex h-9 shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-white/[0.055] px-3 text-[11px] font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.1]" title="End Home Tour">
-                <X className="h-3.5 w-3.5" /> <span className="hidden sm:inline">End tour</span>
-              </button>
-            </div>
-
-            <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2">
-              <button
-                type="button"
-                onClick={() => walkthrough.previousHomeTourRoom()}
-                disabled={!walkthrough.homeTour.canPreviousRoom || walkthrough.homeTour.phase === 'planning'}
-                className="flex h-11 items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.055] px-2 text-[11px] font-semibold text-slate-200 transition hover:bg-white/[0.11] disabled:cursor-not-allowed disabled:opacity-30 sm:px-3"
-                title="Return to the previous room"
-              >
-                <ChevronLeft className="h-4 w-4" /> <span className="hidden sm:inline">Previous room</span><span className="sm:hidden">Previous</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => walkthrough.toggleHomeTourPause()}
-                disabled={walkthrough.homeTour.phase === 'planning'}
-                className="flex h-12 min-w-[132px] items-center justify-center gap-2 rounded-xl bg-[#ff914d] px-5 text-xs font-bold text-slate-950 shadow-[0_10px_30px_rgba(255,145,77,.22)] transition hover:bg-[#ff7a28] disabled:cursor-not-allowed disabled:opacity-40"
-                title={walkthrough.homeTour.paused ? 'Resume Home Tour' : 'Pause Home Tour'}
-              >
-                {walkthrough.homeTour.paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
-                {walkthrough.homeTour.paused ? 'Resume' : 'Pause'}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => walkthrough.nextHomeTourRoom()}
-                disabled={!walkthrough.homeTour.canNextRoom || walkthrough.homeTour.phase === 'planning'}
-                className="flex h-11 items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.055] px-2 text-[11px] font-semibold text-slate-200 transition hover:bg-white/[0.11] disabled:cursor-not-allowed disabled:opacity-30 sm:px-3"
-                title={walkthrough.homeTour.phase === 'traveling' ? 'Skip this room after the current safe arrival' : 'Move to the next room'}
-              >
-                <span className="hidden sm:inline">Next room</span><span className="sm:hidden">Next</span><ChevronRight className="h-4 w-4" />
-              </button>
-            </div>
-          </div>
-        </>
-      )}
+        );
+      })()}
 
       {!homeTourActive && walkthrough.homeTour?.phase === 'failed' && walkthrough.homeTour.failure && (
         <div className="absolute bottom-28 left-1/2 z-40 w-[min(92vw,430px)] -translate-x-1/2 rounded-2xl border border-rose-400/25 bg-slate-950/95 p-4 text-white shadow-2xl backdrop-blur-2xl">

@@ -4,10 +4,17 @@
 export const HOME_TOUR_ROUTE_REQUEST_TIMEOUT_MS = 8_000;
 export const HOME_TOUR_PLANNER_VERSION = 'navmesh-zone-tour-v2.2';
 export const HOME_TOUR_ROUTE_CONTRACT = 'hci.home-tour.navigation-zones.v2';
-export const HOME_TOUR_CRUISE_SPEED_MPS = 0.82;
+// A residential walkthrough should feel like a stabilized dolly, not a game
+// character. The path remains the exact prevalidated NavMesh polyline; speed
+// is eased independently so starts, corners and arrivals do not feel abrupt.
+export const HOME_TOUR_CRUISE_SPEED_MPS = 0.58;
+export const HOME_TOUR_MAX_ACCELERATION_MPS2 = 0.32;
+export const HOME_TOUR_MAX_JERK_MPS3 = 0.72;
+export const HOME_TOUR_CORNER_SPEED_RATIO = 0.42;
+export const HOME_TOUR_ARRIVAL_SNAP_METERS = 0.035;
 export const HOME_TOUR_FIXED_FOV_DEGREES = 70;
 export const HOME_TOUR_CAMERA_PITCH = -0.15;
-export const HOME_TOUR_LOOK_AHEAD_METERS = 0.72;
+export const HOME_TOUR_LOOK_AHEAD_METERS = 1.65;
 export const HOME_TOUR_HERO_REVEAL_MS = 3_600;
 export const HOME_TOUR_SWEEP_DEGREES_PER_SECOND = 6; // A genuinely open 360° room takes 60 seconds; obstructed rooms use a shorter arc.
 export const HOME_TOUR_SWEEP_SAMPLE_COUNT = 48;
@@ -30,7 +37,7 @@ export function homeTourCameraTurnRate(phase) {
   if (phase === 'paused') return 0.34;
   if (phase === 'revealing') return 1.65;
   if (phase === 'sweeping') return 2.8;
-  if (phase === 'traveling') return 2.4;
+  if (phase === 'traveling') return 1.15;
   if (phase === 'planning') return 2.2;
   return 1.8;
 }
@@ -52,6 +59,64 @@ export function homeTourAngleLerp(from, to, alpha) {
 export function homeTourAngleDelta(from, to) {
   if (!Number.isFinite(from) || !Number.isFinite(to)) return 0;
   return Math.atan2(Math.sin(to - from), Math.cos(to - from));
+}
+
+/**
+ * Pick one clear room hero from subjects that have already passed zone and
+ * line-of-sight validation. Primary furniture is preferred, then proximity to
+ * the actual safe stop; this prevents a distant object or an empty open heading
+ * from displacing a nearby bed/sofa as the first shot.
+ */
+export function selectHomeTourHeroSubject({
+  subjects = [],
+  origin,
+  roomPoint = origin,
+  metersPerUnit = 1,
+} = {}) {
+  const unit = Number(metersPerUnit);
+  const point = (value) => value && [value.x, value.y, value.z].every((entry) => Number.isFinite(Number(entry)))
+    ? { x: Number(value.x), y: Number(value.y), z: Number(value.z) }
+    : null;
+  const camera = point(origin);
+  const room = point(roomPoint);
+  if (!camera || !room || !Number.isFinite(unit) || unit <= 0) return null;
+
+  const ranked = (Array.isArray(subjects) ? subjects : []).map((subject) => {
+    const center = point(subject?.center);
+    if (!center) return null;
+    const cameraDistanceMeters = Math.hypot(center.x - camera.x, center.z - camera.z) / unit;
+    const roomDistanceMeters = Math.hypot(center.x - room.x, center.z - room.z) / unit;
+    if (cameraDistanceMeters < 0.55 || cameraDistanceMeters > 8.5 || roomDistanceMeters > 6.5) return null;
+
+    const name = String(subject.name || subject.label || '').toLowerCase();
+    const role = String(subject.role || '').toLowerCase();
+    const rawPriority = Number(subject.priority ?? subject.heroPriority);
+    const priority = homeTourClamp(Number.isFinite(rawPriority) ? rawPriority : 5, 0, 12);
+    const primaryFurniture = /(bed|daybed|sofa|couch|sectional|armchair|recliner|dining table|kitchen island)/.test(name) ? 2.35 : 0;
+    const secondaryFurniture = /(wardrobe|closet|dresser|cabinet|bookcase|bookshelf|tv stand|desk|table)/.test(name) ? 1.1 : 0;
+    const roleBonus = role === 'furniture' ? 1.15 : role === 'fixture' ? 0.55 : 0.1;
+    const localProximity = homeTourClamp(1 - (roomDistanceMeters / 6.5), 0, 1);
+    const framingDistance = homeTourClamp(1 - (Math.abs(cameraDistanceMeters - 2.8) / 5.2), 0.1, 1);
+    const score = (priority * 0.34)
+      + primaryFurniture
+      + secondaryFurniture
+      + roleBonus
+      + (localProximity * 1.8)
+      + (framingDistance * 1.25);
+    return {
+      ...subject,
+      center,
+      score,
+      cameraDistanceMeters,
+      roomDistanceMeters,
+    };
+  }).filter(Boolean);
+
+  ranked.sort((a, b) => b.score - a.score
+    || a.roomDistanceMeters - b.roomDistanceMeters
+    || a.cameraDistanceMeters - b.cameraDistanceMeters
+    || String(a.id || '').localeCompare(String(b.id || '')));
+  return ranked[0] || null;
 }
 
 /**
@@ -170,6 +235,8 @@ export function selectHomeTourViewingArc({
   preferredYaw = 0,
   subjects = [],
   opennessReliable = false,
+  anchorToPreferred = false,
+  preferredStartWindowDegrees = 18,
   openScoreThreshold = HOME_TOUR_SWEEP_OPEN_SCORE_THRESHOLD,
   minSweepDegrees = HOME_TOUR_SWEEP_MIN_DEGREES,
   maxSweepDegrees = HOME_TOUR_SWEEP_MAX_DEGREES,
@@ -222,9 +289,19 @@ export function selectHomeTourViewingArc({
   }
 
   const normalizedDistance = (a, b) => Math.abs(homeTourAngleDelta(a, b));
+  const allStartIndices = samples.map((sample, index) => index).filter((index) => open[index]);
+  let startIndices = allStartIndices;
+  if (anchorToPreferred && allStartIndices.length) {
+    const preferredWindow = (Math.max(8, Number(preferredStartWindowDegrees) || 30) * Math.PI) / 180;
+    const preferredStarts = allStartIndices.filter((index) => (
+      normalizedDistance(samples[index].yaw, fallbackYaw) <= preferredWindow
+    ));
+    // Keep the reveal locked to a trusted hero. If the precise hero bearing is
+    // obstructed, choose the nearest clear sample within the bounded window.
+    if (preferredStarts.length) startIndices = preferredStarts;
+  }
   const candidates = [];
-  for (let startIndex = 0; startIndex < sampleCount; startIndex += 1) {
-    if (!open[startIndex]) continue;
+  for (const startIndex of startIndices) {
     const startYaw = samples[startIndex].yaw;
     for (const direction of [1, -1]) {
       let length = 0;
@@ -251,7 +328,8 @@ export function selectHomeTourViewingArc({
       const averageOpenness = opennessTotal / Math.max(1, length);
       const startPenalty = normalizedDistance(startYaw, fallbackYaw) / Math.PI;
       const lengthQuality = rotationDegrees / Math.max(1, maxSweepDegrees);
-      const score = averageOpenness * 0.24 + subjectScore * 1.35 + lengthQuality * 0.5 - startPenalty * 0.7;
+      const startWeight = anchorToPreferred ? 3.4 : 0.7;
+      const score = averageOpenness * 0.24 + subjectScore * 1.35 + lengthQuality * 0.5 - startPenalty * startWeight;
       candidates.push({
         startYaw,
         direction,
@@ -272,13 +350,24 @@ export function selectHomeTourViewingArc({
 
   // A tightly enclosed or badly occluded stop gets a short look toward its
   // single best heading, not a blind spin through known obstructions.
-  const bestIndex = samples.reduce((best, sample, index) => (
-    sample.openness > samples[best].openness ? index : best
-  ), 0);
+  const bestIndex = anchorToPreferred
+    ? samples.reduce((best, sample, index) => {
+      const distance = normalizedDistance(sample.yaw, fallbackYaw);
+      const bestDistance = normalizedDistance(samples[best].yaw, fallbackYaw);
+      if (distance < bestDistance - 1e-9) return index;
+      if (Math.abs(distance - bestDistance) <= 1e-9 && sample.openness > samples[best].openness) return index;
+      return best;
+    }, 0)
+    : samples.reduce((best, sample, index) => (
+      sample.openness > samples[best].openness ? index : best
+    ), 0);
+  const positiveNeighbour = samples[(bestIndex + 1) % sampleCount];
+  const negativeNeighbour = samples[(bestIndex - 1 + sampleCount) % sampleCount];
+  const fallbackDirection = (positiveNeighbour?.openness ?? 0) >= (negativeNeighbour?.openness ?? 0) ? 1 : -1;
   return {
     startYaw: samples[bestIndex].yaw,
-    direction: 1,
-    rotationRadians: (24 * Math.PI) / 180,
+    direction: fallbackDirection,
+    rotationRadians: (anchorToPreferred ? 12 : 24) * Math.PI / 180,
     fullCircle: false,
     averageOpenness: samples[bestIndex].openness,
     coveredSubjectIds: [],
@@ -380,6 +469,7 @@ export function buildHomeTourPresentationShot({
     preferredYaw: heroYaw,
     subjects: arcSubjects,
     opennessReliable,
+    anchorToPreferred: Boolean(heroCenter),
   });
   const sweepStartYaw = Number.isFinite(viewingArc.startYaw) ? viewingArc.startYaw : heroYaw;
   const sweepTravelRadians = Math.max(0, Number(viewingArc.rotationRadians) || 0);
@@ -580,6 +670,126 @@ export function advanceHomeTourPolyline({ position, path, index = 0, distance = 
   };
 }
 
+function homeTourMoveTowards(current, target, maxDelta) {
+  if (current < target) return Math.min(target, current + maxDelta);
+  return Math.max(target, current - maxDelta);
+}
+
+function homeTourPolylineRemainingUnits(position, path, index) {
+  let total = 0;
+  let previous = position;
+  for (let cursor = Math.max(0, Math.floor(Number(index) || 0)); cursor < path.length; cursor += 1) {
+    const point = path[cursor];
+    if (![point?.x, point?.y, point?.z].every(Number.isFinite)) return Infinity;
+    total += homeTourDistance3D(previous, point);
+    previous = point;
+  }
+  return total;
+}
+
+/**
+ * Distance- and corner-aware jerk-limited speed controller for Home Tour.
+ * It changes only the rate of travel; the camera still advances on the exact
+ * validated NavMesh polyline and never interpolates across a corner.
+ */
+export function computeHomeTourMotionSpeed({
+  position,
+  path,
+  index = 0,
+  speedMps = 0,
+  accelerationMps2 = 0,
+  dt = 0.016,
+  cruiseSpeedMps = HOME_TOUR_CRUISE_SPEED_MPS,
+  metersPerUnit = 1,
+} = {}) {
+  const unit = Number(metersPerUnit);
+  const frame = Math.max(0.001, Math.min(0.05, Number(dt) || 0.016));
+  const cruise = Math.max(0.05, Number(cruiseSpeedMps) || HOME_TOUR_CRUISE_SPEED_MPS);
+  if (!position || !Array.isArray(path) || !path.length
+    || ![position.x, position.y, position.z, unit].every(Number.isFinite) || unit <= 0) {
+    return { speedMps: 0, accelerationMps2: 0, targetSpeedMps: 0, stepDistanceMeters: 0, remainingDistanceMeters: Infinity, invalid: true };
+  }
+
+  const cursor = Math.max(0, Math.min(path.length - 1, Math.floor(Number(index) || 0)));
+  const remainingUnits = homeTourPolylineRemainingUnits(position, path, cursor);
+  if (!Number.isFinite(remainingUnits)) {
+    return { speedMps: 0, accelerationMps2: 0, targetSpeedMps: 0, stepDistanceMeters: 0, remainingDistanceMeters: Infinity, invalid: true };
+  }
+  const remainingDistanceMeters = remainingUnits / unit;
+  if (remainingDistanceMeters <= HOME_TOUR_ARRIVAL_SNAP_METERS) {
+    return {
+      speedMps: 0,
+      accelerationMps2: 0,
+      targetSpeedMps: 0,
+      stepDistanceMeters: remainingDistanceMeters,
+      remainingDistanceMeters,
+      remainingDistanceUnits: remainingUnits,
+      arrived: true,
+      cornerAngleRadians: 0,
+    };
+  }
+
+  const maxAcceleration = HOME_TOUR_MAX_ACCELERATION_MPS2;
+  const maxDeceleration = HOME_TOUR_MAX_ACCELERATION_MPS2 * 1.15;
+  let targetSpeed = cruise;
+  const brakingDistance = Math.max(0, remainingDistanceMeters - HOME_TOUR_ARRIVAL_SNAP_METERS);
+  targetSpeed = Math.min(targetSpeed, Math.sqrt(2 * maxDeceleration * brakingDistance));
+
+  const currentTarget = path[cursor];
+  const nextTarget = path[cursor + 1];
+  let cornerAngleRadians = 0;
+  let distanceToCornerMeters = Infinity;
+  if (currentTarget && nextTarget) {
+    const incoming = {
+      x: currentTarget.x - position.x,
+      y: currentTarget.y - position.y,
+      z: currentTarget.z - position.z,
+    };
+    const outgoing = {
+      x: nextTarget.x - currentTarget.x,
+      y: nextTarget.y - currentTarget.y,
+      z: nextTarget.z - currentTarget.z,
+    };
+    const incomingLength = Math.hypot(incoming.x, incoming.y, incoming.z);
+    const outgoingLength = Math.hypot(outgoing.x, outgoing.y, outgoing.z);
+    if (incomingLength > 1e-6 && outgoingLength > 1e-6) {
+      const dot = (incoming.x * outgoing.x + incoming.y * outgoing.y + incoming.z * outgoing.z)
+        / (incomingLength * outgoingLength);
+      cornerAngleRadians = Math.acos(homeTourClamp(dot, -1, 1));
+      distanceToCornerMeters = incomingLength / unit;
+      const cornerStart = (22 * Math.PI) / 180;
+      const fullCorner = (105 * Math.PI) / 180;
+      const cornerProgress = homeTourClamp((cornerAngleRadians - cornerStart) / (fullCorner - cornerStart), 0, 1);
+      const cornerEased = homeTourSmooth01(cornerProgress);
+      const cornerSpeed = cruise * (1 - (1 - HOME_TOUR_CORNER_SPEED_RATIO) * cornerEased);
+      const cornerSpeedLimit = Math.sqrt(cornerSpeed * cornerSpeed + 2 * maxDeceleration * distanceToCornerMeters);
+      targetSpeed = Math.min(targetSpeed, cornerSpeedLimit);
+    }
+  }
+
+  const currentSpeed = homeTourClamp(Number(speedMps) || 0, 0, cruise);
+  const currentAcceleration = homeTourClamp(Number(accelerationMps2) || 0, -maxAcceleration, maxAcceleration);
+  const desiredAcceleration = homeTourClamp((targetSpeed - currentSpeed) / frame, -maxAcceleration, maxAcceleration);
+  const nextAcceleration = homeTourMoveTowards(currentAcceleration, desiredAcceleration, HOME_TOUR_MAX_JERK_MPS3 * frame);
+  const nextSpeed = homeTourClamp(currentSpeed + nextAcceleration * frame, 0, cruise);
+  // Integrate the acceleration over this frame instead of using only the final
+  // speed. This avoids small start/stop velocity discontinuities at 60–120 Hz.
+  const stepDistanceMeters = Math.max(0, (currentSpeed + nextSpeed) * 0.5 * frame);
+
+  return {
+    speedMps: nextSpeed,
+    accelerationMps2: nextAcceleration,
+    targetSpeedMps: targetSpeed,
+    stepDistanceMeters,
+    remainingDistanceMeters,
+    remainingDistanceUnits: remainingUnits,
+    cornerAngleRadians,
+    distanceToCornerMeters,
+    arrived: false,
+    invalid: false,
+  };
+}
+
 const HOME_TOUR_LOCAL_ROLE_PENALTY = Object.freeze({
   viewpoint: 0,
   'room-center': 0.045,
@@ -640,7 +850,16 @@ function normalizeHomeTourAreas(areas, hotspots) {
 export function resolveHomeTourSubjectZone(
   subjectPosition,
   zones,
-  { metersPerUnit = 1, maxDistanceMeters = 4.5, minSeparationMeters = 0.5 } = {},
+  {
+    metersPerUnit = 1,
+    maxDistanceMeters = 4.5,
+    minSeparationMeters = 0.5,
+    preferredAreaId = null,
+    referencePoint = null,
+    preferredAreaHint = false,
+    preferredAreaMaxDistanceMeters = 4.25,
+    preferredAreaSlackMeters = 0.35,
+  } = {},
 ) {
   const point = homeTourPoint(subjectPosition);
   const unit = Number(metersPerUnit);
@@ -656,7 +875,32 @@ export function resolveHomeTourSubjectZone(
     })
     .sort((a, b) => a.distanceMeters - b.distanceMeters || a.id.localeCompare(b.id));
   if (!ranked.length || ranked[0].distanceMeters > maxDistanceMeters) return null;
-  if (ranked.length > 1 && ranked[1].distanceMeters - ranked[0].distanceMeters < minSeparationMeters) return null;
+  const preferredId = preferredAreaId == null ? null : String(preferredAreaId);
+  const preferred = ranked.find((entry) => entry.id === preferredId);
+  const reference = homeTourPoint(referencePoint);
+  if (preferred && reference && preferredAreaHint) {
+    const preferredStopDistance = homeTourDistanceXZ(point, reference) / unit;
+    const preferredIsCloseEnough = preferred.distanceMeters <= maxDistanceMeters
+      && preferredStopDistance <= preferredAreaMaxDistanceMeters;
+    const preferredIsCompetitive = preferred.distanceMeters <= ranked[0].distanceMeters + preferredAreaSlackMeters;
+    if (preferredIsCloseEnough && preferredIsCompetitive) return preferred.id;
+  }
+  if (ranked.length > 1 && ranked[1].distanceMeters - ranked[0].distanceMeters < minSeparationMeters) {
+    // Navigation-area centres can be close together around open-plan layouts.
+    // A safe stop is a better local reference than either coarse centre, but it
+    // may only disambiguate an object when the object is physically close to
+    // that stop and its centre-distance remains plausible. A saved area hint
+    // is supporting evidence, never an unconditional override.
+    if (preferred && reference) {
+      const preferredStopDistance = homeTourDistanceXZ(point, reference) / unit;
+      const bestCenterDistance = ranked[0].distanceMeters;
+      const preferredIsCloseEnough = preferred.distanceMeters <= maxDistanceMeters
+        && preferredStopDistance <= preferredAreaMaxDistanceMeters;
+      const preferredIsCompetitive = preferred.distanceMeters <= bestCenterDistance + preferredAreaSlackMeters;
+      if (preferredIsCloseEnough && (preferredIsCompetitive || preferredAreaHint)) return preferred.id;
+    }
+    return null;
+  }
   return ranked[0].id;
 }
 

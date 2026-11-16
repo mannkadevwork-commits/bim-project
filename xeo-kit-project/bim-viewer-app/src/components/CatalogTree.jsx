@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef } from 'react';
+import { resolveWallPlacementIntent } from '../engine/placement/wallHostPlacement.mjs';
 import { ChevronRight, ChevronDown, Search, Box, FileBox } from 'lucide-react';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:3000';
@@ -90,14 +91,22 @@ function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection
     itemName.includes('revolving door')
   );
 
+  const wallPlacementIntent = inferredDoor ? null : resolveWallPlacementIntent(item);
+  const wallMountedLight = Boolean(wallPlacementIntent?.wallPlacementKind === 'surface' && (
+    /lighting|light|lamp|sconce/i.test(`${itemCategory} ${itemName}`)
+  ));
+
   const buildPlacementAsset = () => ({
     ...item,
     id: placementId,
     catalogId: item.id,
     url: modelUrl,
-    type: inferredDoor ? 'door' : (itemType || 'furniture'),
+    type: inferredDoor ? 'door' : (wallPlacementIntent?.wallPlacementKind === 'opening' ? 'window' : (itemType || 'furniture')),
     file_type: normalizedFileType,
     source: 'catalog',
+    ...(wallPlacementIntent || {}),
+    ...(wallMountedLight ? { assetCategory: 'lighting', isLightFixture: true } : {}),
+    ...(wallPlacementIntent?.wallPlacementKind === 'surface' ? { pivotMode: item.pivotMode || 'center' } : {}),
   });
 
   const handleDragStart = (e) => {
@@ -147,6 +156,12 @@ function CatalogItemCard({ item, placementMode, setPlacementMode, resetSelection
         <span className="text-[11px] font-semibold text-slate-800 dark:text-slate-200 truncate leading-tight">
           {item.name}
         </span>
+        {wallPlacementIntent?.wallPlacementKind === 'surface' && (
+          <span className="ml-auto text-[8px] font-bold text-emerald-600 dark:text-emerald-400 uppercase shrink-0">Wall mount</span>
+        )}
+        {wallPlacementIntent?.wallPlacementKind === 'opening' && (
+          <span className="ml-auto text-[8px] font-bold text-amber-600 dark:text-amber-400 uppercase shrink-0">Wall opening</span>
+        )}
         {item.file_type === 'glb' && (
           <span className="ml-auto text-[8px] font-bold text-indigo-500 uppercase shrink-0">GLB</span>
         )}

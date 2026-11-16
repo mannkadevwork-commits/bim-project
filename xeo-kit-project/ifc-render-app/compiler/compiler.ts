@@ -14,7 +14,7 @@ import { copyToDocument, createDefaultPropertyResolver } from "@gltf-transform/f
 import { MeshoptDecoder } from "meshoptimizer";
 
 import { extractGeometry } from "./geometry";
-import { computeAssetPivotOffset, eulerToQuaternion } from "./math";
+import { computeAssetCenterPivotOffset, computeAssetPivotOffset, eulerToQuaternion } from "./math";
 import { fileURLToPath, pathToFileURL } from "url";
 import { spawnSync } from "child_process";
 import { WalkNavigationPipeline } from "./navigation/WalkNavigationPipeline";
@@ -69,6 +69,19 @@ interface FurnitureItem {
     width?: number;
     height?: number;
     thickness?: number;
+  };
+  windowHostWallId?: string;
+  windowDimensions?: {
+    width?: number;
+    height?: number;
+    thickness?: number;
+    sillHeight?: number;
+    axisYawCorrection?: number;
+  };
+  wallHost?: {
+    hostType?: string;
+    hostGlobalId?: string | null;
+    hitPoint?: [number, number, number];
   };
   /**
    * The editor persists GLB positions as semantic pivot targets. Reuse the
@@ -808,6 +821,59 @@ function buildHostedDoorGeometryRoot(
   return axisNode;
 }
 
+/**
+ * Normalize catalog window geometry around its true three-dimensional centre.
+ * The editor stores hosted windows by centre position, unlike ordinary floor
+ * furniture which uses a bottom-centre pivot. Scale/rotation remain on the
+ * instance wrapper so edits and compiler output share the same transform.
+ */
+function buildHostedWindowGeometryRoot(
+  sourceDocument: Document,
+  targetDocument: Document,
+  clonedRoot: GltfNode,
+  item: FurnitureItem,
+): GltfNode {
+  const bounds = measureGlbDoorBounds(sourceDocument);
+  if (!bounds) {
+    console.warn(`[compiler:windows] ${item.instanceId}: could not normalize GLB centre pivot; retaining source pivot.`);
+    return clonedRoot;
+  }
+
+  // Hosted windows use a true XYZ centre pivot. Apply the catalogue scale in
+  // its authored coordinate frame before any width-axis correction, matching
+  // the hosted-door compiler path and preventing non-uniform scale swapping.
+  clonedRoot.setTranslation([
+    -(bounds.min[0] + bounds.max[0]) / 2,
+    -(bounds.min[1] + bounds.max[1]) / 2,
+    -(bounds.min[2] + bounds.max[2]) / 2,
+  ]);
+
+  const scale = Array.isArray(item.scale) ? item.scale : [1, 1, 1];
+  const scaledX = bounds.x * Math.abs(Number(scale[0]) || 1);
+  const scaledZ = bounds.z * Math.abs(Number(scale[2]) || 1);
+  const widthAlongZ = scaledZ > scaledX;
+  const alreadyAlignedByEditor = Math.abs(Number(item.windowDimensions?.axisYawCorrection) || 0) > 0.001;
+
+  const scaleNode = targetDocument.createNode(`${item.instanceId}_windowAssetScale`);
+  scaleNode.setScale([
+    Number(scale[0]) || 1,
+    Number(scale[1]) || 1,
+    Number(scale[2]) || 1,
+  ]);
+  scaleNode.addChild(clonedRoot);
+
+  if (!widthAlongZ || alreadyAlignedByEditor) {
+    console.log(`[compiler:windows] ${item.instanceId}: normalized centre pivot; width axis=${widthAlongZ ? "Z (editor yaw correction persisted)" : "X"}; bounds ${bounds.x.toFixed(3)} x ${bounds.y.toFixed(3)} x ${bounds.z.toFixed(3)}.`);
+    return scaleNode;
+  }
+
+  const axisNode = targetDocument.createNode(`${item.instanceId}_windowAxisAlignment`);
+  axisNode.setRotation([0, Math.sin(Math.PI / 4), 0, Math.cos(Math.PI / 4)]);
+  axisNode.addChild(scaleNode);
+  console.log(`[compiler:windows] ${item.instanceId}: normalized centre pivot; width axis=Z, applying +90° local yaw; bounds ${bounds.x.toFixed(3)} x ${bounds.y.toFixed(3)} x ${bounds.z.toFixed(3)}.`);
+  return axisNode;
+}
+
 interface HostedDoorSpec {
   instanceId: string;
   assetId: string;
@@ -945,6 +1011,90 @@ async function prepareStructuralIfcForHostedDoors(
   }
   console.log(`[compiler:doors] Physical portal preparation applied ${hostedDoors.length} GLB door opening(s).`);
   return { inputPath: outputPath, hostedDoors, appliedDoors: Array.isArray(response?.doors) ? response.doors : [] };
+}
+
+interface HostedWindowSpec {
+  instanceId: string;
+  assetId: string;
+  wallGlobalId: string;
+  position: [number, number, number];
+  dimensions: { width: number; height: number; thickness: number; sillHeight: number };
+}
+
+function collectHostedWindows(furniture: FurnitureItem[]): HostedWindowSpec[] {
+  return furniture.filter((item) => Boolean(item.windowHostWallId)).map((item) => {
+    const wallGlobalId = String(item.windowHostWallId || "").trim();
+    if (!wallGlobalId || item.wallHost?.hostType !== "ifc" ||
+        String(item.wallHost?.hostGlobalId || "").trim() !== wallGlobalId) {
+      throw new Error(`Hosted window ${item.instanceId} does not reference a verified IFC wall host. GLB wall openings are not supported yet.`);
+    }
+    const hitPoint = item.wallHost?.hitPoint;
+    if (!Array.isArray(hitPoint) || hitPoint.length !== 3 || hitPoint.some((value) => !Number.isFinite(Number(value)))) {
+      throw new Error(`Hosted window ${item.instanceId} has no valid persisted wallHost.hitPoint. Re-place this window on its IFC wall.`);
+    }
+    const raw = item.windowDimensions || {};
+    const positive = (value: unknown, fallback: number) => {
+      const number = Number(value);
+      return Number.isFinite(number) && number > 0 ? number : fallback;
+    };
+    const sillValue = Number(raw.sillHeight);
+    const dimensions = {
+      width: positive(raw.width, 1.2),
+      height: positive(raw.height, 1.2),
+      thickness: positive(raw.thickness, 0.08),
+      sillHeight: Number.isFinite(sillValue) && sillValue >= 0 ? sillValue : 0.9,
+    };
+    if (dimensions.width < 0.25 || dimensions.width > 4.5 ||
+        dimensions.height < 0.25 || dimensions.height > 3.5 ||
+        dimensions.sillHeight > 3.0 || dimensions.thickness > 1.0) {
+      throw new Error(`Hosted window ${item.instanceId} has dimensions outside safe IFC opening limits.`);
+    }
+    return {
+      instanceId: String(item.instanceId),
+      assetId: String(item.id || item.instanceId),
+      wallGlobalId,
+      position: [Number(hitPoint[0]), Number(hitPoint[1]), Number(hitPoint[2])],
+      dimensions,
+    };
+  });
+}
+
+async function prepareStructuralIfcForHostedWindows(
+  jobDirectory: string,
+  inputIfcPath: string,
+  furniture: FurnitureItem[],
+): Promise<{ inputPath: string; hostedWindows: HostedWindowSpec[]; appliedWindows: any[] }> {
+  const hostedWindows = collectHostedWindows(furniture);
+  if (!hostedWindows.length) return { inputPath: inputIfcPath, hostedWindows, appliedWindows: [] };
+
+  const openingEngineScript = path.join(ROOT_DIR, "..", "window_opening_engine.py");
+  if (!fs.existsSync(openingEngineScript)) {
+    throw new Error(`Hosted IFC windows require window_opening_engine.py at ${openingEngineScript}`);
+  }
+
+  const presentationDir = path.join(jobDirectory, "presentation");
+  fs.mkdirSync(presentationDir, { recursive: true });
+  const specsPath = path.join(presentationDir, "hosted_window_specs.json");
+  const outputPath = path.join(presentationDir, "structural_with_hosted_windows.ifc");
+  fs.writeFileSync(specsPath, JSON.stringify({ version: 1, doors: [], windows: hostedWindows }, null, 2), "utf8");
+
+  const command = resolvePythonCommand();
+  const result = spawnSync(
+    command,
+    [openingEngineScript, "apply-hosted-wall-openings", "--input", inputIfcPath, "--output", outputPath, "--opening-specs", specsPath],
+    { encoding: "utf8", cwd: path.join(ROOT_DIR, "..") },
+  );
+  if (result.error) throw new Error(`Failed to launch hosted-window preparation: ${result.error.message}`);
+  if (result.status !== 0 || !fs.existsSync(outputPath)) {
+    const detail = String(result.stderr || result.stdout || "").trim();
+    throw new Error(`Hosted-window IFC preparation failed.${detail ? ` ${detail}` : ""}`);
+  }
+  let response: any;
+  try { response = JSON.parse(String(result.stdout || "{}")); }
+  catch { throw new Error(`Hosted-window preparation returned invalid JSON: ${String(result.stdout || "").trim()}`); }
+  if (response?.error) throw new Error(response.error);
+  console.log(`[compiler:windows] Physical IFC preparation applied ${hostedWindows.length} hosted window opening(s).`);
+  return { inputPath: outputPath, hostedWindows, appliedWindows: Array.isArray(response?.windows) ? response.windows : [] };
 }
 
 function toPresentationVec3(value: any): [number, number, number] | null {
@@ -1409,9 +1559,15 @@ export async function compileScene(
     projectState.furniture,
     resolveGlbPath,
   );
+  const hostedWindowBuild = await prepareStructuralIfcForHostedWindows(
+    jobDirectory,
+    hostedDoorBuild.inputPath,
+    projectState.furniture,
+  );
   performanceStages.structuralIfcAndHostedDoorPreparationMs = Date.now() - performanceStageStartedAt;
   performanceStageStartedAt = Date.now();
-  const structuralIfcBytes = readFileAsUint8Array(hostedDoorBuild.inputPath);
+  const structuralIfcBuildPath = hostedWindowBuild.inputPath;
+  const structuralIfcBytes = readFileAsUint8Array(structuralIfcBuildPath);
 
   // Presentation room topology is generated from the same physical IFC that
   // feeds the structural GLB. Native IFC openings and compiled GLB-door
@@ -1422,7 +1578,7 @@ export async function compileScene(
   try {
     const roomArtifact = await RoomDetector.run({
       jobDirectory,
-      inputIfcPath: hostedDoorBuild.inputPath,
+      inputIfcPath: structuralIfcBuildPath,
       outputPath: path.join(jobDirectory, "presentation_rooms.json"),
       // Publish the same semantic IfcSpace anchors consumed by the room
       // diagnostics service. Without this flag production emitted zero named
@@ -1666,13 +1822,13 @@ export async function compileScene(
           const copiedMaterials = new Map<Material, Material>();
 
           const isHostedDoor = Boolean(item.doorHostWallId);
-          // Hosted doors keep their dedicated wall-opening normalization.
-          // Regular catalog GLBs must use the same semantic pivot contract as
-          // GLBAssetTransform in the editor.
-          const catalogFurniturePivot = isHostedDoor
+          const isHostedWindow = Boolean(item.windowHostWallId);
+          // Hosted doors and windows have dedicated host-centred normalization.
+          // Regular catalog GLBs use the same semantic pivot contract as the editor.
+          const catalogFurniturePivot = isHostedDoor || isHostedWindow
             ? null
             : getCatalogFurniturePivot(glbDoc, item);
-          if (!isHostedDoor && !catalogFurniturePivot) {
+          if (!isHostedDoor && !isHostedWindow && !catalogFurniturePivot) {
             console.warn(
               `[compiler:glb-transform] ${item.instanceId}: source bounds unavailable; retaining the GLB source origin.`,
             );
@@ -1847,7 +2003,9 @@ export async function compileScene(
 
           const hostedGeometryRoot = isHostedDoor
             ? buildHostedDoorGeometryRoot(glbDoc, doc, clonedRoot, item)
-            : clonedRoot;
+            : isHostedWindow
+              ? buildHostedWindowGeometryRoot(glbDoc, doc, clonedRoot, item)
+              : clonedRoot;
           const instanceWrapper = doc.createNode(item.instanceId);
           instanceWrapper.setExtras({
             hciAssetFormat: "glb",
@@ -1867,19 +2025,19 @@ export async function compileScene(
             applyPersistedGlbTransform(
               instanceWrapper,
               item,
-              isHostedDoor,
+              isHostedDoor || isHostedWindow,
             );
 
           if (!appliedPersistedMatrix) {
-            const placementItem: FurnitureItem = isHostedDoor
+            const placementItem: FurnitureItem = isHostedDoor || isHostedWindow
               ? { ...item, scale: [1, 1, 1] }
               : item;
             applyAuthoredTransform(
               instanceWrapper,
               placementItem,
-              isHostedDoor ? null : catalogFurniturePivot,
-              isHostedDoor,
-              !isHostedDoor,
+              isHostedDoor || isHostedWindow ? null : catalogFurniturePivot,
+              isHostedDoor || isHostedWindow,
+              !isHostedDoor && !isHostedWindow,
             );
           }
 
@@ -2007,12 +2165,15 @@ export async function compileScene(
           let pivot:
             | [number, number, number]
             | null = null;
+          const isHostedIfcCatalogDoor =
+            Boolean(item.doorHostWallId) && assetType !== AssetType.STRUCTURAL_REPLACEMENT;
+          const isHostedIfcCatalogWindow =
+            Boolean(item.windowHostWallId) && assetType !== AssetType.STRUCTURAL_REPLACEMENT;
 
           try {
-            pivot =
-              computeAssetPivotOffset(
-                tempSubtree,
-              );
+            pivot = isHostedIfcCatalogWindow
+              ? computeAssetCenterPivotOffset(tempSubtree)
+              : computeAssetPivotOffset(tempSubtree);
           } catch (error) {
             console.warn(
               `[compiler] Pivot computation failed for "${item.instanceId}": ${
@@ -2021,23 +2182,16 @@ export async function compileScene(
             );
           }
 
-          // Hosted GLB doors are normalized in the GLB path and keep their
-          // bottom-center frame unchanged. Hosted IFC catalog doors do not
-          // have that normalization metadata: extractGeometry bakes source IFC
-          // placements into imported vertices, so apply the measured
-          // bottom-center pivot to align the visible IFC door with its opening.
-          // Structural replacement IFCs (including wall previews) retain their
-          // native frame and must not be pivot-normalized here.
-          const isHostedIfcCatalogDoor =
-            Boolean(item.doorHostWallId) &&
-            assetType !== AssetType.STRUCTURAL_REPLACEMENT;
-
+          // Catalog IFC doors retain their bottom-centre convention; catalog
+          // IFC windows use the geometric centre so they align to the semantic
+          // IfcOpeningElement centre returned by the opening engine. Native
+          // wall-preview IFCs preserve their source transform unchanged.
           applyAuthoredTransform(
             instanceWrapper,
             item,
             pivot,
             assetType === AssetType.STRUCTURAL_REPLACEMENT,
-            isHostedIfcCatalogDoor,
+            isHostedIfcCatalogDoor || isHostedIfcCatalogWindow,
           );
 
           scene.addChild(instanceWrapper);
@@ -2329,8 +2483,8 @@ export async function compileScene(
         rawGlbMiB: Number((glbBuffer.byteLength / (1024 * 1024)).toFixed(3)),
         metrics: rawSceneMetrics,
         structuralIfc: {
-          sourceFile: path.basename(hostedDoorBuild.inputPath),
-          sourceBytes: fs.existsSync(hostedDoorBuild.inputPath) ? fs.statSync(hostedDoorBuild.inputPath).size : null,
+          sourceFile: path.basename(structuralIfcBuildPath),
+          sourceBytes: fs.existsSync(structuralIfcBuildPath) ? fs.statSync(structuralIfcBuildPath).size : null,
           compiledMetrics: structuralNode?.metrics ?? null,
         },
         mountedAssetInstances: assetReports.filter((asset) => asset.includedInScene).length,

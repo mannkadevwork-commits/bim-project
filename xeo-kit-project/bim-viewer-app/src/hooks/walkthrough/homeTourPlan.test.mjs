@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  HOME_TOUR_CRUISE_SPEED_MPS,
   HOME_TOUR_MIN_CLEARANCE_METERS,
   HOME_TOUR_PLANNER_VERSION,
   HOME_TOUR_ROUTE_CONTRACT,
@@ -9,9 +10,11 @@ import {
   HOME_TOUR_PRESENTATION_BASE_PITCH,
   HOME_TOUR_TOP_REVEAL_PITCH,
   buildHomeTourPresentationShot,
+  computeHomeTourMotionSpeed,
   homeTourRoomSweepPose,
   homeTourPausedCameraPose,
   homeTourRevealPose,
+  selectHomeTourHeroSubject,
   selectHomeTourCompositionHeading,
   selectHomeTourViewingArc,
   resolveHomeTourSubjectZone,
@@ -317,6 +320,162 @@ test('does not assign a subject to an ambiguous neighboring navigation zone', ()
   const zones = [area('left', 0), area('right', 5)];
   assert.equal(resolveHomeTourSubjectZone({ x: 2.35, y: 0, z: 0 }, zones), null);
   assert.equal(resolveHomeTourSubjectZone({ x: 4, y: 0, z: 0 }, zones), 'right');
+});
+
+test('a safe room stop can disambiguate a nearby local hero without overriding a distant zone', () => {
+  const zones = [area('space-5', 5.2), area('space-6', 7.0)];
+  const bedPosition = { x: 6.15, y: 0, z: 0.25 };
+  assert.equal(resolveHomeTourSubjectZone(bedPosition, zones), null, 'coarse centres alone are ambiguous');
+  assert.equal(resolveHomeTourSubjectZone(bedPosition, zones, {
+    preferredAreaId: 'space-6',
+    referencePoint: { x: 6.7, y: 0, z: 0.15 },
+    preferredAreaHint: true,
+  }), 'space-6', 'a saved area hint plus a nearby safe stop assigns the bed to the current room');
+  assert.equal(resolveHomeTourSubjectZone({ x: 6.05, y: 0, z: 0.25 }, [area('space-5', 5.2), area('space-6', 7.3)], {
+    preferredAreaId: 'space-6',
+    referencePoint: { x: 6.7, y: 0, z: 0.15 },
+    preferredAreaHint: true,
+    preferredAreaSlackMeters: 0.7,
+  }), 'space-6', 'the safe stop can refine a close centre assignment when the saved area hint agrees');
+  assert.equal(resolveHomeTourSubjectZone({ x: -3.0, y: 0, z: 0 }, zones, {
+    preferredAreaId: 'space-6',
+    referencePoint: { x: 6.7, y: 0, z: 0.15 },
+    preferredAreaHint: true,
+  }), null, 'a distant area hint cannot pull an unrelated subject into the room');
+});
+
+test('a trusted hero anchors the opening camera composition instead of a distant sweep sector', () => {
+  const heroYaw = -Math.PI / 2;
+  const shot = buildHomeTourPresentationShot({
+    origin: { x: 0, y: 0.05, z: 0 },
+    eyeHeightMeters: 1.68,
+    metersPerUnit: 1,
+    currentYaw: Math.PI,
+    hero: { id: 'bed', name: 'Bed', center: { x: 2, y: 0.6, z: 0 } },
+    subjects: [
+      { id: 'bed', name: 'Bed', priority: 9.6, center: { x: 2, y: 0.6, z: 0 } },
+      { id: 'wardrobe', name: 'Wardrobe', priority: 7.3, center: { x: 1.4, y: 1.1, z: -1.5 } },
+    ],
+    headingSamples: openHeadingSamples(),
+    opennessReliable: true,
+  });
+  const angleError = Math.abs(Math.atan2(Math.sin(shot.heroYaw - heroYaw), Math.cos(shot.heroYaw - heroYaw)));
+  assert.ok(angleError <= (15 * Math.PI) / 180, 'the reveal should begin facing the bed');
+  assert.equal(shot.hero.id, 'bed');
+});
+
+test('the nearest primary bedroom hero wins over a farther furniture candidate', () => {
+  const hero = selectHomeTourHeroSubject({
+    origin: { x: 0, y: 0, z: 0 },
+    roomPoint: { x: 0, y: 0, z: 0 },
+    metersPerUnit: 1,
+    subjects: [
+      { id: 'bed-space-6', name: 'Professional Bed', role: 'furniture', priority: 9.6, center: { x: 2.1, y: 0.55, z: 0.2 } },
+      { id: 'sofa-nearby', name: 'Fur Sofa', role: 'furniture', priority: 9.6, center: { x: -4.4, y: 0.62, z: -0.5 } },
+      { id: 'side-table', name: 'Side Table', role: 'furniture', priority: 7.3, center: { x: 1.5, y: 0.45, z: 1.1 } },
+    ],
+  });
+  assert.equal(hero?.id, 'bed-space-6');
+  assert.ok(hero.score > 0);
+});
+
+test('anchored room arc fallback stays near the trusted hero when wall rays are tightly constrained', () => {
+  const preferredYaw = 0.42;
+  const headings = Array.from({ length: 48 }, (_, index) => ({
+    yaw: -Math.PI + (Math.PI * 2 * index) / 48,
+    openness: -8,
+  }));
+  const arc = selectHomeTourViewingArc({
+    headingSamples: headings,
+    preferredYaw,
+    anchorToPreferred: true,
+    opennessReliable: true,
+  });
+  const difference = Math.abs(Math.atan2(Math.sin(arc.startYaw - preferredYaw), Math.cos(arc.startYaw - preferredYaw)));
+  assert.ok(difference <= (3.76 * Math.PI) / 180, 'the fallback starts at the nearest sampled hero heading');
+  assert.ok(arc.rotationRadians <= (12 * Math.PI) / 180);
+  assert.equal(arc.constrained, true);
+});
+
+test('Home Tour movement uses jerk-limited acceleration on straight routes', () => {
+  const path = [{ x: 0, y: 0, z: 0 }, { x: 8, y: 0, z: 0 }];
+  let speedMps = 0;
+  let accelerationMps2 = 0;
+  const speeds = [];
+  for (let frame = 0; frame < 90; frame += 1) {
+    const profile = computeHomeTourMotionSpeed({
+      position: { x: frame * 0.004, y: 0, z: 0 },
+      path,
+      index: 1,
+      speedMps,
+      accelerationMps2,
+      dt: 1 / 60,
+      metersPerUnit: 1,
+    });
+    speedMps = profile.speedMps;
+    accelerationMps2 = profile.accelerationMps2;
+    speeds.push(speedMps);
+  }
+  assert.ok(speeds[0] > 0 && speeds[0] < 0.02, 'movement ramps up gently from rest');
+  assert.ok(speeds.at(-1) > speeds[0], 'speed builds progressively');
+  assert.ok(speeds.every((speed) => speed <= HOME_TOUR_CRUISE_SPEED_MPS));
+  const maxFrameDelta = Math.max(...speeds.slice(1).map((speed, index) => Math.abs(speed - speeds[index])));
+  assert.ok(maxFrameDelta < 0.012, 'speed changes remain bounded frame-to-frame');
+});
+
+test('Home Tour integrates frame travel using average acceleration-limited speed', () => {
+  const profile = computeHomeTourMotionSpeed({
+    position: { x: 0, y: 0, z: 0 },
+    path: [{ x: 0, y: 0, z: 0 }, { x: 10, y: 0, z: 0 }],
+    index: 1,
+    speedMps: 0.2,
+    accelerationMps2: 0.1,
+    dt: 1 / 60,
+    metersPerUnit: 1,
+  });
+  const expected = ((0.2 + profile.speedMps) * 0.5) / 60;
+  assert.ok(Math.abs(profile.stepDistanceMeters - expected) < 1e-9);
+});
+
+test('Home Tour movement reduces speed before a sharp NavMesh corner', () => {
+  const path = [
+    { x: 1, y: 0, z: 0 },
+    { x: 1, y: 0, z: 1.5 },
+  ];
+  const nearCorner = computeHomeTourMotionSpeed({
+    position: { x: 0.82, y: 0, z: 0 },
+    path,
+    index: 0,
+    speedMps: HOME_TOUR_CRUISE_SPEED_MPS,
+    accelerationMps2: 0,
+    dt: 1 / 60,
+    metersPerUnit: 1,
+  });
+  assert.ok(nearCorner.cornerAngleRadians > Math.PI / 3, 'the upcoming bend is detected');
+  assert.ok(nearCorner.targetSpeedMps < HOME_TOUR_CRUISE_SPEED_MPS, 'the speed profile brakes for the corner');
+});
+
+test('Home Tour brakes towards the room stop and reports a small final snap tolerance', () => {
+  const nearEnd = computeHomeTourMotionSpeed({
+    position: { x: 9.7, y: 0, z: 0 },
+    path: [{ x: 10, y: 0, z: 0 }],
+    index: 0,
+    speedMps: HOME_TOUR_CRUISE_SPEED_MPS,
+    accelerationMps2: 0,
+    dt: 1 / 60,
+    metersPerUnit: 1,
+  });
+  assert.ok(nearEnd.targetSpeedMps < HOME_TOUR_CRUISE_SPEED_MPS);
+  const arrived = computeHomeTourMotionSpeed({
+    position: { x: 9.98, y: 0, z: 0 },
+    path: [{ x: 10, y: 0, z: 0 }],
+    index: 0,
+    speedMps: 0.1,
+    accelerationMps2: 0,
+    dt: 1 / 60,
+    metersPerUnit: 1,
+  });
+  assert.equal(arrived.arrived, true);
 });
 
 test('rejects a complete-looking route generated with an obsolete planner contract', () => {

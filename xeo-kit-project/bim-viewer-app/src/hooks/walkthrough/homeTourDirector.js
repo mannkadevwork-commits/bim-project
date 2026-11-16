@@ -1,13 +1,14 @@
 import {
   HOME_TOUR_CAMERA_PITCH,
-  HOME_TOUR_CRUISE_SPEED_MPS,
   HOME_TOUR_FIXED_FOV_DEGREES,
   HOME_TOUR_HERO_REVEAL_MS,
   HOME_TOUR_LOOK_AHEAD_METERS,
   HOME_TOUR_PRESENTATION_BASE_PITCH,
   HOME_TOUR_ROUTE_REQUEST_TIMEOUT_MS,
   HOME_TOUR_SWEEP_SAMPLE_COUNT,
+  computeHomeTourMotionSpeed,
   resolveHomeTourSubjectZone,
+  selectHomeTourHeroSubject,
   HOME_TOUR_TOP_REVEAL_PITCH,
   advanceHomeTourPolyline,
   buildHomeTourPresentationShot,
@@ -166,10 +167,23 @@ export const homeTourDirectorMethods = {
       .filter((subject) => subject?.center && [subject.center.x, subject.center.y, subject.center.z].every(Number.isFinite))
       .map((subject) => {
         const ownershipPoint = subject.basePosition || subject.center;
+        const distanceToCurrentStop = Math.hypot(
+          subject.center.x - stop.point.x,
+          subject.center.z - stop.point.z,
+        ) / unit;
         const assignedAreaId = resolveHomeTourSubjectZone(ownershipPoint, areas, {
           metersPerUnit: unit,
-          maxDistanceMeters: 4.5,
-          minSeparationMeters: 0.5,
+          maxDistanceMeters: 5.8,
+          minSeparationMeters: 0.34,
+          preferredAreaId: String(stop.areaId),
+          referencePoint: stop.point,
+          // A placed hero very close to the safe interior stop is useful local
+          // evidence when adjacent navigation-area centres are nearly tied.
+          // This hint is still bounded by the area's centre-distance check.
+          preferredAreaHint: String(subject.areaId || '') === String(stop.areaId)
+            || (subject.isPlacedAsset && distanceToCurrentStop <= 2.45),
+          preferredAreaMaxDistanceMeters: 3.25,
+          preferredAreaSlackMeters: distanceToCurrentStop <= 2.45 ? 0.92 : 0.52,
         });
         return {
           subject,
@@ -178,7 +192,7 @@ export const homeTourDirectorMethods = {
           areaDistance: Math.hypot(subject.center.x - stop.point.x, subject.center.z - stop.point.z),
         };
       })
-      .filter((entry) => entry.distance >= 0.65 * unit && entry.distance <= 8.5 * unit && entry.areaDistance <= 8.5 * unit);
+      .filter((entry) => entry.distance >= 0.55 * unit && entry.distance <= 8.5 * unit && entry.areaDistance <= 6.5 * unit);
 
     const visibleSubjects = allSubjects.filter((entry) => this._isHomeTourSubjectVisible(entry.subject));
     // Do not trust the old nearest-center areaId attached during generic
@@ -205,8 +219,27 @@ export const homeTourDirectorMethods = {
       opennessAvailable: Boolean(this.model),
       sampleCount: HOME_TOUR_SWEEP_SAMPLE_COUNT,
     });
-    const heroEntry = composition.subjectId
-      ? roomPool.find((entry) => String(entry.subject.id) === composition.subjectId) || null
+    // Choose the room's primary visual subject independently of the most-open
+    // heading. Otherwise a high wall-clearance score can beat a nearby bed and
+    // make the first shot pan away from the feature customers expect to see.
+    const rankedHero = selectHomeTourHeroSubject({
+      subjects: roomPool.map((entry) => ({
+        id: entry.subject.id,
+        name: entry.subject.name || entry.subject.role || 'Room element',
+        role: entry.subject.role,
+        priority: entry.subject.heroPriority || (entry.subject.role === 'furniture' ? 9 : 5),
+        center: {
+          x: entry.subject.center.x,
+          y: entry.subject.center.y,
+          z: entry.subject.center.z,
+        },
+      })),
+      origin,
+      roomPoint: stop.point,
+      metersPerUnit: unit,
+    });
+    const heroEntry = rankedHero
+      ? roomPool.find((entry) => String(entry.subject.id) === String(rankedHero.id)) || null
       : null;
     const hero = heroEntry ? {
       id: heroEntry.subject.id,
@@ -562,6 +595,8 @@ export const homeTourDirectorMethods = {
       path: dedupedPath,
       index: dedupedPath.length > 1 ? 1 : dedupedPath.length,
       lastDirection: null,
+      speedMps: 0,
+      accelerationMps2: 0,
     };
     this.homeTourPhase = 'traveling';
     this.homeTourRemainingMs = 0;
@@ -595,6 +630,8 @@ export const homeTourDirectorMethods = {
       path: stop.path,
       index: stop.path.length > 1 ? 1 : stop.path.length,
       lastDirection: null,
+      speedMps: 0,
+      accelerationMps2: 0,
     };
     this.homeTourPhase = 'traveling';
     this.homeTourRemainingMs = 0;
@@ -622,7 +659,22 @@ export const homeTourDirectorMethods = {
     const motion = this.homeTourMotion;
     if (!motion) return this._failHomeTour('Home Tour lost its active, precomputed camera path.');
     const unit = Math.max(this.metersPerUnit || 1, 1e-6);
-    const step = HOME_TOUR_CRUISE_SPEED_MPS * unit * Math.min(0.05, Math.max(0, dt));
+    const frameDt = Math.min(0.05, Math.max(0.001, Number(dt) || 0.016));
+    const profile = computeHomeTourMotionSpeed({
+      position: { x: this.position.x, y: this.position.y, z: this.position.z },
+      path: motion.path,
+      index: motion.index,
+      speedMps: motion.speedMps || 0,
+      accelerationMps2: motion.accelerationMps2 || 0,
+      dt: frameDt,
+      metersPerUnit: unit,
+    });
+    if (profile.invalid) return this._failHomeTour('Home Tour could not calculate a safe movement profile for its validated path.');
+    motion.speedMps = profile.speedMps;
+    motion.accelerationMps2 = profile.accelerationMps2;
+    const step = profile.arrived
+      ? profile.remainingDistanceUnits + 1e-5
+      : profile.stepDistanceMeters * unit;
     const advanced = advanceHomeTourPolyline({
       position: { x: this.position.x, y: this.position.y, z: this.position.z },
       path: motion.path,

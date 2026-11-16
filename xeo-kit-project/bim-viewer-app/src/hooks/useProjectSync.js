@@ -11,6 +11,7 @@ import {
 } from './projectHistory';
 import { applyGLBPlacementTransform, getGLBPlacementTarget, getGLBRotation, getGLBScale, isGLBModel } from '../engine/assets/GLBAssetTransform';
 import { markAssetTransformApplied } from '../engine/assets/assetTransformIdentity';
+import { sanitizeWallHostRecord } from '../engine/placement/wallHostPlacement.mjs';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -1077,6 +1078,10 @@ export const useProjectSync = (activeProject) => {
     if (!selectedAssetId || !viewerRef.current) return;
     const assetModel = viewerRef.current.scene.models[selectedAssetId];
     if (!assetModel) return;
+    if (assetModel?._assetMeta?.windowHostWallId) {
+      setToastMessage('A hosted window is locked to its physical wall opening. Undo placement to remove it safely.');
+      return;
+    }
     const numValue = parseFloat(value);
     if (!Number.isFinite(numValue)) return;
 
@@ -1207,8 +1212,16 @@ export const useProjectSync = (activeProject) => {
     }), { coalesceKey: `asset-transform:${selectedAssetId}:${isScale ? 'scale' : isRotation ? 'rotation' : 'position'}` });
   };
 
-  const deleteAsset = (viewerRef, selectedAssetId) => {
-    if (!selectedAssetId) return;
+  const deleteAsset = (viewerRef, selectedAssetId, options = {}) => {
+    if (!selectedAssetId) return false;
+
+    const selectedItem = (projectStateRef.current?.furniture || []).find((item) => item.instanceId === selectedAssetId);
+    if (selectedItem?.windowHostWallId) {
+      if (options?.silent !== true) {
+        setToastMessage('This window is connected to a physical IFC wall opening. Undo its placement to remove both safely.');
+      }
+      return false;
+    }
 
     const assetModel = viewerRef.current?.scene.models[selectedAssetId];
     if (assetModel) {
@@ -1223,8 +1236,11 @@ export const useProjectSync = (activeProject) => {
       furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
     }));
 
-    setToastMessage('Asset removed.');
-    setTimeout(() => setToastMessage(null), 3000);
+    if (options?.silent !== true) {
+      setToastMessage('Asset removed.');
+      setTimeout(() => setToastMessage(null), 3000);
+    }
+    return true;
   };
 
   // Replace one placed catalogue asset with another while keeping the rest of the
@@ -1237,7 +1253,7 @@ export const useProjectSync = (activeProject) => {
     const currentState = projectStateRef.current || {};
     const existingItem = (currentState.furniture || []).find((item) => item?.instanceId === selectedAssetId);
     if (!existingItem) throw new Error('The selected item is no longer in this project. Select it again and retry.');
-    if (existingItem.doorHostWallId) throw new Error('Hosted doors cannot be replaced here because they are connected to a wall opening.');
+    if (existingItem.doorHostWallId || existingItem.windowHostWallId) throw new Error('Hosted doors/windows cannot be replaced here because they are connected to a physical wall opening.');
     if ((existingItem.isNativeIsolation || existingItem.nativeSourceId) && !allowIsolatedNative) throw new Error('Native IFC elements must be safely isolated before catalogue replacement.');
 
     const rawUrl = String(replacementAsset.model_url || replacementAsset.url || replacementAsset.src || '').trim();
@@ -1277,7 +1293,7 @@ export const useProjectSync = (activeProject) => {
       if (index < 0) return previous;
 
       const oldItem = items[index];
-      if (oldItem?.doorHostWallId || ((oldItem?.isNativeIsolation || oldItem?.nativeSourceId) && !allowIsolatedNative)) {
+      if (oldItem?.doorHostWallId || oldItem?.windowHostWallId || ((oldItem?.isNativeIsolation || oldItem?.nativeSourceId) && !allowIsolatedNative)) {
         return previous;
       }
 
@@ -1323,7 +1339,7 @@ export const useProjectSync = (activeProject) => {
             existingItem.instanceId === instanceId
               ? {
                   ...existingItem,
-                  position: existingItem.doorHostWallId ? existingItem.position : semanticPosition,
+                  position: (existingItem.doorHostWallId || existingItem.windowHostWallId) ? existingItem.position : semanticPosition,
                   ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
                 }
               : existingItem
@@ -1386,7 +1402,7 @@ export const useProjectSync = (activeProject) => {
 
 
   const spawnAsset = (asset, coordinates, loadIFCAssetIntoScene, rotation = [0, 0, 0]) => {
-    const uniqueId = `${asset.id}_${Date.now()}`;
+    const uniqueId = asset.instanceId ? String(asset.instanceId) : `${asset.id}_${Date.now()}`;
     const urlPath = asset.url || asset.src || `/assets/${asset.id}.ifc`;
     const fullAssetUrl = urlPath.startsWith('http') ? urlPath : `${API_BASE_URL}${urlPath}`;
     const fileType = inferFileType(urlPath, asset.file_type || asset.fileType);
@@ -1398,6 +1414,7 @@ export const useProjectSync = (activeProject) => {
     const effectiveScale = baseScale.map((value, i) => value * sceneScale[i]);
     const position = Array.isArray(coordinates) && coordinates.length === 3 ? [...coordinates] : [0, 0, 0];
     const safeRotation = Array.isArray(rotation) && rotation.length === 3 ? [...rotation] : [0, 0, 0];
+    const wallHost = sanitizeWallHostRecord(asset.wallHost);
 
     // GLB doors placed via insert-door carry hostWallId. Persisting doorHostWallId
     // tells the compiler to use the exact Python-computed void-center position
@@ -1408,6 +1425,16 @@ export const useProjectSync = (activeProject) => {
           width: Number(asset.doorDimensions.width),
           height: Number(asset.doorDimensions.height),
           thickness: Number(asset.doorDimensions.thickness),
+        }
+      : null;
+    const windowHostWallId = asset.windowHostWallId ? String(asset.windowHostWallId) : null;
+    const windowDimensions = windowHostWallId && asset.windowDimensions && typeof asset.windowDimensions === 'object'
+      ? {
+          width: Number(asset.windowDimensions.width),
+          height: Number(asset.windowDimensions.height),
+          thickness: Number(asset.windowDimensions.thickness),
+          sillHeight: Number(asset.windowDimensions.sillHeight),
+          axisYawCorrection: Number(asset.windowDimensions.axisYawCorrection || 0),
         }
       : null;
 
@@ -1423,8 +1450,9 @@ export const useProjectSync = (activeProject) => {
       assetCategory: asset.assetCategory || null,
       isLightFixture: asset.isLightFixture === true || asset.assetCategory === 'lighting',
       lightEnabled: asset.lightEnabled === true,
-      pivotMode: asset.pivotMode || null,
+      pivotMode: wallHost?.anchorMode === 'center' ? 'center' : (asset.pivotMode || null),
       placementSurface: asset.placementSurface || null,
+      ...(wallHost ? { wallHost, wallPlacementKind: asset.wallPlacementKind || 'surface' } : {}),
       ...(asset.roomId ? { roomId: String(asset.roomId) } : {}),
       ...(asset.roomLabel ? { roomLabel: String(asset.roomLabel).slice(0, 120) } : {}),
       ...(asset.ceilingRoomId ? { ceilingRoomId: String(asset.ceilingRoomId) } : {}),
@@ -1432,6 +1460,14 @@ export const useProjectSync = (activeProject) => {
       ...(doorHostWallId ? { doorHostWallId } : {}),
       ...(doorHostWallId && doorDimensions && Object.values(doorDimensions).every((value) => Number.isFinite(value) && value > 0)
         ? { doorDimensions }
+        : {}),
+      ...(windowHostWallId ? { windowHostWallId } : {}),
+      ...(windowHostWallId && windowDimensions &&
+          Number.isFinite(windowDimensions.width) && windowDimensions.width > 0 &&
+          Number.isFinite(windowDimensions.height) && windowDimensions.height > 0 &&
+          Number.isFinite(windowDimensions.thickness) && windowDimensions.thickness > 0 &&
+          Number.isFinite(windowDimensions.sillHeight) && windowDimensions.sillHeight >= 0
+        ? { windowDimensions }
         : {}),
     };
 
@@ -1463,7 +1499,7 @@ export const useProjectSync = (activeProject) => {
           foundItem = true;
           persistedItemForModel = {
             ...item,
-            position: item.doorHostWallId ? item.position : (semanticPosition || item.position),
+            position: item.doorHostWallId || item.windowHostWallId ? item.position : (semanticPosition || item.position),
             ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
           };
           return persistedItemForModel;
@@ -1490,7 +1526,11 @@ export const useProjectSync = (activeProject) => {
           fileType,
           scale: effectiveScale,
           doorHostWallId,
-          pivotMode: asset.pivotMode || null,
+          windowHostWallId,
+          windowDimensions,
+          wallPlacementKind: asset.wallPlacementKind || null,
+          pivotMode: wallHost?.anchorMode === 'center' ? 'center' : (asset.pivotMode || null),
+          wallHost,
           assetCategory: asset.assetCategory || null,
           isLightFixture: asset.isLightFixture === true || asset.assetCategory === 'lighting',
           lightEnabled: asset.lightEnabled === true,
@@ -1672,6 +1712,71 @@ export const useProjectSync = (activeProject) => {
     return true;
   };
 
+  const normalizeDirection = (value, fallback = [0, 1, 0]) => {
+    if (!Array.isArray(value) || value.length !== 3 || !value.every((part) => Number.isFinite(Number(part)))) return [...fallback];
+    const vector = value.map(Number);
+    const length = Math.hypot(...vector);
+    return length > 1e-9 ? vector.map((part) => part / length) : [...fallback];
+  };
+
+  const scaleAlongDirection = (direction, factors, fallback) => {
+    const axis = normalizeDirection(direction, fallback);
+    return Math.hypot(axis[0] * factors[0], axis[1] * factors[1], axis[2] * factors[2]);
+  };
+
+  const transformPointForCalibration = (point, factors, oldSceneCenter, newSceneCenter) => {
+    if (!Array.isArray(point) || point.length !== 3 || !point.every((part) => Number.isFinite(Number(part)))) return point;
+    return point.map((part, axis) => newSceneCenter[axis] + (Number(part) - oldSceneCenter[axis]) * factors[axis]);
+  };
+
+  const transformWallHostForCalibration = (wallHost, factors, oldSceneCenter, newSceneCenter) => {
+    if (!wallHost || typeof wallHost !== 'object') return wallHost;
+    const tangent = normalizeDirection(wallHost.tangent, [1, 0, 0]);
+    const normal = normalizeDirection(wallHost.normal, [0, 0, 1]);
+    const up = normalizeDirection(wallHost.up, [0, 1, 0]);
+    const widthFactor = scaleAlongDirection(tangent, factors, [1, 0, 0]);
+    const heightFactor = scaleAlongDirection(up, factors, [0, 1, 0]);
+    const thicknessFactor = scaleAlongDirection(normal, factors, [0, 0, 1]);
+    const scaledBounds = wallHost.bounds && Array.isArray(wallHost.bounds.min) && Array.isArray(wallHost.bounds.max)
+      ? {
+          min: transformPointForCalibration(wallHost.bounds.min, factors, oldSceneCenter, newSceneCenter),
+          max: transformPointForCalibration(wallHost.bounds.max, factors, oldSceneCenter, newSceneCenter),
+        }
+      : (wallHost.bounds || null);
+    const scaledTangent = normalizeDirection(tangent.map((part, axis) => part * factors[axis]), tangent);
+    const scaledUp = normalizeDirection(up.map((part, axis) => part * factors[axis]), up);
+    const inverseScaledNormal = normalizeDirection(normal.map((part, axis) => part / Math.max(1e-9, factors[axis])), normal);
+    return {
+      ...wallHost,
+      hitPoint: transformPointForCalibration(wallHost.hitPoint, factors, oldSceneCenter, newSceneCenter),
+      tangent: scaledTangent,
+      up: scaledUp,
+      normal: inverseScaledNormal,
+      bounds: scaledBounds,
+      localAnchor: wallHost.localAnchor && typeof wallHost.localAnchor === 'object'
+        ? { ...wallHost.localAnchor, u: Number(wallHost.localAnchor.u || 0) * widthFactor, v: Number(wallHost.localAnchor.v || 0) * heightFactor }
+        : wallHost.localAnchor,
+      standoff: Number.isFinite(Number(wallHost.standoff)) ? Number(wallHost.standoff) * thicknessFactor : wallHost.standoff,
+    };
+  };
+
+  const scaleHostedOpeningDimensions = (dimensions, wallHost, factors) => {
+    if (!dimensions || typeof dimensions !== 'object') return dimensions;
+    const tangent = normalizeDirection(wallHost?.tangent, [1, 0, 0]);
+    const normal = normalizeDirection(wallHost?.normal, [0, 0, 1]);
+    const up = normalizeDirection(wallHost?.up, [0, 1, 0]);
+    const widthFactor = scaleAlongDirection(tangent, factors, [1, 0, 0]);
+    const heightFactor = scaleAlongDirection(up, factors, [0, 1, 0]);
+    const thicknessFactor = scaleAlongDirection(normal, factors, [0, 0, 1]);
+    return {
+      ...dimensions,
+      ...(Number.isFinite(Number(dimensions.width)) ? { width: Number(dimensions.width) * widthFactor } : {}),
+      ...(Number.isFinite(Number(dimensions.height)) ? { height: Number(dimensions.height) * heightFactor } : {}),
+      ...(Number.isFinite(Number(dimensions.thickness)) ? { thickness: Number(dimensions.thickness) * thicknessFactor } : {}),
+      ...(Number.isFinite(Number(dimensions.sillHeight)) ? { sillHeight: Number(dimensions.sillHeight) * heightFactor } : {}),
+    };
+  };
+
   const transformMatrixBySceneScale = (matrix, ratio, oldSceneCenter, newSceneCenter) => {
     const m = normalizeMatrix(matrix);
     if (!m) return null;
@@ -1731,18 +1836,19 @@ export const useProjectSync = (activeProject) => {
         ? transformMatrixBySceneScale(sourceMatrix, ratio, oldSceneCenter, newSceneCenter)
         : null;
 
+      const factors = [ratio, ratio, ratio];
+      const wallHost = transformWallHostForCalibration(item.wallHost, factors, oldSceneCenter, newSceneCenter);
       return {
         ...item,
-        position: [
-          newSceneCenter[0] + (position[0] - oldSceneCenter[0]) * ratio,
-          newSceneCenter[1] + (position[1] - oldSceneCenter[1]) * ratio,
-          newSceneCenter[2] + (position[2] - oldSceneCenter[2]) * ratio,
-        ],
+        position: transformPointForCalibration(position, factors, oldSceneCenter, newSceneCenter),
         scale: [
           scale[0] * ratio,
           scale[1] * ratio,
           scale[2] * ratio,
         ],
+        ...(wallHost ? { wallHost } : {}),
+        ...(item.windowDimensions ? { windowDimensions: scaleHostedOpeningDimensions(item.windowDimensions, item.wallHost, factors) } : {}),
+        ...(item.doorDimensions ? { doorDimensions: scaleHostedOpeningDimensions(item.doorDimensions, item.wallHost, factors) } : {}),
         ...(nextMatrix ? { matrix: nextMatrix } : {}),
       };
     });
@@ -1814,14 +1920,14 @@ export const useProjectSync = (activeProject) => {
     const nextFurniture = (currentState.furniture || []).map(item => {
       const position = Array.isArray(item.position) && item.position.length === 3 ? item.position : [0, 0, 0];
       const scale = Array.isArray(item.scale) && item.scale.length === 3 ? item.scale : [1, 1, 1];
+      const wallHost = transformWallHostForCalibration(item.wallHost, sceneScale, oldSceneCenter, newSceneCenter);
       return {
         ...item,
-        position: [
-          newSceneCenter[0] + (position[0] - oldSceneCenter[0]) * sceneScale[0],
-          newSceneCenter[1] + (position[1] - oldSceneCenter[1]) * sceneScale[1],
-          newSceneCenter[2] + (position[2] - oldSceneCenter[2]) * sceneScale[2],
-        ],
+        position: transformPointForCalibration(position, sceneScale, oldSceneCenter, newSceneCenter),
         scale: [scale[0] * sceneScale[0], scale[1] * sceneScale[1], scale[2] * sceneScale[2]],
+        ...(wallHost ? { wallHost } : {}),
+        ...(item.windowDimensions ? { windowDimensions: scaleHostedOpeningDimensions(item.windowDimensions, item.wallHost, sceneScale) } : {}),
+        ...(item.doorDimensions ? { doorDimensions: scaleHostedOpeningDimensions(item.doorDimensions, item.wallHost, sceneScale) } : {}),
         calibrationSourceScale: undefined,
       };
     });

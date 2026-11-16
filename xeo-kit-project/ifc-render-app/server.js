@@ -1809,6 +1809,198 @@ app.post('/api/elements/:jobId/:globalId/insert-door', (req, res) => {
   }
 });
 
+// Hosted IFC windows use a separate engine and route from legacy door insertion.
+// The door endpoint above is intentionally untouched: this route builds a full
+// structural IFC plus a cumulative wall-only preview for the selected IFC wall.
+const windowOpeningEngineScript = path.join(__dirname, 'window_opening_engine.py');
+
+app.post('/api/elements/:jobId/:globalId/insert-window', (req, res) => {
+  const { jobId, globalId } = req.params;
+  if (!/^[a-zA-Z0-9_-]{1,100}$/.test(jobId)) return res.status(400).json({ error: 'Invalid project id.' });
+  if (!/^[A-Za-z0-9_$-]{1,64}$/.test(globalId)) return res.status(400).json({ error: 'Invalid IFC wall GlobalId.' });
+  if (!requireActiveProject(jobId, res)) return;
+
+  const isVec3 = (value) => Array.isArray(value) && value.length === 3 && value.every((entry) => Number.isFinite(Number(entry)));
+  const positive = (value, fallback, label) => {
+    const number = Number(value);
+    const result = Number.isFinite(number) && number > 0 ? number : fallback;
+    if (!Number.isFinite(result) || result <= 0) throw new Error(`${label} must be a positive finite number.`);
+    return result;
+  };
+  const normalizeDimensions = (raw = {}) => {
+    const sillHeight = Number(raw.sillHeight ?? raw.sill_height ?? 0.9);
+    const dimensions = {
+      width: positive(raw.width, 1.2, 'Window width'),
+      height: positive(raw.height, 1.2, 'Window height'),
+      thickness: positive(raw.thickness, 0.08, 'Window thickness'),
+      sillHeight,
+    };
+    if (dimensions.width < 0.25 || dimensions.width > 4.5 ||
+        dimensions.height < 0.25 || dimensions.height > 3.5 ||
+        dimensions.thickness > 1 || !Number.isFinite(sillHeight) || sillHeight < 0 || sillHeight > 3) {
+      throw new Error('Window dimensions are outside safe limits (width 0.25–4.5m, height 0.25–3.5m, sill 0–3m, thickness ≤1m).');
+    }
+    return dimensions;
+  };
+
+  try {
+    if (!fs.existsSync(windowOpeningEngineScript)) {
+      return res.status(500).json({ error: `Window opening engine is missing: ${windowOpeningEngineScript}` });
+    }
+    const jobDir = path.join(jobsDir, jobId);
+    const inputIfcPath = path.join(jobDir, 'input.ifc');
+    if (!fs.existsSync(inputIfcPath)) return res.status(404).json({ error: 'Canonical IFC source is missing.' });
+
+    const assetId = String(req.body?.assetId || '').trim();
+    const instanceId = String(req.body?.instanceId || `window_${Date.now()}`).trim();
+    const position = req.body?.position;
+    if (!assetId) return res.status(400).json({ error: 'assetId is required.' });
+    if (!/^[A-Za-z0-9_.-]{1,180}$/.test(instanceId)) return res.status(400).json({ error: 'Invalid window instanceId.' });
+    if (!isVec3(position)) return res.status(400).json({ error: 'position must be the IFC wall hit point [x, y, z].' });
+
+    const newWindow = {
+      instanceId,
+      assetId,
+      name: String(req.body?.name || 'Catalog Window').slice(0, 255),
+      wallGlobalId: globalId,
+      position: position.map(Number),
+      dimensions: normalizeDimensions(req.body?.dimensions),
+    };
+
+    const requestedOpenings = req.body?.wallOpenings && typeof req.body.wallOpenings === 'object'
+      ? req.body.wallOpenings
+      : {};
+    const rawDoors = Array.isArray(requestedOpenings.doors) ? requestedOpenings.doors : [];
+    const rawWindows = Array.isArray(requestedOpenings.windows) ? requestedOpenings.windows : [];
+    if (rawDoors.length > 100 || rawWindows.length > 100) {
+      return res.status(400).json({ error: 'A single wall operation may contain at most 100 existing openings of each type.' });
+    }
+
+    const doors = rawDoors.map((entry, index) => {
+      if (!entry || String(entry.wallGlobalId || entry.hostWallId || '') !== globalId) {
+        throw new Error(`Existing door spec ${index + 1} belongs to a different wall.`);
+      }
+      if (!isVec3(entry.position)) throw new Error(`Existing door spec ${index + 1} has an invalid position.`);
+      return {
+        instanceId: String(entry.instanceId || entry.assetId || `existing-door-${index + 1}`),
+        assetId: String(entry.assetId || entry.id || `existing-door-${index + 1}`),
+        wallGlobalId: globalId,
+        position: entry.position.map(Number),
+        dimensions: {
+          width: positive(entry.dimensions?.width, 0.9, 'Existing door width'),
+          height: positive(entry.dimensions?.height, 2.1, 'Existing door height'),
+          thickness: positive(entry.dimensions?.thickness, 0.05, 'Existing door thickness'),
+        },
+      };
+    });
+
+    const windowsByInstance = new Map();
+    for (const [index, entry] of rawWindows.entries()) {
+      if (!entry || String(entry.wallGlobalId || entry.hostWallId || '') !== globalId) {
+        throw new Error(`Existing window spec ${index + 1} belongs to a different wall.`);
+      }
+      if (!isVec3(entry.position)) throw new Error(`Existing window spec ${index + 1} has an invalid wall hit point.`);
+      const existingInstanceId = String(entry.instanceId || entry.assetId || `existing-window-${index + 1}`);
+      if (!/^[A-Za-z0-9_.-]{1,180}$/.test(existingInstanceId)) throw new Error(`Existing window spec ${index + 1} has an invalid instanceId.`);
+      windowsByInstance.set(existingInstanceId, {
+        instanceId: existingInstanceId,
+        assetId: String(entry.assetId || entry.id || existingInstanceId),
+        name: String(entry.name || 'Catalog Window').slice(0, 255),
+        wallGlobalId: globalId,
+        position: entry.position.map(Number),
+        dimensions: normalizeDimensions(entry.dimensions),
+      });
+    }
+    // The just-placed window is authoritative if an autosave snapshot contains
+    // an older item with the same id or no item yet.
+    windowsByInstance.set(instanceId, newWindow);
+    const windows = Array.from(windowsByInstance.values());
+
+    const editsDir = path.join(jobDir, 'element_edits');
+    fs.mkdirSync(editsDir, { recursive: true });
+    const stamp = `${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const outputFileName = `${globalId}_windows_${stamp}.ifc`;
+    const previewFileName = `${globalId}_windows_${stamp}_preview.ifc`;
+    const specsFileName = `${globalId}_windows_${stamp}_specs.json`;
+    const outputPath = path.join(editsDir, outputFileName);
+    const previewPath = path.join(editsDir, previewFileName);
+    const specsPath = path.join(editsDir, specsFileName);
+    fs.writeFileSync(specsPath, JSON.stringify({ version: 1, doors, windows }, null, 2), 'utf8');
+
+    const python = resolvePythonCommand();
+    const child = spawn(python.command, [
+      ...python.prefixArgs,
+      windowOpeningEngineScript,
+      'apply-hosted-wall-openings',
+      '--input', inputIfcPath,
+      '--output', outputPath,
+      '--opening-specs', specsPath,
+      '--preview-wall-id', globalId,
+      '--preview-output', previewPath,
+    ], { cwd: __dirname, windowsHide: true, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill();
+      if (!res.headersSent) res.status(504).json({ error: 'Window opening operation timed out. The original wall remains unchanged in the editor.' });
+    }, 120000);
+    const finish = (status, payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (!res.headersSent) res.status(status).json(payload);
+    };
+
+    child.stdout.on('data', (chunk) => { if (stdout.length < 4 * 1024 * 1024) stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { if (stderr.length < 4 * 1024 * 1024) stderr += chunk.toString(); });
+    child.on('error', (error) => finish(500, { error: `Could not launch the window opening engine: ${error.message}` }));
+    child.on('close', (code, signal) => {
+      if (settled) return;
+      if (code !== 0 || !fs.existsSync(outputPath) || !fs.existsSync(previewPath)) {
+        return finish(500, {
+          error: 'Window opening operation failed. The original IFC was not overwritten.',
+          details: (stderr || stdout || `Process exited with ${code ?? signal}`).slice(-5000),
+        });
+      }
+      try {
+        const response = JSON.parse(stdout.trim() || '{}');
+        if (response.error) return finish(500, { error: response.error, details: stderr.slice(-3000) });
+        const appliedWindow = (Array.isArray(response.windows) ? response.windows : [])
+          .find((entry) => String(entry.instanceId) === instanceId);
+        if (!appliedWindow?.windowPlacement?.position || !Array.isArray(appliedWindow.windowPlacement.position)) {
+          return finish(502, { error: 'Window engine returned no placement for the requested window.', details: stderr.slice(-3000) });
+        }
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        const host = req.headers.host;
+        finish(200, {
+          success: true,
+          ...appliedWindow,
+          doors: response.doors || [],
+          windows: response.windows || [],
+          fileUrl: `${protocol}://${host}/jobs/${jobId}/element_edits/${outputFileName}`,
+          previewFileUrl: `${protocol}://${host}/jobs/${jobId}/element_edits/${previewFileName}`,
+          previewFileName,
+        });
+      } catch (error) {
+        finish(502, { error: 'Window opening engine returned invalid JSON.', details: `${error.message}\n${stdout.slice(-3000)}\n${stderr.slice(-3000)}` });
+      }
+    });
+    res.on('close', () => {
+      if (!res.writableEnded && !settled) {
+        settled = true;
+        clearTimeout(timeout);
+        child.kill();
+      }
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'Invalid window opening request.' });
+  }
+});
+
 // ==========================================
 // IFC GLOBAL RESCALE API
 // ==========================================
