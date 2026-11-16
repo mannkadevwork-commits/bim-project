@@ -17,7 +17,7 @@ import { animateHandleTo, buildStretchHandles, destroyStretchHandles, hideReveal
 import { applyScale, cursorForAxes, resetHoveredStretchHandle } from './stretch/StretchController';
 import { toggleMeasurementMode, clearMeasurements, syncMeasurementsList, deleteMeasurement, flyToMeasurement, toggleSnapping, toggleAxisBreakdown, formatLength, cancelActiveMeasurement, applyMeasurementUnitToPlugin, MEASUREMENT_MODES, ORTHOGONAL_CONSTRAINTS, pickMeasurementReference, createProgrammaticDistanceMeasurement } from './measurements/MeasurementController';
 import { scaleModelByMeasurement, calibrateWallHeight } from './calibration/CalibrationController';
-import { getDropPosition, getWallSnapData, getCursorWorldPosition } from './placement/PlacementController';
+import { getDropPosition, getWallSnapData, getWallHostData, getCursorWorldPosition } from './placement/PlacementController';
 import { loadIFCAssetIntoScene, isolateAndMakeMoveable, inspectNativeElement, updateStructuralTransform, updateNativeOffset, updateDynamicTransform } from './assets/AssetManager';
 import { rememberNativeEntityRef, setNativeEntityVisibleForEdit as setNativeEntityVisible, restoreNativeEntityVisibility as restoreNativeEntityVisible, reconcileNativeEntityVisibility } from './nativeEntityHistory';
 import { calculateGrabPoint, translateMatrixWorld } from './stretch/TranslationController';
@@ -569,6 +569,15 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       lightFixtureControllerRef.current?.setEnabled(model, item.lightEnabled === true);
     }
 
+    if (item.wallHost) {
+      model._assetMeta = {
+        ...(model._assetMeta || {}),
+        wallHost: item.wallHost,
+        wallPlacementKind: item.wallPlacementKind || 'surface',
+        ...(item.windowHostWallId ? { windowHostWallId: item.windowHostWallId, windowDimensions: item.windowDimensions || null } : {}),
+      };
+    }
+
     const isNativeIsolation = !!item.isNativeIsolation;
     const transformKey = assetTransformSignature(item);
 
@@ -786,7 +795,11 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
             nativeSourceId: item.nativeSourceId || item.id || null,
             isNativeIsolation,
             doorHostWallId: item.doorHostWallId || null,
-            pivotMode: item.pivotMode || null,
+            windowHostWallId: item.windowHostWallId || null,
+            windowDimensions: item.windowDimensions || null,
+            wallPlacementKind: item.wallPlacementKind || null,
+            wallHost: item.wallHost || null,
+            pivotMode: item.wallHost?.anchorMode === 'center' ? 'center' : (item.pivotMode || null),
             assetCategory: item.assetCategory || null,
             isLightFixture: item.isLightFixture === true || item.assetCategory === 'lighting',
             lightEnabled: item.lightEnabled === true,
@@ -951,6 +964,16 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
     const model = viewer.scene.models?.[selectedId];
     if (!model) return false;
+
+    if (model?._assetMeta?.windowHostWallId) {
+      stretchHandlesRef.current
+        .filter((mesh) => mesh?._stretchMeta?.targetId === selectedId)
+        .forEach((mesh) => {
+          try { mesh.visible = false; mesh.pickable = false; } catch (_) {}
+        });
+      if (selectionCageRef.current) selectionCageRef.current.visible = false;
+      return false;
+    }
 
     if (!stretchHandlesRef.current.some((mesh) => mesh?._stretchMeta?.targetId === selectedId)) {
       buildStretchHandlesRef.current?.(stretchCtx, selectedId, true);
@@ -1653,6 +1676,30 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           return;
         }
         const activePlacement = placementModeRef.current;
+        if (activePlacement.placementSurface === 'wall' || activePlacement.wallPlacementKind) {
+          const wallHostPlacement = getWallHostData(viewerRef, pickResult.canvasPos, activePlacement);
+          if (!wallHostPlacement) {
+            window.dispatchEvent(new CustomEvent('hci:placement-warning', {
+              detail: { message: 'Select a vertical wall surface. Furniture fronts and unsupported surfaces cannot host this item.' },
+            }));
+            return;
+          }
+          if (activePlacement.wallPlacementKind === 'opening' || activePlacement.type === 'window') {
+            onAssetPlaced(activePlacement, wallHostPlacement);
+            setPlacementMode(null);
+            return;
+          }
+          const wallMountedAsset = {
+            ...activePlacement,
+            placementSurface: 'wall',
+            wallPlacementKind: 'surface',
+            pivotMode: activePlacement.pivotMode || 'center',
+            wallHost: wallHostPlacement.wallHost,
+          };
+          onAssetPlaced(wallMountedAsset, wallHostPlacement);
+          setPlacementMode(null);
+          return;
+        }
         let pickedWorldPos = pickResult.worldPos && typeof pickResult.worldPos.length === 'number' && pickResult.worldPos.length >= 3
           ? Array.from(pickResult.worldPos).slice(0, 3).map(Number)
           : null;
@@ -1795,7 +1842,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
       const targetId = meta.targetId;
       const targetObj = viewer.scene.models[targetId];
-      if (!targetObj) return false;
+      if (!targetObj || targetObj?._assetMeta?.windowHostWallId) return false;
 
       const isIFCMove = isIFCModel(targetObj);
       const startPosition = isGLBModel(targetObj)
@@ -1897,6 +1944,10 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
 
       const targetObj = viewer.scene.models[targetId];
       if (!targetObj) return;
+      if (targetObj?._assetMeta?.windowHostWallId) {
+        viewer.cameraControl.active = true;
+        return;
+      }
 
       if (mode === 'rotate' && type === 'rotate') {
         const center = isAsset && isGLBModel(targetObj)
@@ -2994,6 +3045,7 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
       ),
       getDropPosition: (c, a) => getDropPosition(viewerRef, projectStateRef, c, a),
       getWallSnapData: (c) => getWallSnapData(viewerRef, c),
+      getWallHostData: (c, asset) => getWallHostData(viewerRef, c, asset || {}),
       setLightFixtureEnabled: (instanceId, enabled) => {
         const model = viewerRef.current?.scene?.models?.[instanceId];
         if (!model?._assetMeta?.isLightFixture) return false;

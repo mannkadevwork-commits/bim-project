@@ -126,11 +126,73 @@ async function resolveDoorDimensionsForPlacement(asset, catalogAssetId, projectS
   }
 }
 
+function readWindowCatalogDimensions(asset = {}) {
+  const dimensions = asset.dimensions || asset.size || asset.modelDimensions || asset.model_dimensions || {};
+  const at = (object, keys) => {
+    for (const key of keys) {
+      const value = Number(object?.[key]);
+      if (Number.isFinite(value) && value > 0) return value;
+    }
+    return null;
+  };
+  const arrayDimensions = Array.isArray(dimensions) ? dimensions : null;
+  return {
+    width: at(dimensions, ['width', 'x']) || at(asset, ['width', 'width_m', 'dimensionWidth']) || Number(arrayDimensions?.[0]) || 1.2,
+    height: at(dimensions, ['height', 'y']) || at(asset, ['height', 'height_m', 'dimensionHeight']) || Number(arrayDimensions?.[1]) || 1.2,
+    depth: at(dimensions, ['depth', 'thickness', 'z']) || at(asset, ['depth', 'thickness', 'depth_m']) || Number(arrayDimensions?.[2]) || 0.08,
+  };
+}
+
+async function resolveWindowDimensionsForPlacement(asset, catalogAssetId, projectState) {
+  const catalog = readWindowCatalogDimensions(asset);
+  const baseScale = Array.isArray(asset?.scale) && asset.scale.length === 3 ? asset.scale : [1, 1, 1];
+  const calibration = projectState?.scene_calibration?.scaleFactor || { x: 1, y: 1, z: 1 };
+  const effectiveScale = [
+    Number(baseScale[0] || 1) * Number(calibration.x || 1),
+    Number(baseScale[1] || 1) * Number(calibration.y || 1),
+    Number(baseScale[2] || 1) * Number(calibration.z || 1),
+  ].map((value) => Math.abs(Number(value)) || 1);
+
+  let dimensions = null;
+  let axisYawCorrection = 0;
+  const sourceUrl = String(asset?.url || asset?.src || asset?.model_url || '').split('?')[0].split('#')[0];
+  if (/\.(glb|gltf)$/i.test(sourceUrl)) {
+    try {
+      const bounds = await loadDoorIntrinsicBounds(asset);
+      const sx = bounds.x * effectiveScale[0];
+      const sy = bounds.y * effectiveScale[1];
+      const sz = bounds.z * effectiveScale[2];
+      axisYawCorrection = sz > sx ? 90 : 0;
+      dimensions = { width: Math.max(sx, sz), height: sy, thickness: Math.max(0.025, Math.min(sx, sz)) };
+    } catch (error) {
+      console.warn('[WindowPlacement] GLB bounds could not be measured; using catalog dimensions.', error);
+    }
+  }
+
+  if (!dimensions) {
+    dimensions = {
+      width: Math.max(catalog.width * effectiveScale[0], catalog.width * effectiveScale[2]),
+      height: catalog.height * effectiveScale[1],
+      thickness: Math.max(0.025, catalog.depth * Math.min(effectiveScale[0], effectiveScale[2])),
+    };
+  }
+
+  const rawSillHeight = Number(asset?.sillHeight ?? asset?.sill_height ?? asset?.windowSillHeight ?? asset?.window_sill_height ?? 0.9);
+  const sillHeight = Number.isFinite(rawSillHeight) && rawSillHeight >= 0 ? rawSillHeight : 0.9;
+  const result = { ...dimensions, sillHeight, axisYawCorrection };
+  if (result.width < 0.25 || result.width > 4.5 || result.height < 0.25 || result.height > 3.5 || result.thickness <= 0 || result.thickness > 1 || result.sillHeight > 3) {
+    throw new Error(`Window dimensions ${result.width.toFixed(3)} × ${result.height.toFixed(3)}m (sill ${result.sillHeight.toFixed(2)}m) are outside safe opening limits.`);
+  }
+  console.info(`[WindowPlacement] ${asset?.name || catalogAssetId}: ${result.width.toFixed(3)}m × ${result.height.toFixed(3)}m; sill ${result.sillHeight.toFixed(3)}m.`);
+  return result;
+}
+
 const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSavedLayout, onSavedLayoutCreated }) => {
   const { file, jobId, fileName } = activeProject || {};
   const containerRef = useRef(null);
   const tooltipRef = useRef(null);
   const doorInsertionInFlightRef = useRef(false);
+  const windowInsertionInFlightRef = useRef(false);
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(true);
   const [isRightPanelOpen, setIsRightPanelOpen] = useState(true);
   const [leftTab, setLeftTab] = useState('explorer');
@@ -376,6 +438,154 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     }
   };
 
+  const insertWindow = async (asset, wallPlacement) => {
+    if (!file || !jobId || windowInsertionInFlightRef.current) return;
+
+    const wallHost = wallPlacement?.wallHost;
+    const wallGlobalId = wallHost?.hostGlobalId;
+    const hitPoint = wallHost?.hitPoint;
+    if (wallHost?.hostType !== 'ifc' || !wallGlobalId || !Array.isArray(hitPoint) ||
+        hitPoint.length !== 3 || !hitPoint.every(Number.isFinite)) {
+      setToastMessage('Windows can currently create openings only in verified IFC walls. GLB wall subtraction is not enabled yet.');
+      return;
+    }
+
+    const currentState = projectStateRef.current || {};
+    const currentFurniture = Array.isArray(currentState.furniture) ? currentState.furniture : [];
+    const catalogAssetId = asset.catalogId ?? (
+      typeof asset.id === 'string' && asset.id.startsWith('cat_') ? asset.id.slice(4) : asset.id
+    );
+    const instanceId = `${String(asset.id || catalogAssetId || 'window').replace(/[^A-Za-z0-9_.-]/g, '_')}_window_${Date.now()}`;
+
+    windowInsertionInFlightRef.current = true;
+    let historyTransactionOpen = false;
+    let hostWallVisibilityChangedByThisOperation = false;
+    beginHistoryTransaction('Insert window');
+    historyTransactionOpen = true;
+    engineActions.setIsLoading(true);
+    setToastMessage('Calculating IFC window opening...');
+
+    try {
+      const windowDimensions = await resolveWindowDimensionsForPlacement(asset, catalogAssetId, currentState);
+      const existingDoors = currentFurniture
+        .filter((item) => String(item?.doorHostWallId || '') === String(wallGlobalId))
+        .map((item) => ({
+          instanceId: item.instanceId,
+          assetId: item.id,
+          wallGlobalId,
+          // Door opening placement is stored at the wall-run centre. The door
+          // engine deliberately ignores its vertical value and anchors to floor.
+          position: item.position,
+          dimensions: item.doorDimensions || {},
+        }));
+      const existingWindows = currentFurniture
+        .filter((item) => String(item?.windowHostWallId || '') === String(wallGlobalId))
+        .map((item) => ({
+          instanceId: item.instanceId,
+          assetId: item.id,
+          name: item.name,
+          wallGlobalId,
+          position: item.wallHost?.hitPoint,
+          dimensions: item.windowDimensions || {},
+        }));
+
+      const response = await fetch(`${API_BASE_URL}/api/elements/${jobId}/${wallGlobalId}/insert-window`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          assetId: String(catalogAssetId || asset.id),
+          instanceId,
+          name: asset.name || 'Catalog Window',
+          position: [...hitPoint],
+          dimensions: windowDimensions,
+          wallOpenings: { doors: existingDoors, windows: existingWindows },
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.error) throw new Error(data.error || `Window insertion failed (${response.status}).`);
+      if (!data.previewFileUrl) throw new Error('The IFC window engine did not return a wall-only preview. The viewport was not changed.');
+      if (!data.windowPlacement || !Array.isArray(data.windowPlacement.position) ||
+          data.windowPlacement.position.length !== 3 || !data.windowPlacement.position.every(Number.isFinite) ||
+          !Array.isArray(data.windowPlacement.rotation) || data.windowPlacement.rotation.length !== 3 ||
+          !data.windowPlacement.rotation.every(Number.isFinite)) {
+        throw new Error('The IFC window engine returned an invalid placement transform.');
+      }
+
+      // Preserve the original IFC entity reference before the preview model
+      // shadows its GlobalId. The preview replaces any older isolated preview
+      // of this wall so all hosted door/window cuts remain cumulative.
+      if (!engineActions.rememberNativeEntity(wallGlobalId)) {
+        throw new Error('Could not safely identify the original IFC wall. No viewport changes were made.');
+      }
+      const wasAlreadyHidden = currentState.structural_edits?.[wallGlobalId]?.visible === false;
+      if (!engineActions.setNativeEntityVisibleForEdit(wallGlobalId, false)) {
+        throw new Error('Could not hide the original host wall safely. Window placement was cancelled.');
+      }
+      hostWallVisibilityChangedByThisOperation = !wasAlreadyHidden;
+      updateStructuralEdit(wallGlobalId, 'visible', false, false);
+      clearNativeIFCMaterialOverride(refs.viewerRef.current, wallGlobalId);
+
+      const previousWallPreviews = currentFurniture.filter((item) => (
+        item?.isNativeIsolation === true && String(item?.nativeSourceId || '') === String(wallGlobalId)
+      ));
+      for (const previousPreview of previousWallPreviews) {
+        deleteAsset(refs.viewerRef, previousPreview.instanceId, { silent: true });
+      }
+
+      const modifiedWallId = `${wallGlobalId}_window_openings_${Date.now()}`;
+      await engineActions.loadIFCAssetIntoScene(
+        modifiedWallId,
+        data.previewFileUrl,
+        null,
+        null,
+        { fileType: 'ifc', isNativeIsolation: true, nativeSourceId: wallGlobalId, sourceJobId: jobId }
+      );
+      adoptIsolatedAsset(wallGlobalId, modifiedWallId, data.previewFileUrl, 'Wall with Openings', [0, 0, 0], [0, 0, 0], [1, 1, 1], {
+        nativeSourceId: wallGlobalId,
+        isNativeIsolation: true,
+      });
+
+      const placedWindowAsset = {
+        ...asset,
+        id: String(catalogAssetId || asset.id),
+        instanceId,
+        wallHost,
+        placementSurface: 'wall',
+        wallPlacementKind: 'opening',
+        pivotMode: 'center',
+        windowHostWallId: wallGlobalId,
+        windowDimensions,
+      };
+      await spawnAsset(
+        attachActiveRoomMetadata(placedWindowAsset, data.windowPlacement.position),
+        data.windowPlacement.position,
+        engineActions.loadIFCAssetIntoScene,
+        [
+          data.windowPlacement.rotation[0],
+          data.windowPlacement.rotation[1] + Number(windowDimensions.axisYawCorrection || 0),
+          data.windowPlacement.rotation[2],
+        ],
+      );
+
+      endHistoryTransaction();
+      historyTransactionOpen = false;
+      setToastMessage('Window placed and IFC wall opening created.');
+    } catch (error) {
+      console.error('[BIMViewer] Window insertion failed:', error);
+      if (historyTransactionOpen) {
+        cancelHistoryTransaction();
+        historyTransactionOpen = false;
+      }
+      if (hostWallVisibilityChangedByThisOperation) {
+        engineActions.restoreNativeEntityVisibility(wallGlobalId);
+      }
+      setToastMessage(`Window placement cancelled: ${error.message}`);
+    } finally {
+      windowInsertionInFlightRef.current = false;
+      engineActions.setIsLoading(false);
+    }
+  };
+
   const {
     refs, state: engineState, actions: engineActions,
   } = useBIMEngine(
@@ -385,6 +595,22 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     (asset, data) => {
       if (asset.type === 'door') {
         insertDoor(asset, data);
+      } else if (asset.wallPlacementKind === 'opening' || asset.type === 'window') {
+        insertWindow(asset, data);
+      } else if (data?.wallHost && Array.isArray(data.position)) {
+        const wallMountedAsset = {
+          ...asset,
+          wallHost: data.wallHost,
+          placementSurface: 'wall',
+          wallPlacementKind: 'surface',
+          pivotMode: 'center',
+        };
+        spawnAsset(
+          attachActiveRoomMetadata(wallMountedAsset, data.position),
+          data.position,
+          engineActions.loadIFCAssetIntoScene,
+          Array.isArray(data.rotation) ? data.rotation : [0, 0, 0]
+        );
       } else {
         const placementPosition = Array.isArray(data) ? data : data?.position;
         spawnAsset(attachActiveRoomMetadata(asset, placementPosition), data, engineActions.loadIFCAssetIntoScene);
@@ -397,6 +623,20 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     isDarkMode,
     projectStateHydratedRef
   );
+
+  useEffect(() => {
+    const handlePlacementWarning = (event) => {
+      const message = String(event?.detail?.message || 'This surface cannot host the selected asset.');
+      setToastMessage(message);
+      window.clearTimeout(handlePlacementWarning.timeoutId);
+      handlePlacementWarning.timeoutId = window.setTimeout(() => setToastMessage(null), 4200);
+    };
+    window.addEventListener('hci:placement-warning', handlePlacementWarning);
+    return () => {
+      window.removeEventListener('hci:placement-warning', handlePlacementWarning);
+      window.clearTimeout(handlePlacementWarning.timeoutId);
+    };
+  }, [setToastMessage]);
 
   // Discover original IFC ceiling/roof entities after the main model has
   // finished loading. The UI only offers hide/show controls when a real ceiling
@@ -532,14 +772,14 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   }, [engineActions, refs.canvasRef, setToastMessage]);
 
   const openReplaceRoomAsset = useCallback((item) => {
-    if (!item?.instanceId || item.doorHostWallId || item.isNativeIsolation || item.nativeSourceId) return;
+    if (!item?.instanceId || item.doorHostWallId || item.windowHostWallId || item.isNativeIsolation || item.nativeSourceId) return;
     setReplaceTargetId(item.instanceId);
     setReplaceTargetItem({ ...item });
     setShowReplaceAssetModal(true);
   }, []);
 
   const deleteRoomAsset = useCallback((item) => {
-    if (!item?.instanceId || item.doorHostWallId || item.isNativeIsolation || item.nativeSourceId) return;
+    if (!item?.instanceId || item.doorHostWallId || item.windowHostWallId || item.isNativeIsolation || item.nativeSourceId) return;
     beginHistoryTransaction(`Remove ${item.name || 'room item'}`);
     try {
       deleteAsset(refs.viewerRef, item.instanceId);
@@ -981,9 +1221,9 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   })();
   const canReplaceSelectedAsset = Boolean(
     (activeAsset && selectedFurnitureItem &&
-      !selectedFurnitureItem.doorHostWallId &&
+      !selectedFurnitureItem.doorHostWallId && !selectedFurnitureItem.windowHostWallId &&
       !selectedFurnitureItem.isNativeIsolation && !selectedFurnitureItem.nativeSourceId &&
-      !activeAsset?._assetMeta?.isNativeIsolation) || nativeReplaceDescriptor
+      !activeAsset?._assetMeta?.isNativeIsolation && !activeAsset?._assetMeta?.windowHostWallId) || nativeReplaceDescriptor
   ) && (engineState.selectedElements?.length || 0) <= 1;
 
   const openReplaceAssetModal = () => {
@@ -1194,6 +1434,32 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
           return;
         }
         await insertDoor(asset, dropData);
+      } else if (asset.placementSurface === 'wall' || asset.wallPlacementKind) {
+        const wallPlacement = engineActions.getWallHostData(canvasPos, asset);
+        if (!wallPlacement) {
+          setToastMessage('Drop this item onto a detected vertical wall surface.');
+          setTimeout(() => setToastMessage(null), 3200);
+          return;
+        }
+        if (asset.wallPlacementKind === 'opening' || asset.type === 'window') {
+          await insertWindow(asset, wallPlacement);
+          setIsRightPanelOpen(true);
+          setRightTab('properties');
+          return;
+        }
+        const wallMountedAsset = {
+          ...asset,
+          wallHost: wallPlacement.wallHost,
+          placementSurface: 'wall',
+          wallPlacementKind: 'surface',
+          pivotMode: 'center',
+        };
+        await spawnAsset(
+          attachActiveRoomMetadata(wallMountedAsset, wallPlacement.position),
+          wallPlacement.position,
+          engineActions.loadIFCAssetIntoScene,
+          wallPlacement.rotation
+        );
       } else {
         const placementSurface = asset.placementSurface === 'surface' ? 'surface' : null;
         const worldPos = engineActions.getDropPosition(canvasPos, placementSurface);
@@ -1584,9 +1850,13 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
         <div className="absolute top-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 px-5 py-2.5 bg-[#ff914d] text-white rounded-full shadow-lg animate-in slide-in-from-top-2 fade-in duration-200">
           <MousePointerClick className="w-4 h-4 animate-pulse" />
           <span className="font-semibold text-sm">
-            {engineState.placementMode.placementSurface === 'surface'
-              ? `Click a ceiling surface to place ${engineState.placementMode.name}`
-              : `Click canvas to place ${engineState.placementMode.name}`}
+            {engineState.placementMode.placementSurface === 'wall'
+              ? (engineState.placementMode.wallPlacementKind === 'opening'
+                ? `Select a wall to validate the host for ${engineState.placementMode.name}`
+                : `Click a vertical wall to mount ${engineState.placementMode.name}`)
+              : engineState.placementMode.placementSurface === 'surface'
+                ? `Click a ceiling surface to place ${engineState.placementMode.name}`
+                : `Click canvas to place ${engineState.placementMode.name}`}
           </span>
           <button onClick={() => engineActions.setPlacementMode(null)} className="ml-1 hover:bg-[#ff7a28] p-1 rounded-full cursor-pointer">
             <X className="w-3 h-3" />

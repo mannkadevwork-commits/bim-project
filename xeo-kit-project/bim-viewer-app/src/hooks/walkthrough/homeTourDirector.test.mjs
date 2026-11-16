@@ -153,3 +153,38 @@ test('tour state disables next while a skip-after-arrival is already queued', ()
   homeTourDirectorMethods._emitHomeTourState.call(runtime);
   assert.equal(runtime.events.at(-1).canNextRoom, false);
 });
+
+test('room presentation anchors Space 6 on its nearby bed instead of a farther local object', () => {
+  const runtime = makeRuntime({
+    position: { x: 6.8, y: 0.05, z: 0, set(x, y, z) { this.x = x; this.y = y; this.z = z; } },
+    metersPerUnit: 1,
+    currentYaw: Math.PI,
+    targetYaw: Math.PI,
+    homeTourAreaSource: [
+      { id: 'space-5', center: [5.1, 0, 0] },
+      { id: 'space-6', center: [6.8, 0, 0] },
+    ],
+    walkAreas: [],
+    presentationSubjects: [
+      {
+        id: 'bed-space-6', name: 'Professional Bed', role: 'furniture', heroPriority: 9.6,
+        center: { x: 5.95, y: 0.55, z: 0.25 },
+        basePosition: { x: 5.95, y: 0, z: 0.25 },
+        areaId: 'space-5', isPlacedAsset: true,
+      },
+      {
+        id: 'sofa-space-6', name: 'Fur Sofa', role: 'furniture', heroPriority: 9.6,
+        center: { x: 8.2, y: 0.62, z: -0.2 },
+        basePosition: { x: 8.2, y: 0, z: -0.2 },
+        areaId: 'space-6', isPlacedAsset: true,
+      },
+    ],
+    _isHomeTourSubjectVisible() { return true; },
+  });
+  const shot = homeTourDirectorMethods._resolveHomeTourPresentation.call(runtime, {
+    areaId: 'space-6',
+    point: { x: 6.8, y: 0.05, z: 0 },
+  });
+  assert.equal(shot?.heroSubject?.id, 'bed-space-6');
+  assert.equal(shot?.hero?.name, 'Professional Bed');
+});

@@ -161,6 +161,9 @@ export const loadIFCAssetIntoScene = async (
         srcUrl,
         assetCategory: options.assetCategory || null,
         isLightFixture: options.isLightFixture === true || options.assetCategory === 'lighting',
+        wallHost: options.wallHost || null,
+        wallPlacementKind: options.wallPlacementKind || (options.wallHost ? 'surface' : null),
+        ...(options.windowHostWallId ? { windowHostWallId: options.windowHostWallId, windowDimensions: options.windowDimensions || null } : {}),
         lightEnabled: options.lightEnabled === true,
         lightIntensity: Number.isFinite(Number(options.lightIntensity)) ? Number(options.lightIntensity) : 0.12,
         lightTemperature: Number.isFinite(Number(options.lightTemperature)) ? Number(options.lightTemperature) : 4000,
@@ -302,6 +305,8 @@ export const loadIFCAssetIntoScene = async (
       // be recognised by LightFixtureController.
       assetCategory: options.assetCategory || null,
       isLightFixture: options.isLightFixture === true || options.assetCategory === 'lighting',
+      wallHost: options.wallHost || null,
+      wallPlacementKind: options.wallPlacementKind || (options.wallHost ? 'surface' : null),
       lightEnabled: options.lightEnabled === true,
       lightIntensity: Number.isFinite(Number(options.lightIntensity)) ? Number(options.lightIntensity) : 0.12,
       lightTemperature: Number.isFinite(Number(options.lightTemperature)) ? Number(options.lightTemperature) : 4000,
@@ -309,6 +314,8 @@ export const loadIFCAssetIntoScene = async (
       ...(options.nativeSourceId ? { nativeSourceId: options.nativeSourceId } : {}),
       ...(options.sourceJobId ? { sourceJobId: options.sourceJobId } : {}),
       ...(options.doorHostWallId ? { doorHostWallId: options.doorHostWallId } : {}),
+      ...(options.windowHostWallId ? { windowHostWallId: options.windowHostWallId } : {}),
+      ...(options.windowDimensions ? { windowDimensions: options.windowDimensions } : {}),
     };
 
     assetModel.on('loaded', () => {
@@ -347,11 +354,11 @@ export const loadIFCAssetIntoScene = async (
           const aabb = assetModel.aabb;
           if (aabb && aabb.length >= 6) {
             const centerX = (aabb[0] + aabb[3]) / 2;
+            const centerY = options.wallHost?.anchorMode === 'center' ? (aabb[1] + aabb[4]) / 2 : aabb[1];
             const centerZ = (aabb[2] + aabb[5]) / 2;
-            const bottomY = aabb[1];
             assetModel.position = [
               targetPosition[0] - centerX,
-              targetPosition[1] - bottomY,
+              targetPosition[1] - centerY,
               targetPosition[2] - centerZ,
             ];
           } else {

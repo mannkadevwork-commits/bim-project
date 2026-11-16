@@ -119,6 +119,27 @@ export function computeAssetPivotOffset(node: Node): [number, number, number] {
 }
 
 /**
+ * Computes the geometric centre pivot for a wall-hosted asset. Unlike the
+ * regular furniture pivot (bottom-centre), wall openings and surface-mounted
+ * fixtures are positioned by their visual centre on the wall plane.
+ */
+export function computeAssetCenterPivotOffset(node: Node): [number, number, number] {
+  const aabb = createEmptyAABB();
+  const ownMesh = node.getMesh();
+  if (ownMesh) accumulateMeshAABB(aabb, ownMesh);
+  for (const child of node.listChildren()) {
+    const childMesh = child.getMesh();
+    if (childMesh) accumulateMeshAABB(aabb, childMesh);
+  }
+  if (!isFinite(aabb.minX) || !isFinite(aabb.maxX)) return [0, 0, 0];
+  return [
+    (aabb.minX + aabb.maxX) / 2,
+    (aabb.minY + aabb.maxY) / 2,
+    (aabb.minZ + aabb.maxZ) / 2,
+  ];
+}
+
+/**
  * Converts Euler angles in degrees [X, Y, Z] to a glTF-compliant
  * Quaternion [x, y, z, w], using intrinsic XYZ rotation order —
  * matching three.js's default `Euler` order and standard WebGL/glTF

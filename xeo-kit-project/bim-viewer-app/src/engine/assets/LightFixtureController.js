@@ -21,11 +21,22 @@ const getEmitterPosition = (model) => {
   const aabb = model?.aabb;
   if (!aabb || aabb.length < 6 || !Array.from(aabb).slice(0, 6).every(Number.isFinite)) return null;
   const height = Math.max(0.05, aabb[4] - aabb[1]);
+  const center = [
+    (aabb[0] + aabb[3]) / 2,
+    (aabb[1] + aabb[4]) / 2,
+    (aabb[2] + aabb[5]) / 2,
+  ];
+  const wallNormal = model?._assetMeta?.wallHost?.normal;
+  if (Array.isArray(wallNormal) && wallNormal.length === 3 && wallNormal.every(Number.isFinite)) {
+    // Wall sconces should emit into the room from the fixture's front/centre,
+    // rather than from the lower edge as ceiling/floor fixtures do.
+    return center.map((value, axis) => value + Number(wallNormal[axis]) * 0.08);
+  }
   // The fixture's lower/front side faces the room in the viewer's Y-up frame.
   return [
-    (aabb[0] + aabb[3]) / 2,
+    center[0],
     aabb[1] + Math.min(height * 0.18, 0.10),
-    (aabb[2] + aabb[5]) / 2,
+    center[2],
   ];
 };
 
