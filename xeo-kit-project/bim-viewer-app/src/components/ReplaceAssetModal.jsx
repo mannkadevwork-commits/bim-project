@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Check, FileBox, Loader2, RefreshCw, Search, X } from 'lucide-react';
+import { isCompatibleCatalogReplacement } from '../engine/assets/ifcReplacement.mjs';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
@@ -69,6 +70,7 @@ export function ReplaceAssetModal({
   open,
   currentItem,
   catalogTree = [],
+  replacementKind = null,
   onClose,
   onReplace,
 }) {
@@ -95,8 +97,9 @@ export function ReplaceAssetModal({
   const eligibleItems = useMemo(() => flatItems.filter((item) => {
     if (isDoorAsset(item)) return false;
     if (sameAsset(item, currentItem)) return false;
+    if (replacementKind && !isCompatibleCatalogReplacement(item, replacementKind)) return false;
     return true;
-  }), [flatItems, currentItem]);
+  }), [flatItems, currentItem, replacementKind]);
   const categories = useMemo(() => [...new Set(eligibleItems.map((item) => item._categoryPath).filter(Boolean))].sort((a, b) => a.localeCompare(b)), [eligibleItems]);
   const filteredItems = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -110,8 +113,8 @@ export function ReplaceAssetModal({
 
   useEffect(() => {
     if (!open) return undefined;
-    setQuery(currentItem?.isNativeIfcElement ? String(currentItem?.name || '').replace(/[^a-z0-9 ]/gi, ' ').trim().split(/\s+/).filter(Boolean).slice(0, 2).join(' ') : '');
-    setCategoryFilter(currentCatalogMatch?._categoryPath || 'all');
+    setQuery(currentItem?.isNativeIfcElement ? (replacementKind === 'wall' ? 'wall' : replacementKind === 'window' ? 'window' : '') : '');
+    setCategoryFilter(currentItem?.isNativeIfcElement ? 'all' : (currentCatalogMatch?._categoryPath || 'all'));
     setSelectedId('');
     setPreserveFinish(true);
     setError('');
@@ -120,7 +123,7 @@ export function ReplaceAssetModal({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open, currentItem?.instanceId, currentCatalogMatch?._categoryPath]);
+  }, [open, currentItem?.instanceId, currentCatalogMatch?._categoryPath, replacementKind]);
 
   if (!open) return null;
 
@@ -155,7 +158,7 @@ export function ReplaceAssetModal({
           <div className="min-w-0">
             <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#d96b25]">Design edit · Replace item</p>
             <h2 id="replace-asset-title" className="mt-1 text-lg font-bold text-slate-900 dark:text-white">Replace {currentItem?.name || 'selected item'}</h2>
-            <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">{currentItem?.isNativeIfcElement ? 'Choose a catalogue asset to replace this IFC furniture element. The original IFC source is preserved and hidden through a tracked edit.' : 'Choose a catalogue alternative. The rest of your design stays in place.'}</p>
+            <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">{currentItem?.isNativeIfcElement ? `Choose a ${replacementKind || 'compatible'} catalogue asset. The original IFC product is preserved and hidden through a tracked edit; its measured position, orientation and dimensions are used for placement.` : 'Choose a catalogue alternative. The rest of your design stays in place.'}</p>
           </div>
           <button type="button" onClick={onClose} disabled={submitting} className="rounded-xl border border-slate-200 p-2 text-slate-500 transition hover:bg-slate-100 disabled:opacity-40 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800" aria-label="Close replace item dialog">
             <X className="h-4 w-4" />
@@ -165,7 +168,7 @@ export function ReplaceAssetModal({
         <div className="grid shrink-0 grid-cols-1 gap-3 border-b border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/60 sm:grid-cols-[minmax(0,1fr)_250px] sm:px-6">
           <label className="relative block">
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} autoFocus placeholder="Search sofas, chairs, tables…" className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-orange-300 focus:ring-2 focus:ring-orange-100 dark:border-slate-700 dark:bg-slate-950 dark:text-white dark:focus:border-orange-500/50 dark:focus:ring-orange-500/10" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} autoFocus placeholder={replacementKind === 'window' ? "Search windows, sliders, casements…" : replacementKind === 'wall' ? "Search walls, partitions, panels…" : "Search sofas, chairs, tables…"} className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-orange-300 focus:ring-2 focus:ring-orange-100 dark:border-slate-700 dark:bg-slate-950 dark:text-white dark:focus:border-orange-500/50 dark:focus:ring-orange-500/10" />
           </label>
           <label className="block">
             <span className="sr-only">Filter by category</span>
@@ -208,16 +211,20 @@ export function ReplaceAssetModal({
             <div className="flex min-h-52 flex-col items-center justify-center rounded-2xl border border-dashed border-slate-300 text-center dark:border-slate-700">
               <Search className="h-7 w-7 text-slate-300 dark:text-slate-600" />
               <p className="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-200">No replacement items found</p>
-              <p className="mt-1 max-w-sm text-xs leading-5 text-slate-500 dark:text-slate-400">Try another search or choose a different category.</p>
+              <p className="mt-1 max-w-sm text-xs leading-5 text-slate-500 dark:text-slate-400">{replacementKind ? `No compatible ${replacementKind} assets were found in the current catalogue. Check the asset names and categories, or add a compatible model to the catalogue.` : "Try another search or choose a different category."}</p>
             </div>
           )}
         </div>
 
         <footer className="flex shrink-0 flex-col gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80 sm:flex-row sm:items-center sm:justify-between sm:px-6">
-          <label className="flex cursor-pointer items-start gap-2 text-xs text-slate-600 dark:text-slate-300">
-            <input type="checkbox" checked={preserveFinish} onChange={(event) => setPreserveFinish(event.target.checked)} className="mt-0.5 accent-orange-500" />
-            <span><span className="font-semibold">Keep current finish where possible</span><span className="mt-0.5 block text-[10px] text-slate-400">Applies the selected color/fabric/texture to the new item when supported.</span></span>
-          </label>
+          {!currentItem?.isNativeIfcElement ? (
+            <label className="flex cursor-pointer items-start gap-2 text-xs text-slate-600 dark:text-slate-300">
+              <input type="checkbox" checked={preserveFinish} onChange={(event) => setPreserveFinish(event.target.checked)} className="mt-0.5 accent-orange-500" />
+              <span><span className="font-semibold">Keep current finish where possible</span><span className="mt-0.5 block text-[10px] text-slate-400">Applies the selected color/fabric/texture to the new item when supported.</span></span>
+            </label>
+          ) : (
+            <p className="text-[10px] text-slate-500 dark:text-slate-400">The replacement uses the selected catalogue model's original materials.</p>
+          )}
           <div className="flex items-center justify-end gap-2">
             <span className="mr-2 hidden max-w-[230px] truncate text-[10px] text-slate-400 sm:inline">{selectedItem ? `Selected: ${selectedItem.name}` : 'Select an item to continue'}</span>
             <button type="button" onClick={onClose} disabled={submitting} className="rounded-xl border border-slate-200 px-4 py-2.5 text-xs font-bold text-slate-600 transition hover:bg-white disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800">Cancel</button>

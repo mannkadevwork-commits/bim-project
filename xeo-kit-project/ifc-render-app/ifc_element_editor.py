@@ -81,6 +81,8 @@ try:
     import ifcopenshell.api.root
     import ifcopenshell.api.geometry
     import ifcopenshell.api.feature
+    import ifcopenshell.geom
+    import ifcopenshell.util.unit
 except ImportError:
     print(json.dumps({
         "error": "ifcopenshell is not installed on this server. Run: pip install ifcopenshell"
@@ -134,9 +136,218 @@ def _pset_number(psets, names):
     return 0.0
 
 
+def _replacement_kind(element):
+    """Return the narrow, supported catalogue replacement class for an IFC product."""
+    if element is None:
+        return None
+    try:
+        if element.is_a("IfcWindow"):
+            return "window"
+        if element.is_a("IfcWall") or element.is_a("IfcCurtainWall"):
+            return "wall"
+        if element.is_a("IfcDoor") or element.is_a("IfcOpeningElement"):
+            return None
+    except Exception:
+        pass
+
+    ifc_type = str(getattr(element, "is_a", lambda: "")() or "").lower()
+    name = str(getattr(element, "Name", "") or "").lower()
+    name_tokens = {token for token in name.replace("-", " ").replace("_", " ").split() if token}
+
+    # Some image-to-IFC pipelines emit generic IfcBuildingElementProxy objects
+    # instead of semantic IfcWindow/IfcWall classes. Accept explicit element
+    # names in that case, but avoid classifying wall-mounted accessories as walls.
+    if "window" in name_tokens or "windows" in name_tokens or "glazing" in name_tokens:
+        return "window"
+    if ({"wall", "walls", "partition", "masonry"} & name_tokens) and not (
+        {"lamp", "light", "sconce", "clock", "art", "mirror", "shelf"} & name_tokens
+    ):
+        return "wall"
+
+    furniture_classes = (
+        "ifcfurnishingelement", "ifcfurniture", "ifcsystemfurnitureelement",
+        "ifcdiscreteaccessory", "ifctransportelement",
+    )
+    furniture_names = {
+        "bed", "sofa", "couch", "chair", "armchair", "table", "cabinet",
+        "desk", "wardrobe", "shelf", "stool", "dresser", "nightstand",
+        "ottoman", "commode", "sink", "mirror",
+    }
+    if any(token in ifc_type for token in furniture_classes) or (furniture_names & name_tokens):
+        return "furniture"
+    return None
+
+
+def _replacement_relationships(source, element, kind):
+    """Find existing semantic window host/opening links and wall opening counts."""
+    result = {
+        "hostWallId": None,
+        "openingGlobalId": None,
+        "hostedOpeningCount": 0,
+        "hasOpeningRelationship": False,
+    }
+    try:
+        if kind == "window":
+            for fills in source.by_type("IfcRelFillsElement"):
+                if fills.RelatedBuildingElement != element:
+                    continue
+                opening = fills.RelatingOpeningElement
+                result["openingGlobalId"] = getattr(opening, "GlobalId", None)
+                result["hasOpeningRelationship"] = True
+                for voids in source.by_type("IfcRelVoidsElement"):
+                    if voids.RelatedOpeningElement == opening:
+                        wall = voids.RelatingBuildingElement
+                        result["hostWallId"] = getattr(wall, "GlobalId", None)
+                        break
+                break
+        elif kind == "wall":
+            result["hostedOpeningCount"] = sum(
+                1 for rel in source.by_type("IfcRelVoidsElement")
+                if rel.RelatingBuildingElement == element
+            )
+    except Exception as exc:
+        logger.warning("Could not inspect replacement relationships for %s: %s", getattr(element, "GlobalId", "?"), exc)
+    return result
+
+
+def _matrix_for_product_placement(element, unit_scale):
+    """Return product placement in metre-valued IFC world coordinates."""
+    placement = getattr(element, "ObjectPlacement", None)
+    if placement is None:
+        matrix = np.eye(4, dtype=float)
+    elif placement.is_a("IfcLocalPlacement"):
+        matrix = np.asarray(get_local_placement(placement), dtype=float)
+    elif placement.is_a("IfcAxis2Placement3D"):
+        matrix = np.asarray(get_axis2placement(placement), dtype=float)
+    else:
+        raise ValueError(f"Unsupported IFC ObjectPlacement type: {placement.is_a()}")
+    matrix = matrix.copy()
+    matrix[:3, 3] *= float(unit_scale)
+    return matrix
+
+
+def _inspect_replacement_frame(source, element, kind):
+    """Build a stable HCI Y-up frame for replacing a native IFC product.
+
+    IfcOpenShell geometry is measured in SI metres. Product-local geometry
+    extents are recovered by inverse-transforming world vertices through the
+    element's actual ObjectPlacement. The HCI scene mapping is (IFC X, IFC Z,
+    -IFC Y). The element's actual local vertical axis is detected from its
+    placement basis instead of assuming every IFC product uses local Z as up.
+    """
+    settings = ifcopenshell.geom.settings()
+    settings.set(settings.USE_WORLD_COORDS, True)
+    try:
+        # IfcOpenShell geometry is SI by default. Explicitly keep that contract
+        # where the installed version exposes the setting.
+        settings.set(settings.CONVERT_BACK_UNITS, False)
+    except Exception:
+        pass
+
+    shape = ifcopenshell.geom.create_shape(settings, element)
+    raw_vertices = np.asarray(shape.geometry.verts, dtype=float)
+    if raw_vertices.size < 9 or raw_vertices.size % 3:
+        raise ValueError("IFC product has no usable triangulated geometry.")
+    world_ifc = raw_vertices.reshape((-1, 3))
+    if not np.isfinite(world_ifc).all():
+        raise ValueError("IFC product geometry contains non-finite coordinates.")
+
+    unit_scale = float(ifcopenshell.util.unit.calculate_unit_scale(source) or 1.0)
+    if not math.isfinite(unit_scale) or unit_scale <= 0:
+        raise ValueError("IFC project units could not be resolved.")
+
+    placement = _matrix_for_product_placement(element, unit_scale)
+    inverse = np.linalg.inv(placement)
+    homogeneous = np.column_stack([world_ifc, np.ones((len(world_ifc),), dtype=float)])
+    local_h = (inverse @ homogeneous.T).T
+    local = local_h[:, :3]
+    local_min = local.min(axis=0)
+    local_max = local.max(axis=0)
+    spans = local_max - local_min
+    if not np.isfinite(spans).all() or np.any(spans <= 1e-5):
+        raise ValueError("IFC product local bounds are degenerate.")
+
+    # Convert the three product-placement basis vectors into the viewer's Y-up
+    # scene frame. IFC files from different authoring pipelines do not always
+    # put the vertical direction on the same local axis.
+    placement_axes_scene = []
+    for axis_index in range(3):
+        axis_ifc = placement[:3, axis_index]
+        axis_scene = np.array([axis_ifc[0], axis_ifc[2], -axis_ifc[1]], dtype=float)
+        axis_length = float(np.linalg.norm(axis_scene))
+        if axis_length <= 1e-8:
+            raise ValueError("IFC product placement contains a degenerate basis axis.")
+        placement_axes_scene.append(axis_scene / axis_length)
+
+    vertical_axis_index = max(range(3), key=lambda index: abs(float(placement_axes_scene[index][1])))
+    vertical_axis = placement_axes_scene[vertical_axis_index]
+    if float(vertical_axis[1]) < 0.85:
+        raise ValueError("IFC product placement does not have a reliable upright axis; tilted products cannot be replaced safely.")
+
+    horizontal_indices = [index for index in range(3) if index != vertical_axis_index]
+    width_axis_index = max(horizontal_indices, key=lambda index: float(spans[index]))
+    depth_axis_index = next(index for index in horizontal_indices if index != width_axis_index)
+
+    width = float(spans[width_axis_index])
+    height = float(spans[vertical_axis_index])
+    depth = float(spans[depth_axis_index])
+    if min(width, height, depth) <= 1e-5:
+        raise ValueError("IFC product replacement dimensions are degenerate.")
+
+    # The viewer and catalogue GLBs use local X=width, Y=up, Z=depth. Anchor
+    # the replacement at the source product's bottom-centre in world space.
+    local_anchor = np.zeros(4, dtype=float)
+    local_anchor[3] = 1.0
+    local_anchor[width_axis_index] = (local_min[width_axis_index] + local_max[width_axis_index]) / 2.0
+    local_anchor[depth_axis_index] = (local_min[depth_axis_index] + local_max[depth_axis_index]) / 2.0
+    local_anchor[vertical_axis_index] = local_min[vertical_axis_index]
+
+    anchor_ifc = placement @ local_anchor
+    anchor_scene = [float(anchor_ifc[0]), float(anchor_ifc[2]), float(-anchor_ifc[1])]
+
+    width_axis_scene = placement_axes_scene[width_axis_index]
+    horizontal_length = math.hypot(float(width_axis_scene[0]), float(width_axis_scene[2]))
+    if horizontal_length <= 1e-8:
+        raise ValueError("IFC product width axis is not horizontal in the HCI scene.")
+    yaw = math.degrees(math.atan2(-float(width_axis_scene[2]), float(width_axis_scene[0])))
+
+    world_scene = np.column_stack([
+        world_ifc[:, 0],
+        world_ifc[:, 2],
+        -world_ifc[:, 1],
+    ])
+    scene_min = world_scene.min(axis=0)
+    scene_max = world_scene.max(axis=0)
+
+    return {
+        "position": anchor_scene,
+        "rotation": [0.0, float(yaw), 0.0],
+        "dimensions": [width, height, depth],
+        "worldBounds": {
+            "min": [float(value) for value in scene_min],
+            "max": [float(value) for value in scene_max],
+        },
+        "localDimensionsIfc": [float(value) for value in spans],
+        "localAxes": {
+            "width": width_axis_index,
+            "height": vertical_axis_index,
+            "depth": depth_axis_index,
+        },
+        "coordinateSystem": "hci-y-up",
+        "unit": "m",
+    }
+
+
 def cmd_inspect(args):
     source = ifcopenshell.open(args.input)
     element = find_element(source, args.global_id)
+
+    result = {
+        "height": None,
+        "width": None,
+        "length": None,
+        "supported": False,
+    }
 
     # Prefer exact parametric dimensions where the representation supports them.
     reps = getattr(element, "Representation", None)
@@ -159,29 +370,47 @@ def cmd_inspect(args):
                     ys = [float(p[1]) for p in pts]
                     width = max(xs) - min(xs) if xs else 0.0
                     length = max(ys) - min(ys) if ys else 0.0
-                print(json.dumps({"height": height, "width": width, "length": length, "supported": True}))
-                return
+                result.update({
+                    "height": height,
+                    "width": width,
+                    "length": length,
+                    "supported": True,
+                })
+                break
+        if result["supported"]:
+            break
 
-    # Many IFC walls are not represented as IfcExtrudedAreaSolid. For those,
-    # fall back to common wall property sets so selecting the element never
-    # becomes an HTTP error. This is inspection-only; resize remains disabled
-    # unless a parametric extrusion is available.
-    try:
-        psets = ifcopenshell.util.element.get_psets(element)
-    except Exception:
-        psets = {}
+    if not result["supported"]:
+        # This remains advisory. Property sets often contain useful dimensions
+        # even when the geometry is not an editable extrusion.
+        try:
+            psets = ifcopenshell.util.element.get_psets(element)
+        except Exception:
+            psets = {}
+        result.update({
+            "height": _pset_number(psets, ["OverallHeight", "Height", "NetHeight"]) or None,
+            "width": _pset_number(psets, ["Width", "Thickness", "OverallWidth"]) or None,
+            "length": _pset_number(psets, ["Length", "OverallLength"]) or None,
+            "supported": False,
+            "source": "property-set-fallback",
+        })
 
-    height = _pset_number(psets, ["OverallHeight", "Height", "NetHeight"])
-    width = _pset_number(psets, ["Width", "Thickness", "OverallWidth"])
-    length = _pset_number(psets, ["Length", "OverallLength"])
+    kind = _replacement_kind(element)
+    if kind:
+        replacement = {
+            "kind": kind,
+            "ifcClass": element.is_a(),
+            **_replacement_relationships(source, element, kind),
+        }
+        try:
+            replacement["frame"] = _inspect_replacement_frame(source, element, kind)
+            replacement["frameAvailable"] = True
+        except Exception as exc:
+            replacement["frameAvailable"] = False
+            replacement["frameError"] = str(exc)
+        result["replacement"] = replacement
 
-    print(json.dumps({
-        "height": height or None,
-        "width": width or None,
-        "length": length or None,
-        "supported": False,
-        "source": "property-set-fallback"
-    }))
+    print(json.dumps(result))
 
 
 def cmd_resize(args):
