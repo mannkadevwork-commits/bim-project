@@ -26,6 +26,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { getFurnitureInRoom, isPositionInsideRoom } from './utils/roomFurniture';
 import { filterRenderableCeilingDesigns } from './engine/assets/ceilingRegistryValidation.mjs';
+import { classifyNativeIfcReplacement, normalizeNativeReplacementInfo } from './engine/assets/ifcReplacement.mjs';
 
 const doorIntrinsicBoundsCache = new Map();
 
@@ -1208,16 +1209,15 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
   const nativeReplaceDescriptor = (() => {
     const object = engineState.selectedObject;
     if (!object?.id || activeAsset || (engineState.selectedElements?.length || 0) > 1) return null;
-    const name = String(object.name || '').toLowerCase();
-    const type = String(object.type || object.ifcType || object.ifcClass || '').toLowerCase();
-    // Only furniture-like IFC entities are eligible. Structural and hosted
-    // elements must never be replaced through this catalogue workflow.
-    const excluded = /door|window|wall|slab|beam|column|stair|railing|roof|opening|curtainwall|distribution|pipe|duct|space|site|building|storey/;
-    const furnitureType = /furniture|furnishingelement|systemfurniture|chair|sofa|table|bed|cabinet|desk|wardrobe|shelf/;
-    const furnitureName = /sofa|couch|chair|armchair|table|bed|cabinet|desk|wardrobe|shelf|stool|dresser|nightstand|ottoman/;
-    if (excluded.test(type) || excluded.test(name)) return null;
-    if (!furnitureType.test(type) && !furnitureName.test(name)) return null;
-    return { ...object, isNativeIfcElement: true, nativeEntityId: object.id };
+    const type = String(object.type || object.ifcType || object.ifcClass || '');
+    const kind = classifyNativeIfcReplacement(type, object.name);
+    if (!kind) return null;
+    return {
+      ...object,
+      replacementKind: kind,
+      isNativeIfcElement: true,
+      nativeEntityId: object.id,
+    };
   })();
   const canReplaceSelectedAsset = Boolean(
     (activeAsset && selectedFurnitureItem &&
@@ -1251,25 +1251,91 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
     const replacingNative = Boolean(replaceTargetItem?.isNativeIfcElement);
     if (replacingNative) {
       const entityId = replaceTargetItem.nativeEntityId || replaceTargetItem.id;
-      if (!entityId) throw new Error('The selected IFC furniture element could not be identified.');
-      beginHistoryTransaction(`Replace IFC furniture: ${replaceTargetItem.name || 'Furniture'}`);
-      try {
-        // Isolate the exact IFC entity first. This preserves the original IFC
-        // source and records its visibility override, then the isolated copy can
-        // be replaced as a normal editable catalogue asset.
-        targetId = await engineActions.isolateAndMakeMoveable(
+      const replacementKind = replaceTargetItem.replacementKind || 'furniture';
+      if (!entityId) throw new Error('The selected IFC element could not be identified.');
+
+      const existingStructuralEdit = projectState?.structural_edits?.[entityId];
+      if (existingStructuralEdit?.visible === false) {
+        throw new Error('This IFC element is already hidden by another edit. Restore it before replacing it.');
+      }
+
+      // Inspect the source IFC itself. Never use the selected mesh's screen
+      // coordinates, an isolated model-origin matrix, or a default [0,0,0].
+      const inspection = await engineActions.inspectNativeElement(entityId);
+      if (!inspection || inspection.error) {
+        throw new Error('Could not inspect the selected IFC element. Check the backend inspect endpoint and try again.');
+      }
+      const nativeInfo = normalizeNativeReplacementInfo(inspection, replacementKind);
+      const frame = nativeInfo.frame;
+
+      if (replacementKind === 'wall' && Number(nativeInfo.hostedOpeningCount || 0) > 0) {
+        throw new Error(`This wall contains ${nativeInfo.hostedOpeningCount} IFC opening(s). Replacing it with a solid catalogue wall would destroy the door/window openings. Opening-aware wall replacement is not enabled yet.`);
+      }
+
+      if (replacementKind === 'window' && nativeInfo.hasOpeningRelationship !== true) {
+        // Some generated IFC files contain a visual IfcWindow but no formal
+        // IfcOpeningElement / IfcRelFillsElement relationship. We can position
+        // the replacement from its measured source geometry, but cannot promise
+        // a physical wall void without a supported host relationship.
+        console.warn('[IFC Replacement] Window has no formal opening relationship; wall geometry will be left unchanged.', {
           entityId,
-          adoptIsolatedAsset,
-          updateStructuralEdit
+          replacement: nativeInfo,
+        });
+      }
+
+      const remembered = engineActions.rememberNativeEntity?.(entityId);
+      if (!remembered || remembered.originalVisible === false) {
+        throw new Error('The original IFC element is not available or was already hidden. Replacement was cancelled.');
+      }
+
+      const rawModelUrl = catalogItem.model_url || catalogItem.url || catalogItem.src || catalogItem._modelUrl;
+      if (!rawModelUrl) throw new Error('The selected catalogue asset has no model file.');
+      const nativeReplacement = {
+        sourceGlobalId: String(entityId),
+        sourceIfcClass: String(nativeInfo.ifcClass || replaceTargetItem.type || replaceTargetItem.ifcType || replaceTargetItem.ifcClass || ''),
+        sourceKind: replacementKind,
+        hostWallGlobalId: nativeInfo.hostWallId || null,
+        openingGlobalId: nativeInfo.openingGlobalId || null,
+        hasOpeningRelationship: nativeInfo.hasOpeningRelationship === true,
+        originalVisible: true,
+        frameDimensions: [...frame.dimensions],
+      };
+      const placementAsset = {
+        ...catalogItem,
+        url: /^https?:\/\//i.test(String(rawModelUrl)) ? String(rawModelUrl) : `/${String(rawModelUrl).replace(/^\/+/, '')}`,
+        file_type: catalogItem.file_type || catalogItem.fileType || catalogItem._fileType,
+        fitDimensions: frame.dimensions,
+        pivotMode: 'bottom-center',
+        replacementKind,
+        assetCategory: replacementKind,
+        nativeReplacement,
+      };
+
+      beginHistoryTransaction(`Replace IFC ${replacementKind}: ${replaceTargetItem.name || replacementKind}`);
+      let sourceHidden = false;
+      try {
+        sourceHidden = engineActions.setNativeEntityVisibleForEdit?.(entityId, false) === true;
+        if (!sourceHidden) throw new Error('Could not hide the original IFC element safely.');
+        updateStructuralEdit(entityId, 'visible', null, false);
+
+        const placedModel = await spawnAsset(
+          placementAsset,
+          frame.position,
+          engineActions.loadIFCAssetIntoScene,
+          frame.rotation
         );
-        if (!targetId) throw new Error('Could not isolate this IFC element safely.');
-        const replacement = replaceAsset(targetId, catalogItem, preserveFinish, true);
+        if (!placedModel) throw new Error('The replacement catalogue model did not finish loading.');
+
         endHistoryTransaction();
         engineActions.clearSelection();
-        setToastMessage(`IFC furniture replaced with ${replacement.name}. The original IFC remains intact; use Undo to restore it.`);
-        setTimeout(() => setToastMessage(null), 3600);
-        return replacement;
+        const message = replacementKind === 'window' && !nativeInfo.hasOpeningRelationship
+          ? `Window replaced with ${catalogItem.name}. The source IFC has no formal wall-opening relationship, so the wall itself was not cut.`
+          : `IFC ${replacementKind} replaced with ${catalogItem.name}. Original IFC geometry is preserved; use Undo to restore it.`;
+        setToastMessage(message);
+        setTimeout(() => setToastMessage(null), 5200);
+        return placedModel;
       } catch (error) {
+        if (sourceHidden) engineActions.restoreNativeEntityVisibility?.(entityId);
         cancelHistoryTransaction();
         throw error;
       }
@@ -2106,6 +2172,7 @@ const BIMViewer = ({ activeProject, onDelete, onAdd, onReplaceProject, onOpenSav
       <ReplaceAssetModal
         open={showReplaceAssetModal}
         currentItem={replaceTargetItem}
+        replacementKind={replaceTargetItem?.isNativeIfcElement ? replaceTargetItem.replacementKind : null}
         catalogTree={catalogTree}
         onClose={closeReplaceAssetModal}
         onReplace={handleReplaceAsset}

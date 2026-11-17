@@ -792,6 +792,8 @@ export const useBIMEngine = (activeProject, projectStateRef, projectState, onAss
           {
             fileType: item.fileType || item.file_type,
             scale: item.scale || [1, 1, 1],
+            fitDimensions: item.fitDimensions || null,
+            nativeReplacement: item.nativeReplacement || null,
             nativeSourceId: item.nativeSourceId || item.id || null,
             isNativeIsolation,
             doorHostWallId: item.doorHostWallId || null,

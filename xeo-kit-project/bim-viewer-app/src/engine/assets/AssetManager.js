@@ -12,6 +12,7 @@ import {
 } from './GLBAssetTransform';
 import { inspectGLBSource } from './GLBAssetDescriptor';
 import { ensureIFCResizeMetadata } from '../stretch/IFCResizeController';
+import { computeFitScale } from './ifcReplacement.mjs';
 
 const nativeIsolationInFlight = new Set();
 
@@ -163,6 +164,7 @@ export const loadIFCAssetIntoScene = async (
         isLightFixture: options.isLightFixture === true || options.assetCategory === 'lighting',
         wallHost: options.wallHost || null,
         wallPlacementKind: options.wallPlacementKind || (options.wallHost ? 'surface' : null),
+        nativeReplacement: options.nativeReplacement || null,
         ...(options.windowHostWallId ? { windowHostWallId: options.windowHostWallId, windowDimensions: options.windowDimensions || null } : {}),
         lightEnabled: options.lightEnabled === true,
         lightIntensity: Number.isFinite(Number(options.lightIntensity)) ? Number(options.lightIntensity) : 0.12,
@@ -196,7 +198,9 @@ export const loadIFCAssetIntoScene = async (
             ? options.persistedMatrix
             : null;
 
-          const userScale = sanitizeScale(options.scale || [1, 1, 1]);
+          const userScale = Array.isArray(options.fitDimensions)
+            ? computeFitScale(normalization.dimensions, options.fitDimensions)
+            : sanitizeScale(options.scale || [1, 1, 1]);
           const safeRotation = sanitizeRotation(rotation);
           let semanticTarget = Array.isArray(targetPosition) && targetPosition.length === 3
             ? [...targetPosition]
@@ -307,6 +311,7 @@ export const loadIFCAssetIntoScene = async (
       isLightFixture: options.isLightFixture === true || options.assetCategory === 'lighting',
       wallHost: options.wallHost || null,
       wallPlacementKind: options.wallPlacementKind || (options.wallHost ? 'surface' : null),
+      nativeReplacement: options.nativeReplacement || null,
       lightEnabled: options.lightEnabled === true,
       lightIntensity: Number.isFinite(Number(options.lightIntensity)) ? Number(options.lightIntensity) : 0.12,
       lightTemperature: Number.isFinite(Number(options.lightTemperature)) ? Number(options.lightTemperature) : 4000,
@@ -325,9 +330,21 @@ export const loadIFCAssetIntoScene = async (
         // to keep the opposite face anchored during local-axis scaling.
         ensureIFCResizeMetadata(assetModel);
 
-        const userScale = Array.isArray(options.scale) && options.scale.length === 3
-          ? options.scale
+        let userScale = Array.isArray(options.scale) && options.scale.length === 3
+          ? options.scale.map(Number)
           : [1, 1, 1];
+        if (Array.isArray(options.fitDimensions) && options.fitDimensions.length === 3) {
+          const sourceAabb = assetModel.aabb;
+          if (!sourceAabb || sourceAabb.length < 6) {
+            throw new Error('Cannot fit IFC replacement: catalogue model bounds are unavailable.');
+          }
+          const sourceDimensions = [
+            Number(sourceAabb[3]) - Number(sourceAabb[0]),
+            Number(sourceAabb[4]) - Number(sourceAabb[1]),
+            Number(sourceAabb[5]) - Number(sourceAabb[2]),
+          ];
+          userScale = computeFitScale(sourceDimensions, options.fitDimensions);
+        }
 
         const safeRotation = Array.isArray(rotation) && rotation.length === 3
           ? rotation

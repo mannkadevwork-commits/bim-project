@@ -1198,6 +1198,7 @@ export const useProjectSync = (activeProject) => {
           scale: updatedScale || f.scale || [1, 1, 1],
           ...(glbNormalization ? { glbNormalization } : {}),
         };
+        delete nextItem.fitDimensions;
 
         if (persistedMatrix) {
           nextItem.matrix = persistedMatrix;
@@ -1228,13 +1229,34 @@ export const useProjectSync = (activeProject) => {
       assetModel.destroy();
     }
 
-    // Persistence is authoritative. Even if the live xeokit model is already
-    // gone (for example after a reload/race), the saved furniture entry must
-    // always be removed so a later calibration/reload cannot resurrect it.
-    setProjectStateTracked(prev => ({
-      ...prev,
-      furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
-    }));
+    const nativeReplacement = selectedItem?.nativeReplacement || null;
+    const sourceGlobalId = nativeReplacement?.sourceGlobalId ? String(nativeReplacement.sourceGlobalId) : null;
+    const restoreSourceVisible = nativeReplacement ? nativeReplacement.originalVisible !== false : false;
+    if (sourceGlobalId && restoreSourceVisible) {
+      const sourceEntity = viewerRef.current?.scene?.objects?.[sourceGlobalId];
+      if (sourceEntity) {
+        try { sourceEntity.visible = true; } catch (_) {}
+      }
+    }
+
+    // Deleting a catalogue replacement restores the hidden native IFC source.
+    // The structural visibility override is part of the same history entry as
+    // removing the catalogue model, so undo/redo cannot leave a phantom hole or
+    // a hidden original element behind.
+    setProjectStateTracked(prev => {
+      const structuralEdits = { ...(prev.structural_edits || {}) };
+      if (sourceGlobalId) {
+        structuralEdits[sourceGlobalId] = {
+          ...(structuralEdits[sourceGlobalId] || {}),
+          visible: restoreSourceVisible,
+        };
+      }
+      return {
+        ...prev,
+        furniture: (prev.furniture || []).filter(f => f.instanceId !== selectedAssetId),
+        ...(sourceGlobalId ? { structural_edits: structuralEdits } : {}),
+      };
+    });
 
     if (options?.silent !== true) {
       setToastMessage('Asset removed.');
@@ -1277,6 +1299,11 @@ export const useProjectSync = (activeProject) => {
       position: safeVector(existingItem.position, [0, 0, 0]),
       rotation: safeVector(existingItem.rotation, [0, 0, 0]),
       scale: safeVector(existingItem.scale, [1, 1, 1]),
+      ...(existingItem.pivotMode ? { pivotMode: existingItem.pivotMode } : {}),
+      ...(existingItem.nativeReplacement ? { nativeReplacement: existingItem.nativeReplacement } : {}),
+      ...(Array.isArray(existingItem.nativeReplacement?.frameDimensions)
+        ? { fitDimensions: [...existingItem.nativeReplacement.frameDimensions] }
+        : {}),
       ...(existingItem.roomId ? { roomId: existingItem.roomId } : {}),
       ...(existingItem.roomLabel ? { roomLabel: existingItem.roomLabel } : {}),
       ...(existingItem.ceilingRoomId ? { ceilingRoomId: existingItem.ceilingRoomId } : {}),
@@ -1411,7 +1438,12 @@ export const useProjectSync = (activeProject) => {
     // Newly placed library assets need the current scene calibration baked into
     // their initial effective scale. Existing persisted assets already carry the
     // effective scale for their current scene frame.
-    const effectiveScale = baseScale.map((value, i) => value * sceneScale[i]);
+    const hasFitDimensions = Array.isArray(asset.fitDimensions) && asset.fitDimensions.length === 3
+      && asset.fitDimensions.every((value) => Number.isFinite(Number(value)) && Number(value) > 1e-6);
+    // Native IFC replacement dimensions are measured in the current canonical
+    // IFC frame. Do not multiply them by the scene calibration a second time.
+    const effectiveScale = hasFitDimensions ? [...baseScale] : baseScale.map((value, i) => value * sceneScale[i]);
+    const fitDimensions = hasFitDimensions ? asset.fitDimensions.map(Number) : null;
     const position = Array.isArray(coordinates) && coordinates.length === 3 ? [...coordinates] : [0, 0, 0];
     const safeRotation = Array.isArray(rotation) && rotation.length === 3 ? [...rotation] : [0, 0, 0];
     const wallHost = sanitizeWallHostRecord(asset.wallHost);
@@ -1447,7 +1479,9 @@ export const useProjectSync = (activeProject) => {
       position,
       rotation: safeRotation,
       scale: effectiveScale,
-      assetCategory: asset.assetCategory || null,
+      ...(fitDimensions ? { fitDimensions } : {}),
+      ...(asset.nativeReplacement ? { nativeReplacement: asset.nativeReplacement } : {}),
+      assetCategory: asset.assetCategory || asset.replacementKind || null,
       isLightFixture: asset.isLightFixture === true || asset.assetCategory === 'lighting',
       lightEnabled: asset.lightEnabled === true,
       pivotMode: wallHost?.anchorMode === 'center' ? 'center' : (asset.pivotMode || null),
@@ -1500,8 +1534,18 @@ export const useProjectSync = (activeProject) => {
           persistedItemForModel = {
             ...item,
             position: item.doorHostWallId || item.windowHostWallId ? item.position : (semanticPosition || item.position),
+            rotation: (Array.isArray(model?.rotation) || ArrayBuffer.isView(model?.rotation)) && model.rotation.length === 3
+              ? Array.from(model.rotation, Number)
+              : item.rotation,
+            scale: (Array.isArray(model?.scale) || ArrayBuffer.isView(model?.scale)) && model.scale.length === 3
+              ? Array.from(model.scale, Number)
+              : item.scale,
             ...(normalizedGLB ? { glbNormalization: normalizedGLB } : {}),
           };
+          // fitDimensions is only needed while the first model load calculates
+          // the exact source-to-native scale ratio. Persist the ratio itself so
+          // later reloads use the same transform without re-fitting.
+          delete persistedItemForModel.fitDimensions;
           return persistedItemForModel;
         });
         return foundItem ? { ...prev, furniture } : prev;
@@ -1525,6 +1569,8 @@ export const useProjectSync = (activeProject) => {
         {
           fileType,
           scale: effectiveScale,
+          ...(fitDimensions ? { fitDimensions } : {}),
+          nativeReplacement: asset.nativeReplacement || null,
           doorHostWallId,
           windowHostWallId,
           windowDimensions,
