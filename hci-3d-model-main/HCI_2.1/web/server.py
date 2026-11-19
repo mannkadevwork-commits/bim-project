@@ -331,8 +331,7 @@ def _autolabel_worker(selected_files: list = None, metadata_choice: str = "local
     hci21_path, hci21_src = resolve_hci21_model()
     if not hci21_path:
         _push(
-            "ERROR: No HCI_2.1 YOLO model found. Set HCI21_MODEL_PATH to "
-            r"D:\HCI_interor\cubicasa_hqa_500\runs\hqa500_offline\weights\best.pt",
+            "ERROR: No HCI_2.1 YOLO model found. Set HCI21_MODEL_PATH env var to the absolute path of your best.pt file.",
             status="Error",
         )
         return
@@ -943,8 +942,7 @@ async def detect(file: UploadFile = File(...),
     if not model_path or not os.path.exists(model_path):
         return JSONResponse(
             {
-                "error": "No HCI_2.1 model found. Set HCI21_MODEL_PATH or ensure "
-                r"cubicasa_hqa_500\runs\hqa500_offline\weights\best.pt exists."
+                "error": "No HCI_2.1 model found. Set HCI21_MODEL_PATH env var to the absolute path of your best.pt file."
             },
             status_code=400,
         )

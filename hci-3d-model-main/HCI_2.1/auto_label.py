@@ -32,8 +32,8 @@ def generate_labels(img_path, detector=None):
     model_path, model_src = resolve_hci21_model()
     if not model_path:
         raise ModelNotFoundError(
-            "No HCI_2.1 YOLO weights found. Set HCI21_MODEL_PATH to "
-            r"D:\HCI_interor\cubicasa_hqa_500\runs\hqa500_offline\weights\best.pt"
+            "No HCI_2.1 YOLO weights found. "
+            "Set HCI21_MODEL_PATH env var to the absolute path of your best.pt file."
         )
 
     try:

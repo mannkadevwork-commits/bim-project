@@ -177,8 +177,9 @@ def _get_model(model_path: str | None = None):
     path = model_path or find_model_path()
     if not path or not os.path.exists(path):
         raise ModelNotFoundError(
-            "No HCI_2.1 YOLO model found. Set HCI21_MODEL_PATH or place weights at "
-            f"{CUBICASA_OFFLINE_BEST}"
+            "No HCI_2.1 YOLO model found. "
+            "Set HCI21_MODEL_PATH env var to the absolute path of your best.pt file, "
+            f"or place weights at {HCI21_ACTIVE_MODEL}"
         )
     with _model_lock:
         if _model_cache["path"] == path and _model_cache["model"] is not None:
