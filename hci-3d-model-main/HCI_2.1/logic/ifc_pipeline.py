@@ -6,6 +6,7 @@ Does NOT touch best_gdrive.pt or Hci_1.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -531,8 +532,6 @@ def _polyline_key_m(poly_m: list, nd: int = 4) -> tuple:
 
 def stable_geometry_fingerprint(graph_m: dict, opening_map: dict | None = None) -> str:
     """Deterministic string for P1 geometry/association identity checks (read-only use)."""
-    import hashlib
-
     segs = []
     for s in sorted(graph_m.get("segments", []), key=lambda x: x["id"]):
         segs.append(
@@ -2214,6 +2213,11 @@ def write_ifc4(graph_m: dict, opening_map: dict, out_ifc: Path, basename: str) -
     )
     unit_l = model.create_entity("IfcSIUnit", UnitType="LENGTHUNIT", Name="METRE")
     units = model.create_entity("IfcUnitAssignment", Units=[unit_l])
+    def _new_world_pl():
+        """Create a fresh identity IfcAxis2Placement3D (IFC4 spec: each placement must be unique)."""
+        _origin = model.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0))
+        return model.create_entity("IfcAxis2Placement3D", Location=_origin)
+
     origin = model.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0))
     world_pl = model.create_entity("IfcAxis2Placement3D", Location=origin)
     context = model.create_entity(
@@ -2242,18 +2246,18 @@ def write_ifc4(graph_m: dict, opening_map: dict, out_ifc: Path, basename: str) -
         "IfcSite",
         GlobalId=ifcopenshell.guid.new(),
         Name="Site",
-        ObjectPlacement=model.create_entity("IfcLocalPlacement", RelativePlacement=world_pl),
+        ObjectPlacement=model.create_entity("IfcLocalPlacement", RelativePlacement=_new_world_pl()),
     )
     building = model.create_entity(
         "IfcBuilding",
         GlobalId=ifcopenshell.guid.new(),
         Name="Building",
         ObjectPlacement=model.create_entity(
-            "IfcLocalPlacement", PlacementRelTo=site.ObjectPlacement, RelativePlacement=world_pl
+            "IfcLocalPlacement", PlacementRelTo=site.ObjectPlacement, RelativePlacement=_new_world_pl()
         ),
     )
     storey_pl = model.create_entity(
-        "IfcLocalPlacement", PlacementRelTo=building.ObjectPlacement, RelativePlacement=world_pl
+        "IfcLocalPlacement", PlacementRelTo=building.ObjectPlacement, RelativePlacement=_new_world_pl()
     )
     storey = model.create_entity(
         "IfcBuildingStorey",
@@ -2272,7 +2276,7 @@ def write_ifc4(graph_m: dict, opening_map: dict, out_ifc: Path, basename: str) -
         "IfcRelAggregates", GlobalId=ifcopenshell.guid.new(), RelatingObject=building, RelatedObjects=[storey]
     )
 
-    def make_extruded_box(length, width, height, z0=0.0,x_start=0.0):
+    def make_extruded_box(length, width, height, z0=0.0, x_start=0.0):
         half = width / 2.0
         x_end = x_start + length
         pts = [
@@ -2284,11 +2288,8 @@ def write_ifc4(graph_m: dict, opening_map: dict, out_ifc: Path, basename: str) -
             ProfileType="AREA",
             OuterCurve=model.create_entity("IfcPolyline", Points=pts),
         )
-        if abs(z0) > 1e-9:
-            z_origin = model.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, float(z0)))
-            pos = model.create_entity("IfcAxis2Placement3D", Location=z_origin)
-        else:
-            pos = world_pl
+        z_origin = model.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, float(z0)))
+        pos = model.create_entity("IfcAxis2Placement3D", Location=z_origin)
         return model.create_entity(
             "IfcExtrudedAreaSolid",
             SweptArea=profile,
@@ -2321,7 +2322,7 @@ def write_ifc4(graph_m: dict, opening_map: dict, out_ifc: Path, basename: str) -
         if length < 1e-4:
             continue
         angle = math.atan2(dy, dx)
-        thick = float(np.clip(s["thickness_m"], THICK_MIN, THICK_MAX))
+        thick = float(np.clip(s["thickness_m"], THICK_SOFT_HIGH_MIN_M, THICK_SOFT_HIGH_MAX_M))
         wall_origin = model.create_entity("IfcCartesianPoint", Coordinates=(float(x0), float(y0), 0.0))
         wall_ax = model.create_entity(
             "IfcAxis2Placement3D",

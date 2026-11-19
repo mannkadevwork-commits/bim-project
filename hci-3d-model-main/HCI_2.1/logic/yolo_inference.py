@@ -1,6 +1,7 @@
 # logic/yolo_inference.py — shared YOLO inference helpers (Auto Label + Detect)
 import logging
 import os
+import threading
 from pathlib import Path
 
 import cv2
@@ -65,6 +66,7 @@ _NAME_ALIASES = {
 }
 
 _model_cache = {"path": None, "model": None}
+_model_lock = threading.Lock()
 
 # WALL DETECTION SETTINGS
 WALL_MIN_CONF = 0.020
@@ -132,8 +134,9 @@ def resolve_hci21_model() -> tuple[str, str]:
 
 def invalidate_model_cache() -> None:
     """M9b: drop cached YOLO weights so the next load reads from disk."""
-    _model_cache["path"] = None
-    _model_cache["model"] = None
+    with _model_lock:
+        _model_cache["path"] = None
+        _model_cache["model"] = None
 
 
 def find_production_model_path() -> str:
@@ -177,13 +180,13 @@ def _get_model(model_path: str | None = None):
             "No HCI_2.1 YOLO model found. Set HCI21_MODEL_PATH or place weights at "
             f"{CUBICASA_OFFLINE_BEST}"
         )
-    if _model_cache["path"] == path and _model_cache["model"] is not None:
-        return _model_cache["model"], path
-    from ultralytics import YOLO
-
-    model = YOLO(path)
-    _model_cache["path"] = path
-    _model_cache["model"] = model
+    with _model_lock:
+        if _model_cache["path"] == path and _model_cache["model"] is not None:
+            return _model_cache["model"], path
+        from ultralytics import YOLO
+        model = YOLO(path)
+        _model_cache["path"] = path
+        _model_cache["model"] = model
     return model, path
 
 
@@ -450,7 +453,7 @@ def run_yolo_inference(
                     label_lines.append(line)
 
             logger.info(
-                "Wall detection: YOLO=%d Final=%d",
+                "Wall detection: YOLO=%d Final=%d dupes_removed=%d",
                 len(yolo_walls),
                 len(new_walls),
                 conn_report.get("duplicates_removed", 0),

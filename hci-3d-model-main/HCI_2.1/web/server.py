@@ -44,9 +44,11 @@ if sys.platform == "darwin":
         os.environ.setdefault("DYLD_FALLBACK_LIBRARY_PATH", _brew)
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 import cv2, numpy as np
 
 from config.classes import CLASS_IDS, ID_TO_CLASS
@@ -72,7 +74,8 @@ ensure_dataset_dirs(DATASET_DIR)
 _log_queue: list[str] = []          # SSE log lines
 _progress: dict       = {"pct": 0, "status": "Ready", "metrics": {}}
 _analysis: dict       = {}          # basename -> {labelled, img, n_labels, label_lines}
-_training_lock        = threading.Lock()
+# ISSUE-005: use a real lock so concurrent train/finetune calls are rejected atomically
+_training_lock = threading.Lock()
 _training_active      = False
 
 # ── Corrected-files tracker (for Update Model panel) ─────────────────────────
@@ -101,6 +104,18 @@ def _push(msg: str, pct: float = None, status: str = None, metrics: dict = None)
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Floor Plan Trainer")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ISSUE-003: enforce upload size limit (50 MB)
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+class _LimitUploadSize(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        cl = request.headers.get("content-length")
+        if cl and int(cl) > _MAX_UPLOAD_BYTES:
+            return JSONResponse({"error": "File too large (max 50 MB)"}, status_code=413)
+        return await call_next(request)
+
+app.add_middleware(_LimitUploadSize)
 
 WEB_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
@@ -704,8 +719,10 @@ def _rebuild_labels(basename: str, info: dict):
 @app.post("/api/train")
 def train(body: dict, background_tasks: BackgroundTasks):
     global _training_active
-    if _training_active:
+    if not _training_lock.acquire(blocking=False):
         return JSONResponse({"error": "Training already running"}, status_code=409)
+    _training_active = True
+    _training_lock.release()
     epochs = int(body.get("epochs", 1))
     batch  = int(body.get("batch", 4))
     imgsz  = int(body.get("imgsz", 640))
@@ -731,8 +748,10 @@ def train_imported_dataset(body: dict, background_tasks: BackgroundTasks):
     Body: { version, epochs?, batch?, imgsz?, run_name? }
     """
     global _training_active
-    if _training_active:
+    if not _training_lock.acquire(blocking=False):
         return JSONResponse({"error": "Training already running"}, status_code=409)
+    _training_active = True
+    _training_lock.release()
     version = str(body.get("version") or "").strip()
     if not version:
         return JSONResponse({"error": "version is required (H import id)"}, status_code=400)
@@ -1767,8 +1786,10 @@ def train_from_corrections(body: dict, background_tasks: BackgroundTasks):
     train_files: explicit list of basenames (overrides train_scope)
     """
     global _training_active
-    if _training_active:
+    if not _training_lock.acquire(blocking=False):
         return JSONResponse({"error": "Training already running"}, status_code=409)
+    _training_active = True
+    _training_lock.release()
 
     epochs      = int(body.get("epochs", 5))
     batch       = int(body.get("batch", 2))
@@ -2354,9 +2375,14 @@ def generate_ifc_geometry(basename: str, body: dict = None):
     return result
 
 
+# ISSUE-002: sanitize basename to prevent path traversal
+import re as _re
+
 @app.get("/api/ifc/file/{basename}")
 def download_ifc_file(basename: str):
     """Download generated IFC from gdrive_dataset/output/{basename}.ifc"""
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]+", basename):
+        return JSONResponse({"error": "Invalid basename"}, status_code=400)
     path = ifc_file_path(DATASET_DIR, basename)
     if not path.exists():
         return JSONResponse(
