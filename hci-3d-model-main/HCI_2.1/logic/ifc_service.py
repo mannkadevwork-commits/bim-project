@@ -80,6 +80,9 @@ def generate_ifc_for_basename(
         dataset_dir, basename, meters_per_pixel=meters_per_pixel
     )
 
+    # Use high scale confidence when mpp was explicitly provided (request or saved calibration)
+    scale_confidence = "high" if mpp_source in ("request", "manual_ui") else "low"
+
     out_dir = ifc_output_dir(dataset_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_ifc = ifc_file_path(dataset_dir, basename)
@@ -91,6 +94,7 @@ def generate_ifc_for_basename(
         output_ifc=out_ifc,
         meters_per_pixel=mpp,
         work_dir=work_dir,
+        scale_confidence=scale_confidence,
     )
     result["mpp_source"] = mpp_source
     result["download_url"] = (
