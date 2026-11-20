@@ -1891,10 +1891,22 @@ function setCorrectView(view) {
 function _renderCorrectImage() {
   const d = _correctData;
   if (!d || !d.marked_b64) return;
-  let b64 = d.marked_b64;
-  if (_correctView === 'pre'  && d.pre_label_b64)  b64 = d.pre_label_b64;
-  if (_correctView === 'post' && d.post_label_b64) b64 = d.post_label_b64;
-  pzSetImage('correctViewer', `data:image/jpeg;base64,${b64}`, _correctBasename + ' [' + _correctView + ']');
+
+  if (_correctView === 'pre') {
+    if (!d.pre_label_b64) {
+      pzSetPlaceholder('correctViewer', '🔍 Pre-OCR image not available — re-run Auto Label to generate it');
+      return;
+    }
+    pzSetImage('correctViewer', `data:image/jpeg;base64,${d.pre_label_b64}`, _correctBasename + ' [Pre-OCR]');
+  } else if (_correctView === 'post') {
+    if (!d.post_label_b64) {
+      pzSetPlaceholder('correctViewer', '✅ Post-OCR image not available — re-run Auto Label to generate it');
+      return;
+    }
+    pzSetImage('correctViewer', `data:image/jpeg;base64,${d.post_label_b64}`, _correctBasename + ' [Post-OCR]');
+  } else {
+    pzSetImage('correctViewer', `data:image/jpeg;base64,${d.marked_b64}`, _correctBasename + ' [Labelled]');
+  }
   // Refresh edit overlay after image loads (pan-zoom state may change)
   setTimeout(() => {
     if (_activeEdit) {
@@ -3114,6 +3126,8 @@ function _pzApply(id) {
 function pzSetImage(id, src, alt) {
   const inner = document.getElementById(id + 'Inner');
   if (!inner) return;
+  // Clear immediately so stale image never persists while new one loads
+  inner.innerHTML = `<div class="placeholder" style="padding:40px;color:var(--text-dim)">Loading...</div>`;
   const img = new window.Image();
   img.alt = alt || '';
   img.style.display = 'block';
@@ -3121,6 +3135,9 @@ function pzSetImage(id, src, alt) {
     inner.innerHTML = '';
     inner.appendChild(img);
     pzFit(id);
+  };
+  img.onerror = () => {
+    inner.innerHTML = `<div class="placeholder" style="padding:40px;color:var(--text-dim)">Failed to load image</div>`;
   };
   img.src = src;
 }
