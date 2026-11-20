@@ -1623,10 +1623,12 @@ async function trainSelected() {
       appendLog('\n✅ Labelling complete — starting training...');
       // Start training
       const body = {
-        epochs: parseInt(document.getElementById('epochs').value) || 1,
-        batch:  parseInt(document.getElementById('batch').value)  || 4,
-        imgsz:  parseInt(document.getElementById('imgsz').value)  || 640,
+        epochs:      parseInt(document.getElementById('epochs').value) || 1,
+        batch:       parseInt(document.getElementById('batch').value)  || 4,
+        imgsz:       parseInt(document.getElementById('imgsz').value)  || 640,
+        train_files: files.map(f => f.replace(/\.[^.]+$/, '')),  // basenames (no ext)
       };
+      appendLog(`Training on ${body.train_files.length} file(s): ${body.train_files.join(', ')}`);
       try {
         await fetch(API + '/api/train', {
           method: 'POST',

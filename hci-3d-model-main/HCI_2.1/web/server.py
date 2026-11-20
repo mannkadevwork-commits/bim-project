@@ -722,11 +722,12 @@ def train(body: dict, background_tasks: BackgroundTasks):
         return JSONResponse({"error": "Training already running"}, status_code=409)
     _training_active = True
     _training_lock.release()
-    epochs = int(body.get("epochs", 1))
-    batch  = int(body.get("batch", 4))
-    imgsz  = int(body.get("imgsz", 640))
-    background_tasks.add_task(_train_worker, epochs, batch, imgsz)
-    return {"ok": True}
+    epochs     = int(body.get("epochs", 1))
+    batch      = int(body.get("batch", 4))
+    imgsz      = int(body.get("imgsz", 640))
+    train_files = body.get("train_files", [])  # optional list of basenames
+    background_tasks.add_task(_train_worker, epochs, batch, imgsz, train_files)
+    return {"ok": True, "train_files": train_files or "all"}
 
 
 @app.get("/api/cubicasa_imports")
@@ -854,7 +855,7 @@ def _train_imported_worker(
         _training_active = False
 
 
-def _train_worker(epochs: int, batch: int, imgsz: int):
+def _train_worker(epochs: int, batch: int, imgsz: int, train_files: list = None):
     global _training_active
     _training_active = True
     yaml_path = DATASET_DIR / "dataset.yaml"
@@ -863,7 +864,7 @@ def _train_worker(epochs: int, batch: int, imgsz: int):
         _training_active = False; return
     try:
         from ultralytics import YOLO
-        import torch
+        import torch, tempfile as _tmp
         _mb = PROJECT_ROOT / "yolov8n-seg.pt"
         model_base = str(_mb.resolve() if _mb.exists() else _mb)
         if not os.path.exists(model_base):
@@ -901,6 +902,13 @@ def _train_worker(epochs: int, batch: int, imgsz: int):
         train_lbl_dir = DATASET_DIR / "labels" / "train"
         img_files = sorted(train_img_dir.glob("*")) if train_img_dir.exists() else []
         img_files = [f for f in img_files if f.suffix.lower() in {'.jpg','.jpeg','.png','.bmp'}]
+
+        # Filter to selected files if train_files specified
+        if train_files:
+            sel_set   = set(train_files)
+            # match by stem (basename without ext) or full filename
+            img_files = [f for f in img_files if f.name in sel_set or f.stem in sel_set]
+            _push(f"  Training on {len(img_files)} selected file(s) (subset mode)")
         _push(f"  Dataset: {len(img_files)} training images")
         if not img_files:
             _push("ERROR: No training images found in images/train — run Auto Label first", status="Error")
@@ -912,9 +920,35 @@ def _train_worker(epochs: int, batch: int, imgsz: int):
         _push(f"  Starting {epochs} epoch(s) with batch={batch} imgsz={imgsz}...")
 
         project_dir = str(DATASET_DIR / "runs")
-        model.train(data=str(yaml_path), epochs=epochs, batch=batch, imgsz=imgsz,
+
+        # If subset, create a temp dataset dir with only selected images+labels
+        active_yaml = str(yaml_path)
+        tmp_dir = None
+        if train_files and img_files:
+            tmp_dir  = Path(_tmp.mkdtemp(prefix="train_subset_"))
+            tmp_imgs = tmp_dir / "images" / "train"
+            tmp_lbls = tmp_dir / "labels" / "train"
+            tmp_imgs.mkdir(parents=True); tmp_lbls.mkdir(parents=True)
+            for f in img_files:
+                shutil.copy2(str(f), str(tmp_imgs / f.name))
+                lbl = train_lbl_dir / (f.stem + ".txt")
+                if lbl.exists():
+                    shutil.copy2(str(lbl), str(tmp_lbls / lbl.name))
+            tmp_yaml = tmp_dir / "dataset.yaml"
+            orig = yaml_path.read_text()
+            tmp_yaml.write_text("\n".join(
+                (f"path: {tmp_dir}" if l.startswith("path:") else l)
+                for l in orig.splitlines()
+            ))
+            active_yaml = str(tmp_yaml)
+            _push(f"  Subset dataset: {tmp_dir}")
+
+        model.train(data=active_yaml, epochs=epochs, batch=batch, imgsz=imgsz,
                     device=device, project=project_dir, name="train",
                     workers=0, amp=True, verbose=False)
+
+        if tmp_dir and tmp_dir.exists():
+            shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
         cands = glob.glob(os.path.join(project_dir, "**", "best.pt"), recursive=True)
         if cands:

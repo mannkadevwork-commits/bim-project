@@ -29,7 +29,16 @@ def generate_labels(img_path, detector=None, dataset_dir=None):
     dataset_dir: path to gdrive_dataset/ — required for feedback persistence.
     Never writes best_gdrive.pt.
     """
-    img = cv2.imread(img_path)
+    img = cv2.imread(img_path, cv2.IMREAD_COLOR)  # always BGR, strips alpha
+    if img is None:
+        # Fallback: try via PIL to handle RGBA/unusual formats
+        try:
+            from PIL import Image as _PILImage
+            import numpy as _np
+            pil = _PILImage.open(img_path).convert("RGB")
+            img = cv2.cvtColor(_np.array(pil), cv2.COLOR_RGB2BGR)
+        except Exception:
+            pass
     if img is None:
         labelled = {"_skip_reason": "image unreadable"}
         logger.error("generate_labels: cannot read %s", img_path)
