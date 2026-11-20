@@ -453,7 +453,7 @@ def _autolabel_worker(selected_files: list = None, metadata_choice: str = "local
                     "summary": text_analysis["summary"],
                     "was_corrected": was_corrected,
                     "ocr_rooms": len(room_names),
-                    "detector_rooms": len(room_cnts),
+                    "detector_rooms": len(labelled.get("Room", [])),
                 },
                 "pre_label_path":  pre_path,
                 "post_label_path": post_path,
