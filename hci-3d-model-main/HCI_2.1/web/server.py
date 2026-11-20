@@ -902,6 +902,9 @@ def _train_worker(epochs: int, batch: int, imgsz: int):
         img_files = sorted(train_img_dir.glob("*")) if train_img_dir.exists() else []
         img_files = [f for f in img_files if f.suffix.lower() in {'.jpg','.jpeg','.png','.bmp'}]
         _push(f"  Dataset: {len(img_files)} training images")
+        if not img_files:
+            _push("ERROR: No training images found in images/train — run Auto Label first", status="Error")
+            _training_active = False; return
         for f in img_files:
             lbl = train_lbl_dir / (f.stem + ".txt")
             n_labels = len(lbl.read_text().splitlines()) if lbl.exists() else 0
