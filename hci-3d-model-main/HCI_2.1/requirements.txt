@@ -14,6 +14,7 @@ ultralytics>=8.3,<9.0
 torch>=2.2
 PyYAML>=6.0
 requests>=2.31
+boto3>=1.34
 tqdm>=4.66
 packaging>=23.0
 typing-extensions>=4.8

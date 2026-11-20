@@ -344,7 +344,7 @@ def _autolabel_worker(selected_files: list = None, metadata_choice: str = "local
         pct = (i + 1) / len(files) * 100
         _push(f"Labelling {i+1}/{len(files)}: {basename}", pct=pct, status=f"Labelling {i+1}/{len(files)}")
         try:
-            label_lines, img, labelled = generate_labels(str(img_path), detector)
+            label_lines, img, labelled = generate_labels(str(img_path), detector, dataset_dir=DATASET_DIR)
             # ------------------------------------------------------------
             # WINDOW-ONLY INFERENCE
             # ------------------------------------------------------------
@@ -380,7 +380,7 @@ def _autolabel_worker(selected_files: list = None, metadata_choice: str = "local
                 continue
 
             # ── Enhanced analyzer: OCR seeds + watershed room splitting ──
-            enhanced = analyse_floor_plan(img, labelled)
+            enhanced = analyse_floor_plan(img, labelled, dataset_dir=DATASET_DIR)
             # Merge enhanced results back into labelled
             for key in ["rooms", "stairs", "flow_terminals", "furniture"]:
                 if enhanced.get(key) and len(enhanced[key]) > len(labelled.get(key, [])):

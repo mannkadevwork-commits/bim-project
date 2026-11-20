@@ -573,11 +573,10 @@ def run_window_inference(
     )
 
     if window_model_id is None:
-
-        raise RuntimeError(
-            "Window class was not found in YOLO model names. "
-            f"Available classes: {model.names}"
+        logger.info(
+            "Window class not found in model (COCO/non-floor-plan model) — skipping window inference"
         )
+        return [], [], used_path
 
     logger.info(
         "Window model class id: %s",

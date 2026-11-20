@@ -15,11 +15,18 @@ from logic.yolo_inference import (
 logger = logging.getLogger(__name__)
 
 
-def generate_labels(img_path, detector=None):
+def generate_labels(img_path, detector=None, dataset_dir=None):
     """
     Run YOLO inference and return (label_lines, img, labelled) for _autolabel_worker.
-    Falls back to FloorPlanDetector heuristic when YOLO finds zero detections.
-    HCI_2.1 default: CubiCasa via resolve_hci21_model() / HCI21_MODEL_PATH.
+
+    Pipeline:
+      1. YOLO inference (HCI21_MODEL_PATH / resolver)
+      2. If zero YOLO detections → CV heuristic fallback (FloorPlanDetector)
+         - CV thresholds loaded from cv_feedback (adapted over time)
+      3. Cloud agent merge via analyse_floor_plan (always runs if enabled)
+      4. Feedback recorded to dataset_dir/metadata/_cv_feedback.json
+
+    dataset_dir: path to gdrive_dataset/ — required for feedback persistence.
     Never writes best_gdrive.pt.
     """
     img = cv2.imread(img_path)
@@ -46,19 +53,24 @@ def generate_labels(img_path, detector=None):
 
     if not label_lines:
         logger.warning(
-            "generate_labels: zero YOLO detections for %s using %s (%s) — trying heuristic fallback",
+            "generate_labels: zero YOLO detections for %s using %s (%s) — trying CV heuristic",
             img_path, used, model_src,
         )
         try:
             from logic.detector import FloorPlanDetector
+            from logic.cv_feedback import get_cv_thresholds
             from config.classes import CLASS_IDS
+
+            # Load feedback-adapted thresholds
+            thresholds = get_cv_thresholds(dataset_dir) if dataset_dir else {}
+
             _det = detector or FloorPlanDetector(
                 debug_mode=False, output_dir=".",
-                remove_captions=True, detection_mode="heuristic_only"
+                remove_captions=True, detection_mode="heuristic_only",
+                thresholds=thresholds,
             )
             heur = _det.detect(img)
             img_h, img_w = img.shape[:2]
-            # Map heuristic keys to HCI class names
             key_map = {
                 "rooms": "Room", "doors": "Door", "windows": "Window",
                 "walls": "Wall", "furniture": "Furniture",
@@ -76,11 +88,12 @@ def generate_labels(img_path, detector=None):
                     line = contour_to_yolo_seg(cnt, img_w, img_h, cid)
                     if line:
                         label_lines.append(line)
+
             if label_lines:
                 labelled["_model_path"] = used
-                labelled["_model_source"] = "heuristic_fallback"
+                labelled["_model_source"] = "cv_heuristic"
                 logger.info(
-                    "generate_labels: heuristic produced %d polygons for %s",
+                    "generate_labels: CV heuristic produced %d polygons for %s",
                     len(label_lines), img_path,
                 )
             else:
@@ -88,7 +101,7 @@ def generate_labels(img_path, detector=None):
                     f"zero detections (model={os.path.basename(used)}, source={model_src})"
                 )
         except Exception as he:
-            logger.exception("generate_labels: heuristic fallback failed for %s: %s", img_path, he)
+            logger.exception("generate_labels: CV heuristic failed for %s: %s", img_path, he)
             labelled["_skip_reason"] = (
                 f"zero detections (model={os.path.basename(used)}, source={model_src})"
             )
