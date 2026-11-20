@@ -792,7 +792,8 @@ def _train_imported_worker(
         import torch
         import datetime as _dt
 
-        model_base = str(PROJECT_ROOT / "yolov8n-seg.pt")
+        _mb = PROJECT_ROOT / "yolov8n-seg.pt"
+        model_base = str(_mb.resolve() if _mb.exists() else _mb)
         if not os.path.exists(model_base):
             model_base = "yolov8n-seg.pt"
         model = YOLO(model_base)
@@ -863,7 +864,8 @@ def _train_worker(epochs: int, batch: int, imgsz: int):
     try:
         from ultralytics import YOLO
         import torch
-        model_base = str(PROJECT_ROOT / "yolov8n-seg.pt")
+        _mb = PROJECT_ROOT / "yolov8n-seg.pt"
+        model_base = str(_mb.resolve() if _mb.exists() else _mb)
         if not os.path.exists(model_base):
             model_base = "yolov8n-seg.pt"
         model = YOLO(model_base)
