@@ -418,8 +418,13 @@ def _autolabel_worker(selected_files: list = None, metadata_choice: str = "local
             draw_labelled_image(img, labelled, marked_path)
 
             # ── Text OCR analysis for pre/post views ────────────────
-            room_cnts = labelled.get("Room", [])
-            text_analysis = analyse_image(img, room_cnts)
+            # Pass all labelled contours so OCR text can be mapped to
+            # any class (Door, Stair, Furniture, etc.) not just Room
+            all_cnts = {
+                cls: cnts for cls, cnts in labelled.items()
+                if not cls.startswith("_") and isinstance(cnts, list) and cnts
+            }
+            text_analysis = analyse_image(img, all_cnts)
             text_mappings  = text_analysis["mappings"]
             assigned       = text_analysis["assigned"]
 
