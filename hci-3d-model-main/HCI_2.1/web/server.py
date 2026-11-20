@@ -901,7 +901,7 @@ def _train_worker(epochs: int, batch: int, imgsz: int, train_files: list = None)
         train_img_dir = DATASET_DIR / "images" / "train"
         train_lbl_dir = DATASET_DIR / "labels" / "train"
         img_files = sorted(train_img_dir.glob("*")) if train_img_dir.exists() else []
-        img_files = [f for f in img_files if f.suffix.lower() in {'.jpg','.jpeg','.png','.bmp'}]
+        img_files = [f for f in img_files if f.suffix.lower() in {'.jpg','.jpeg','.png','.bmp','.webp','.tiff','.tif'}]
 
         # Filter to selected files if train_files specified
         if train_files:
