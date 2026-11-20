@@ -178,7 +178,7 @@ def analyse_image(img, cnts_by_class=None):
         import pytesseract
     except ImportError:
         logger.warning("pytesseract not installed — OCR unavailable")
-        return _empty(img)
+        return _empty(img, "pytesseract not installed")
 
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -195,7 +195,7 @@ def analyse_image(img, cnts_by_class=None):
         )
     except Exception as exc:
         logger.warning("OCR failed: %s", exc)
-        return _empty(img)
+        return _empty(img, f"OCR failed: {exc}")
 
     # ── Collect valid word regions ────────────────────────────────────────────
     regions = []
@@ -321,13 +321,27 @@ def draw_text_mapping_overlay(img, mappings):
     return vis
 
 
-def _empty(img):
-    copy = img.copy() if img is not None else None
+def _empty(img, reason="OCR unavailable"):
+    """Return a result where pre shows a grey 'unavailable' banner and post is distinct."""
+    if img is None:
+        return {
+            "mappings": [], "assigned": [], "summary": reason,
+            "pre_label_img": None, "post_label_img": None, "regions": [],
+        }
+    h, w = img.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.5, min(w, h) / 1500.0)
+    thick = max(1, int(min(w, h) / 600))
+
+    pre = img.copy()
+    cv2.rectangle(pre, (0, 0), (w, 36), (40, 40, 40), -1)
+    cv2.putText(pre, f"Pre-OCR: {reason}", (8, 26), font, scale, (0, 200, 0), thick, cv2.LINE_AA)
+
+    post = img.copy()
+    cv2.rectangle(post, (0, 0), (w, 36), (40, 40, 40), -1)
+    cv2.putText(post, f"Post-OCR: {reason}", (8, 26), font, scale, (0, 165, 255), thick, cv2.LINE_AA)
+
     return {
-        "mappings":       [],
-        "assigned":       [],
-        "summary":        "OCR unavailable",
-        "pre_label_img":  copy,
-        "post_label_img": copy,
-        "regions":        [],
+        "mappings": [], "assigned": [], "summary": reason,
+        "pre_label_img": pre, "post_label_img": post, "regions": [],
     }

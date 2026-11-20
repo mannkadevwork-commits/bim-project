@@ -502,6 +502,25 @@ def _load_existing_labels():
     if not marked_dir.is_dir():
         return
 
+    # ── Purge stale pre/post files that are byte-identical (written by old stub)
+    _stale = 0
+    for pre_path in marked_dir.glob("*_pre_label.jpg"):
+        post_path = marked_dir / pre_path.name.replace("_pre_label", "_post_label")
+        if post_path.exists() and pre_path.stat().st_size == post_path.stat().st_size:
+            try:
+                if pre_path.read_bytes() == post_path.read_bytes():
+                    pre_path.unlink()
+                    post_path.unlink()
+                    _stale += 1
+            except Exception:
+                pass
+    if _stale:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "Deleted %d stale identical pre/post OCR file pair(s) — re-run Auto Label to regenerate",
+            _stale,
+        )
+
     for marked_path in sorted(marked_dir.glob("*_labelled.jpg")):
         basename = marked_path.stem.replace("_labelled", "")
 
