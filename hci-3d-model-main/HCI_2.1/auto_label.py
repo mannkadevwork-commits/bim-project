@@ -81,9 +81,23 @@ def generate_labels(img_path, detector=None, dataset_dir=None):
             heur = _det.detect(img)
             img_h, img_w = img.shape[:2]
             key_map = {
-                "rooms": "Room", "doors": "Door", "windows": "Window",
-                "walls": "Wall", "furniture": "Furniture",
-                "stairs": "Stair", "flow_terminals": "FlowTerminal",
+                "rooms":               "Room",
+                "doors":               "Door",
+                "windows":             "Window",
+                "walls":               "Wall",
+                "columns":             "Column",
+                "stairs":              "Stair",
+                "furniture":           "Furniture",
+                "flow_terminals":      "FlowTerminal",
+                "slabs":               "Slab",
+                "roofs":               "Roof",
+                "beams":               "Beam",
+                "railings":            "Railing",
+                "curtain_walls":       "CurtainWall",
+                "coverings":           "Covering",
+                "light_fixtures":      "LightFixture",
+                "electric_appliances": "ElectricAppliance",
+                "energy_devices":      "EnergyConversionDevice",
             }
             for hkey, cls_name in key_map.items():
                 cnts = heur.get(hkey, [])

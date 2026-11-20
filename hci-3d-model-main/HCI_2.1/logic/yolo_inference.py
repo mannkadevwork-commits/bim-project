@@ -56,13 +56,53 @@ HCI_COLORS = {
 PRIORITY_HCI_CLASSES = frozenset({"Wall", "Door", "Window"})
 
 _NAME_ALIASES = {
-    "wall": "Wall",
-    "walls": "Wall",
-    "door": "Door",
-    "doors": "Door",
-    "window": "Window",
-    "windows": "Window",
-    "section door": "Door",
+    # Wall
+    "wall": "Wall", "walls": "Wall",
+    # Door
+    "door": "Door", "doors": "Door", "section door": "Door",
+    # Window
+    "window": "Window", "windows": "Window",
+    # Room
+    "room": "Room", "space": "Room", "area": "Room",
+    "living room": "Room", "bedroom": "Room", "kitchen": "Room",
+    "bathroom": "Room", "balcony": "Room", "corridor": "Room",
+    "hallway": "Room", "foyer": "Room",
+    # Slab
+    "slab": "Slab", "floor slab": "Slab", "ceiling slab": "Slab",
+    # Roof
+    "roof": "Roof", "rooftop": "Roof",
+    # Column
+    "column": "Column", "columns": "Column", "pillar": "Column", "post": "Column",
+    # Beam
+    "beam": "Beam", "beams": "Beam",
+    # Stair
+    "stair": "Stair", "stairs": "Stair", "staircase": "Stair", "steps": "Stair",
+    # Railing
+    "railing": "Railing", "railings": "Railing", "handrail": "Railing",
+    # CurtainWall
+    "curtainwall": "CurtainWall", "curtain wall": "CurtainWall", "glazing": "CurtainWall",
+    # Furniture
+    "furniture": "Furniture", "sofa": "Furniture", "bed": "Furniture",
+    "table": "Furniture", "chair": "Furniture", "wardrobe": "Furniture",
+    "cabinet": "Furniture", "desk": "Furniture",
+    # Covering
+    "covering": "Covering", "flooring": "Covering", "ceiling": "Covering",
+    # LightFixture
+    "lightfixture": "LightFixture", "light": "LightFixture", "lamp": "LightFixture",
+    "light fixture": "LightFixture", "ceiling light": "LightFixture",
+    # ElectricAppliance
+    "electricappliance": "ElectricAppliance", "appliance": "ElectricAppliance",
+    "electric appliance": "ElectricAppliance", "ac": "ElectricAppliance",
+    "refrigerator": "ElectricAppliance", "stove": "ElectricAppliance",
+    # FlowTerminal
+    "flowterminal": "FlowTerminal", "flow terminal": "FlowTerminal",
+    "toilet": "FlowTerminal", "wc": "FlowTerminal", "sink": "FlowTerminal",
+    "basin": "FlowTerminal", "shower": "FlowTerminal", "bathtub": "FlowTerminal",
+    "sanitary": "FlowTerminal", "plumbing": "FlowTerminal",
+    # EnergyConversionDevice
+    "energyconversiondevice": "EnergyConversionDevice",
+    "energy device": "EnergyConversionDevice", "hvac": "EnergyConversionDevice",
+    "boiler": "EnergyConversionDevice", "heat pump": "EnergyConversionDevice",
 }
 
 _model_cache = {"path": None, "model": None}
@@ -156,18 +196,20 @@ def find_model_path() -> str:
 
 
 def map_model_class_to_hci(model_cls_id: int, model_names: dict) -> str | None:
-    """Map a YOLO model class id to an HCI class name (Wall/Door/Window only)."""
+    """Map a YOLO model class id to an HCI class name (all 17 classes)."""
     raw = model_names.get(int(model_cls_id), str(model_cls_id))
     if isinstance(raw, (list, tuple)):
         raw = raw[0]
     raw_str = str(raw).strip()
-    if raw_str in CLASS_IDS and raw_str in PRIORITY_HCI_CLASSES:
+    # Exact match against any HCI class
+    if raw_str in CLASS_IDS:
         return raw_str
     key = raw_str.lower().replace("_", " ")
     hci = _NAME_ALIASES.get(key)
-    if hci and hci in PRIORITY_HCI_CLASSES:
+    if hci:
         return hci
-    for name in PRIORITY_HCI_CLASSES:
+    # Case-insensitive fallback against all HCI class names
+    for name in CLASS_IDS:
         if raw_str.lower() == name.lower():
             return name
     return None
@@ -344,11 +386,9 @@ def run_yolo_inference(
                 if hci_name == "Wall":
                     if box_conf < WALL_MIN_CONF:
                         continue
-             
                 else:
                     if box_conf < 0.05:
                         continue
-                        
                 hci_cid = CLASS_IDS[hci_name]
                 mask = mask_data[i]
                 if mask.shape != (img_h, img_w):
@@ -376,11 +416,9 @@ def run_yolo_inference(
                 if hci_name == "Wall":
                     if box_conf < WALL_MIN_CONF:
                         continue
-               
                 else:
                     if box_conf < 0.05:
                         continue
-                    
                 hci_cid = CLASS_IDS[hci_name]
                 x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
                 cnt = _bbox_to_contour(x1, y1, x2, y2)

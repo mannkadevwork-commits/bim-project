@@ -95,12 +95,102 @@ class FloorPlanDetector:
         rooms   = sorted(rooms,   key=cv2.contourArea, reverse=True)[:20]
         walls   = sorted(walls,   key=cv2.contourArea, reverse=True)[:60]
 
+        # ── COLUMN detection (small, near-square, solid blobs) ────────────────
+        columns = []
+        min_col = max(10.0, self._th("column_min_area_ratio", 0.00005) * h * w)
+        max_col = max(200.0, self._th("column_max_area_ratio", 0.002) * h * w)
+        for cnt in wall_cnts:
+            area = cv2.contourArea(cnt)
+            if area < min_col or area > max_col:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (rw, rh), _ = rect
+            long_side  = max(float(rw), float(rh))
+            short_side = min(float(rw), float(rh))
+            aspect = long_side / max(short_side, 1.0)
+            # Columns are near-square (aspect < 2.0) and solid
+            if aspect < 2.0:
+                hull = cv2.convexHull(cnt)
+                hull_area = float(cv2.contourArea(hull))
+                if hull_area > 0 and area / hull_area > 0.75:
+                    columns.append(cnt)
+        columns = sorted(columns, key=cv2.contourArea, reverse=True)[:20]
+
+        # ── STAIR detection (medium rectangular regions with internal lines) ──
+        stairs = []
+        min_stair = max(200.0, self._th("stair_min_area_ratio", 0.001) * h * w)
+        max_stair = max(2000.0, self._th("stair_max_area_ratio", 0.05) * h * w)
+        for cnt in room_cnts:
+            area = cv2.contourArea(cnt)
+            if area < min_stair or area > max_stair:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (rw, rh), _ = rect
+            long_side  = max(float(rw), float(rh))
+            short_side = min(float(rw), float(rh))
+            aspect = long_side / max(short_side, 1.0)
+            # Stairs tend to be rectangular (aspect 1.5–5)
+            if 1.5 <= aspect <= 5.0:
+                stairs.append(cnt)
+        stairs = sorted(stairs, key=cv2.contourArea, reverse=True)[:10]
+
+        # ── FURNITURE detection (medium blobs, not elongated) ─────────────────
+        furniture = []
+        min_furn = max(100.0, self._th("furniture_min_area_ratio", 0.0003) * h * w)
+        max_furn = max(1000.0, self._th("furniture_max_area_ratio", 0.02) * h * w)
+        for cnt in small_cnts:
+            area = cv2.contourArea(cnt)
+            if area < min_furn or area > max_furn:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (rw, rh), _ = rect
+            long_side  = max(float(rw), float(rh))
+            short_side = min(float(rw), float(rh))
+            aspect = long_side / max(short_side, 1.0)
+            # Furniture: compact blobs (aspect < 3)
+            if aspect < 3.0:
+                hull = cv2.convexHull(cnt)
+                hull_area = float(cv2.contourArea(hull))
+                if hull_area > 0 and area / hull_area > 0.55:
+                    furniture.append(cnt)
+        furniture = sorted(furniture, key=cv2.contourArea, reverse=True)[:30]
+
+        # ── FLOW TERMINAL detection (very small, near-square sanitary fixtures)
+        flow_terminals = []
+        min_ft = max(20.0, self._th("ft_min_area_ratio", 0.00005) * h * w)
+        max_ft = max(300.0, self._th("ft_max_area_ratio", 0.003) * h * w)
+        for cnt in small_cnts:
+            area = cv2.contourArea(cnt)
+            if area < min_ft or area > max_ft:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (rw, rh), _ = rect
+            long_side  = max(float(rw), float(rh))
+            short_side = min(float(rw), float(rh))
+            aspect = long_side / max(short_side, 1.0)
+            # Sanitary fixtures: compact (aspect < 2.5)
+            if aspect < 2.5:
+                flow_terminals.append(cnt)
+        flow_terminals = sorted(flow_terminals, key=cv2.contourArea, reverse=True)[:20]
+
         return {
             "rooms":          rooms,
             "doors":          doors,
             "windows":        windows,
             "walls":          walls,
-            "furniture":      [],
-            "stairs":         [],
-            "flow_terminals": [],
+            "columns":        columns,
+            "stairs":         stairs,
+            "furniture":      furniture,
+            "flow_terminals": flow_terminals,
+            # These require semantic context — CV cannot reliably detect them
+            # but we return empty lists so the key_map in auto_label.py is consistent
+            "slabs":          [],
+            "roofs":          [],
+            "beams":          [],
+            "railings":       [],
+            "curtain_walls":  [],
+            "coverings":      [],
+            "light_fixtures": [],
+            "electric_appliances": [],
+            "energy_devices": [],
         }
